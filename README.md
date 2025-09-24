@@ -19,6 +19,7 @@ A high-performance inference framework leveraging Rust's Candle for maximum spee
 
 - [ ] [Canary-180M-flash](https://huggingface.co/nvidia/canary-180m-flash)
 - [ ] [SmolDocing-256M](https://huggingface.co/ds4sd/SmolDocling-256M-preview)
+- [x] Qwen3
 
 submit your models make other users use it easier!
 
