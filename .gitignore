@@ -10,3 +10,4 @@ outputs/
 
 *.bin
 tests/
+.vscode/

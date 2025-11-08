@@ -25,7 +25,7 @@ pub struct TextGeneration {
     pub model: Model,
     pub device: Device,
     pub tokenizer: TokenOutputStream,
-    pub logits_processor: LogitsProcessor
+    pub logits_processor: LogitsProcessor,
     pub repeat_penalty: f32,
     pub repeat_last_n: usize,
 }

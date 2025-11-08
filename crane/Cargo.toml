@@ -13,16 +13,22 @@ crane-core = { path = "../crane-core" }
 
 [[bin]]
 name = "llmbench"
-path = "apps/llmbench/main.rs"
+path = "src/demos/llmbench/main.rs"
 
 [[bin]]
 name = "sparktts"
-path = "apps/sparktts/main.rs"
+path = "src/demos/sparktts/main.rs"
 
 [[bin]]
 name = "qwenchat"
-path = "apps/qwenchat/main.rs"
+path = "src/demos/qwenchat/main.rs"
 
 [[bin]]
 name = "example"
-path = "apps/example/main.rs"
+path = "src/demos/example/main.rs"
+
+
+
+[[bin]]
+name = "moonshine_asr"
+path = "src/demos/moonshine_asr.rs"
