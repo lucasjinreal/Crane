@@ -9,6 +9,6 @@ vendor/
 outputs/
 
 *.bin
-tests/
+# tests/
 .vscode/
 /vendor
