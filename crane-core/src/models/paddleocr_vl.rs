@@ -3,9 +3,9 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::paddleocr_vl::{Config, PaddleOCRVLModel};
 use hf_hub::{api::sync::Api, Repo, RepoType};
+use std::path::{Path, PathBuf};
+use std::time::Instant;
 use tokenizers::Tokenizer;
-
-use std::path::Path;
 
 pub struct PaddleOcrVL {
     model: PaddleOCRVLModel,
@@ -17,7 +17,7 @@ pub struct PaddleOcrVL {
     image_token_id: u32,
     vision_start_token_id: u32,
     vision_end_token_id: u32,
-    video_token_id: Option<u32>, // 只有 video 模式才會用到
+    // video_token_id: u32,  // 目前 PaddleOCR-VL video 支援仍實驗性，先註解
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -26,7 +26,6 @@ pub enum OcrTask {
     Table,
     Formula,
     Chart,
-    // Video 模式目前建議單獨處理，這裡先不包含在 enum 裡
 }
 
 impl OcrTask {
@@ -48,7 +47,6 @@ pub struct OcrResult {
 }
 
 impl PaddleOcrVL {
-    /// 從 HuggingFace repo 加載模型（推薦方式）
     pub fn from_pretrained(
         model_id: &str,
         revision: Option<&str>,
@@ -67,6 +65,12 @@ impl PaddleOcrVL {
             DType::F32
         };
 
+        println!(
+            "Loading PaddleOCR-VL from HF: {} @ {}",
+            model_id,
+            revision.unwrap_or("main")
+        );
+
         let api = Api::new()?;
         let repo = api.repo(Repo::with_revision(
             model_id.to_string(),
@@ -74,21 +78,20 @@ impl PaddleOcrVL {
             revision.unwrap_or("main").to_string(),
         ));
 
-        // config
         let config_path = repo.get("config.json")?;
         let config: Config = serde_json::from_str(&std::fs::read_to_string(config_path)?)?;
 
-        // tokenizer
         let tokenizer_path = repo.get("tokenizer.json")?;
-        let tokenizer = Tokenizer::from_file(tokenizer_path).map_err(E::msg)?;
+        let tokenizer = Tokenizer::from_file(tokenizer_path)
+            .map_err(|e| E::msg(format!("Failed to load tokenizer: {}", e)))?;
 
-        // weights
-        let model_file = match repo.get("model.safetensors") {
-            Ok(p) => p,
-            Err(_) => repo.get("pytorch_model.bin")?,
-        };
+        let model_file = repo
+            .get("model.safetensors")
+            .or_else(|_| repo.get("pytorch_model.bin"))?;
 
-        let vb = if model_file.extension().map_or(false, |e| e == "bin") {
+        println!("Loading weights from: {:?}", model_file.display());
+
+        let vb = if model_file.extension().map_or(false, |ext| ext == "bin") {
             VarBuilder::from_pth(&model_file, dtype, &device)?
         } else {
             unsafe { VarBuilder::from_mmaped_safetensors(&[&model_file], dtype, &device)? }
@@ -107,16 +110,14 @@ impl PaddleOcrVL {
             tokenizer,
             device,
             dtype,
-            config,
+            config: config.clone(),
             eos_token_id,
             image_token_id: config.image_token_id,
             vision_start_token_id: config.vision_start_token_id,
             vision_end_token_id: config.vision_end_token_id,
-            video_token_id: config.video_token_id,
         })
     }
 
-    /// 從本地目錄載入（已下載好的模型）
     pub fn from_local(path: impl AsRef<Path>, cpu: bool, bf16: bool) -> Result<Self> {
         let device = if cpu {
             Device::Cpu
@@ -129,15 +130,27 @@ impl PaddleOcrVL {
             DType::F32
         };
 
-        let path = path.as_ref();
+        let base = path.as_ref().to_path_buf();
+        if !base.is_dir() {
+            return Err(E::msg(format!("Not a directory: {:?}", base)));
+        }
 
-        let config_path = path.join("config.json");
-        let config: Config = serde_json::from_str(&std::fs::read_to_string(config_path)?)?;
+        let config: Config =
+            serde_json::from_str(&std::fs::read_to_string(base.join("config.json"))?)?;
+        let tokenizer = Tokenizer::from_file(base.join("tokenizer.json")).map_err(E::msg)?;
 
-        let tokenizer = Tokenizer::from_file(path.join("tokenizer.json")).map_err(E::msg)?;
-
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[&path.join("model.safetensors")], dtype, &device)?
+        let safetensors_path = base.join("model.safetensors");
+        let vb = if safetensors_path.exists() {
+            unsafe { VarBuilder::from_mmaped_safetensors(&[&safetensors_path], dtype, &device)? }
+        } else {
+            let pth_path = base.join("pytorch_model.bin");
+            if pth_path.exists() {
+                VarBuilder::from_pth(&pth_path, dtype, &device)?
+            } else {
+                return Err(E::msg(
+                    "Neither model.safetensors nor pytorch_model.bin found",
+                ));
+            }
         };
 
         let model = PaddleOCRVLModel::new(&config, vb)?;
@@ -152,12 +165,11 @@ impl PaddleOcrVL {
             tokenizer,
             device,
             dtype,
-            config,
+            config: config.clone(),
             eos_token_id,
             image_token_id: config.image_token_id,
             vision_start_token_id: config.vision_start_token_id,
             vision_end_token_id: config.vision_end_token_id,
-            video_token_id: config.video_token_id,
         })
     }
 
@@ -167,27 +179,19 @@ impl PaddleOcrVL {
         task: OcrTask,
         max_new_tokens: usize,
     ) -> Result<OcrResult> {
-        use std::time::Instant;
-
         let start = Instant::now();
 
-        let (pixel_values, grid_thw) = crate::load_image(
-            // 假設你把 load_image 抽成獨立函數
-            image_path.as_ref().to_str().unwrap(),
-            &self.device,
-            self.dtype,
-        )?;
+        let (pixel_values, grid_thw) = load_image(image_path.as_ref(), &self.device, self.dtype)?;
 
-        let grid_vec: Vec<Vec<u32>> = grid_thw.to_vec2()?;
+        let grid_vec: Vec<Vec<u32>> = grid_thw.to_vec2().map_err(|e| E::msg(e.to_string()))?;
         let g = &grid_vec[0];
         let spatial_merge = self.config.vision_config.spatial_merge_size as usize;
-        let num_tokens = (g[1] as usize / spatial_merge) * (g[2] as usize / spatial_merge);
+        let num_image_tokens = (g[1] as usize / spatial_merge) * (g[2] as usize / spatial_merge);
 
-        let input_ids = crate::build_input_tokens(
-            // 同樣假設已抽出的 helper
+        let input_ids = build_input_tokens(
             &self.tokenizer,
             task,
-            num_tokens,
+            num_image_tokens,
             self.image_token_id,
             self.vision_start_token_id,
             self.vision_end_token_id,
@@ -209,11 +213,15 @@ impl PaddleOcrVL {
             .take_while(|&t| t != self.eos_token_id)
             .collect();
 
-        let text = self
+        let mut text = self
             .tokenizer
-            .decode(&output_tokens, true)?
-            .trim()
-            .to_string();
+            .decode(&output_tokens, true)
+            .map_err(|e| anyhow::anyhow!("Tokenizer decode failed: {}", e))?;
+        text = text.trim().to_string();
+
+        if text.is_empty() {
+            text = "[no text recognized]".to_string();
+        }
 
         let duration = start.elapsed().as_secs_f32();
 
@@ -224,7 +232,6 @@ impl PaddleOcrVL {
         })
     }
 
-    /// 簡單的 streaming 版本（一行一行印）
     pub fn recognize_and_print(
         &mut self,
         image_path: impl AsRef<Path>,
@@ -232,34 +239,141 @@ impl PaddleOcrVL {
         max_new_tokens: usize,
     ) -> Result<()> {
         let result = self.recognize(image_path, task, max_new_tokens)?;
-        println!("\n{}", "=".repeat(60));
-        println!("Task: {:?}", task);
-        println!("{}", result.text);
+        println!("\n{}", "=".repeat(70));
+        println!("Task          : {:?}", task);
+        println!("Duration      : {:.2} s", result.duration_secs);
         println!(
-            "{} tokens in {:.2}s ({:.1} tok/s)",
+            "Tokens        : {} ({:.1} tok/s)",
             result.tokens_generated,
-            result.duration_secs,
             result.tokens_generated as f32 / result.duration_secs.max(0.01)
         );
-        println!("{}\n", "=".repeat(60));
+        println!("{}", "=".repeat(70));
+        println!("{}", result.text);
+        println!("{}", "=".repeat(70));
         Ok(())
     }
-
-    // 如果之後想要支援 batch / video，可以再擴充
-    // pub fn recognize_batch(...)
-    // pub fn recognize_video(...)
 }
 
-impl std::fmt::Debug for PaddleOcrVL {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PaddleOcrVL")
-            .field("device", &self.device)
-            .field("dtype", &self.dtype)
-            .field(
-                "vision_layers",
-                &self.config.vision_config.num_hidden_layers,
-            )
-            .field("text_layers", &self.config.num_hidden_layers)
-            .finish()
+// ======================== Helper functions ========================
+
+pub fn load_image(path: &Path, device: &Device, dtype: DType) -> Result<(Tensor, Tensor)> {
+    let img = image::ImageReader::open(path)?
+        .decode()
+        .map_err(|e| E::msg(format!("Cannot decode image {}: {}", path.display(), e)))?
+        .to_rgb8();
+
+    let (width, height) = (img.width() as usize, img.height() as usize);
+
+    // PaddleOCR-VL 常見參數 (來自 preprocessor_config.json)
+    const PATCH_SIZE: usize = 14;
+    const SPATIAL_MERGE: usize = 2;
+    const FACTOR: usize = PATCH_SIZE * SPATIAL_MERGE; // 28
+    const MIN_PIXELS: usize = 147_384;
+    const MAX_PIXELS: usize = 2_822_400;
+
+    let (new_h, new_w) = smart_resize(height, width, FACTOR, MIN_PIXELS, MAX_PIXELS)?;
+
+    let resized = image::imageops::resize(
+        &img,
+        new_w as u32,
+        new_h as u32,
+        image::imageops::FilterType::CatmullRom,
+    );
+
+    let mut buf = vec![0f32; 3 * new_h * new_w];
+    for c in 0..3 {
+        for y in 0..new_h {
+            for x in 0..new_w {
+                let idx = c * new_h * new_w + y * new_w + x;
+                buf[idx] = resized.get_pixel(x as u32, y as u32)[c] as f32 / 255.0 * 2.0 - 1.0;
+            }
+        }
     }
+
+    let pixel_values = Tensor::from_vec(buf, (1, 3, new_h, new_w), device)?.to_dtype(dtype)?;
+
+    let h_patches = (new_h / PATCH_SIZE) as u32;
+    let w_patches = (new_w / PATCH_SIZE) as u32;
+    let grid_thw = Tensor::new(&[[1u32, h_patches, w_patches]], device)?;
+
+    Ok((pixel_values, grid_thw))
+}
+
+fn smart_resize(
+    h: usize,
+    w: usize,
+    factor: usize,
+    min_pixels: usize,
+    max_pixels: usize,
+) -> Result<(usize, usize)> {
+    let mut height = h;
+    let mut width = w;
+
+    // 避免太小
+    if height < factor {
+        width = width * factor / height.max(1);
+        height = factor;
+    }
+    if width < factor {
+        height = height * factor / width.max(1);
+        width = factor;
+    }
+
+    let mut h_bar = ((height + factor / 2) / factor) * factor;
+    let mut w_bar = ((width + factor / 2) / factor) * factor;
+
+    let pixels = h_bar * w_bar;
+
+    if pixels > max_pixels {
+        let scale = (pixels as f64 / max_pixels as f64).sqrt();
+        h_bar = ((height as f64 / scale / factor as f64).floor() as usize).max(1) * factor;
+        w_bar = ((width as f64 / scale / factor as f64).floor() as usize).max(1) * factor;
+    } else if pixels < min_pixels {
+        let scale = (min_pixels as f64 / pixels as f64).sqrt();
+        h_bar = ((height as f64 * scale / factor as f64).ceil() as usize) * factor;
+        w_bar = ((width as f64 * scale / factor as f64).ceil() as usize) * factor;
+    }
+
+    if (h_bar as f64 / w_bar as f64).max(w_bar as f64 / h_bar as f64) > 200.0 {
+        return Err(E::msg("Aspect ratio too extreme after resize"));
+    }
+
+    Ok((h_bar, w_bar))
+}
+
+pub fn build_input_tokens(
+    tokenizer: &Tokenizer,
+    task: OcrTask,
+    num_image_tokens: usize,
+    image_token_id: u32,
+    vision_start_token_id: u32,
+    vision_end_token_id: u32,
+    device: &Device,
+) -> Result<Tensor> {
+    let bos_id = tokenizer.token_to_id("<|begin_of_sentence|>").unwrap_or(1);
+
+    let parts = [
+        "User: ",
+        "<|image_start|>",
+        // image placeholders will be inserted here
+        "<|image_end|>",
+        task.prompt(),
+        "\nAssistant: ",
+    ];
+
+    let mut tokens = vec![bos_id];
+
+    for &part in &parts[..2] {
+        // User: + <|image_start|>
+        tokens.extend(tokenizer.encode(part, false)?.get_ids().iter().copied());
+    }
+
+    tokens.extend(vec![image_token_id; num_image_tokens]);
+
+    for &part in &parts[2..] {
+        // <|image_end|> + prompt + \nAssistant:
+        tokens.extend(tokenizer.encode(part, false)?.get_ids().iter().copied());
+    }
+
+    Tensor::new(tokens.as_slice(), device)?.unsqueeze(0)
 }
