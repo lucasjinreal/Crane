@@ -318,14 +318,28 @@ pub fn build_input_tokens(
 
     for &part in &parts[..2] {
         // User: + <|image_start|>
-        tokens.extend(tokenizer.encode(part, false)?.get_ids().iter().copied());
+        tokens.extend(
+            tokenizer
+                .encode(part, false)
+                .map_err(|e| E::msg(format!("Tokenizer encode failed: {}", e)))?
+                .get_ids()
+                .iter()
+                .copied(),
+        );
     }
 
     tokens.extend(vec![image_token_id; num_image_tokens]);
 
     for &part in &parts[2..] {
         // <|image_end|> + prompt + \nAssistant:
-        tokens.extend(tokenizer.encode(part, false)?.get_ids().iter().copied());
+        tokens.extend(
+            tokenizer
+                .encode(part, false)
+                .map_err(|e| E::msg(format!("Tokenizer encode failed: {}", e)))?
+                .get_ids()
+                .iter()
+                .copied(),
+        );
     }
 
     Tensor::new(tokens.as_slice(), device)?
