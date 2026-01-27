@@ -5,7 +5,9 @@ edition = "2021"
 
 [dependencies]
 crane = { path = "../crane" }
-anyhow = "1.0.97"
+crane-core = { path = "../crane-core" }
+anyhow = "1.0.100"
+image = "0.25.9"
 
 [[bin]]
 name = "chat_simple"
@@ -22,6 +24,10 @@ path = "src/asr_simple.rs"
 [[bin]]
 name = "vision_simple"
 path = "src/vision_simple.rs"
+
+[[bin]]
+name = "bm_resize"
+path = "src/bm_resize.rs"
 
 [features]
 default = []

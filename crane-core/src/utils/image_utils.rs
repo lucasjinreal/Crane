@@ -1,23 +1,89 @@
 use anyhow::{Error as E, Result};
 use candle_core::{DType, Device, Tensor};
-use kornia::image::{Image, ImageSize};
-use kornia::imgproc::interpolation::InterpolationMode;
-use kornia::imgproc::resize::resize_native;
-use kornia::io::functional as F;
-
-use kornia::tensor::CpuAllocator;
 use std::path::Path;
+
+use anyhow::Context;
+
+/// Interpolation mode for resizing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResizeMode {
+    /// Bilinear (smooth, default for most image tasks)
+    Bilinear,
+    /// Nearest neighbor (fast, preserves hard edges, pixelated)
+    Nearest,
+    // Future: Bicubic, Lanczos, etc. (would require custom kernel or different backend)
+    Bicubic,
+}
+
+/// Loads an image from disk, converts to normalized float tensor, resizes it,
+/// and returns a **B×C×H×W** tensor (batch=1, channels=3) ready for model input.
+///
+/// # Arguments
+/// * `path`       - Path to the image file
+/// * `target_h`   - Desired output height
+/// * `target_w`   - Desired output width
+/// * `mode`       - Interpolation method
+/// * `device`     - Target device (CUDA/CPU)
+///
+/// # Returns
+/// Tensor of shape `[1, 3, target_h, target_w]` with values ∈ [0.0, 1.0]
+pub fn load_and_resize_image_to_tensor(
+    path: impl AsRef<std::path::Path>,
+    target_h: usize,
+    target_w: usize,
+    mode: ResizeMode,
+    device: &Device,
+) -> Result<Tensor> {
+    let img = image::ImageReader::open(path.as_ref())
+        .with_context(|| format!("Failed to open image: {:?}", path.as_ref()))?
+        .decode()
+        .context("Image decoding failed")?
+        .to_rgb8();
+
+    let (orig_w, orig_h) = img.dimensions();
+    let needs_resize = orig_h as usize != target_h || orig_w as usize != target_w;
+
+    let raw = img.into_raw();
+
+    let mut tensor = (Tensor::from_vec(raw, (orig_h as usize, orig_w as usize, 3), device)?
+        .to_dtype(DType::F32)?
+        .permute((2, 0, 1))?
+        / 255.0)?;
+
+    if needs_resize {
+        tensor = match mode {
+            ResizeMode::Bilinear => {
+                let t = tensor.unsqueeze(0)?;
+                let t = t.upsample_bilinear2d(target_h, target_w, false)?;
+                t.squeeze(0)?
+            }
+            ResizeMode::Nearest => {
+                let t = tensor.unsqueeze(0)?;
+                let t = t.upsample_nearest2d(target_h, target_w)?;
+                t.squeeze(0)?
+            }
+            ResizeMode::Bicubic => {
+                return Err(E::msg("Bicubic resize not implemented yet"));
+            }
+        };
+    }
+
+    Ok(tensor)
+}
 
 pub fn load_image_and_smart_resize(
     path: &Path,
     device: &Device,
     dtype: DType,
+    mode: ResizeMode,
 ) -> Result<(Tensor, Tensor)> {
-    // 1. 用 kornia 读图（RGB8，HWC，连续内存）
-    let img_u8: Image<u8, 3, CpuAllocator> = F::read_image_any_rgb8(path)?;
-    let size = img_u8.size();
+    let img = image::ImageReader::open(path)
+        .with_context(|| format!("Failed to open image: {:?}", path))?
+        .decode()
+        .context("Image decoding failed")?
+        .to_rgb8();
 
-    let img_f32: Image<f32, 3, CpuAllocator> = img_u8.cast_and_scale(1.0 / 255.0)?;
+    let (orig_w, orig_h) = img.dimensions();
 
     const PATCH_SIZE: usize = 14;
     const SPATIAL_MERGE: usize = 2;
@@ -25,47 +91,41 @@ pub fn load_image_and_smart_resize(
     const MIN_PIXELS: usize = 147_384;
     const MAX_PIXELS: usize = 2_822_400;
 
-    let (width, height) = (size.width as usize, size.height as usize);
-
-    let (resized_h, resized_w) = smart_resize(height, width, FACTOR, MIN_PIXELS, MAX_PIXELS)?;
-
-    // 3. resize（kornia 的强项）
-    let mut resized = Image::<f32, 3, CpuAllocator>::from_size_val(
-        ImageSize {
-            width: resized_w,
-            height: resized_h,
-        },
-        0.0,
-        CpuAllocator,
+    let (resized_h, resized_w) = smart_resize(
+        orig_h as usize,
+        orig_w as usize,
+        FACTOR,
+        MIN_PIXELS,
+        MAX_PIXELS,
     )?;
 
-    resize_native(&img_f32, &mut resized, InterpolationMode::Bicubic)?;
+    let raw = img.into_raw();
+    let mut tensor = (Tensor::from_vec(raw, (orig_h as usize, orig_w as usize, 3), device)?
+        .to_dtype(DType::F32)?
+        .permute((2, 0, 1))?
+        / 255.0)?;
 
-    let raw: Vec<f32> = resized.to_vec();
-
-    // H * W
-    let hw = resized_h * resized_w;
-
-    // CHW buffer
-    let mut buf = vec![0f32; 3 * hw];
-
-    // HWC -> CHW + normalize [-1, 1]
-    for i in 0..hw {
-        let base = i * 3;
-
-        buf[i] = raw[base] * 2.0 - 1.0; // R
-        buf[hw + i] = raw[base + 1] * 2.0 - 1.0; // G
-        buf[2 * hw + i] = raw[base + 2] * 2.0 - 1.0; // B
-    }
-
-    let pixel_values =
-        Tensor::from_vec(buf, (1, 3, resized_h, resized_w), device)?.to_dtype(dtype)?;
+    tensor = match mode {
+        ResizeMode::Bilinear => {
+            let t = tensor.unsqueeze(0)?;
+            let t = t.upsample_bilinear2d(resized_h, resized_w, false)?;
+            t.squeeze(0)?
+        }
+        ResizeMode::Nearest => {
+            let t = tensor.unsqueeze(0)?;
+            let t = t.upsample_nearest2d(resized_h, resized_w)?;
+            t.squeeze(0)?
+        }
+        ResizeMode::Bicubic => {
+            return Err(E::msg("Bicubic resize not implemented yet"));
+        }
+    };
 
     let h_patches = (resized_h / PATCH_SIZE) as u32;
     let w_patches = (resized_w / PATCH_SIZE) as u32;
     let grid_thw = Tensor::new(&[[1u32, h_patches, w_patches]], device)?;
 
-    Ok((pixel_values, grid_thw))
+    Ok((tensor, grid_thw))
 }
 
 pub fn smart_resize(

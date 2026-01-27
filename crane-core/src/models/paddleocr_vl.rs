@@ -291,7 +291,7 @@ pub fn load_image(path: &Path, device: &Device, dtype: DType) -> Result<(Tensor,
 
     // Ok((pixel_values, grid_thw))
 
-    image_utils::load_image_and_smart_resize(path, device, dtype)
+    image_utils::load_image_and_smart_resize(path, device, dtype, image_utils::ResizeMode::Bilinear)
 }
 
 pub fn build_input_tokens(
