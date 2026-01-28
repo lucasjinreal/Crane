@@ -89,7 +89,9 @@ pub fn load_image_and_smart_resize(
     const SPATIAL_MERGE: usize = 2;
     const FACTOR: usize = PATCH_SIZE * SPATIAL_MERGE; // 28
     const MIN_PIXELS: usize = 147_384;
-    const MAX_PIXELS: usize = 2_822_400;
+    // const MAX_PIXELS: usize = 2_822_400;
+    // const MAX_PIXELS: usize = 2_073_600;
+    const MAX_PIXELS: usize = 1_473_600;
 
     let (resized_h, resized_w) = smart_resize(
         orig_h as usize,
