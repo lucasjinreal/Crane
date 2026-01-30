@@ -1,7 +1,8 @@
-// v2 version of Namo-500M-v2
-// it uses Siglip2 as vision encoder and Qwen2.5 500M as llm
-// the connector part is also very simple
-// but we added a VLPatchMerger to siglip2 to reduce tokens
+// Implement various Connector of vision encoder and LLMs
+//
+// GLU used in Namo-Hydra or 2-layer Linear used in QwenVL
+
+use candle_nn::{Sequential, VarBuilder};
 
 pub struct MMProjector {
     pub modules: Sequential,

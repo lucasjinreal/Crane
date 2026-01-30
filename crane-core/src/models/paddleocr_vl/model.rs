@@ -164,7 +164,7 @@ impl PaddleOcrVL {
         let eos_token_id = tokenizer
             .token_to_id("</s>")
             .or_else(|| tokenizer.token_to_id("<|end_of_sentence|>"))
-            .or_else(|| tokenizer.token_to_id("<|endoftext|>"))
+            .or_else(|| tokenizer.token_to_id(""))
             .unwrap_or(2);
 
         Ok(Self {

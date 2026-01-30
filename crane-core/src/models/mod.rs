@@ -1,10 +1,13 @@
+pub mod modules;
 #[cfg(feature = "onnx")]
 pub mod moonshine_asr;
 pub mod orpheus;
 pub mod paddleocr_vl;
 pub mod qwen25;
+pub mod qwen25_vit;
 pub mod qwen3;
-pub mod siglip2;
+pub mod qwen3_vl;
+
 #[cfg(feature = "onnx")]
 pub mod silero_vad;
 #[cfg(feature = "onnx")]
