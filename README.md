@@ -60,6 +60,18 @@ We include:
 
 
 
+## AI Abilities Use out-of-box
+
+**1. OCR**
+
+![](assets/image.webp)
+
+
+**2. more to come**
+
+
+
+
 ## 🧐 Why Choose Crane?
 
 While traditional approaches face limitations:
