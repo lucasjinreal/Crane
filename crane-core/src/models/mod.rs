@@ -1,3 +1,4 @@
+pub mod hunyuan_dense;
 pub mod modules;
 #[cfg(feature = "onnx")]
 pub mod moonshine_asr;

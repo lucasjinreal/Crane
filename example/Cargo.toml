@@ -33,7 +33,16 @@ path = "src/bm_resize.rs"
 name = "ocr_simple"
 path = "src/ocr_simple.rs"
 
+[[bin]]
+name = "hunyuan_simple"
+path = "src/hunyuan_simple.rs"
+
+[[bin]]
+name = "orion_translate"
+path = "src/orion_translate.rs"
 
 [features]
-default = []
-onnx = ["crane/onnx"]
+cuda = ["crane-core/cuda"]
+flash-attn = ["crane-core/flash-attn"]
+cudnn = ["crane-core/cudnn"]
+mkl = ["crane-core/mkl"]
