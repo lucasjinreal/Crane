@@ -97,6 +97,27 @@ impl Model {
         self.prepare_inputs(&formatted)
     }
 
+    /// Run a single forward step, returning raw logits. Caller manages KV cache.
+    pub fn forward_step(&mut self, input_ids: &[u32], start_pos: usize) -> candle_core::Result<Tensor> {
+        let input = Tensor::new(input_ids, &self.device)?.unsqueeze(0)?;
+        self.inner.forward(&input, start_pos)
+    }
+
+    /// Number of transformer layers.
+    pub fn num_layers(&self) -> usize {
+        self.inner.num_layers()
+    }
+
+    /// Extract per-layer KV caches (cheap Arc clone).
+    pub fn get_kv_caches(&self) -> Vec<Option<(Tensor, Tensor)>> {
+        self.inner.get_kv_caches()
+    }
+
+    /// Restore per-layer KV caches.
+    pub fn set_kv_caches(&mut self, caches: Vec<Option<(Tensor, Tensor)>>) {
+        self.inner.set_kv_caches(caches);
+    }
+
     pub fn warmup(&mut self) {
         if let Err(e) = self.generate(
             &[45, 546, 456],

@@ -478,4 +478,24 @@ impl HunYuanDenseV1 {
         self.rotary_emb.sin_cache = None;
         self.rotary_emb.cached_len = 0;
     }
+
+    /// Number of transformer layers.
+    pub fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// Extract per-layer KV caches (cheap: Tensor is Arc-based).
+    pub fn get_kv_caches(&self) -> Vec<Option<(Tensor, Tensor)>> {
+        self.layers
+            .iter()
+            .map(|l| l.self_attn.kv_cache.clone())
+            .collect()
+    }
+
+    /// Restore per-layer KV caches (e.g. after swapping sequences).
+    pub fn set_kv_caches(&mut self, caches: Vec<Option<(Tensor, Tensor)>>) {
+        for (layer, cache) in self.layers.iter_mut().zip(caches.into_iter()) {
+            layer.self_attn.kv_cache = cache;
+        }
+    }
 }
