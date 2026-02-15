@@ -24,7 +24,7 @@ use tracing::info;
 
 use crane_core::models::hunyuan_dense::Model;
 
-use engine::{EngineHandle, EngineResponse, InferenceEngine};
+use engine::{EngineHandle, EngineResponse, InferenceEngine, StatsSnapshot};
 use openai_api::*;
 
 // ── CLI ──
@@ -58,6 +58,10 @@ struct Args {
     /// Max concurrent sequences in decode phase
     #[arg(long, default_value_t = 8)]
     max_concurrent: usize,
+
+    /// Tokens to decode per sequence before switching (higher = fewer KV swaps)
+    #[arg(long, default_value_t = 1)]
+    decode_tokens_per_seq: usize,
 }
 
 // ── App state ──
@@ -122,6 +126,11 @@ fn now_epoch() -> u64 {
 
 async fn health() -> impl IntoResponse {
     Json(json!({"status": "ok"}))
+}
+
+async fn stats(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let snap = state.engine.stats.snapshot();
+    Json(snap)
 }
 
 async fn list_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -370,14 +379,18 @@ async fn main() -> Result<()> {
 
     // ── Start engine on dedicated thread ──
 
-    let (engine, handle) = InferenceEngine::new(model, args.max_concurrent);
+    let (engine, handle) = InferenceEngine::new(
+        model,
+        args.max_concurrent,
+        args.decode_tokens_per_seq,
+    );
     std::thread::Builder::new()
         .name("inference-engine".into())
         .spawn(move || engine.run())
         .expect("Failed to spawn engine thread");
     info!(
-        "Inference engine started (max_concurrent={})",
-        args.max_concurrent
+        "Inference engine started (max_concurrent={}, decode_tokens_per_seq={})",
+        args.max_concurrent, args.decode_tokens_per_seq,
     );
 
     // ── Build router ──
@@ -391,6 +404,7 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(list_models))
+        .route("/v1/stats", get(stats))
         .route("/v1/chat/completions", post(chat_completions))
         .with_state(state);
 
@@ -398,6 +412,7 @@ async fn main() -> Result<()> {
     info!("Starting server on {addr}");
     info!("  POST http://{addr}/v1/chat/completions");
     info!("  GET  http://{addr}/v1/models");
+    info!("  GET  http://{addr}/v1/stats");
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
