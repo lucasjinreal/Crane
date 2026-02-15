@@ -1,5 +1,6 @@
 use candle_core::{DType, Device, Module, Result, Tensor, D};
 use candle_nn::{linear_no_bias, Linear, RmsNorm, VarBuilder};
+use candle_nn::rotary_emb::rope;
 use serde::Deserialize;
 
 #[cfg(feature = "flash-attn")]
@@ -59,18 +60,8 @@ impl Config {
     }
 }
 
-fn rotate_half(x: &Tensor) -> Result<Tensor> {
-    let half = x.dim(D::Minus1)? / 2;
-    let x1 = x.narrow(D::Minus1, 0, half)?;
-    let x2 = x.narrow(D::Minus1, half, half)?;
-    Tensor::cat(&[&x2.neg()?, &x1], D::Minus1)
-}
-
-fn apply_rotary_pos_emb(q: &Tensor, k: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<(Tensor, Tensor)> {
-    let q_embed = (q.broadcast_mul(cos)? + rotate_half(q)?.broadcast_mul(sin)?)?;
-    let k_embed = (k.broadcast_mul(cos)? + rotate_half(k)?.broadcast_mul(sin)?)?;
-    Ok((q_embed, k_embed))
-}
+// RoPE is applied via candle's fused `rope()` kernel (1 CUDA launch per tensor)
+// instead of manual rotate_half + broadcast_mul (~5 launches per tensor).
 
 struct RotaryEmbedding {
     inv_freq: Tensor,
@@ -132,9 +123,10 @@ impl RotaryEmbedding {
         let freqs = positions
             .unsqueeze(1)?
             .matmul(&self.inv_freq.unsqueeze(0)?)?; // [seq_len, dim/2]
-        let emb = Tensor::cat(&[&freqs, &freqs], D::Minus1)?; // [seq_len, dim]
-        let cos = emb.cos()?;
-        let sin = emb.sin()?;
+        // Return [seq_len, dim/2] — candle's fused rope() expects half-dim cos/sin
+        // and handles the rotation internally.
+        let cos = freqs.cos()?;
+        let sin = freqs.sin()?;
 
         self.cos_cache = Some(cos.clone());
         self.sin_cache = Some(sin.clone());
@@ -304,11 +296,10 @@ impl Attention {
             .reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
 
-        // Apply rotary embeddings.
-        // cos/sin are pre-shaped by the caller:
-        //   Single-sequence: [1, 1, seq_len, head_dim]
-        //   Batched decode:  [N, 1, 1, head_dim]
-        let (q, k) = apply_rotary_pos_emb(&q, &k, cos, sin)?;
+        // Apply rotary embeddings via fused kernel.
+        // rope() expects xs [B, H, S, D] contiguous, cos/sin [S, D/2] or [B, S, D/2].
+        let q = rope(&q.contiguous()?, cos, sin)?;
+        let k = rope(&k.contiguous()?, cos, sin)?;
 
         // Apply QK norm after RoPE
         let q = if let Some(ref norm) = self.query_layernorm {
@@ -527,11 +518,9 @@ impl HunYuanDenseV1 {
         let total_len = start_pos + seq_len;
         let (full_cos, full_sin) = self.rotary_emb.forward(total_len, input_ids.device())?;
         // Slice for current positions; cast to model dtype (RoPE computes in F32)
+        // cos/sin: [seq_len, dim/2] — rope() handles broadcasting.
         let cos = full_cos.narrow(0, start_pos, seq_len)?.to_dtype(self.dtype)?;
         let sin = full_sin.narrow(0, start_pos, seq_len)?.to_dtype(self.dtype)?;
-        // Shape for attention: [1, 1, seq_len, head_dim]
-        let cos = cos.unsqueeze(0)?.unsqueeze(0)?;
-        let sin = sin.unsqueeze(0)?.unsqueeze(0)?;
 
         // Build causal mask
         let attention_mask = if seq_len > 1 {
@@ -660,6 +649,10 @@ impl HunYuanDenseV1 {
             )?;
 
             if let Some((k, v)) = batched_kv {
+                // Ensure contiguous for slice_set (narrow views from
+                // get_kv_caches / extract_batch_kv are strided).
+                let k = k.contiguous()?;
+                let v = v.contiguous()?;
                 if extra_room > 0 {
                     // Pre-allocate buffer with room for decode rounds.
                     let (b, h, s, d) = k.dims4()?;
@@ -708,15 +701,15 @@ impl HunYuanDenseV1 {
 
         let pos_ids: Vec<u32> = positions.iter().map(|&p| p as u32).collect();
         let pos_tensor = Tensor::new(pos_ids.as_slice(), device)?;
+        // cos/sin: [N, dim/2] after index_select → [N, 1, dim/2] for rope()
+        // rope() accepts 3D cos/sin as [B, S, D/2].
         let cos = full_cos
             .index_select(&pos_tensor, 0)?
             .to_dtype(self.dtype)?
-            .unsqueeze(1)?
             .unsqueeze(1)?;
         let sin = full_sin
             .index_select(&pos_tensor, 0)?
             .to_dtype(self.dtype)?
-            .unsqueeze(1)?
             .unsqueeze(1)?;
 
         let mut hidden_states = hidden_states;
@@ -877,7 +870,7 @@ fn pad_and_stack_kv_caches(
         }
     }
 
-    let stacked_k = Tensor::cat(&padded_ks, 0)?; // [N, kv_heads, max_len, head_dim]
-    let stacked_v = Tensor::cat(&padded_vs, 0)?;
+    let stacked_k = Tensor::cat(&padded_ks, 0)?.contiguous()?;
+    let stacked_v = Tensor::cat(&padded_vs, 0)?.contiguous()?;
     Ok(Some((stacked_k, stacked_v)))
 }
