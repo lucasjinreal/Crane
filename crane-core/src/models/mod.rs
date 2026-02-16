@@ -7,6 +7,7 @@ pub mod qwen25;
 pub mod qwen25_vit;
 pub mod qwen3;
 // pub mod qwen3_vl;
+pub mod hunyuan_dense;
 
 #[cfg(feature = "onnx")]
 pub mod silero_vad;
