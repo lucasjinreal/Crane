@@ -1,7 +1,41 @@
 use anyhow::Result;
 use crane_core::generation::based::ModelForCausalLM;
+use crane_core::generation::streamer::TokenStreamer;
 use crane_core::generation::GenerationConfig;
 use crane_core::models::hunyuan_dense::Model;
+use std::io::Write;
+
+struct StdoutTokenStreamer {
+    stream: crane_core::utils::token_output_stream::TokenOutputStream,
+}
+
+impl TokenStreamer for StdoutTokenStreamer {
+    fn append(&mut self, token_id: u32) -> Result<()> {
+        if let Some(text) = self
+            .stream
+            .next_token(token_id)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+        {
+            print!("{text}");
+            std::io::stdout()
+                .flush()
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        Ok(())
+    }
+
+    fn finalize(&mut self) -> Result<()> {
+        if let Some(text) = self
+            .stream
+            .decode_rest()
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+        {
+            print!("{text}");
+        }
+        println!();
+        Ok(())
+    }
+}
 
 fn main() -> Result<()> {
     let model_path = std::env::args()
@@ -45,7 +79,12 @@ fn main() -> Result<()> {
     };
 
     println!("\nGenerating...");
-    let output_ids = model.generate(&input_ids, &gen_config, None)?;
+    let mut streamer = StdoutTokenStreamer {
+        stream: crane_core::utils::token_output_stream::TokenOutputStream::new(
+            model.tokenizer.tokenizer.clone(),
+        ),
+    };
+    let output_ids = model.generate(&input_ids, &gen_config, Some(&mut streamer))?;
 
     let decoded = model
         .tokenizer
