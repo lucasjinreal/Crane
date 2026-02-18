@@ -304,6 +304,7 @@ impl ModelForCausalLM for Model {
         let mut generated_tokens = 0usize;
         // Hunyuan uses eos_token_id = 120020
         let eos_token = config.eos_token_id.unwrap_or(120020);
+        let mut streamer_finalized = false;
 
         let start_gen = std::time::Instant::now();
         for index in 0..config.max_new_tokens {
@@ -333,6 +334,7 @@ impl ModelForCausalLM for Model {
                 if let Some(ref mut s) = streamer {
                     s.finalize()?;
                 }
+                streamer_finalized = true;
                 break;
             }
 
@@ -341,6 +343,11 @@ impl ModelForCausalLM for Model {
             }
         }
         let dt = start_gen.elapsed();
+        if let Some(ref mut s) = streamer {
+            if !streamer_finalized {
+                s.finalize()?;
+            }
+        }
 
         if config.report_speed {
             println!(

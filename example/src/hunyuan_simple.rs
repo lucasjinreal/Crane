@@ -92,9 +92,13 @@ fn main() -> Result<()> {
         match message {
             crane_core::generation::streamer::StreamerMessage::Token(token_text) => {
                 print!("{token_text}");
+                std::io::stdout()
+                    .flush()
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
                 response_text.push_str(&token_text);
             }
             crane_core::generation::streamer::StreamerMessage::End => {
+                println!();
                 break;
             }
         }
