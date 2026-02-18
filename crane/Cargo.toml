@@ -13,6 +13,7 @@ thiserror = "2.0"
 
 crane-core = { path = "../crane-core" }
 ribo = "0.1.3"
+tokenizers = "0.22.2"
 
 [features]
 onnx = ["crane-core/onnx"]

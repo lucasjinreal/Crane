@@ -4,13 +4,14 @@
 
 use crane::prelude::*;
 use crane::common::config::{CommonConfig, DataType, DeviceConfig};
-use crane::llm::GenerationConfig;
+use crane::llm::{GenerationConfig, LlmModelType};
 
 fn main() -> CraneResult<()> {
     // Create a chat configuration
     let config = ChatConfig {
         common: CommonConfig {
             model_path: "checkpoints/Qwen2.5-0.5B-Instruct".to_string(), // Update this path to your model
+            model_type: LlmModelType::Qwen25,
             device: DeviceConfig::Cpu, // Use DeviceConfig::Cuda(0) for GPU
             dtype: DataType::F16,
             max_memory: None,

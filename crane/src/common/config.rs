@@ -2,11 +2,16 @@ use std::fmt::write;
 
 use serde::{Deserialize, Serialize};
 
+use crate::llm::LlmModelType;
+
 /// Common configuration for Crane SDK
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommonConfig {
     /// Path to model checkpoints
     pub model_path: String,
+
+    /// Which model architecture to load for this checkpoint
+    pub model_type: LlmModelType,
 
     /// Device to run models on (CPU/GPU)
     pub device: DeviceConfig,
@@ -22,6 +27,7 @@ impl Default for CommonConfig {
     fn default() -> Self {
         Self {
             model_path: "checkpoints".to_string(),
+            model_type: LlmModelType::Qwen25,
             device: DeviceConfig::Cpu,
             dtype: DataType::F16,
             max_memory: None,

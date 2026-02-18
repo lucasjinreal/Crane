@@ -4,6 +4,12 @@
 //! Note: This requires the 'onnx' feature to be enabled.
 
 #[cfg(feature = "onnx")]
+use crane::common::config::{CommonConfig, DataType, DeviceConfig};
+
+#[cfg(feature = "onnx")]
+use crane::llm::LlmModelType;
+
+#[cfg(feature = "onnx")]
 use crane::prelude::*;
 
 #[cfg(feature = "onnx")]
@@ -11,6 +17,7 @@ fn main() -> CraneResult<()> {
     // Create an ASR configuration
     let config = CommonConfig {
         model_path: "checkpoints/moonshine".to_string(), // Update this path to your ASR model
+        model_type: LlmModelType::MoonshineAsr,
         device: DeviceConfig::Cpu,
         dtype: DataType::F16,
         max_memory: None,

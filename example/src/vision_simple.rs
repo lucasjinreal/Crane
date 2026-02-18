@@ -4,11 +4,13 @@
 
 use crane::prelude::*;
 use crane::common::config::{CommonConfig, DataType, DeviceConfig};
+use crane::llm::LlmModelType;
 
 fn main() -> CraneResult<()> {
     // Create a vision configuration
     let config = CommonConfig {
         model_path: "checkpoints/vision_model".to_string(), // Update this path to your vision model
+        model_type: LlmModelType::Vision,
         device: DeviceConfig::Cpu,
         dtype: DataType::F16,
         max_memory: None,

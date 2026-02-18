@@ -16,7 +16,7 @@ use candle_core::{bail, utils, DType, Device, Error, Tensor};
 use candle_onnx::onnx::ModelProto;
 use ribo::utils::log;
 
-use crate::utils::candle_utils::select_device;
+use crate::utils::select_device;
 
 /// Supported sample rates.
 pub const SAMPLE_RATES: [usize; 2] = [8000, 16000];

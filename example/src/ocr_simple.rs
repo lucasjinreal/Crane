@@ -1,4 +1,5 @@
 use crane::common::config::{CommonConfig, DataType, DeviceConfig};
+use crane::llm::LlmModelType;
 use crane::prelude::*;
 use std::env;
 
@@ -12,6 +13,7 @@ fn main() -> CraneResult<()> {
     let config = CommonConfig {
         // model_path: "checkpoints/PaddleOCR-VL".to_string(),
         model_path: "checkpoints/PaddleOCR-VL-1.5".to_string(),
+        model_type: LlmModelType::PaddleOcrVl,
         // device: DeviceConfig::Cpu,
         device: DeviceConfig::Cuda(0),
         // dtype: DataType::BF16,

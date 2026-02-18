@@ -1,7 +1,6 @@
-use crate::common::{CraneResult, CraneError};
+use crate::common::CraneResult;
 use crate::chat::{ChatConfig, ChatHistory, ChatMessage, ChatRole};
-use crate::llm::{GenerationConfig, LlmClient};
-use std::sync::Arc;
+use crate::llm::LlmClient;
 
 /// High-level chat client for conversational AI applications
 pub struct ChatClient {
@@ -31,9 +30,8 @@ impl ChatClient {
             content: message.to_string(),
         });
         
-        // Generate response
-        let prompt = self.format_conversation()?;
-        let response = self.llm_client.generate(&prompt, &self.config.generation)?;
+        let messages = self.to_core_messages();
+        let response = self.llm_client.generate_chat(&messages, &self.config.generation)?;
         
         // Add assistant response to history
         self.history.add_message(ChatMessage {
@@ -55,9 +53,10 @@ impl ChatClient {
             content: message.to_string(),
         });
         
-        // Generate response with streaming
-        let prompt = self.format_conversation()?;
-        let response = self.llm_client.generate_streaming(&prompt, &self.config.generation, callback)?;
+        let messages = self.to_core_messages();
+        let response = self
+            .llm_client
+            .generate_chat_streaming(&messages, &self.config.generation, callback)?;
         
         // Add assistant response to history
         self.history.add_message(ChatMessage {
@@ -79,9 +78,10 @@ impl ChatClient {
     }
     
     /// Format the conversation for the model
-    fn format_conversation(&self) -> CraneResult<String> {
-        // Convert our chat messages to the format expected by the underlying model
-        let messages: Vec<crane_core::chat::Message> = self.history.messages.iter()
+    fn to_core_messages(&self) -> Vec<crane_core::chat::Message> {
+        self.history
+            .messages
+            .iter()
             .map(|msg| crane_core::chat::Message {
                 role: match msg.role {
                     ChatRole::User => crane_core::chat::Role::User,
@@ -90,13 +90,6 @@ impl ChatClient {
                 },
                 content: msg.content.clone(),
             })
-            .collect();
-        
-        // Use the tokenizer to apply chat template
-        let tokenizer = self.llm_client.get_tokenizer()?;
-        let prompt = tokenizer.apply_chat_template(&messages, true)
-            .map_err(|e| CraneError::TokenizationError(e.to_string()))?;
-        
-        Ok(prompt)
+            .collect()
     }
 }

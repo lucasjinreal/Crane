@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use crate::common::config::{CommonConfig, DataType, DeviceConfig};
 
 /// Generation configuration for LLMs
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,12 +39,16 @@ impl GenerationConfig {
     }
 }
 
-/// Type of LLM model
+/// Type of model
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LlmModelType {
     Qwen25,
     Qwen3,
     Qwen3VL,
     DeepSeek,
+    HunyuanDense,
+    PaddleOcrVl,
+    MoonshineAsr,
+    Vision,
     // Add more as needed
 }
