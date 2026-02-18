@@ -6,8 +6,8 @@
 use crate::utils::utils;
 use candle_core::{DType, Device, Module, Result, Tensor, D};
 use candle_nn::{
-    conv2d_no_bias, embedding, func, layer_norm, linear, Activation, Conv2d, Conv2dConfig,
-    Embedding, LayerNorm, LayerNormConfig, Linear, VarBuilder,
+    conv2d_no_bias, embedding, layer_norm, linear, Activation, Conv2d, Conv2dConfig,
+    Embedding, LayerNorm, Linear, VarBuilder,
 };
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]

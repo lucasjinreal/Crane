@@ -9,7 +9,7 @@ use std::io::Write;
 use anyhow::{Error as E, Result};
 
 use candle_transformers::models::qwen2::{Config as ConfigBase, ModelForCausalLM as ModelBase};
-use candle_transformers::models::qwen2_moe::{Config as ConfigMoe, Model as ModelMoe};
+use candle_transformers::models::qwen2_moe::{Model as ModelMoe};
 
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;

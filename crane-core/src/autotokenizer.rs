@@ -1,7 +1,6 @@
 use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
 use std::collections::HashMap;
-use std::fs::exists;
-use std::path::{self, PathBuf};
+use std::path::PathBuf;
 use tokenizers::{EncodeInput, Tokenizer};
 
 /// Defines the aditional parameters available for the `from_pretrained` function

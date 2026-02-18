@@ -363,8 +363,8 @@ pub fn build_input_tokens(
     task: OcrTask,
     num_image_tokens: usize,
     image_token_id: u32,
-    vision_start_token_id: u32,
-    vision_end_token_id: u32,
+    _vision_start_token_id: u32,
+    _vision_end_token_id: u32,
     device: &Device,
 ) -> Result<Tensor> {
     let bos_id = tokenizer.token_to_id("<|begin_of_sentence|>").unwrap_or(1);

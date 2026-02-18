@@ -1,7 +1,7 @@
 use anyhow::Result;
-use crane_core::models::{DType, Device, Tensor};
+use crane_core::models::{DType, Device};
 use crane_core::utils::image_utils;
-use image::{ImageBuffer, ImageReader, Rgb};
+use image::{ImageBuffer, Rgb};
 use std::{env, path::Path};
 
 fn main() -> Result<()> {

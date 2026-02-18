@@ -1,4 +1,4 @@
-use crate::common::{CraneResult, CraneError, config::{CommonConfig, DataType, DeviceConfig}};
+use crate::common::{CraneResult, CraneError, config::{CommonConfig, DeviceConfig}};
 use std::path::Path;
 
 /// Text-to-Speech client

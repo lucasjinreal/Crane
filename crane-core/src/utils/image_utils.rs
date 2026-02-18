@@ -74,7 +74,7 @@ pub fn load_and_resize_image_to_tensor(
 pub fn load_image_and_smart_resize(
     path: &Path,
     device: &Device,
-    dtype: DType,
+    _dtype: DType,
     mode: ResizeMode,
 ) -> Result<(Tensor, Tensor)> {
     let img = image::ImageReader::open(path)

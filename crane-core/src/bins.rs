@@ -1,9 +1,8 @@
 use anyhow::anyhow;
-use anyhow::Error as E;
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
 
 /**
  * Code for loading tensor data from python
