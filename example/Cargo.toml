@@ -33,6 +33,9 @@ path = "src/bm_resize.rs"
 name = "ocr_simple"
 path = "src/ocr_simple.rs"
 
+[[bin]]
+name = "hunyuan_simple"
+path = "src/hunyuan_simple.rs"
 
 [features]
 default = []
