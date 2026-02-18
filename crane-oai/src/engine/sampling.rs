@@ -149,6 +149,31 @@ pub fn sample(
 
         let mut top_k = seq.top_k.unwrap_or(0);
         if top_k == 0 && top_p_active {
+            // For large vocabularies (>64 K tokens) where top_k was NOT
+            // explicitly requested, avoid the expensive GPU topk kernel.
+            // Fall back to CPU LogitsProcessor which handles temperature +
+            // top-p natively and only needs a ~600 KB DtoH copy.
+            // Set CRANE_FORCE_GPU_TOPK=1 to override this heuristic.
+            if vocab > 65536
+                && std::env::var("CRANE_FORCE_GPU_TOPK")
+                    .ok()
+                    .as_deref()
+                    != Some("1")
+            {
+                let next_token = seq.logits_processor.sample(&logits)?;
+                if trace {
+                    let t_done = Instant::now();
+                    debug!(
+                        id = %seq_id,
+                        vocab,
+                        top_p = ?seq.top_p,
+                        temp = ?seq.temperature,
+                        total_us = t_done.duration_since(t0).as_micros() as u64,
+                        "sample(cpu_logits_processor)"
+                    );
+                }
+                return Ok(next_token);
+            }
             top_k = std::env::var("CRANE_TOPP_FALLBACK_TOPK")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())

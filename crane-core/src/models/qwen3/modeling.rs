@@ -108,19 +108,21 @@ impl RotaryEmbedding {
             }
         }
 
-        let positions: Vec<f32> = (0..seq_len).map(|i| i as f32).collect();
+        // Pre-grow the cache so we don't recompute cos/sin every decode step.
+        let alloc_len = seq_len.max(self.cached_len.saturating_mul(2)).max(512);
+        let positions: Vec<f32> = (0..alloc_len).map(|i| i as f32).collect();
         let positions = Tensor::new(positions.as_slice(), device)?;
         let freqs = positions
             .unsqueeze(1)?
-            .matmul(&self.inv_freq.unsqueeze(0)?)?; // [seq_len, dim/2]
+            .matmul(&self.inv_freq.unsqueeze(0)?)?; // [alloc_len, dim/2]
         let cos = freqs.cos()?;
         let sin = freqs.sin()?;
 
         self.cos_cache = Some(cos.clone());
         self.sin_cache = Some(sin.clone());
-        self.cached_len = seq_len;
+        self.cached_len = alloc_len;
 
-        Ok((cos, sin))
+        Ok((cos.narrow(0, 0, seq_len)?, sin.narrow(0, 0, seq_len)?))
     }
 }
 
@@ -335,21 +337,17 @@ impl Attention {
             .reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
 
-        // Per-head QK norm (Qwen3 applies before RoPE)
+        // Per-head QK norm (Qwen3 applies before RoPE).
+        // RmsNorm normalises over the last dim, so it operates directly on
+        // [B, H, S, D] without the reshape that would trigger an extra
+        // contiguous copy on the non-contiguous q/k after transpose.
         let q = if let Some(ref norm) = self.q_norm {
-            // Flatten [B, H, S, D] → [B*H, S, D] for RmsNorm, then reshape back
-            let (b, h, s, d) = q.dims4()?;
-            let q_flat = q.reshape((b * h, s, d))?;
-            let q_normed = norm.forward(&q_flat)?;
-            q_normed.reshape((b, h, s, d))?
+            norm.forward(&q)?
         } else {
             q
         };
         let k = if let Some(ref norm) = self.k_norm {
-            let (b, h, s, d) = k.dims4()?;
-            let k_flat = k.reshape((b * h, s, d))?;
-            let k_normed = norm.forward(&k_flat)?;
-            k_normed.reshape((b, h, s, d))?
+            norm.forward(&k)?
         } else {
             k
         };
@@ -367,36 +365,33 @@ impl Attention {
 
         if n_rep > 1 && seq_len == 1 {
             // ── GQA-grouped SDPA for decode (seq_len=1) ──
-            // Q: [B, H, 1, D] → [B*kv_heads, n_rep, D]
-            let q_g = q
-                .reshape((b_sz, self.num_kv_heads, n_rep, self.head_dim))?
-                .reshape((b_sz * self.num_kv_heads, n_rep, self.head_dim))?
-                .contiguous()?;
-            // K: [B, kv_heads, S, D] → [B*kv_heads, D, S]
-            let k_g = k
-                .reshape((b_sz * self.num_kv_heads, kv_s, self.head_dim))?
-                .transpose(D::Minus2, D::Minus1)?
-                .contiguous()?;
-            // V: [B, kv_heads, S, D] → [B*kv_heads, S, D]
-            let v_g = v
-                .reshape((b_sz * self.num_kv_heads, kv_s, self.head_dim))?
-                .contiguous()?;
-
+            // Use 4D tensors throughout so candle's matmul only has to
+            // flatten+contiguous the non-contiguous K narrow-view ONCE
+            // instead of reshape(contiguous) + transpose + contiguous.
             let scale = 1.0 / (self.head_dim as f64).sqrt();
-            let attn_weights = (q_g.matmul(&k_g)? * scale)?; // [B*kv_heads, n_rep, S]
+
+            // Q: [B, H, 1, D] → [B, kv_heads, n_rep, D], pre-scaled
+            let q_g =
+                (q.reshape((b_sz, self.num_kv_heads, n_rep, self.head_dim))? * scale)?;
+
+            // K^T: [B, kv_heads, D, S] — just a view (0 copies here;
+            //       matmul will flatten+contiguous in one pass).
+            let k_t = k.transpose(2, 3)?;
+
+            // scores: [B, kv_heads, n_rep, S]
+            let attn_weights = q_g.matmul(&k_t)?;
 
             let attn_weights = match attention_mask {
                 Some(mask) => {
-                    let mask_g = mask
-                        .expand((b_sz, self.num_kv_heads, 1, kv_s))?
-                        .reshape((b_sz * self.num_kv_heads, 1, kv_s))?
-                        .contiguous()?;
-                    attn_weights.broadcast_add(&mask_g)?
+                    // mask [B, 1, 1, S] broadcasts over kv_heads & n_rep
+                    attn_weights.broadcast_add(mask)?
                 }
                 None => attn_weights,
             };
             let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-            let attn_output = attn_weights.matmul(&v_g)?; // [B*kv_heads, n_rep, D]
+
+            // V: [B, kv_heads, S, D] — matmul handles non-contiguous
+            let attn_output = attn_weights.matmul(&v)?; // [B, kv_heads, n_rep, D]
 
             // Reshape back: → [B, H, D] → [B, 1, H*D]
             let attn_output = attn_output
