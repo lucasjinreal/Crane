@@ -8,8 +8,8 @@ use std::io::Write;
 
 use anyhow::{Error as E, Result};
 
-use candle_transformers::models::qwen2::{Config as ConfigBase, ModelForCausalLM as ModelBase};
-use candle_transformers::models::qwen2_moe::{Model as ModelMoe};
+use candle_transformers::models::qwen3::{Config as ConfigBase, ModelForCausalLM as ModelBase};
+use candle_transformers::models::qwen3_moe::{ModelForCausalLM as ModelMoe};
 
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
@@ -226,10 +226,9 @@ impl ModelForCausalLM for Model {
         std::io::stdout().flush()?;
 
         let mut generated_tokens = 0usize;
-        let eos_token = match self.tokenizer.get_token("") {
-            Some(token) => token,
-            None => anyhow::bail!("cannot find the  token"),
-        };
+        let eos_token: Option<u32> = config.eos_token_id
+            .or_else(|| self.tokenizer.get_token("<|endoftext|>"))
+            .or_else(|| self.tokenizer.get_token("<|im_end|>"));
         let start_gen = std::time::Instant::now();
         for index in 0..config.max_new_tokens {
             let context_size = if index > 0 { 1 } else { tokens.len() };
@@ -253,7 +252,7 @@ impl ModelForCausalLM for Model {
             let next_token = logits_processor.sample(&logits)?;
             tokens.push(next_token);
             generated_tokens += 1;
-            if next_token == eos_token {
+            if eos_token == Some(next_token) {
                 break;
             }
             if let Some(t) = self.tokenizer.next_token(next_token)? {
