@@ -101,7 +101,7 @@ pub struct AutoTokenizerConfig {
     pub eos_token: Option<Token>,
     pub pad_token: Option<Token>,
     pub unk_token: Option<Token>,
-    pub chat_template: String,
+    pub chat_template: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -116,7 +116,15 @@ impl AutoTokenizer {
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let file = file.as_ref();
         let content = std::fs::read_to_string(file)?;
-        let config: AutoTokenizerConfig = serde_json::from_str(&content)?;
+        let mut config: AutoTokenizerConfig = serde_json::from_str(&content)?;
+
+        // Fall back to a standalone chat_template.jinja if the field is absent.
+        if config.chat_template.is_none() {
+            let jinja_path = file.parent().unwrap_or(std::path::Path::new(".")).join("chat_template.jinja");
+            if jinja_path.exists() {
+                config.chat_template = std::fs::read_to_string(&jinja_path).ok();
+            }
+        }
 
         // Load actual tokenizer model
         let d = file.parent();
@@ -171,9 +179,14 @@ impl AutoTokenizer {
         ctx: S,
         add_generation_prompt: bool,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let template_str = self.config.chat_template.as_deref().ok_or_else(|| {
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "missing field `chat_template`",
+            )) as Box<dyn std::error::Error + Send + Sync>
+        })?;
         let mut env = minijinja::Environment::new();
-        env.add_template("default", &self.config.chat_template)
-            .unwrap();
+        env.add_template("default", template_str).unwrap();
         let tmpl = env.get_template("default").unwrap();
         let eos = if let Some(eos) = &self.config.eos_token {
             match eos {
