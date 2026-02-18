@@ -286,7 +286,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/chat/completions", post(handlers::openai::chat_completions))
         .route("/v1/completions", post(handlers::openai::completions))
         .route("/v1/models", get(handlers::openai::list_models))
-        .route("/v1/models/:model_id", get(handlers::openai::retrieve_model))
+        .route("/v1/models/{model_id}", get(handlers::openai::retrieve_model))
         .route("/v1/tokenize", post(handlers::openai::tokenize))
         .route("/v1/detokenize", post(handlers::openai::detokenize))
         // ── Convenience aliases (SGLang-style) ──

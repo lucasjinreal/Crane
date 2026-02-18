@@ -186,7 +186,7 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> impl IntoRespons
 /// `GET /v1/models/:model_id` — retrieve a specific model.
 pub async fn retrieve_model(
     State(state): State<Arc<AppState>>,
-    Path(model_id): Path<String>,
+    axum::extract::Path(model_id): axum::extract::Path<String>,
 ) -> Result<Json<ModelInfo>, (StatusCode, Json<ErrorResponse>)> {
     if model_id == state.model_name {
         Ok(Json(make_model_info(&state)))
