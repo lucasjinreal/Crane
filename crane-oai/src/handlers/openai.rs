@@ -64,7 +64,7 @@ pub async fn chat_completions(
             req.top_p.or(Some(0.95)),
             req.top_k.or(Some(40)),
             req.repetition_penalty.unwrap_or(1.05),
-            state.eos_token_id,
+            state.eos_token_id.clone(),
         )
         .map_err(|e| make_error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()))?;
 
@@ -136,7 +136,7 @@ pub async fn completions(
             req.top_p.or(Some(0.95)),
             req.top_k.or(Some(40)),
             req.repetition_penalty.unwrap_or(1.05),
-            state.eos_token_id,
+            state.eos_token_id.clone(),
         )
         .map_err(|e| make_error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()))?;
 

@@ -80,8 +80,8 @@ pub struct AppState {
     pub tokenizer: tokenizers::Tokenizer,
     /// Chat template processor (model-specific).
     pub chat_template: Box<dyn ChatTemplateProcessor>,
-    /// Default EOS token ID for this model.
-    pub eos_token_id: u32,
+    /// Default EOS token ID(s) for this model.
+    pub eos_token_id: Vec<u32>,
     /// Server start time (epoch seconds).
     pub server_start_time: u64,
     // ── Fields for /model_info and /server_info ──

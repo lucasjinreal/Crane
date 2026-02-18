@@ -71,7 +71,7 @@ pub async fn generate(
             sp.top_p.or(Some(0.95)),
             sp.top_k.or(Some(20)),
             sp.repetition_penalty,
-            state.eos_token_id,
+            state.eos_token_id.clone(),
         )
         .map_err(|e| make_error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()))?;
 
@@ -169,7 +169,7 @@ pub async fn server_info(State(state): State<Arc<AppState>>) -> impl IntoRespons
 pub async fn health_generate(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let probe_tokens = vec![state.eos_token_id]; // minimal input
+    let probe_tokens = state.eos_token_id.clone(); // minimal input (already a Vec)
     let request_id = format!("health-{}", uuid::Uuid::new_v4());
 
     let response_rx = state
@@ -182,7 +182,7 @@ pub async fn health_generate(
             None,
             None,
             1.0,
-            state.eos_token_id,
+            state.eos_token_id.clone(),
         )
         .map_err(|e| {
             make_error(

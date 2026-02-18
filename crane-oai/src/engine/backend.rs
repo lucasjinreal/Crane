@@ -47,8 +47,8 @@ pub trait ModelBackend: Send + 'static {
     /// Reference to the underlying tokenizer.
     fn tokenizer(&self) -> &tokenizers::Tokenizer;
 
-    /// The model's end-of-sequence token ID.
-    fn eos_token_id(&self) -> u32;
+    /// The model's end-of-sequence token ID(s).
+    fn eos_token_id(&self) -> Vec<u32>;
 
     /// Warm up the model with a small forward pass.
     fn warmup(&mut self);
@@ -164,8 +164,8 @@ impl ModelBackend for HunyuanBackend {
         &self.model.tokenizer.tokenizer
     }
 
-    fn eos_token_id(&self) -> u32 {
-        120020
+    fn eos_token_id(&self) -> Vec<u32> {
+        vec![120020]
     }
 
     fn warmup(&mut self) {
@@ -283,13 +283,14 @@ impl ModelBackend for Qwen25Backend {
         &self.model.tokenizer.tokenizer
     }
 
-    fn eos_token_id(&self) -> u32 {
+    fn eos_token_id(&self) -> Vec<u32> {
         self.model
             .tokenizer
             .tokenizer
             .token_to_id("<|endoftext|>")
             .or_else(|| self.model.tokenizer.tokenizer.token_to_id("<|im_end|>"))
-            .unwrap_or(151643)
+            .map(|id| vec![id])
+            .unwrap_or_else(|| vec![151643])
     }
 
     fn warmup(&mut self) {
@@ -343,13 +344,15 @@ impl ModelBackend for Qwen3Backend {
         &self.model.tokenizer.tokenizer
     }
 
-    fn eos_token_id(&self) -> u32 {
-        self.model
-            .tokenizer
-            .tokenizer
-            .token_to_id("<|endoftext|>")
-            .or_else(|| self.model.tokenizer.tokenizer.token_to_id("<|im_end|>"))
-            .unwrap_or(151643)
+    fn eos_token_id(&self) -> Vec<u32> {
+        // Qwen3 chat models stop at <|im_end|> (151645).
+        // Also include <|endoftext|> (151643) as a fallback.
+        let tok = &self.model.tokenizer.tokenizer;
+        let mut ids = Vec::new();
+        if let Some(id) = tok.token_to_id("<|im_end|>") { ids.push(id); }
+        if let Some(id) = tok.token_to_id("<|endoftext|>") { ids.push(id); }
+        if ids.is_empty() { ids.push(151645); ids.push(151643); }
+        ids
     }
 
     fn warmup(&mut self) {

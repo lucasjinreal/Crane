@@ -357,3 +357,95 @@ impl AutoTokenizer {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── rewrite_split_index ──────────────────────────────────────────────
+
+    #[test]
+    fn split_index_first() {
+        let input = r#"content.split('<tool_response>')[0]"#;
+        let output = rewrite_split_index(input);
+        assert_eq!(output, r#"content | split('<tool_response>') | first"#);
+    }
+
+    #[test]
+    fn split_index_last() {
+        let input = r#"content.split('<tool_response>')[-1]"#;
+        let output = rewrite_split_index(input);
+        assert_eq!(output, r#"content | split('<tool_response>') | last"#);
+    }
+
+    #[test]
+    fn split_index_unchanged_middle() {
+        // [1] is not handled — should be left as-is
+        let input = r#"content.split('/')[1]"#;
+        let output = rewrite_split_index(input);
+        assert_eq!(output, r#"content.split('/')[1]"#);
+    }
+
+    #[test]
+    fn split_index_no_match() {
+        let input = "no split here";
+        let output = rewrite_split_index(input);
+        assert_eq!(output, input);
+    }
+
+    // ── rewrite_python_str_methods ───────────────────────────────────────
+
+    #[test]
+    fn method_startswith() {
+        let input = r#"message.role.startswith('tool')"#;
+        let output = rewrite_python_str_methods(input);
+        assert_eq!(output, r#"message.role | startswith('tool')"#);
+    }
+
+    #[test]
+    fn method_endswith() {
+        let input = r#"filename.endswith('.json')"#;
+        let output = rewrite_python_str_methods(input);
+        assert_eq!(output, r#"filename | endswith('.json')"#);
+    }
+
+    #[test]
+    fn method_strip() {
+        let input = "s.strip()";
+        let output = rewrite_python_str_methods(input);
+        assert_eq!(output, "s | strip()");
+    }
+
+    #[test]
+    fn method_lstrip_rstrip() {
+        let input = "s.lstrip(' ').rstrip(' ')";
+        let output = rewrite_python_str_methods(input);
+        assert_eq!(output, "s | lstrip(' ') | rstrip(' ')");
+    }
+
+    #[test]
+    fn method_split_and_index_combined() {
+        // Full pipeline: .split(...)[0] AND .startswith(...)
+        let input = r#"msg.content.split('<tool_response>')[0].strip()"#;
+        let output = rewrite_python_str_methods(input);
+        assert_eq!(
+            output,
+            r#"msg.content | split('<tool_response>') | first | strip()"#
+        );
+    }
+
+    #[test]
+    fn method_split_then_index_last() {
+        let input = r#"text.split('\n')[-1]"#;
+        let output = rewrite_python_str_methods(input);
+        assert_eq!(output, r#"text | split('\n') | last"#);
+    }
+
+    #[test]
+    fn no_false_positives() {
+        // Variables that look like method names but aren't preceded by '.'
+        let input = "startswith is not a method call here";
+        let output = rewrite_python_str_methods(input);
+        assert_eq!(output, input);
+    }
+}

@@ -38,7 +38,7 @@ pub struct Sequence {
     pub top_p: Option<f64>,
     pub top_k: Option<usize>,
     pub max_tokens: usize,
-    pub eos_token_id: u32,
+    pub eos_token_id: Vec<u32>,
     pub repetition_penalty: f32,
     pub repeat_last_n: usize,
 
@@ -59,7 +59,7 @@ impl Sequence {
             return true;
         }
         if let Some(&last) = self.tokens.last() {
-            if last == self.eos_token_id {
+            if self.eos_token_id.contains(&last) {
                 return true;
             }
         }
@@ -95,7 +95,7 @@ impl Sequence {
     /// Finish reason string for the OpenAI response.
     pub fn finish_reason(&self) -> &'static str {
         if let Some(&last) = self.tokens.last() {
-            if last == self.eos_token_id {
+            if self.eos_token_id.contains(&last) {
                 return "stop";
             }
         }
@@ -130,7 +130,7 @@ mod tests {
             top_p: Some(0.95),
             top_k: Some(40),
             max_tokens,
-            eos_token_id,
+            eos_token_id: vec![eos_token_id],
             repetition_penalty: 1.0,
             repeat_last_n: 64,
             response_tx: tx,

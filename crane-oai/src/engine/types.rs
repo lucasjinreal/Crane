@@ -16,7 +16,7 @@ pub struct EngineRequest {
     pub top_p: Option<f64>,
     pub top_k: Option<usize>,
     pub repetition_penalty: f32,
-    pub eos_token_id: u32,
+    pub eos_token_id: Vec<u32>,
     pub response_tx: mpsc::UnboundedSender<EngineResponse>,
 }
 
@@ -54,7 +54,7 @@ impl EngineHandle {
         top_p: Option<f64>,
         top_k: Option<usize>,
         repetition_penalty: f32,
-        eos_token_id: u32,
+        eos_token_id: Vec<u32>,
     ) -> anyhow::Result<mpsc::UnboundedReceiver<EngineResponse>> {
         let (response_tx, response_rx) = mpsc::unbounded_channel();
         self.request_tx
@@ -206,7 +206,7 @@ mod tests {
             Some(0.9),
             None,
             1.1,
-            2,
+            vec![2],
         ).unwrap();
 
         let req = rx.recv().await.unwrap();
@@ -217,6 +217,6 @@ mod tests {
         assert_eq!(req.top_p, Some(0.9));
         assert_eq!(req.top_k, None);
         assert!((req.repetition_penalty - 1.1).abs() < 0.001);
-        assert_eq!(req.eos_token_id, 2);
+        assert_eq!(req.eos_token_id, vec![2]);
     }
 }
