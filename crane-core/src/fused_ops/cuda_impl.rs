@@ -16,10 +16,13 @@ mod ptx {
 const MODULE_NAME: &str = "crane_fused_ops";
 
 /// Load a function from the crane fused-ops PTX module.
-fn load_func(dev: &CudaDevice, fn_name: &str) -> Result<candle_core::cuda_backend::CudaFunc> {
-    #[allow(unused_imports)]
-    use candle_core::cuda_backend::CudaFunc;
-    dev.get_or_load_custom_func(fn_name, MODULE_NAME, ptx::FUSED_OPS)
+///
+/// Returns candle's `CudaFunc` opaque wrapper (not re-exported in candle 0.9.x,
+/// so we avoid naming the type explicitly — callers rely on type inference).
+macro_rules! load_func {
+    ($dev:expr, $fn_name:expr) => {
+        $dev.get_or_load_custom_func($fn_name, MODULE_NAME, ptx::FUSED_OPS)
+    };
 }
 
 // =====================================================================
@@ -128,7 +131,7 @@ impl candle_core::CustomOp1 for FusedSiluMul {
             DType::F32 => "fused_silu_mul_f32",
             dt => candle_core::bail!("fused_silu_mul: unsupported dtype {dt:?}"),
         };
-        let func = load_func(dev, fn_name)?;
+        let func = load_func!(dev, fn_name)?;
 
         let block_size = 1024u32.min(intermediate_size as u32);
         let cfg = LaunchConfig {
@@ -293,8 +296,8 @@ pub fn gpu_argmax(logits: &Tensor) -> Result<u32> {
     let num_blocks = 256u32.min((vocab_size as u32 + 1023) / 1024);
     let block_size = 256u32;
 
-    let func1 = load_func(dev, "gpu_argmax_bf16_phase1")?;
-    let func2 = load_func(dev, "gpu_argmax_phase2")?;
+    let func1 = load_func!(dev, "gpu_argmax_bf16_phase1")?;
+    let func2 = load_func!(dev, "gpu_argmax_phase2")?;
 
     // Allocate temporary buffers for block results
     let block_max_vals: candle_core::cuda_backend::cudarc::driver::CudaSlice<f32> =
@@ -494,7 +497,7 @@ impl candle_core::CustomOp1 for TopKIndicesOp {
         let out_idx = unsafe { dev.alloc::<u32>(k)? };
 
         // Stage 1
-        let f1 = load_func(dev, "topk_stage1_f32")?;
+        let f1 = load_func!(dev, "topk_stage1_f32")?;
         let items_per_block_u32 = items_per_block as u32;
         {
             let mut builder = f1.builder();
@@ -516,7 +519,7 @@ impl candle_core::CustomOp1 for TopKIndicesOp {
 
         // Stage 2
         let m = grid_dim * k_u32;
-        let f2 = load_func(dev, "topk_stage2_f32")?;
+        let f2 = load_func!(dev, "topk_stage2_f32")?;
         {
             let mut builder = f2.builder();
             builder.arg(&tmp_vals);
@@ -543,95 +546,25 @@ impl candle_core::CustomOp1 for TopKIndicesOp {
 // 5. CUDA tensor memory utilities
 // =====================================================================
 
-/// Copy a u32 slice from host into a contiguous CUDA U32 tensor.
+/// Copy a u32 slice from host to the target device, returning a new 1-D U32 tensor.
 ///
-/// This is a direct HtoD memcpy — no kernel launch, no allocation.
+/// The returned tensor has shape `[src.len()]` on the same device as `device`.
+/// This is a plain HtoD allocation — no kernel launch.
 #[cfg(feature = "cuda")]
-pub fn copy_from_slice_u32(tensor: &Tensor, src: &[u32]) -> Result<()> {
-    copy_from_slice_offset_u32(tensor, src, 0)
+pub fn copy_from_slice_u32(src: &[u32], device: &Device) -> Result<Tensor> {
+    Tensor::new(src, device)
 }
 
-/// Copy a u32 slice from host into a contiguous CUDA U32 tensor at the given offset.
+/// Clone a contiguous f32 tensor — returns a new contiguous copy on the same device.
+///
+/// For CUDA tensors this is a DtoD copy (no host round-trip).
 #[cfg(feature = "cuda")]
-pub fn copy_from_slice_offset_u32(tensor: &Tensor, src: &[u32], dst_offset: usize) -> Result<()> {
-    if tensor.dtype() != DType::U32 {
+pub fn copy_from_tensor_f32(src_tensor: &Tensor) -> Result<Tensor> {
+    if src_tensor.dtype() != DType::F32 {
         candle_core::bail!(
-            "copy_from_slice_offset_u32: expected U32, got {:?}",
-            tensor.dtype()
-        );
-    }
-    if !tensor.is_contiguous() {
-        candle_core::bail!("copy_from_slice_offset_u32: tensor must be contiguous");
-    }
-    if !tensor.device().is_cuda() {
-        candle_core::bail!("copy_from_slice_offset_u32: tensor must be on CUDA");
-    }
-
-    let (mut storage, layout) = tensor.storage_mut_and_layout();
-    let start = layout.start_offset() + dst_offset;
-    let elem_count = layout.shape().elem_count();
-    if start + src.len() > elem_count {
-        candle_core::bail!(
-            "copy_from_slice_offset_u32: out of bounds (start={start}, len={}, elem_count={elem_count})",
-            src.len()
-        );
-    }
-
-    match &mut *storage {
-        candle_core::Storage::Cuda(cs) => {
-            let dev = cs.device.clone();
-            let dst = cs.as_cuda_slice_mut::<u32>()?;
-            let mut dst = dst.slice_mut(start..start + src.len());
-            dev.memcpy_htod(src, &mut dst)?;
-            Ok(())
-        }
-        _ => candle_core::bail!("copy_from_slice_offset_u32: not CUDA storage"),
-    }
-}
-
-/// Copy contents of one contiguous CUDA f32 tensor into another (DtoD memcpy).
-#[cfg(feature = "cuda")]
-pub fn copy_from_tensor_f32(dst_tensor: &Tensor, src_tensor: &Tensor) -> Result<()> {
-    if dst_tensor.dtype() != DType::F32 || src_tensor.dtype() != DType::F32 {
-        candle_core::bail!(
-            "copy_from_tensor_f32: expected f32 tensors (dst={:?}, src={:?})",
-            dst_tensor.dtype(),
+            "copy_from_tensor_f32: expected f32 tensor, got {:?}",
             src_tensor.dtype()
         );
     }
-    if !dst_tensor.is_contiguous() || !src_tensor.is_contiguous() {
-        candle_core::bail!("copy_from_tensor_f32: both tensors must be contiguous");
-    }
-    if !dst_tensor.device().is_cuda() || !src_tensor.device().is_cuda() {
-        candle_core::bail!("copy_from_tensor_f32: both tensors must be on CUDA");
-    }
-    if !dst_tensor.device().same_device(src_tensor.device()) {
-        candle_core::bail!("copy_from_tensor_f32: tensors must be on the same device");
-    }
-    if dst_tensor.elem_count() != src_tensor.elem_count() {
-        candle_core::bail!(
-            "copy_from_tensor_f32: elem count mismatch (dst={}, src={})",
-            dst_tensor.elem_count(),
-            src_tensor.elem_count()
-        );
-    }
-
-    let (mut dst_storage, dst_layout) = dst_tensor.storage_mut_and_layout();
-    let (src_storage, src_layout) = src_tensor.storage_and_layout();
-
-    match (&mut *dst_storage, &*src_storage) {
-        (candle_core::Storage::Cuda(dst_cs), candle_core::Storage::Cuda(src_cs)) => {
-            let dst_start = dst_layout.start_offset();
-            let src_start = src_layout.start_offset();
-            let len = src_tensor.elem_count();
-            let dev = dst_cs.device.clone();
-            let src = src_cs.as_cuda_slice::<f32>()?;
-            let dst = dst_cs.as_cuda_slice_mut::<f32>()?;
-            let src = src.slice(src_start..src_start + len);
-            let mut dst = dst.slice_mut(dst_start..dst_start + len);
-            dev.memcpy_dtod(&src, &mut dst)?;
-            Ok(())
-        }
-        _ => candle_core::bail!("copy_from_tensor_f32: not CUDA storage"),
-    }
+    src_tensor.contiguous()
 }

@@ -44,7 +44,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
-use candle_core::{DType, Tensor};
+use candle_core::Tensor;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -77,7 +77,6 @@ pub struct InferenceEngine {
     start_time: Instant,
     /// Step counter for periodic stats logging.
     step_counter: u64,
-    decode_input_ids_buf: Option<Tensor>,
     sampling_buffers: SamplingBuffers,
 }
 
@@ -117,7 +116,6 @@ impl InferenceEngine {
             decode_tokens_per_seq: decode_tokens_per_seq.max(1),
             start_time: Instant::now(),
             step_counter: 0,
-            decode_input_ids_buf: None,
             sampling_buffers: SamplingBuffers::new(),
         };
         let handle = EngineHandle {
@@ -400,18 +398,6 @@ impl InferenceEngine {
 
         let batch_size = batch.len();
 
-        if self.model.device().is_cuda() && self.decode_input_ids_buf.is_none() {
-            let max_batch = self.scheduler.max_running;
-            self.decode_input_ids_buf =
-                match Tensor::zeros((max_batch, 1), DType::U32, self.model.device()) {
-                    Ok(t) => Some(t),
-                    Err(e) => {
-                        error!("Decode input_ids buffer alloc failed: {e}");
-                        None
-                    }
-                };
-        }
-
         // Flush model's internal KV cache state.
         if let Some(ref prev_id) = self.active_seq_id.take() {
             if self.sequences.contains_key(prev_id) {
@@ -494,35 +480,17 @@ impl InferenceEngine {
                 })
                 .collect();
 
-            let input_ids = if let Some(buf) = self.decode_input_ids_buf.as_ref() {
-                if let Err(e) = crane_core::fused_ops::copy_from_slice_u32(buf, &tokens) {
+            let input_ids = match crane_core::fused_ops::copy_from_slice_u32(
+                &tokens,
+                self.model.device(),
+            )
+            .and_then(|t| t.reshape((batch_size, 1)))
+            {
+                Ok(t) => t,
+                Err(e) => {
                     error!("Decode input_ids upload failed: {e}");
                     self.model.clear_kv_cache();
                     return;
-                }
-                match buf.narrow(0, 0, batch_size) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        error!("Decode input_ids narrow failed: {e}");
-                        self.model.clear_kv_cache();
-                        return;
-                    }
-                }
-            } else {
-                match Tensor::new(tokens.as_slice(), self.model.device()) {
-                    Ok(t) => match t.reshape((batch_size, 1)) {
-                        Ok(t) => t,
-                        Err(e) => {
-                            error!("Decode input_ids reshape failed: {e}");
-                            self.model.clear_kv_cache();
-                            return;
-                        }
-                    },
-                    Err(e) => {
-                        error!("Decode input_ids creation failed: {e}");
-                        self.model.clear_kv_cache();
-                        return;
-                    }
                 }
             };
 

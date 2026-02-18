@@ -5,8 +5,8 @@
 //! - `fused_add_rmsnorm` — Fused residual_add + RMSNorm
 //! - `gpu_argmax` — GPU-side argmax for greedy sampling
 //! - `topk_indices` — GPU top-k on 1D f32 tensors
-//! - `copy_from_slice_u32` — HtoD copy into CUDA U32 tensor
-//! - `copy_from_tensor_f32` — DtoD copy between CUDA f32 tensors
+//! - `copy_from_slice_u32` — HtoD: create a new CUDA U32 tensor from a host slice
+//! - `copy_from_tensor_f32` — contiguous copy of a CUDA f32 tensor
 //!
 //! Each operation eliminates multiple kernel launches and intermediate
 //! GMEM round-trips compared to the equivalent candle op chain.
@@ -56,12 +56,12 @@ mod fallback {
         Tensor::new(out.as_slice(), logits.device())
     }
 
-    pub fn copy_from_slice_u32(_tensor: &Tensor, _src: &[u32]) -> Result<()> {
-        candle_core::bail!("copy_from_slice_u32 requires CUDA feature")
+    pub fn copy_from_slice_u32(src: &[u32], device: &candle_core::Device) -> Result<Tensor> {
+        Tensor::new(src, device)
     }
 
-    pub fn copy_from_tensor_f32(_dst: &Tensor, _src: &Tensor) -> Result<()> {
-        candle_core::bail!("copy_from_tensor_f32 requires CUDA feature")
+    pub fn copy_from_tensor_f32(src: &Tensor) -> Result<Tensor> {
+        src.contiguous()
     }
 }
 

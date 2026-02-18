@@ -1,21 +1,29 @@
-// Optimized Qwen3 transformer implementation.
-//
-// Adapted from the Hunyuan Dense model with full parity on all optimizations:
-//
-// 1. **Pre-allocated KV cache** with in-place `slice_set` writes
-//    — O(new_seq_len) per decode step instead of O(cache_len) `Tensor::cat`.
-// 2. **GQA-grouped SDPA for decode** (seq_len=1)
-//    — Reshapes Q into [B*kv_heads, n_rep, D] and uses 3-D batch matmul with
-//      implicit broadcasting, avoiding the expensive N× KV head expansion.
-// 3. **Fused RoPE kernel** via `candle_nn::rotary_emb::rope()`
-//    — One CUDA launch per Q/K instead of 5 manual tensor ops.
-// 4. **GGUF quantization** via the polymorphic `LinearLayer` enum
-//    — Same model code serves both safetensors (f16/f32/bf16) and GGUF weights.
-// 5. **Batched decode infrastructure**
-//    — `setup_batch_decode`, `step_batch_decode`, `extract_batch_kv` enable
-//      GPU-efficient concurrent sequence serving in the engine.
-// 6. **KV cache save/restore**
-//    — `get_kv_caches` / `set_kv_caches` for continuous-batching context swap.
+//! Optimized Qwen3 transformer implementation.
+//!
+//! Adapted from the HunyuanDense model with full parity on all optimizations:
+//!
+//! 1. **Pre-allocated KV cache** with in-place `slice_set` writes
+//!    — O(new_seq_len) per decode step instead of O(cache_len) `Tensor::cat`.
+//! 2. **GQA-grouped SDPA for decode** (seq_len=1)
+//!    — Reshapes Q into `[B*kv_heads, n_rep, D]` and uses 3-D batch matmul with
+//!      implicit broadcasting, avoiding the expensive N× KV head expansion.
+//! 3. **Fused RoPE kernel** via `candle_nn::rotary_emb::rope()`
+//!    — One CUDA launch per Q/K instead of 5 manual tensor ops.
+//!    — Precomputed `[max_pos, head_dim/2]` cos/sin tables (half-width, as
+//!      required by the `rope()` API).
+//! 4. **GGUF quantization** via the polymorphic `LinearLayer` enum
+//!    — Same model code serves both safetensors (f16/f32/bf16) and GGUF weights.
+//! 5. **Batched decode infrastructure**
+//!    — `setup_batch_decode`, `step_batch_decode`, `extract_batch_kv` enable
+//!      GPU-efficient concurrent sequence serving in the engine.
+//! 6. **KV cache save/restore**
+//!    — `get_kv_caches` / `set_kv_caches` for continuous-batching context swap.
+//! 7. **Fused SiLU-mul MLP gate**
+//!    — `fused_silu_mul` replaces the `narrow + silu + mul` op chain in each
+//!      MLP block, reducing kernel launches and intermediate allocations.
+//! 8. **Merged QKV / gate+up projections**
+//!    — Q, K, V weights fused into one matmul; gate and up weights fused into
+//!      one matmul — halves the number of linear-layer dispatches per layer.
 
 use candle_core::quantized::gguf_file;
 use candle_core::{DType, Device, Module, Result, Tensor, D};
@@ -23,7 +31,6 @@ use candle_nn::rotary_emb::rope;
 use candle_nn::{linear_no_bias, Linear, RmsNorm, VarBuilder};
 use serde::Deserialize;
 use std::io::{Read, Seek};
-use std::sync::Arc;
 
 // Reuse the polymorphic linear layer and GGUF loader from the shared Hunyuan module.
 pub use crate::models::hunyuan_dense::modeling::{Gguf, LinearLayer};
@@ -32,39 +39,22 @@ pub use crate::models::hunyuan_dense::modeling::{Gguf, LinearLayer};
 //
 // Candle defaults to tracking per-tensor CudaEvents for multi-stream safety.
 // Crane uses a single CUDA stream — those events are pure overhead.
-// This guard disables tracking during a forward pass and re-enables it after.
+// This guard disables event tracking on first use and leaves it disabled
+// (candle 0.9.x exposes only `disable_event_tracking`, not a re-enable).
 
 #[cfg(feature = "cuda")]
-struct EventTrackingGuard<'a> {
-    device: &'a candle_core::Device,
-    was_enabled: bool,
-}
+struct EventTrackingGuard;
 
 #[cfg(feature = "cuda")]
-impl<'a> EventTrackingGuard<'a> {
-    fn disable(device: &'a candle_core::Device) -> Self {
+impl EventTrackingGuard {
+    fn disable(device: &candle_core::Device) -> Self {
         if let candle_core::Device::Cuda(ref dev) = device {
-            let was_enabled = dev.is_event_tracking();
-            if was_enabled {
-                // Safety: we ensure sequential use of single CUDA stream.
+            if dev.is_event_tracking() {
+                // Safety: we ensure sequential use of a single CUDA stream.
                 unsafe { dev.disable_event_tracking() };
             }
-            Self { device, was_enabled }
-        } else {
-            Self { device, was_enabled: false }
         }
-    }
-}
-
-#[cfg(feature = "cuda")]
-impl<'a> Drop for EventTrackingGuard<'a> {
-    fn drop(&mut self) {
-        if self.was_enabled {
-            if let candle_core::Device::Cuda(ref dev) = self.device {
-                // Safety: restoring to previous state — still single-stream.
-                unsafe { dev.enable_event_tracking() };
-            }
-        }
+        Self
     }
 }
 
@@ -437,7 +427,7 @@ impl Attention {
 
         // ── SDPA ──
         let n_rep = self.num_heads / self.num_kv_heads;
-        let kv_s = k.dim(2)?;
+        let _kv_s = k.dim(2)?;
 
         if n_rep > 1 && seq_len == 1 {
             // ── GQA-grouped SDPA for decode (seq_len=1) ──
