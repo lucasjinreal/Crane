@@ -4,6 +4,7 @@ use tokio::sync::mpsc;
 
 /// Per-request lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum SequenceStatus {
     /// Queued, waiting for prefill.
     Waiting,
@@ -14,6 +15,7 @@ pub enum SequenceStatus {
 }
 
 /// A single in-flight generation request managed by the engine.
+#[allow(dead_code)]
 pub struct Sequence {
     // ── identity ──
     pub id: String,

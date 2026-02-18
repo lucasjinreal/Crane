@@ -3,7 +3,9 @@
 //! Covers:
 //! * `/v1/chat/completions`  (chat)
 //! * `/v1/completions`       (text completion)
-//! * `/v1/models`            (model listing)
+//! * `/v1/models`            (model listing + retrieval)
+//! * `/v1/tokenize`          (tokenization)
+//! * `/v1/detokenize`        (detokenization)
 //!
 //! Wire format follows the
 //! [OpenAI API reference](https://platform.openai.com/docs/api-reference).
@@ -25,6 +27,7 @@ fn default_max_tokens() -> usize {
 // ── Request ──
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct ChatCompletionRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,
@@ -43,6 +46,8 @@ pub struct ChatCompletionRequest {
     pub presence_penalty: Option<f32>,
     pub seed: Option<u64>,
     pub n: Option<usize>,
+    /// Response format constraint (e.g., `{"type": "json_object"}`).
+    pub response_format: Option<ResponseFormat>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +60,12 @@ pub struct ChatMessage {
 pub struct StreamOptions {
     #[serde(default)]
     pub include_usage: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct ResponseFormat {
+    pub r#type: String,
 }
 
 // ── Response ──
@@ -111,6 +122,7 @@ pub struct ChunkDelta {
 // ── Request ──
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct CompletionRequest {
     pub model: String,
     pub prompt: StringOrArray,
@@ -187,6 +199,41 @@ pub struct CompletionChunkChoice {
 }
 
 // ═════════════════════════════════════════════════════════════
+//  Tokenize / Detokenize  (/v1/tokenize, /v1/detokenize)
+// ═════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TokenizeRequest {
+    /// Text to tokenize. Can be a single string or a list of chat messages.
+    pub text: Option<String>,
+    /// If provided, treat as chat messages and apply the chat template first.
+    pub messages: Option<Vec<ChatMessage>>,
+    /// Whether to add special tokens (default: true).
+    #[serde(default = "default_true")]
+    pub add_special_tokens: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TokenizeResponse {
+    pub tokens: Vec<u32>,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DetokenizeRequest {
+    pub tokens: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DetokenizeResponse {
+    pub text: String,
+}
+
+// ═════════════════════════════════════════════════════════════
 //  Common types
 // ═════════════════════════════════════════════════════════════
 
@@ -211,6 +258,10 @@ pub struct ModelInfo {
     pub object: String,
     pub created: u64,
     pub owned_by: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_model_len: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permission: Option<Vec<serde_json::Value>>,
 }
 
 // ── Error ──

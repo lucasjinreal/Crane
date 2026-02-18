@@ -1,39 +1,35 @@
 mod chat_template;
 mod engine;
+mod handlers;
 mod openai_api;
+mod sglang_api;
 
-use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use axum::{
-    extract::State,
     http::StatusCode,
-    response::{
-        sse::{Event, KeepAlive, Sse},
-        IntoResponse, Json, Response,
-    },
+    response::Json,
     routing::{get, post},
     Router,
 };
 use clap::Parser;
-use futures::stream::Stream;
-use serde_json::json;
-use tokio::sync::mpsc;
 use tracing::info;
 
 use chat_template::ChatTemplateProcessor;
 use engine::model_factory::{ModelFormat, ModelType};
-use engine::{EngineHandle, EngineResponse, InferenceEngine};
-use openai_api::*;
+use engine::{EngineHandle, InferenceEngine};
+use openai_api::ErrorResponse;
 
-// ── CLI ──
+// ═════════════════════════════════════════════════════════════
+//  CLI
+// ═════════════════════════════════════════════════════════════
 
 #[derive(Parser, Debug)]
 #[command(
     name = "crane-oai",
-    about = "OpenAI-compatible API server with continuous batching"
+    about = "OpenAI & SGLang compatible API server with continuous batching"
 )]
 struct Args {
     /// Path to model directory or GGUF file
@@ -44,7 +40,7 @@ struct Args {
     #[arg(long, default_value = "auto")]
     model_type: String,
 
-    /// Model name to report in API responses (defaults to detected type)
+    /// Model name to report in API responses (defaults to directory name)
     #[arg(long)]
     model_name: Option<String>,
 
@@ -73,437 +69,51 @@ struct Args {
     format: String,
 }
 
-// ── App state ──
+// ═════════════════════════════════════════════════════════════
+//  App state (shared across handlers)
+// ═════════════════════════════════════════════════════════════
 
-struct AppState {
-    engine: EngineHandle,
-    model_name: String,
-    /// Shared tokenizer for request pre-processing (encode only).
-    tokenizer: tokenizers::Tokenizer,
+pub struct AppState {
+    pub engine: EngineHandle,
+    pub model_name: String,
+    /// Shared tokenizer for request pre-processing.
+    pub tokenizer: tokenizers::Tokenizer,
     /// Chat template processor (model-specific).
-    chat_template: Box<dyn ChatTemplateProcessor>,
+    pub chat_template: Box<dyn ChatTemplateProcessor>,
     /// Default EOS token ID for this model.
-    eos_token_id: u32,
+    pub eos_token_id: u32,
+    /// Server start time (epoch seconds).
+    pub server_start_time: u64,
+    // ── Fields for /model_info and /server_info ──
+    pub model_path: String,
+    pub model_type_name: String,
+    pub dtype_name: String,
+    pub device_name: String,
+    pub host: String,
+    pub port: u16,
+    pub max_concurrent: usize,
+    pub decode_tokens_per_seq: usize,
 }
 
-fn now_epoch() -> u64 {
+// ═════════════════════════════════════════════════════════════
+//  Shared helpers
+// ═════════════════════════════════════════════════════════════
+
+pub fn now_epoch() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
 }
 
-// ── Handlers ──
-
-async fn health() -> impl IntoResponse {
-    Json(json!({"status": "ok"}))
-}
-
-async fn stats(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let snap = state.engine.stats.snapshot();
-    Json(snap)
-}
-
-async fn list_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(ModelList {
-        object: "list".into(),
-        data: vec![ModelInfo {
-            id: state.model_name.clone(),
-            object: "model".into(),
-            created: now_epoch(),
-            owned_by: "crane".into(),
-        }],
-    })
-}
-
-/// POST /v1/chat/completions — streaming and non-streaming.
-async fn chat_completions(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<ChatCompletionRequest>,
-) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
-    // Apply chat template.
-    let formatted = state
-        .chat_template
-        .apply(&req.messages)
-        .map_err(|e| make_error(StatusCode::BAD_REQUEST, &format!("Chat template failed: {e}")))?;
-
-    // Tokenize.
-    let input_ids = state
-        .tokenizer
-        .encode(formatted.as_str(), true)
-        .map_err(|e| make_error(StatusCode::BAD_REQUEST, &format!("Tokenize failed: {e}")))?
-        .get_ids()
-        .to_vec();
-
-    let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
-    let include_usage = req
-        .stream_options
-        .as_ref()
-        .map_or(false, |so| so.include_usage);
-
-    // Submit to engine.
-    let response_rx = state
-        .engine
-        .submit(
-            request_id.clone(),
-            input_ids,
-            req.max_tokens,
-            req.temperature.or(Some(0.8)),
-            req.top_p.or(Some(0.95)),
-            req.top_k.or(Some(40)),
-            req.repetition_penalty.unwrap_or(1.05),
-            state.eos_token_id,
-        )
-        .map_err(|e| make_error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()))?;
-
-    if req.stream {
-        let model_name = state.model_name.clone();
-        let stream = make_chat_sse_stream(request_id, model_name, response_rx, include_usage);
-        Ok(Sse::new(stream)
-            .keep_alive(KeepAlive::default())
-            .into_response())
-    } else {
-        // Non-streaming — collect all tokens.
-        let mut full_text = String::new();
-        let mut prompt_tokens = 0usize;
-        let mut completion_tokens = 0usize;
-        let mut finish_reason = "length".to_string();
-
-        let mut response_rx = response_rx;
-        while let Some(resp) = response_rx.recv().await {
-            match resp {
-                EngineResponse::Token { text, .. } => {
-                    full_text.push_str(&text);
-                }
-                EngineResponse::Finished {
-                    full_text: ft,
-                    prompt_tokens: pt,
-                    completion_tokens: ct,
-                    finish_reason: fr,
-                } => {
-                    full_text = ft;
-                    prompt_tokens = pt;
-                    completion_tokens = ct;
-                    finish_reason = fr;
-                    break;
-                }
-                EngineResponse::Error(e) => {
-                    return Err(make_error(StatusCode::INTERNAL_SERVER_ERROR, &e));
-                }
-            }
-        }
-
-        let response = ChatCompletionResponse {
-            id: request_id,
-            object: "chat.completion".into(),
-            created: now_epoch(),
-            model: state.model_name.clone(),
-            choices: vec![ChatChoice {
-                index: 0,
-                message: ChatMessage {
-                    role: "assistant".into(),
-                    content: full_text,
-                },
-                finish_reason: Some(finish_reason),
-            }],
-            usage: Usage {
-                prompt_tokens,
-                completion_tokens,
-                total_tokens: prompt_tokens + completion_tokens,
-            },
-        };
-
-        Ok(Json(response).into_response())
-    }
-}
-
-/// POST /v1/completions — text completion (no chat template).
-async fn completions(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<CompletionRequest>,
-) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
-    let prompt = req.prompt.as_string();
-    let include_usage = req
-        .stream_options
-        .as_ref()
-        .map_or(false, |so| so.include_usage);
-
-    let input_ids = state
-        .tokenizer
-        .encode(prompt.as_str(), true)
-        .map_err(|e| make_error(StatusCode::BAD_REQUEST, &format!("Tokenize failed: {e}")))?
-        .get_ids()
-        .to_vec();
-
-    let request_id = format!("cmpl-{}", uuid::Uuid::new_v4());
-
-    let response_rx = state
-        .engine
-        .submit(
-            request_id.clone(),
-            input_ids,
-            req.max_tokens,
-            req.temperature.or(Some(0.8)),
-            req.top_p.or(Some(0.95)),
-            req.top_k.or(Some(40)),
-            req.repetition_penalty.unwrap_or(1.05),
-            state.eos_token_id,
-        )
-        .map_err(|e| make_error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()))?;
-
-    if req.stream {
-        let model_name = state.model_name.clone();
-        let stream =
-            make_completion_sse_stream(request_id, model_name, response_rx, include_usage);
-        Ok(Sse::new(stream)
-            .keep_alive(KeepAlive::default())
-            .into_response())
-    } else {
-        let mut full_text = String::new();
-        let mut prompt_tokens = 0usize;
-        let mut completion_tokens = 0usize;
-        let mut finish_reason = "length".to_string();
-
-        let mut response_rx = response_rx;
-        while let Some(resp) = response_rx.recv().await {
-            match resp {
-                EngineResponse::Token { text, .. } => full_text.push_str(&text),
-                EngineResponse::Finished {
-                    full_text: ft,
-                    prompt_tokens: pt,
-                    completion_tokens: ct,
-                    finish_reason: fr,
-                } => {
-                    full_text = ft;
-                    prompt_tokens = pt;
-                    completion_tokens = ct;
-                    finish_reason = fr;
-                    break;
-                }
-                EngineResponse::Error(e) => {
-                    return Err(make_error(StatusCode::INTERNAL_SERVER_ERROR, &e));
-                }
-            }
-        }
-
-        let response = CompletionResponse {
-            id: request_id,
-            object: "text_completion".into(),
-            created: now_epoch(),
-            model: state.model_name.clone(),
-            choices: vec![CompletionChoice {
-                index: 0,
-                text: full_text,
-                finish_reason: Some(finish_reason),
-            }],
-            usage: Usage {
-                prompt_tokens,
-                completion_tokens,
-                total_tokens: prompt_tokens + completion_tokens,
-            },
-        };
-
-        Ok(Json(response).into_response())
-    }
-}
-
-// ── SSE streams ──
-
-/// Build an SSE stream for chat completions.
-fn make_chat_sse_stream(
-    request_id: String,
-    model_name: String,
-    mut rx: mpsc::UnboundedReceiver<EngineResponse>,
-    include_usage: bool,
-) -> impl Stream<Item = Result<Event, Infallible>> {
-    let created = now_epoch();
-
-    async_stream::stream! {
-        // First chunk: role announcement.
-        let first_chunk = ChatCompletionChunk {
-            id: request_id.clone(),
-            object: "chat.completion.chunk".into(),
-            created,
-            model: model_name.clone(),
-            choices: vec![ChunkChoice {
-                index: 0,
-                delta: ChunkDelta {
-                    role: Some("assistant".into()),
-                    content: None,
-                },
-                finish_reason: None,
-            }],
-            usage: None,
-        };
-        yield Ok(Event::default().json_data(&first_chunk).unwrap());
-
-        let mut prompt_tokens = 0usize;
-        let mut completion_tokens = 0usize;
-
-        while let Some(resp) = rx.recv().await {
-            match resp {
-                EngineResponse::Token { text, .. } => {
-                    completion_tokens += 1;
-                    let chunk = ChatCompletionChunk {
-                        id: request_id.clone(),
-                        object: "chat.completion.chunk".into(),
-                        created,
-                        model: model_name.clone(),
-                        choices: vec![ChunkChoice {
-                            index: 0,
-                            delta: ChunkDelta {
-                                role: None,
-                                content: Some(text),
-                            },
-                            finish_reason: None,
-                        }],
-                        usage: None,
-                    };
-                    yield Ok(Event::default().json_data(&chunk).unwrap());
-                }
-                EngineResponse::Finished {
-                    finish_reason,
-                    prompt_tokens: pt,
-                    completion_tokens: ct,
-                    ..
-                } => {
-                    prompt_tokens = pt;
-                    completion_tokens = ct;
-
-                    // Final chunk with finish_reason.
-                    let chunk = ChatCompletionChunk {
-                        id: request_id.clone(),
-                        object: "chat.completion.chunk".into(),
-                        created,
-                        model: model_name.clone(),
-                        choices: vec![ChunkChoice {
-                            index: 0,
-                            delta: ChunkDelta {
-                                role: None,
-                                content: None,
-                            },
-                            finish_reason: Some(finish_reason),
-                        }],
-                        usage: None,
-                    };
-                    yield Ok(Event::default().json_data(&chunk).unwrap());
-
-                    // Usage chunk (if requested).
-                    if include_usage {
-                        let usage_chunk = ChatCompletionChunk {
-                            id: request_id.clone(),
-                            object: "chat.completion.chunk".into(),
-                            created,
-                            model: model_name.clone(),
-                            choices: vec![],
-                            usage: Some(Usage {
-                                prompt_tokens,
-                                completion_tokens,
-                                total_tokens: prompt_tokens + completion_tokens,
-                            }),
-                        };
-                        yield Ok(Event::default().json_data(&usage_chunk).unwrap());
-                    }
-
-                    yield Ok(Event::default().data("[DONE]"));
-                    break;
-                }
-                EngineResponse::Error(e) => {
-                    yield Ok(Event::default().data(format!("error: {e}")));
-                    break;
-                }
-            }
-        }
-    }
-}
-
-/// Build an SSE stream for text completions.
-fn make_completion_sse_stream(
-    request_id: String,
-    model_name: String,
-    mut rx: mpsc::UnboundedReceiver<EngineResponse>,
-    include_usage: bool,
-) -> impl Stream<Item = Result<Event, Infallible>> {
-    let created = now_epoch();
-
-    async_stream::stream! {
-        let mut prompt_tokens = 0usize;
-        let mut completion_tokens = 0usize;
-
-        while let Some(resp) = rx.recv().await {
-            match resp {
-                EngineResponse::Token { text, .. } => {
-                    completion_tokens += 1;
-                    let chunk = CompletionChunk {
-                        id: request_id.clone(),
-                        object: "text_completion".into(),
-                        created,
-                        model: model_name.clone(),
-                        choices: vec![CompletionChunkChoice {
-                            index: 0,
-                            text,
-                            finish_reason: None,
-                        }],
-                        usage: None,
-                    };
-                    yield Ok(Event::default().json_data(&chunk).unwrap());
-                }
-                EngineResponse::Finished {
-                    finish_reason,
-                    prompt_tokens: pt,
-                    completion_tokens: ct,
-                    ..
-                } => {
-                    prompt_tokens = pt;
-                    completion_tokens = ct;
-
-                    let chunk = CompletionChunk {
-                        id: request_id.clone(),
-                        object: "text_completion".into(),
-                        created,
-                        model: model_name.clone(),
-                        choices: vec![CompletionChunkChoice {
-                            index: 0,
-                            text: String::new(),
-                            finish_reason: Some(finish_reason),
-                        }],
-                        usage: None,
-                    };
-                    yield Ok(Event::default().json_data(&chunk).unwrap());
-
-                    if include_usage {
-                        let usage_chunk = CompletionChunk {
-                            id: request_id.clone(),
-                            object: "text_completion".into(),
-                            created,
-                            model: model_name.clone(),
-                            choices: vec![],
-                            usage: Some(Usage {
-                                prompt_tokens,
-                                completion_tokens,
-                                total_tokens: prompt_tokens + completion_tokens,
-                            }),
-                        };
-                        yield Ok(Event::default().json_data(&usage_chunk).unwrap());
-                    }
-
-                    yield Ok(Event::default().data("[DONE]"));
-                    break;
-                }
-                EngineResponse::Error(e) => {
-                    yield Ok(Event::default().data(format!("error: {e}")));
-                    break;
-                }
-            }
-        }
-    }
-}
-
-fn make_error(status: StatusCode, msg: &str) -> (StatusCode, Json<ErrorResponse>) {
+pub fn make_error(
+    status: StatusCode,
+    msg: &str,
+) -> (StatusCode, Json<ErrorResponse>) {
     (
         status,
         Json(ErrorResponse {
-            error: ErrorDetail {
+            error: openai_api::ErrorDetail {
                 message: msg.to_string(),
                 r#type: "invalid_request_error".into(),
                 code: None,
@@ -512,7 +122,9 @@ fn make_error(status: StatusCode, msg: &str) -> (StatusCode, Json<ErrorResponse>
     )
 }
 
-// ── Main ──
+// ═════════════════════════════════════════════════════════════
+//  Main
+// ═════════════════════════════════════════════════════════════
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -554,7 +166,10 @@ async fn main() -> Result<()> {
     #[cfg(not(feature = "cuda"))]
     let dtype = crane_core::models::DType::F32;
 
-    info!("Device: {:?}, dtype: {:?}", device, dtype);
+    let device_name = format!("{:?}", device);
+    let dtype_name = format!("{:?}", dtype);
+
+    info!("Device: {}, dtype: {}", device_name, dtype_name);
 
     // ── Resolve model type ──
 
@@ -592,11 +207,10 @@ async fn main() -> Result<()> {
     // ── Model name for API responses ──
 
     let model_name = args.model_name.unwrap_or_else(|| {
-        let base = std::path::Path::new(&args.model_path)
+        std::path::Path::new(&args.model_path)
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| resolved_type.display_name().to_string());
-        base
+            .unwrap_or_else(|| resolved_type.display_name().to_string())
     });
 
     // ── Start engine on dedicated thread ──
@@ -621,25 +235,69 @@ async fn main() -> Result<()> {
         tokenizer,
         chat_template,
         eos_token_id,
+        server_start_time: now_epoch(),
+        model_path: args.model_path.clone(),
+        model_type_name: resolved_type.display_name().to_string(),
+        dtype_name,
+        device_name,
+        host: args.host.clone(),
+        port: args.port,
+        max_concurrent: args.max_concurrent,
+        decode_tokens_per_seq: args.decode_tokens_per_seq,
     });
 
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/v1/models", get(list_models))
-        .route("/v1/stats", get(stats))
-        .route("/v1/chat/completions", post(chat_completions))
-        .route("/v1/completions", post(completions))
-        .with_state(state);
+    let app = build_router(state);
 
     let addr = format!("{}:{}", args.host, args.port);
     info!("Starting server on {addr}");
+    info!("  ── OpenAI-compatible ──");
     info!("  POST http://{addr}/v1/chat/completions");
     info!("  POST http://{addr}/v1/completions");
     info!("  GET  http://{addr}/v1/models");
+    info!("  GET  http://{addr}/v1/models/{{model_id}}");
+    info!("  POST http://{addr}/v1/tokenize");
+    info!("  POST http://{addr}/v1/detokenize");
+    info!("  ── SGLang-compatible ──");
+    info!("  POST http://{addr}/generate");
+    info!("  GET  http://{addr}/model_info");
+    info!("  GET  http://{addr}/server_info");
+    info!("  GET  http://{addr}/health_generate");
+    info!("  POST http://{addr}/flush_cache");
+    info!("  POST http://{addr}/abort_request");
+    info!("  ── Management ──");
+    info!("  GET  http://{addr}/health");
     info!("  GET  http://{addr}/v1/stats");
+    info!("  POST http://{addr}/tokenize");
+    info!("  POST http://{addr}/detokenize");
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+/// Build the Axum router with all endpoint families.
+fn build_router(state: Arc<AppState>) -> Router {
+    Router::new()
+        // ── Health & management ──
+        .route("/health", get(handlers::common::health))
+        .route("/v1/stats", get(handlers::common::stats))
+        // ── OpenAI-compatible ──
+        .route("/v1/chat/completions", post(handlers::openai::chat_completions))
+        .route("/v1/completions", post(handlers::openai::completions))
+        .route("/v1/models", get(handlers::openai::list_models))
+        .route("/v1/models/:model_id", get(handlers::openai::retrieve_model))
+        .route("/v1/tokenize", post(handlers::openai::tokenize))
+        .route("/v1/detokenize", post(handlers::openai::detokenize))
+        // ── Convenience aliases (SGLang-style) ──
+        .route("/tokenize", post(handlers::openai::tokenize))
+        .route("/detokenize", post(handlers::openai::detokenize))
+        // ── SGLang-compatible native API ──
+        .route("/generate", post(handlers::sglang::generate))
+        .route("/model_info", get(handlers::sglang::model_info))
+        .route("/server_info", get(handlers::sglang::server_info))
+        .route("/health_generate", get(handlers::sglang::health_generate))
+        .route("/flush_cache", get(handlers::sglang::flush_cache).post(handlers::sglang::flush_cache))
+        .route("/abort_request", post(handlers::sglang::abort_request))
+        .with_state(state)
 }

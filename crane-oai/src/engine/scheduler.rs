@@ -82,11 +82,13 @@ impl Scheduler {
     }
 
     /// Total active sequences (waiting + running).
+    #[allow(dead_code)]
     pub fn active_count(&self) -> usize {
         self.waiting.len() + self.running.len()
     }
 
     /// Whether there is any work pending.
+    #[allow(dead_code)]
     pub fn has_work(&self) -> bool {
         !self.waiting.is_empty() || !self.running.is_empty()
     }
