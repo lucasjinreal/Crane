@@ -2,6 +2,7 @@ use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tokenizers::{EncodeInput, Tokenizer};
+use minijinja_contrib::add_to_environment;
 
 /// Defines the aditional parameters available for the `from_pretrained` function
 #[derive(Debug, Clone)]
@@ -175,19 +176,86 @@ impl AutoTokenizer {
     }
 }
 
-/// Rewrite Python-style string method calls to minijinja filter syntax.
+/// Rewrite Python-style string method calls and indexing to minijinja filter syntax.
 ///
-/// Handles: `.startswith(`, `.endswith(`, `.split(`, `.lstrip(`, `.rstrip(`, `.strip(`
-/// e.g. `content.startswith('x')` → `(content) | startswith('x')`
+/// Handles:
+/// - `s.startswith(x)` → `s | startswith(x)`
+/// - `s.split(x)[-1]` → `s | split(x) | last`
+/// - `s.split(x)[0]`  → `s | split(x) | first`
 fn rewrite_python_str_methods(template: &str) -> String {
+    // Step 1: rewrite `.split(...)[-1]` → ` | split(...) | last`
+    //         and    `.split(...)[0]`  → ` | split(...) | first`
+    // Use a simple char-by-char scan to find these patterns.
+    let template = rewrite_split_index(template);
+
+    // Step 2: rewrite remaining `.method(` → ` | method(`
     const METHODS: &[&str] = &["startswith", "endswith", "split", "lstrip", "rstrip", "strip"];
-    let mut out = template.to_string();
+    let mut out = template;
     for method in METHODS {
         let pat = format!(".{}(", method);
         let repl = format!(" | {}(", method);
         out = out.replace(&pat, &repl);
     }
     out
+}
+
+/// Rewrite `.split(SEP)[N]` to ` | split(SEP) | first/last`.
+/// Handles `[0]` → `| first` and `[-1]` → `| last`.
+fn rewrite_split_index(template: &str) -> String {
+    let mut out = String::with_capacity(template.len());
+    let bytes = template.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len {
+        // Look for `.split(`
+        if template[i..].starts_with(".split(") {
+            // Find matching closing paren
+            let start = i + 1; // points to 's' in 'split'
+            let args_start = i + 7; // after `.split(`
+            if let Some(close) = find_matching_paren(&template[args_start..]) {
+                let after_close = args_start + close + 1; // index after ')'
+                // Check for [0] or [-1]
+                if template[after_close..].starts_with("[0]") {
+                    out.push_str(" | ");
+                    out.push_str(&template[start..args_start + close + 1]);
+                    out.push_str(" | first");
+                    i = after_close + 3;
+                    continue;
+                } else if template[after_close..].starts_with("[-1]") {
+                    out.push_str(" | ");
+                    out.push_str(&template[start..args_start + close + 1]);
+                    out.push_str(" | last");
+                    i = after_close + 4;
+                    continue;
+                }
+            }
+        }
+        out.push(template[i..].chars().next().unwrap());
+        i += template[i..].chars().next().unwrap().len_utf8();
+    }
+    out
+}
+
+/// Find the index of the closing `)` that matches the opening `(` assumed at position -1.
+fn find_matching_paren(s: &str) -> Option<usize> {
+    let mut depth = 1usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    for (i, c) in s.char_indices() {
+        match c {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            '(' if !in_single && !in_double => depth += 1,
+            ')' if !in_single && !in_double => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 impl AutoTokenizer {
@@ -207,8 +275,10 @@ impl AutoTokenizer {
         let template_str = rewrite_python_str_methods(template_str);
 
         let mut env = minijinja::Environment::new();
+        // Register Python-compatible builtins (tojson, namespace, etc.)
+        add_to_environment(&mut env);
 
-        // Python-style string methods not built into minijinja.
+        // Additional Python-style string filters.
         env.add_filter("startswith", |s: &str, prefix: &str| s.starts_with(prefix));
         env.add_filter("endswith", |s: &str, suffix: &str| s.ends_with(suffix));
         env.add_filter("split", |s: String, sep: String| -> Vec<String> {
