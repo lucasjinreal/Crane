@@ -1,3 +1,11 @@
 [workspace]
 members = ["crane-core", "crane", "crane-oai", "example"]
 resolver = "2"
+
+[patch.crates-io]
+candle-core = { path = "../candle/candle-core" }
+candle-nn = { path = "../candle/candle-nn" }
+candle-transformers = { path = "../candle/candle-transformers" }
+candle-onnx = { path = "../candle/candle-onnx" }
+candle-flash-attn = { path = "../candle/candle-flash-attn" }
+cudarc = { path = "../cudarc" }

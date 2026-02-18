@@ -266,10 +266,6 @@ struct Attention {
     kv_cache: Option<(Tensor, Tensor)>,
     /// Number of valid (filled) positions in the KV cache buffer.
     cache_seq_len: usize,
-    /// When true, the KV cache covers the full pre-allocated buffer and
-    /// attention operates on the full width (masked). Used for CUDA-graph
-    /// compatible decode where tensor shapes must be fixed.
-    full_buffer_attn: bool,
     #[cfg(feature = "flash-attn")]
     use_flash_attn: bool,
 }
@@ -363,7 +359,6 @@ impl Attention {
             head_dim,
             kv_cache: None,
             cache_seq_len: 0,
-            full_buffer_attn: false,
             #[cfg(feature = "flash-attn")]
             use_flash_attn: true,
         })
@@ -406,7 +401,6 @@ impl Attention {
             head_dim,
             kv_cache: None,
             cache_seq_len: 0,
-            full_buffer_attn: false,
             #[cfg(feature = "flash-attn")]
             use_flash_attn: true,
         })
@@ -475,54 +469,12 @@ impl Attention {
         }
     }
 
-    /// Scatter-based KV cache write using a position tensor.
-    ///
-    /// Writes new K/V at positions specified by `write_pos` using `scatter_set`.
-    /// Returns the **full** pre-allocated buffer (not narrowed), suitable for
-    /// attention with a mask. This makes the output shape fixed and compatible
-    /// with CUDA graph capture.
-    ///
-    /// # Arguments
-    /// - `k`, `v`: new data `[B, H, 1, D]`
-    /// - `write_pos`: `[B]` tensor of u32 write positions
-    fn update_kv_cache_scatter(
-        &mut self,
-        k: Tensor,
-        v: Tensor,
-        write_pos: &Tensor,
-    ) -> Result<(Tensor, Tensor)> {
-        let k = k.contiguous()?;
-        let v = v.contiguous()?;
-        let (b, h, _one, d) = k.dims4()?;
-
-        match self.kv_cache {
-            Some((ref buf_k, ref buf_v)) => {
-                // Build scatter index: expand [B] → [B, H, 1, D]
-                let idx = write_pos
-                    .reshape((b, 1, 1, 1))?
-                    .expand((b, h, 1, d))?
-                    .contiguous()?;
-                buf_k.scatter_set(&idx, &k, 2)?;
-                buf_v.scatter_set(&idx, &v, 2)?;
-                // Return full buffer — caller uses mask for invalid positions.
-                Ok((buf_k.clone(), buf_v.clone()))
-            }
-            None => {
-                candle_core::bail!(
-                    "update_kv_cache_scatter called without pre-allocated buffer; \
-                     call setup_batch_decode first"
-                )
-            }
-        }
-    }
-
     fn forward(
         &mut self,
         hidden_states: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
         attention_mask: Option<&Tensor>,
-        write_pos: Option<&Tensor>,
         varlen_ctx: Option<&VarlenContext>,
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _) = hidden_states.dims3()?;
@@ -560,24 +512,16 @@ impl Attention {
             k
         };
 
-        // KV cache update — scatter-based (graph-compatible) or slice_set.
-        let (k, v) = if let Some(wp) = write_pos {
-            self.update_kv_cache_scatter(k, v, wp)?
-        } else {
-            self.update_kv_cache(k, v)?
-        };
+        let (k, v) = self.update_kv_cache(k, v)?;
 
         // ── Attention computation ──
         // Try flash attention first (eliminates repeat_kv + fuses SDPA into 1 kernel).
         // flash_attn handles GQA natively (num_heads_q != num_heads_kv).
         // Fall back to manual SDPA when a custom attention mask is needed
         // (e.g., batched decode with padding) since flash_attn only supports causal masking.
-        // When write_pos is Some (graph-capture mode), K/V are the full pre-allocated
-        // buffer — flash_attn cannot be used (it assumes valid-length data), so we
-        // always fall through to mask-based SDPA.
         #[cfg(feature = "flash-attn")]
         {
-            if self.use_flash_attn && write_pos.is_none() {
+            if self.use_flash_attn {
                 let can_use_flash = attention_mask.is_none() || seq_len > 1;
                 if can_use_flash {
                     let softmax_scale = 1f32 / (self.head_dim as f32).sqrt();
@@ -832,19 +776,13 @@ impl DecoderLayer {
         cos: &Tensor,
         sin: &Tensor,
         attention_mask: Option<&Tensor>,
-        write_pos: Option<&Tensor>,
         varlen_ctx: Option<&VarlenContext>,
     ) -> Result<Tensor> {
         let residual = hidden_states;
         let hidden_states = self.input_layernorm.forward(hidden_states)?;
-        let hidden_states = self.self_attn.forward(
-            &hidden_states,
-            cos,
-            sin,
-            attention_mask,
-            write_pos,
-            varlen_ctx,
-        )?;
+        let hidden_states =
+            self.self_attn
+                .forward(&hidden_states, cos, sin, attention_mask, varlen_ctx)?;
         let hidden_states = (residual + hidden_states)?;
 
         let residual = &hidden_states;
@@ -1074,14 +1012,8 @@ impl HunYuanDenseV1 {
 
         let mut hidden_states = hidden_states;
         for layer in self.layers.iter_mut() {
-            hidden_states = layer.forward(
-                &hidden_states,
-                &cos,
-                &sin,
-                attention_mask.as_ref(),
-                None,
-                None,
-            )?;
+            hidden_states =
+                layer.forward(&hidden_states, &cos, &sin, attention_mask.as_ref(), None)?;
         }
 
         let hidden_states = self.norm.forward(&hidden_states)?;
@@ -1306,55 +1238,13 @@ impl HunYuanDenseV1 {
                     &cos,
                     &sin,
                     attention_mask,
-                    None,
                     varlen_ctx.as_ref(),
                 )?;
             }
             #[cfg(not(feature = "flash-attn"))]
             {
-                hidden_states =
-                    layer.forward(&hidden_states, &cos, &sin, attention_mask, None, None)?;
+                hidden_states = layer.forward(&hidden_states, &cos, &sin, attention_mask, None)?;
             }
-        }
-
-        let hidden_states = self.norm.forward(&hidden_states)?;
-        self.lm_head.forward(&hidden_states) // [N, 1, vocab]
-    }
-
-    /// Graph-compatible batched decode step.
-    ///
-    /// Unlike `step_batch_decode`, all inputs are **pre-allocated tensors** —
-    /// no CPU→GPU copies happen inside this function. The caller updates the
-    /// tensors' contents (via `slice_set` / `copy_`) between graph replays.
-    ///
-    /// # Arguments
-    /// - `input_ids`: `[N, 1]` token IDs (u32)
-    /// - `cos`, `sin`: `[N, 1, dim/2]` rotary-embedding vectors
-    /// - `attention_mask`: `[N, 1, 1, max_kv_len]` mask (0.0 = attend, -1e9 = ignore)
-    /// - `write_pos`: `[N]` u32 positions to write into the KV buffer
-    ///
-    /// # Returns
-    /// Logits tensor `[N, 1, vocab_size]`.
-    pub fn step_batch_decode_graph(
-        &mut self,
-        input_ids: &Tensor,
-        cos: &Tensor,
-        sin: &Tensor,
-        attention_mask: &Tensor,
-        write_pos: &Tensor,
-    ) -> candle_core::Result<Tensor> {
-        let hidden_states = self.embed_tokens.forward(input_ids)?.to_dtype(self.dtype)?;
-
-        let mut hidden_states = hidden_states;
-        for layer in self.layers.iter_mut() {
-            hidden_states = layer.forward(
-                &hidden_states,
-                cos,
-                sin,
-                Some(attention_mask),
-                Some(write_pos),
-                None,
-            )?;
         }
 
         let hidden_states = self.norm.forward(&hidden_states)?;
@@ -1406,160 +1296,6 @@ impl HunYuanDenseV1 {
             }
             layer.self_attn.kv_cache = None;
             layer.self_attn.cache_seq_len = 0;
-        }
-
-        Ok(result)
-    }
-
-    // ── CUDA Graph mode infrastructure ──
-
-    /// Pre-allocate PERMANENT KV cache buffers for all layers.
-    ///
-    /// These buffers have fixed shape `[max_batch, kv_heads, max_kv_len, head_dim]`
-    /// and their device-memory addresses are baked into CUDA graphs during
-    /// capture. Call this once at startup before `capture_decode_graph`.
-    pub fn preallocate_graph_kv(
-        &mut self,
-        max_batch: usize,
-        max_kv_len: usize,
-    ) -> candle_core::Result<()> {
-        let kv_heads = self.config.num_key_value_heads;
-        let head_dim = self.config.head_dim();
-        let device = self.embed_tokens.embeddings().device();
-        for layer in self.layers.iter_mut() {
-            let buf_k = Tensor::zeros(
-                (max_batch, kv_heads, max_kv_len, head_dim),
-                self.dtype,
-                device,
-            )?;
-            let buf_v = Tensor::zeros(
-                (max_batch, kv_heads, max_kv_len, head_dim),
-                self.dtype,
-                device,
-            )?;
-            layer.self_attn.kv_cache = Some((buf_k, buf_v));
-            layer.self_attn.cache_seq_len = 0;
-            layer.self_attn.full_buffer_attn = true;
-        }
-        Ok(())
-    }
-
-    /// Load per-sequence KV caches into the permanent graph buffers.
-    ///
-    /// Zeroes the entire permanent buffer, then writes each sequence's cached
-    /// KV data at batch-row `i` starting at seq-position 0.
-    ///
-    /// # Returns
-    /// `(kv_lens, max_kv_len)` — same semantics as `setup_batch_decode`.
-    pub fn load_kv_for_graph(
-        &mut self,
-        seq_kv_caches: &[Vec<Option<(Tensor, Tensor)>>],
-    ) -> candle_core::Result<(Vec<usize>, usize)> {
-        let n_seqs = seq_kv_caches.len();
-
-        // Compute per-sequence KV lengths from the first layer's cache.
-        let kv_lens: Vec<usize> = seq_kv_caches
-            .iter()
-            .map(|caches| {
-                caches
-                    .first()
-                    .and_then(|c| c.as_ref())
-                    .map(|(k, _)| k.dim(2).unwrap_or(0))
-                    .unwrap_or(0)
-            })
-            .collect();
-        let max_kv_len = kv_lens.iter().copied().max().unwrap_or(0);
-
-        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
-            let (ref buf_k, ref buf_v) = layer.self_attn.kv_cache.as_ref().ok_or_else(|| {
-                candle_core::Error::Msg(
-                    "load_kv_for_graph: no pre-allocated KV buffer; \
-                     call preallocate_graph_kv first"
-                        .into(),
-                )
-            })?;
-            // Zero the entire buffer so dead/padding regions are clean.
-            buf_k.zero_set()?;
-            buf_v.zero_set()?;
-
-            // Write each sequence's KV at its batch row.
-            for (seq_idx, seq_caches) in seq_kv_caches.iter().enumerate() {
-                if let Some((ref k, ref v)) = seq_caches[layer_idx] {
-                    // k: [1, kv_heads, seq_len, head_dim]
-                    // Write into buf[seq_idx, :, 0..seq_len, :]
-                    // narrow(0, seq_idx, 1) gives a view of that batch row.
-                    let dest_k = buf_k.narrow(0, seq_idx, 1)?;
-                    let dest_v = buf_v.narrow(0, seq_idx, 1)?;
-                    dest_k.slice_set(&k.contiguous()?, 2, 0)?;
-                    dest_v.slice_set(&v.contiguous()?, 2, 0)?;
-                }
-            }
-            layer.self_attn.cache_seq_len = max_kv_len;
-        }
-
-        Ok((kv_lens, max_kv_len))
-    }
-
-    /// Compute rotary embeddings for given positions.
-    ///
-    /// Returns `(cos, sin)` with shape `[N, 1, head_dim/2]` in model dtype,
-    /// suitable for passing to `step_batch_decode_graph`.
-    pub fn compute_rotary(&mut self, positions: &[usize]) -> candle_core::Result<(Tensor, Tensor)> {
-        let device = self.embed_tokens.embeddings().device();
-        let max_pos = positions.iter().copied().max().unwrap_or(0) + 1;
-        let (full_cos, full_sin) = self.rotary_emb.forward(max_pos, device)?;
-
-        let pos_ids: Vec<u32> = positions.iter().map(|&p| p as u32).collect();
-        let pos_tensor = Tensor::new(pos_ids.as_slice(), device)?;
-        let cos = full_cos
-            .index_select(&pos_tensor, 0)?
-            .to_dtype(self.dtype)?
-            .unsqueeze(1)?;
-        let sin = full_sin
-            .index_select(&pos_tensor, 0)?
-            .to_dtype(self.dtype)?
-            .unsqueeze(1)?;
-        Ok((cos, sin))
-    }
-
-    /// Extract per-sequence KV caches from the graph buffers without
-    /// deallocating them. The permanent buffers remain intact for the
-    /// next graph replay batch.
-    ///
-    /// Unlike `extract_batch_kv`, this does NOT clear the model's KV cache.
-    pub fn extract_graph_kv(
-        &self,
-        kv_lens: &[usize],
-        rounds_done: usize,
-    ) -> candle_core::Result<Vec<Vec<Option<(Tensor, Tensor)>>>> {
-        let n_seqs = kv_lens.len();
-        let num_layers = self.layers.len();
-        let mut result: Vec<Vec<Option<(Tensor, Tensor)>>> = (0..n_seqs)
-            .map(|_| Vec::with_capacity(num_layers))
-            .collect();
-
-        for layer in self.layers.iter() {
-            if let Some((ref full_k, ref full_v)) = layer.self_attn.kv_cache {
-                for i in 0..n_seqs {
-                    let total = kv_lens[i] + rounds_done;
-                    let row_k = full_k.narrow(0, i, 1)?;
-                    let row_v = full_v.narrow(0, i, 1)?;
-                    // In graph mode, data is written contiguously at positions
-                    // 0..kv_lens[i] (from load_kv_for_graph) then at
-                    // kv_lens[i]..kv_lens[i]+rounds_done (from scatter_set during decode).
-                    // Wait — scatter_set writes at the POSITION specified, which
-                    // is the logical position (varies per sequence). So the data
-                    // IS at 0..total contiguously.
-                    result[i].push(Some((
-                        row_k.narrow(2, 0, total)?.contiguous()?,
-                        row_v.narrow(2, 0, total)?.contiguous()?,
-                    )));
-                }
-            } else {
-                for i in 0..n_seqs {
-                    result[i].push(None);
-                }
-            }
         }
 
         Ok(result)

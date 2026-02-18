@@ -31,7 +31,6 @@ pub enum ModelFormat {
 }
 
 pub struct Model {
-    // pub tokenizer: TokenOutputStream,
     pub tokenizer: TokenOutputStream,
     pub device: Device,
     pub dtype: DType,
@@ -52,7 +51,11 @@ impl Model {
         let format = match format {
             ModelFormat::Auto => {
                 let p = std::path::Path::new(model_path);
-                if p.is_file() && p.extension().map(|e| e == "gguf").unwrap_or(false) {
+                if p.is_file()
+                    && p.extension()
+                        .map(|e| e == "gguf")
+                        .unwrap_or(false)
+                {
                     ModelFormat::Gguf
                 } else {
                     ModelFormat::Safetensors
@@ -191,8 +194,8 @@ impl Model {
 
     /// Run a single forward step, returning raw logits. Caller manages KV cache.
     pub fn forward_step(
-        &mut self,
-        input_ids: &[u32],
+        &mut self, 
+        input_ids: &[u32], 
         start_pos: usize,
     ) -> candle_core::Result<Tensor> {
         let input = Tensor::new(input_ids, &self.device)?.unsqueeze(0)?;
@@ -227,8 +230,18 @@ impl Model {
     ) -> candle_core::Result<Tensor> {
         let n = positions.len();
         let input = Tensor::new(tokens, &self.device)?.reshape((n, 1))?;
+        self.inner.step_batch_decode(&input, positions, attention_mask, batch_kv_info)
+    }
+
+    pub fn step_batch_decode_with_input_ids(
+        &mut self,
+        input_ids: &Tensor,
+        positions: &[usize],
+        attention_mask: Option<&Tensor>,
+        batch_kv_info: Option<(&[usize], usize)>,
+    ) -> candle_core::Result<Tensor> {
         self.inner
-            .step_batch_decode(&input, positions, attention_mask, batch_kv_info)
+            .step_batch_decode(input_ids, positions, attention_mask, batch_kv_info)
     }
 
     /// Extract per-sequence KV caches from the model's batched state,
@@ -239,58 +252,7 @@ impl Model {
         original_max_kv: usize,
         rounds_done: usize,
     ) -> candle_core::Result<Vec<Vec<Option<(Tensor, Tensor)>>>> {
-        self.inner
-            .extract_batch_kv(kv_lens, original_max_kv, rounds_done)
-    }
-
-    /// Graph-compatible decode step. All inputs are pre-allocated tensors;
-    /// caller updates contents before each graph replay.
-    pub fn step_batch_decode_graph(
-        &mut self,
-        input_ids: &Tensor,
-        cos: &Tensor,
-        sin: &Tensor,
-        attention_mask: &Tensor,
-        write_pos: &Tensor,
-    ) -> candle_core::Result<Tensor> {
-        self.inner
-            .step_batch_decode_graph(input_ids, cos, sin, attention_mask, write_pos)
-    }
-
-    /// Pre-allocate permanent KV cache buffers for graph mode.
-    pub fn preallocate_graph_kv(
-        &mut self,
-        max_batch: usize,
-        max_kv_len: usize,
-    ) -> candle_core::Result<()> {
-        self.inner.preallocate_graph_kv(max_batch, max_kv_len)
-    }
-
-    /// Load per-sequence KV caches into the permanent graph buffers.
-    pub fn load_kv_for_graph(
-        &mut self,
-        seq_kv_caches: &[Vec<Option<(Tensor, Tensor)>>],
-    ) -> candle_core::Result<(Vec<usize>, usize)> {
-        self.inner.load_kv_for_graph(seq_kv_caches)
-    }
-
-    /// Compute rotary embeddings for the given positions.
-    pub fn compute_rotary(&mut self, positions: &[usize]) -> candle_core::Result<(Tensor, Tensor)> {
-        self.inner.compute_rotary(positions)
-    }
-
-    /// Extract per-sequence KV from the permanent graph buffers.
-    pub fn extract_graph_kv(
-        &self,
-        kv_lens: &[usize],
-        rounds_done: usize,
-    ) -> candle_core::Result<Vec<Vec<Option<(Tensor, Tensor)>>>> {
-        self.inner.extract_graph_kv(kv_lens, rounds_done)
-    }
-
-    /// Access the model's half-head-dim for rotary embedding.
-    pub fn half_head_dim(&self) -> usize {
-        self.inner.config().head_dim() / 2
+        self.inner.extract_batch_kv(kv_lens, original_max_kv, rounds_done)
     }
 
     /// Number of transformer layers.
@@ -309,8 +271,11 @@ impl Model {
     }
 
     pub fn warmup(&mut self) {
-        if let Err(e) = self.generate(&[45, 546, 456], &GenerationConfig::with_max_tokens(5), None)
-        {
+        if let Err(e) = self.generate(
+            &[45, 546, 456],
+            &GenerationConfig::with_max_tokens(5),
+            None,
+        ) {
             eprintln!("warmup failed (non-fatal): {e}");
         }
         self.clear_kv_cache();

@@ -1,6 +1,29 @@
 [package]
 name = "crane-oai"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
+crane-core = { path = "../crane-core" }
+anyhow = "1.0.100"
+axum = { version = "0.8", features = ["json"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+tokio-stream = "0.1"
+futures = "0.3"
+async-stream = "0.3"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+candle-core = "0.9.2-alpha.2"
+candle-nn = "0.9.2-alpha.2"
+candle-transformers = "0.9.2-alpha.2"
+
+[features]
+cuda = ["crane-core/cuda"]
+flash-attn = ["crane-core/flash-attn"]
+cudnn = ["crane-core/cudnn"]
+mkl = ["crane-core/mkl"]
