@@ -8,11 +8,11 @@ pub struct SchedulerOutput {
     pub is_prefill: bool,
 }
 
-/// Simple FIFO scheduler with prefill priority.
+/// Simple FIFO scheduler with prefill-decode interleaving.
 ///
 /// Invariants:
-///   - Prefill has priority over decode (new requests get served first
-///     so they can start streaming sooner).
+///   - After a prefill step, if there are running sequences, the next
+///     step is always a decode (prevents prefill-starvation under load).
 ///   - A prefill step processes exactly ONE new sequence (its full prompt).
 ///   - A decode step processes ALL running sequences (one token each).
 ///   - `max_running` limits how many sequences can be in decode phase
@@ -24,6 +24,10 @@ pub struct Scheduler {
     pub running: VecDeque<String>,
     /// Maximum concurrent decode sequences.
     pub max_running: usize,
+    /// Whether the last scheduled step was a prefill.
+    /// Used to interleave decode between consecutive prefills
+    /// so running sequences are not starved.
+    last_was_prefill: bool,
 }
 
 impl Scheduler {
@@ -32,6 +36,7 @@ impl Scheduler {
             waiting: VecDeque::new(),
             running: VecDeque::new(),
             max_running,
+            last_was_prefill: false,
         }
     }
 
@@ -49,19 +54,29 @@ impl Scheduler {
     /// Decide what to do next.
     ///
     /// Returns `None` if there is no work (engine should wait for new requests).
+    ///
+    /// Uses prefill-decode interleaving: after a prefill, if there are running
+    /// sequences, always do a decode step before the next prefill. This prevents
+    /// running sequences from being starved under high concurrency.
     pub fn schedule(&mut self) -> Option<SchedulerOutput> {
-        // Priority 1: Prefill a waiting sequence if there's capacity.
-        if !self.waiting.is_empty() && self.running.len() < self.max_running {
+        // If the last step was a prefill and we have running sequences,
+        // force a decode step to avoid starving running sequences.
+        let force_decode = self.last_was_prefill && !self.running.is_empty();
+
+        // Priority 1: Prefill a waiting sequence if there's capacity
+        // and we're not forcing decode.
+        if !force_decode && !self.waiting.is_empty() && self.running.len() < self.max_running {
             let seq_id = self.waiting.pop_front().unwrap();
-            // It will be moved to `running` after prefill completes.
+            self.last_was_prefill = true;
             return Some(SchedulerOutput {
                 batch: vec![seq_id],
                 is_prefill: true,
             });
         }
 
-        // Priority 2: Decode all running sequences (round-robin, one token each).
+        // Priority 2: Decode all running sequences.
         if !self.running.is_empty() {
+            self.last_was_prefill = false;
             let batch: Vec<String> = self.running.iter().cloned().collect();
             return Some(SchedulerOutput {
                 batch,
@@ -69,11 +84,23 @@ impl Scheduler {
             });
         }
 
-        // Priority 3: If we're at max capacity but have waiting sequences,
-        // still do a decode step to free up a slot eventually.
-        // (Already covered by the running check above.)
+        // Priority 3: Nothing running but waiting has items — prefill.
+        if !self.waiting.is_empty() {
+            let seq_id = self.waiting.pop_front().unwrap();
+            self.last_was_prefill = true;
+            return Some(SchedulerOutput {
+                batch: vec![seq_id],
+                is_prefill: true,
+            });
+        }
 
         None // No work.
+    }
+
+    /// Reset the interleave flag (e.g. when the engine defers a prefill
+    /// and manually forces a decode step).
+    pub fn reset_prefill_flag(&mut self) {
+        self.last_was_prefill = false;
     }
 
     /// Move a sequence from waiting state to running state (called after prefill).

@@ -344,6 +344,9 @@ impl InferenceEngine {
                             for seq_id in &output.batch {
                                 self.scheduler.waiting.push_front(seq_id.clone());
                             }
+                            // Reset interleave flag so the deferred prefill is
+                            // retried immediately after this forced decode.
+                            self.scheduler.reset_prefill_flag();
                             let decode_batch: Vec<String> =
                                 self.scheduler.running.iter().cloned().collect();
                             let decode_output = SchedulerOutput {
