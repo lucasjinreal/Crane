@@ -188,6 +188,11 @@ impl Model {
         self.inner.set_kv_caches(caches);
     }
 
+    /// Total bytes held by the model's KV caches (no GPU copies).
+    pub fn active_kv_cache_bytes(&self) -> u64 {
+        self.inner.active_kv_cache_bytes()
+    }
+
     // ── Batched decode (GPU-efficient concurrent serving) ───────────────
 
     pub fn setup_batch_decode(

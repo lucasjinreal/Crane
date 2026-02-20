@@ -341,7 +341,7 @@ impl Attention {
                     drop(cur_k);
                     drop(cur_v);
                     let total = full_k.dim(2)?;
-                    let room = total.max(256);
+                    let room = 256; // fixed small room — avoids 2x over-allocation
                     let (b, h, _, d) = full_k.dims4()?;
                     let new_buf_k =
                         Tensor::zeros((b, h, total + room, d), k.dtype(), k.device())?;
@@ -357,7 +357,7 @@ impl Attention {
             None => {
                 // First use — allocate buffer with extra room.
                 let (b, h, s, d) = k.dims4()?;
-                let room = s.max(256);
+                let room = 256; // fixed small room — avoids 2x over-allocation
                 let buf_k = Tensor::zeros((b, h, s + room, d), k.dtype(), k.device())?;
                 let buf_v = Tensor::zeros((b, h, s + room, d), v.dtype(), v.device())?;
                 buf_k.slice_set(&k, 2, 0)?;
@@ -510,52 +510,46 @@ impl Attention {
 
 // ── MLP ─────────────────────────────────────────────────────────────────
 
+/// Gate+up projection: either a merged [2*I, H] weight (Standard) or separate quantized projections.
+enum MlpGateUp {
+    /// Merged gate+up weight — one gemv instead of two. Standard (BF16/F16/F32) only.
+    Merged { gate_up_proj: Linear, intermediate_size: usize },
+    /// Separate quantized gate and up projections (GGUF).
+    Separate { gate_proj: LinearLayer, up_proj: LinearLayer, intermediate_size: usize },
+}
+
 struct Mlp {
-    gate_proj: LinearLayer,
-    up_proj: LinearLayer,
+    gate_up: MlpGateUp,
     down_proj: LinearLayer,
-    /// Merged gate+up weight [2*intermediate_size, hidden_size] — one gemv instead of two.
-    /// Only set for Standard (non-quantized) weights.
-    gate_up_proj: Option<Linear>,
-    intermediate_size: usize,
 }
 
 impl Mlp {
     fn new(config: &Config, vb: VarBuilder) -> Result<Self> {
-        let gate_proj = LinearLayer::Standard(linear_no_bias(
+        let gate_proj = linear_no_bias(
             config.hidden_size,
             config.intermediate_size,
             vb.pp("gate_proj"),
-        )?);
-        let up_proj = LinearLayer::Standard(linear_no_bias(
+        )?;
+        let up_proj = linear_no_bias(
             config.hidden_size,
             config.intermediate_size,
             vb.pp("up_proj"),
-        )?);
+        )?;
         let down_proj = LinearLayer::Standard(linear_no_bias(
             config.intermediate_size,
             config.hidden_size,
             vb.pp("down_proj"),
         )?);
 
-        // Create merged gate+up projection for Standard weights.
-        let gate_up_proj =
-            if let (LinearLayer::Standard(ref g), LinearLayer::Standard(ref u)) =
-                (&gate_proj, &up_proj)
-            {
-                let gate_up_w = Tensor::cat(&[g.weight(), u.weight()], 0)?;
-                Some(Linear::new(gate_up_w, None))
-            } else {
-                None
-            };
-
-        Ok(Self {
-            gate_proj,
-            up_proj,
-            down_proj,
-            gate_up_proj,
+        // Merge gate+up into a single weight, then drop the originals to save VRAM.
+        let gate_up_w = Tensor::cat(&[gate_proj.weight(), up_proj.weight()], 0)?;
+        // gate_proj and up_proj are dropped here — their VRAM is freed.
+        let gate_up = MlpGateUp::Merged {
+            gate_up_proj: Linear::new(gate_up_w, None),
             intermediate_size: config.intermediate_size,
-        })
+        };
+
+        Ok(Self { gate_up, down_proj })
     }
 
     fn new_from_gguf<R: Read + Seek>(gg: &mut Gguf<R>, layer_idx: usize, intermediate_size: usize) -> Result<Self> {
@@ -564,42 +558,46 @@ impl Mlp {
         let up_proj = gg.linear(&format!("{prefix}.ffn_up.weight"))?;
         let down_proj = gg.linear(&format!("{prefix}.ffn_down.weight"))?;
         Ok(Self {
-            gate_proj,
-            up_proj,
+            gate_up: MlpGateUp::Separate {
+                gate_proj,
+                up_proj,
+                intermediate_size,
+            },
             down_proj,
-            gate_up_proj: None, // GGUF quantized — cannot merge
-            intermediate_size,
         })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        if let Some(ref gate_up) = self.gate_up_proj {
-            // Merged path: one gemv → fused SiLU(gate) * up
-            let gu = gate_up.forward(x)?; // [B, S, 2*intermediate_size]
+        match &self.gate_up {
+            MlpGateUp::Merged { gate_up_proj, intermediate_size } => {
+                let gu = gate_up_proj.forward(x)?; // [B, S, 2*intermediate_size]
 
-            // Use fused CUDA kernel when available: eliminates narrow + silu + mul
-            // (3 kernel launches → 1).
-            #[cfg(feature = "cuda")]
-            {
-                if gu.device().is_cuda() {
-                    let activated = crate::fused_ops::fused_silu_mul(
-                        &gu.contiguous()?,
-                        self.intermediate_size,
-                    )?;
-                    return self.down_proj.forward(&activated);
+                // Use fused CUDA kernel when available: eliminates narrow + silu + mul
+                // (3 kernel launches → 1).
+                #[cfg(feature = "cuda")]
+                {
+                    if gu.device().is_cuda() {
+                        let activated = crate::fused_ops::fused_silu_mul(
+                            &gu.contiguous()?,
+                            *intermediate_size,
+                        )?;
+                        return self.down_proj.forward(&activated);
+                    }
                 }
-            }
 
-            // CPU / non-CUDA fallback
-            let gate = gu.narrow(D::Minus1, 0, self.intermediate_size)?;
-            let up = gu.narrow(D::Minus1, self.intermediate_size, self.intermediate_size)?;
-            let gate = candle_nn::Activation::Silu.forward(&gate)?;
-            return self.down_proj.forward(&(gate * up)?);
+                // CPU / non-CUDA fallback
+                let gate = gu.narrow(D::Minus1, 0, *intermediate_size)?;
+                let up = gu.narrow(D::Minus1, *intermediate_size, *intermediate_size)?;
+                let gate = candle_nn::Activation::Silu.forward(&gate)?;
+                self.down_proj.forward(&(gate * up)?)
+            }
+            MlpGateUp::Separate { gate_proj, up_proj, .. } => {
+                let gate = gate_proj.forward(x)?;
+                let gate = candle_nn::Activation::Silu.forward(&gate)?;
+                let up = up_proj.forward(x)?;
+                self.down_proj.forward(&(gate * up)?)
+            }
         }
-        let gate = self.gate_proj.forward(x)?;
-        let gate = candle_nn::Activation::Silu.forward(&gate)?;
-        let up = self.up_proj.forward(x)?;
-        self.down_proj.forward(&(gate * up)?)
     }
 }
 
@@ -910,7 +908,32 @@ impl Qwen3Model {
         self.layers.len()
     }
 
+    /// Total bytes held by the model's KV caches (no GPU copies).
+    pub fn active_kv_cache_bytes(&self) -> u64 {
+        self.layers
+            .iter()
+            .map(|l| {
+                l.self_attn
+                    .kv_cache
+                    .as_ref()
+                    .map(|(k, v)| {
+                        let k_bytes =
+                            k.elem_count() as u64 * k.dtype().size_in_bytes() as u64;
+                        let v_bytes =
+                            v.elem_count() as u64 * v.dtype().size_in_bytes() as u64;
+                        k_bytes + v_bytes
+                    })
+                    .unwrap_or(0)
+            })
+            .sum()
+    }
+
     /// Extract per-layer KV caches (valid portion only, zero-copy narrow views).
+    ///
+    /// The returned views still reference the pre-allocated buffer.  Callers
+    /// that need to free the buffer (e.g. batch-decode extract) should use
+    /// `Tensor::contiguous()` on their side, or clear `seq.kv_caches` after
+    /// consuming the views.
     pub fn get_kv_caches(&self) -> Vec<Option<(Tensor, Tensor)>> {
         self.layers
             .iter()
@@ -1059,9 +1082,10 @@ impl Qwen3Model {
                     let row_v = full_v.narrow(0, i, 1)?;
                     let total = kv_lens[i] + rounds_done;
                     let offset = original_max_kv - kv_lens[i];
+                    // Contiguous copy — breaks ref to padded batch buffer.
                     let clean = Some((
-                        row_k.narrow(2, offset, total)?,
-                        row_v.narrow(2, offset, total)?,
+                        row_k.narrow(2, offset, total)?.contiguous()?,
+                        row_v.narrow(2, offset, total)?.contiguous()?,
                     ));
                     result[i].push(clean);
                 }

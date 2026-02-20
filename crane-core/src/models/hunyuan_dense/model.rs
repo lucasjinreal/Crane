@@ -270,6 +270,11 @@ impl Model {
         self.inner.set_kv_caches(caches);
     }
 
+    /// Total bytes held by the model's KV caches (no GPU copies).
+    pub fn active_kv_cache_bytes(&self) -> u64 {
+        self.inner.active_kv_cache_bytes()
+    }
+
     pub fn warmup(&mut self) {
         if let Err(e) = self.generate(
             &[45, 546, 456],
@@ -314,19 +319,25 @@ impl ModelForCausalLM for Model {
             let input = Tensor::new(ctxt, &self.device)?.unsqueeze(0)?;
 
             let logits = self.forward(&input, start_pos)?;
-            let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
-            let logits = if config.repetition_penalty == 1. {
-                logits
-            } else {
-                let start_at = tokens.len().saturating_sub(config.repeat_last_n);
-                candle_transformers::utils::apply_repeat_penalty(
-                    &logits,
-                    config.repetition_penalty,
-                    &tokens[start_at..],
-                )?
-            };
+            let logits = logits.squeeze(0)?.squeeze(0)?;
 
-            let next_token = logits_processor.sample(&logits)?;
+            // Greedy + no repetition penalty: GPU argmax avoids D→H logits copy.
+            let next_token = if config.temperature.is_none() && config.repetition_penalty == 1. {
+                crate::fused_ops::gpu_argmax(&logits)?
+            } else {
+                let logits = logits.to_dtype(DType::F32)?;
+                let logits = if config.repetition_penalty == 1. {
+                    logits
+                } else {
+                    let start_at = tokens.len().saturating_sub(config.repeat_last_n);
+                    candle_transformers::utils::apply_repeat_penalty(
+                        &logits,
+                        config.repetition_penalty,
+                        &tokens[start_at..],
+                    )?
+                };
+                logits_processor.sample(&logits)?
+            };
             tokens.push(next_token);
             generated_tokens += 1;
 

@@ -183,11 +183,14 @@ To use `crane`, here are some notes:
 - `crane-oai`: OpenAI & SGLang compatible API server with continuous batching, see [crane-oai/README.md](crane-oai/README.md) for full documentation;
 
 1. Make sure latest Rust were installed;
-2. Build:
+2. Build (choose based on your hardware):
 
    ```bash
-   cargo run --bin llmbench --release
-   cargo run --bin qwenchat --release
+   # CPU
+   cargo build --release
+
+   # CUDA (GPU)
+   cargo build --release --features cuda
    ```
 
 That's it!
@@ -198,7 +201,10 @@ Start a server compatible with OpenAI SDK and SGLang client:
 
 ```bash
 # Build
+# CPU
 cargo build -p crane-oai --release
+# CUDA
+cargo build -p crane-oai --release --features cuda
 
 # Start (auto-detect model type and device)
 ./target/release/crane-oai --model-path /path/to/Qwen2.5-7B-Instruct
@@ -278,17 +284,7 @@ One can reference to `crane-core/src/models/namo2.rs` for new arch add, which us
 
 ## ⚡ Inference Optimizations
 
-Crane implements production-grade inference optimizations for both **Qwen3** and **Hunyuan Dense**:
-
-| Optimization | Description | Benefit |
-|-------------|-------------|--------|
-| **Pre-allocated KV cache** | `slice_set` in-place writes instead of `Tensor::cat` | O(new_tokens) per step instead of O(cache_len) |
-| **GQA 4D matmul** | Keep [B, kv_heads, n_rep, D] shape, avoid reshape+contiguous copies | ~3x fewer copy kernels per decode step |
-| **Fused RoPE** | `candle_nn::rotary_emb::rope()` CUDA kernel with cos/sin pre-growth | 1 kernel launch per Q/K, cache hit on decode |
-| **GGUF quantization** | Polymorphic `LinearLayer` enum (safetensors + GGUF) | 2-4x memory reduction, same code path |
-| **Batched decode** | `setup_batch_decode` / `step_batch_decode` / `extract_batch_kv` | GPU-efficient concurrent sequence serving |
-| **KV cache swap** | Save/restore per-sequence caches for continuous batching | Context switch without recomputation |
-| **Smart sampling** | CPU fallback for large vocabularies (>64K) when top_p active | Avoids expensive GPU topk on 151K vocab |
+Crane implements production-grade inference optimizations for both **Qwen3** and **Hunyuan Dense**.
 
 Environment variables for tuning:
 

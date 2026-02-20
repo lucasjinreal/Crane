@@ -8,11 +8,14 @@ pub struct SchedulerOutput {
     pub is_prefill: bool,
 }
 
-/// Simple FIFO scheduler with prefill priority.
+/// Simple FIFO scheduler with prefill-priority batching.
 ///
 /// Invariants:
-///   - Prefill has priority over decode (new requests get served first
-///     so they can start streaming sooner).
+///   - Prefills are prioritized: waiting sequences are prefilled as fast as
+///     possible (one at a time) to build up the decode batch quickly. This
+///     maximizes GPU utilization since larger batch decodes are more efficient.
+///   - Once `running` reaches `max_running` (or `effective_max_running`),
+///     no more prefills are admitted — the scheduler only decodes.
 ///   - A prefill step processes exactly ONE new sequence (its full prompt).
 ///   - A decode step processes ALL running sequences (one token each).
 ///   - `max_running` limits how many sequences can be in decode phase
@@ -24,6 +27,13 @@ pub struct Scheduler {
     pub running: VecDeque<String>,
     /// Maximum concurrent decode sequences.
     pub max_running: usize,
+    /// Dynamic cap on running sequences, set after eviction.
+    ///
+    /// When eviction occurs, the current running count (post-eviction) is
+    /// stored here to prevent immediately re-admitting sequences that would
+    /// exceed the KV budget again. Reset to `None` when a sequence finishes
+    /// naturally, allowing the system to try admitting more.
+    pub effective_max_running: Option<usize>,
 }
 
 impl Scheduler {
@@ -32,6 +42,7 @@ impl Scheduler {
             waiting: VecDeque::new(),
             running: VecDeque::new(),
             max_running,
+            effective_max_running: None,
         }
     }
 
@@ -49,18 +60,21 @@ impl Scheduler {
     /// Decide what to do next.
     ///
     /// Returns `None` if there is no work (engine should wait for new requests).
+    ///
+    /// Prioritizes prefilling waiting sequences up to `max_running` (or `effective_max_running`)
+    /// to build up the batch size for efficient decoding.
     pub fn schedule(&mut self) -> Option<SchedulerOutput> {
         // Priority 1: Prefill a waiting sequence if there's capacity.
-        if !self.waiting.is_empty() && self.running.len() < self.max_running {
+        let max = self.effective_max_running.unwrap_or(self.max_running);
+        if !self.waiting.is_empty() && self.running.len() < max {
             let seq_id = self.waiting.pop_front().unwrap();
-            // It will be moved to `running` after prefill completes.
             return Some(SchedulerOutput {
                 batch: vec![seq_id],
                 is_prefill: true,
             });
         }
 
-        // Priority 2: Decode all running sequences (round-robin, one token each).
+        // Priority 2: Decode all running sequences.
         if !self.running.is_empty() {
             let batch: Vec<String> = self.running.iter().cloned().collect();
             return Some(SchedulerOutput {
@@ -69,9 +83,15 @@ impl Scheduler {
             });
         }
 
-        // Priority 3: If we're at max capacity but have waiting sequences,
-        // still do a decode step to free up a slot eventually.
-        // (Already covered by the running check above.)
+        // Priority 3: Nothing running but waiting has items — prefill.
+        // (This happens if max is 0, which shouldn't normally happen, but just in case).
+        if !self.waiting.is_empty() {
+            let seq_id = self.waiting.pop_front().unwrap();
+            return Some(SchedulerOutput {
+                batch: vec![seq_id],
+                is_prefill: true,
+            });
+        }
 
         None // No work.
     }
@@ -236,25 +256,111 @@ mod tests {
         s.add("r3".into());
         assert_eq!(s.active_count(), 3);
 
-        // Prefill r1.
+        // Step 1: Prefill r1 (nothing running, capacity available).
         let out = s.schedule().unwrap();
         assert!(out.is_prefill);
         assert_eq!(out.batch[0], "r1");
         s.promote_to_running("r1".into());
 
-        // Prefill r2.
+        // Step 2: Prefill r2 (running=1 < max=2, capacity available).
         let out = s.schedule().unwrap();
         assert!(out.is_prefill);
         assert_eq!(out.batch[0], "r2");
         s.promote_to_running("r2".into());
 
-        // At max_running=2, r3 waits; decode r1+r2.
+        // Step 3: At max_running=2 with r3 waiting → can't prefill, decode.
+        let out = s.schedule().unwrap();
+        assert!(!out.is_prefill);
+        assert_eq!(out.batch.len(), 2);
+
+        // Step 4: Still at capacity → decode.
         let out = s.schedule().unwrap();
         assert!(!out.is_prefill);
         assert_eq!(out.batch.len(), 2);
 
         // Finish r1, now room for r3.
         s.remove("r1");
+        let out = s.schedule().unwrap();
+        assert!(out.is_prefill);
+        assert_eq!(out.batch[0], "r3");
+    }
+
+    #[test]
+    fn consecutive_prefills_then_decode() {
+        let mut s = Scheduler::new(8);
+        // Simulate 4 requests arriving at once.
+        s.add("a".into());
+        s.add("b".into());
+        s.add("c".into());
+        s.add("d".into());
+
+        // Step 1: prefill "a" (nothing running).
+        let out = s.schedule().unwrap();
+        assert!(out.is_prefill);
+        assert_eq!(out.batch[0], "a");
+        s.promote_to_running("a".into());
+
+        // Step 2: prefill "b" (capacity available, no interleaving).
+        let out = s.schedule().unwrap();
+        assert!(out.is_prefill);
+        assert_eq!(out.batch[0], "b");
+        s.promote_to_running("b".into());
+
+        // Step 3: prefill "c".
+        let out = s.schedule().unwrap();
+        assert!(out.is_prefill);
+        assert_eq!(out.batch[0], "c");
+        s.promote_to_running("c".into());
+
+        // Step 4: prefill "d".
+        let out = s.schedule().unwrap();
+        assert!(out.is_prefill);
+        assert_eq!(out.batch[0], "d");
+        s.promote_to_running("d".into());
+
+        // Step 5: nothing waiting, running has items → decode.
+        let out = s.schedule().unwrap();
+        assert!(!out.is_prefill);
+        assert_eq!(out.batch.len(), 4);
+    }
+
+    #[test]
+    fn effective_max_running_prevents_prefill() {
+        let mut s = Scheduler::new(8);
+        s.promote_to_running("r1".into());
+        s.promote_to_running("r2".into());
+        s.promote_to_running("r3".into());
+        s.add("r4".into()); // waiting
+
+        // Without cap: would prefill r4 (3 < 8).
+        // With cap set to 3: should decode instead.
+        s.effective_max_running = Some(3);
+
+        let out = s.schedule().unwrap();
+        assert!(!out.is_prefill, "Should decode, not prefill (capped at 3)");
+        assert_eq!(out.batch.len(), 3);
+
+        // Remove one running → running=2 < cap=3 → now can prefill.
+        s.remove("r1");
+        let out = s.schedule().unwrap();
+        assert!(out.is_prefill);
+        assert_eq!(out.batch[0], "r4");
+    }
+
+    #[test]
+    fn effective_max_running_reset_allows_admission() {
+        let mut s = Scheduler::new(8);
+        s.promote_to_running("r1".into());
+        s.promote_to_running("r2".into());
+        s.add("r3".into());
+
+        // Cap at 2 → can't admit r3.
+        s.effective_max_running = Some(2);
+        let out = s.schedule().unwrap();
+        assert!(!out.is_prefill);
+
+        // Lift cap → can now admit r3.
+        s.effective_max_running = None;
         let out = s.schedule().unwrap();
         assert!(out.is_prefill);
         assert_eq!(out.batch[0], "r3");
