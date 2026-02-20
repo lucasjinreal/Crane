@@ -44,7 +44,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
-use candle_core::Tensor;
+use candle_core::{Device, Tensor};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -53,6 +53,105 @@ use crane_core::utils::token_output_stream::TokenOutputStream;
 use sampling::SamplingBuffers;
 use scheduler::{Scheduler, SchedulerOutput};
 use sequence::{Sequence, SequenceStatus};
+
+// ─────────────────────────────────────────────────────────────
+//  Memory configuration
+// ─────────────────────────────────────────────────────────────
+
+/// Configuration for GPU memory limits.
+#[derive(Debug, Clone)]
+pub struct MemoryConfig {
+    /// Maximum tokens per sequence (prompt + completion). 0 = unlimited.
+    pub max_seq_len: usize,
+    /// GPU memory limit in bytes. 0 = unlimited.
+    pub gpu_memory_limit_bytes: u64,
+}
+
+impl MemoryConfig {
+    /// Parse memory configuration from CLI arguments.
+    ///
+    /// `gpu_memory_limit` accepts:
+    ///   - Absolute sizes: "5G", "8G", "5120M", "5368709120" (bytes)
+    ///   - Utilization fraction: "0.7" (70% of total GPU memory)
+    pub fn parse(max_seq_len: usize, gpu_memory_limit: Option<&str>, device: &Device) -> Self {
+        let gpu_memory_limit_bytes = match gpu_memory_limit {
+            Some(s) => Self::parse_memory_limit(s, device),
+            None => 0,
+        };
+        Self {
+            max_seq_len,
+            gpu_memory_limit_bytes,
+        }
+    }
+
+    fn parse_memory_limit(s: &str, device: &Device) -> u64 {
+        let s = s.trim();
+        if s.is_empty() || s == "0" {
+            return 0;
+        }
+
+        // Try absolute sizes: "5G", "8G", "5120M", "1024K"
+        let upper = s.to_uppercase();
+        if upper.ends_with('G') {
+            if let Ok(n) = upper[..upper.len() - 1].trim().parse::<f64>() {
+                return (n * (1u64 << 30) as f64) as u64;
+            }
+        }
+        if upper.ends_with('M') {
+            if let Ok(n) = upper[..upper.len() - 1].trim().parse::<f64>() {
+                return (n * (1u64 << 20) as f64) as u64;
+            }
+        }
+
+        // Try as a fraction (0.0 - 1.0)
+        if let Ok(frac) = s.parse::<f64>() {
+            if (0.0..=1.0).contains(&frac) {
+                let total = Self::query_total_gpu_memory(device);
+                if total > 0 {
+                    return (frac * total as f64) as u64;
+                }
+            }
+            // If > 1.0, treat as bytes
+            if frac > 1.0 {
+                return frac as u64;
+            }
+        }
+
+        tracing::warn!("Could not parse gpu_memory_limit '{}', ignoring", s);
+        0
+    }
+
+    /// Query total GPU memory (bytes). Returns 0 if unavailable.
+    fn query_total_gpu_memory(_device: &Device) -> u64 {
+        #[cfg(feature = "cuda")]
+        {
+            if let Device::Cuda(_) = _device {
+                if let Ok((_free, total)) =
+                    candle_core::cuda_backend::cudarc::driver::result::mem_get_info()
+                {
+                    return total as u64;
+                }
+            }
+        }
+        0
+    }
+}
+
+/// Query current GPU memory usage. Returns (used_bytes, total_bytes).
+/// Returns (0, 0) if not on CUDA.
+fn query_gpu_memory_usage(_device: &Device) -> (u64, u64) {
+    #[cfg(feature = "cuda")]
+    {
+        if let Device::Cuda(_) = _device {
+            if let Ok((free, total)) =
+                candle_core::cuda_backend::cudarc::driver::result::mem_get_info()
+            {
+                return ((total - free) as u64, total as u64);
+            }
+        }
+    }
+    (0, 0)
+}
 
 // ─────────────────────────────────────────────────────────────
 //  InferenceEngine
@@ -78,6 +177,8 @@ pub struct InferenceEngine {
     /// Step counter for periodic stats logging.
     step_counter: u64,
     sampling_buffers: SamplingBuffers,
+    /// Memory configuration for VRAM limits.
+    memory_config: MemoryConfig,
 }
 
 impl InferenceEngine {
@@ -86,6 +187,7 @@ impl InferenceEngine {
         model: Box<dyn ModelBackend>,
         max_concurrent: usize,
         decode_tokens_per_seq: usize,
+        memory_config: MemoryConfig,
     ) -> (Self, EngineHandle) {
         let (request_tx, request_rx) = mpsc::unbounded_channel();
         let num_layers = model.num_layers();
@@ -117,6 +219,7 @@ impl InferenceEngine {
             start_time: Instant::now(),
             step_counter: 0,
             sampling_buffers: SamplingBuffers::new(),
+            memory_config,
         };
         let handle = EngineHandle {
             request_tx,
@@ -132,8 +235,11 @@ impl InferenceEngine {
     /// Run the engine loop (blocking — call from a dedicated thread).
     pub fn run(mut self) {
         info!(
-            "Engine started (max_concurrent={}, decode_tokens_per_seq={})",
-            self.scheduler.max_running, self.decode_tokens_per_seq,
+            "Engine started (max_concurrent={}, decode_tokens_per_seq={}, max_seq_len={}, gpu_memory_limit={})",
+            self.scheduler.max_running,
+            self.decode_tokens_per_seq,
+            if self.memory_config.max_seq_len == 0 { "unlimited".to_string() } else { self.memory_config.max_seq_len.to_string() },
+            if self.memory_config.gpu_memory_limit_bytes == 0 { "unlimited".to_string() } else { format!("{}B", self.memory_config.gpu_memory_limit_bytes) },
         );
 
         loop {
@@ -151,7 +257,30 @@ impl InferenceEngine {
 
             match output {
                 Some(output) => {
-                    self.execute_step(output);
+                    // GPU memory gate: if a prefill is scheduled but we're over the
+                    // memory limit, defer it — only allow decode steps to finish
+                    // existing sequences and free memory.
+                    if output.is_prefill && self.is_over_memory_limit() {
+                        // Put the sequence back into the waiting queue.
+                        for seq_id in &output.batch {
+                            self.scheduler.waiting.push_front(seq_id.clone());
+                        }
+                        // If there are running sequences, do a decode step instead.
+                        if !self.scheduler.running.is_empty() {
+                            let decode_batch: Vec<String> =
+                                self.scheduler.running.iter().cloned().collect();
+                            let decode_output = SchedulerOutput {
+                                batch: decode_batch,
+                                is_prefill: false,
+                            };
+                            self.execute_step(decode_output);
+                        } else {
+                            // Nothing running, nothing we can do — wait briefly.
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        }
+                    } else {
+                        self.execute_step(output);
+                    }
                     self.step_counter += 1;
 
                     if self.step_counter % 50 == 0 {
@@ -175,12 +304,23 @@ impl InferenceEngine {
     fn log_stats(&self) {
         let snap = self.stats.snapshot();
         let uptime = self.start_time.elapsed().as_secs();
+        let (gpu_used, gpu_total) = query_gpu_memory_usage(self.model.device());
+        let gpu_info = if gpu_total > 0 {
+            format!(
+                " | gpu_mem: {:.1}G/{:.1}G ({:.0}%)",
+                gpu_used as f64 / (1u64 << 30) as f64,
+                gpu_total as f64 / (1u64 << 30) as f64,
+                gpu_used as f64 / gpu_total as f64 * 100.0,
+            )
+        } else {
+            String::new()
+        };
         info!(
             "Engine stats | uptime={}s | requests: total={} completed={} cancelled={} failed={} | \
              sequences: active={} waiting={} | \
              tokens: prompt={} completion={} | \
              kv_swaps={} | \
-             speed: prefill={:.1} tok/s decode={:.1} tok/s",
+             speed: prefill={:.1} tok/s decode={:.1} tok/s{}",
             uptime,
             snap.total_requests,
             snap.completed_requests,
@@ -193,7 +333,39 @@ impl InferenceEngine {
             snap.total_kv_swaps,
             snap.avg_prefill_tokens_per_sec,
             snap.avg_decode_tokens_per_sec,
+            gpu_info,
         );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    //  Memory management
+    // ─────────────────────────────────────────────────────────
+
+    /// Check whether current GPU memory usage exceeds the configured limit.
+    fn is_over_memory_limit(&self) -> bool {
+        if self.memory_config.gpu_memory_limit_bytes == 0 {
+            return false;
+        }
+        let (used, _total) = query_gpu_memory_usage(self.model.device());
+        if used >= self.memory_config.gpu_memory_limit_bytes {
+            debug!(
+                "GPU memory limit reached: used={:.1}G >= limit={:.1}G, deferring prefill",
+                used as f64 / (1u64 << 30) as f64,
+                self.memory_config.gpu_memory_limit_bytes as f64 / (1u64 << 30) as f64,
+            );
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Effective max_tokens for a request, taking server-level max_seq_len into account.
+    fn effective_max_tokens(&self, prompt_len: usize, requested_max_tokens: usize) -> usize {
+        if self.memory_config.max_seq_len == 0 {
+            return requested_max_tokens;
+        }
+        let remaining = self.memory_config.max_seq_len.saturating_sub(prompt_len);
+        requested_max_tokens.min(remaining)
     }
 
     // ─────────────────────────────────────────────────────────
@@ -210,10 +382,31 @@ impl InferenceEngine {
         let prompt_len = req.tokens.len();
         let tokenizer = self.model.tokenizer().clone();
 
+        // Reject prompts that already exceed max_seq_len.
+        if self.memory_config.max_seq_len > 0 && prompt_len > self.memory_config.max_seq_len {
+            warn!(
+                id = %req.id,
+                prompt_len,
+                max_seq_len = self.memory_config.max_seq_len,
+                "Prompt exceeds max_seq_len, rejecting request",
+            );
+            let _ = req.response_tx.send(EngineResponse::Error(
+                format!(
+                    "Prompt length ({}) exceeds server max_seq_len ({})",
+                    prompt_len, self.memory_config.max_seq_len,
+                ),
+            ));
+            self.stats.failed_requests.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
+        // Cap max_tokens to respect max_seq_len.
+        let effective_max_tokens = self.effective_max_tokens(prompt_len, req.max_tokens);
+
         info!(
             id = %req.id,
             prompt_len,
-            max_tokens = req.max_tokens,
+            max_tokens = effective_max_tokens,
             temp = ?req.temperature,
             top_p = ?req.top_p,
             top_k = ?req.top_k,
@@ -242,7 +435,7 @@ impl InferenceEngine {
             temperature: req.temperature,
             top_p: req.top_p,
             top_k: req.top_k,
-            max_tokens: req.max_tokens,
+            max_tokens: effective_max_tokens,
             eos_token_id: req.eos_token_id,
             repetition_penalty: req.repetition_penalty,
             repeat_last_n: 64,
