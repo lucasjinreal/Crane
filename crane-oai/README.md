@@ -55,6 +55,34 @@ crane-oai --model-path /path/to/model --cpu
 | `--max-concurrent` | `32` | 解码阶段最大并发序列数 |
 | `--decode-tokens-per-seq` | `16` | 每个序列切换前解码的 token 数（越大 KV 交换越少） |
 | `--format` | `auto` | 权重格式: `auto`, `safetensors`, `gguf` |
+| `--max-seq-len` | `0` | 最大序列长度（prompt + 生成），0 = 不限制 |
+| `--gpu-memory-limit` | 不限制 | 显存限制，支持: `5G`/`8G`/`5120M`(绝对值) 或 `0.7`(总显存的 70%) |
+
+#### 显存控制
+
+在小显存 GPU（如 RTX 3060 12G）上推理时，显存可能会随推理过程持续增长。通过以下参数组合可有效控制：
+
+```bash
+# 限制显存使用 5GB 以内，每个序列最多 2048 tokens
+crane-oai --model-path /path/to/model \
+    --gpu-memory-limit 5G \
+    --max-seq-len 2048 \
+    --max-concurrent 1
+
+# 限制显存使用 8GB，自动调控
+crane-oai --model-path /path/to/model \
+    --gpu-memory-limit 8G \
+    --max-seq-len 4096
+
+# 使用 70% 的显存
+crane-oai --model-path /path/to/model \
+    --gpu-memory-limit 0.7
+```
+
+**工作原理**:
+- `--max-seq-len`: 限制每个请求的最大序列长度，直接控制 KV 缓存的最大占用
+- `--gpu-memory-limit`: 引擎在每次接纳新请求前查询 CUDA 显存占用，超出限制时暂停接纳新请求，优先完成已有序列以释放显存
+- `--max-concurrent`: 降低并发数可减少同时存在的 KV 缓存数量
 
 ## API 端点
 
