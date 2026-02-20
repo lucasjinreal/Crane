@@ -2,6 +2,19 @@ use candle_core::Tensor;
 use candle_transformers::generation::LogitsProcessor;
 use tokio::sync::mpsc;
 
+/// Compute the total GPU memory (in bytes) held by a set of KV caches.
+pub fn kv_cache_bytes(caches: &[Option<(Tensor, Tensor)>]) -> u64 {
+    caches
+        .iter()
+        .filter_map(|c| c.as_ref())
+        .map(|(k, v)| {
+            let k_bytes = k.elem_count() as u64 * k.dtype().size_in_bytes() as u64;
+            let v_bytes = v.elem_count() as u64 * v.dtype().size_in_bytes() as u64;
+            k_bytes + v_bytes
+        })
+        .sum()
+}
+
 /// Per-request lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]

@@ -205,6 +205,9 @@ pub struct InferenceEngine {
     memory_config: MemoryConfig,
     /// Timestamp of last memory-limit warning (to throttle log spam).
     last_mem_warn: Instant,
+    /// Tracked total KV cache bytes across all sequences (not relying on
+    /// `cuMemGetInfo` which includes CUDA allocator pool bloat).
+    tracked_kv_bytes: u64,
 }
 
 impl InferenceEngine {
@@ -247,6 +250,7 @@ impl InferenceEngine {
             sampling_buffers: SamplingBuffers::new(),
             memory_config,
             last_mem_warn: Instant::now() - std::time::Duration::from_secs(60),
+            tracked_kv_bytes: 0,
         };
         let handle = EngineHandle {
             request_tx,
@@ -265,20 +269,20 @@ impl InferenceEngine {
         let baseline = self.memory_config.baseline_gpu_bytes;
         let limit = self.memory_config.gpu_memory_limit_bytes;
         if limit > 0 {
-            if limit <= baseline {
+            let kv_budget = self.kv_budget_bytes();
+            if kv_budget == 0 || limit <= baseline {
                 warn!(
                     "gpu_memory_limit ({}) <= model baseline ({}). \
-                     KV-cache budget is 0 — memory gate will only fire when \
-                     other sequences are running.",
+                     KV-cache budget is 0 — all sequences will be immediately preempted.",
                     format_bytes_engine(limit),
                     format_bytes_engine(baseline),
                 );
             } else {
                 info!(
-                    "Memory budget: total_limit={}, model_baseline={}, kv_budget={}",
+                    "Memory budget: total_limit={}, model_baseline={}, kv_budget={} (tracked, not cuMemGetInfo)",
                     format_bytes_engine(limit),
                     format_bytes_engine(baseline),
-                    format_bytes_engine(limit - baseline),
+                    format_bytes_engine(kv_budget),
                 );
             }
         }
@@ -304,30 +308,30 @@ impl InferenceEngine {
 
             match output {
                 Some(output) => {
-                    // GPU memory gate: if a prefill is scheduled but we're over the
-                    // memory limit, defer it — only allow decode steps to finish
-                    // existing sequences and free memory.
-                    //
-                    // Safety valve: if nothing is currently running we cannot free
-                    // any memory by waiting, so admit the request unconditionally
-                    // (CUDA allocators cache freed blocks; the "high" reading is
-                    // usually the allocator pool, not live data).
-                    let over_limit = output.is_prefill
-                        && !self.scheduler.running.is_empty()
-                        && self.is_over_memory_limit();
-                    if over_limit {
-                        // Put the sequence back into the waiting queue.
-                        for seq_id in &output.batch {
-                            self.scheduler.waiting.push_front(seq_id.clone());
+                    // KV cache budget gate: if a prefill is scheduled but we're
+                    // over the KV budget, first try to evict (preempt) the
+                    // largest running sequence to make room. If still over,
+                    // defer the prefill and drain existing sequences.
+                    if output.is_prefill && self.is_over_kv_budget() {
+                        // Attempt eviction before deferring.
+                        self.evict_if_needed();
+
+                        if self.is_over_kv_budget() && !self.scheduler.running.is_empty() {
+                            // Still over budget and have running sequences to drain.
+                            for seq_id in &output.batch {
+                                self.scheduler.waiting.push_front(seq_id.clone());
+                            }
+                            let decode_batch: Vec<String> =
+                                self.scheduler.running.iter().cloned().collect();
+                            let decode_output = SchedulerOutput {
+                                batch: decode_batch,
+                                is_prefill: false,
+                            };
+                            self.execute_step(decode_output);
+                        } else {
+                            // Budget OK after eviction (or nothing running) — proceed.
+                            self.execute_step(output);
                         }
-                        // Drain existing sequences to reduce memory.
-                        let decode_batch: Vec<String> =
-                            self.scheduler.running.iter().cloned().collect();
-                        let decode_output = SchedulerOutput {
-                            batch: decode_batch,
-                            is_prefill: false,
-                        };
-                        self.execute_step(decode_output);
                     } else {
                         self.execute_step(output);
                     }
@@ -357,13 +361,14 @@ impl InferenceEngine {
         let (gpu_used, gpu_total) = query_gpu_memory_usage(self.model.device());
         let gpu_info = if gpu_total > 0 {
             format!(
-                " | gpu_mem: {:.1}G/{:.1}G ({:.0}%)",
+                " | gpu_mem: {:.1}G/{:.1}G ({:.0}%) | kv_cache: {}",
                 gpu_used as f64 / (1u64 << 30) as f64,
                 gpu_total as f64 / (1u64 << 30) as f64,
                 gpu_used as f64 / gpu_total as f64 * 100.0,
+                format_bytes_engine(self.tracked_kv_bytes),
             )
         } else {
-            String::new()
+            format!(" | kv_cache: {}", format_bytes_engine(self.tracked_kv_bytes))
         };
         info!(
             "Engine stats | uptime={}s | requests: total={} completed={} cancelled={} failed={} | \
@@ -391,27 +396,116 @@ impl InferenceEngine {
     //  Memory management
     // ─────────────────────────────────────────────────────────
 
-    /// Check whether current GPU memory usage exceeds the configured limit.
-    fn is_over_memory_limit(&mut self) -> bool {
+    /// Recount `tracked_kv_bytes` from all sequences.
+    /// Call this after batch operations that change multiple sequences' KV caches.
+    fn recount_kv_bytes(&mut self) {
+        self.tracked_kv_bytes = self
+            .sequences
+            .values()
+            .map(|seq| sequence::kv_cache_bytes(&seq.kv_caches))
+            .sum();
+    }
+
+    /// KV cache budget (bytes). If gpu_memory_limit is configured, the budget
+    /// is `gpu_memory_limit - baseline`. Otherwise unlimited (u64::MAX).
+    fn kv_budget_bytes(&self) -> u64 {
         let limit = self.memory_config.gpu_memory_limit_bytes;
         if limit == 0 {
+            return u64::MAX;
+        }
+        limit.saturating_sub(self.memory_config.baseline_gpu_bytes)
+    }
+
+    /// Check whether the *tracked* KV cache bytes exceed the budget.
+    /// Unlike `cuMemGetInfo`, this is not affected by CUDA allocator pool bloat.
+    fn is_over_kv_budget(&mut self) -> bool {
+        let budget = self.kv_budget_bytes();
+        if budget == u64::MAX {
             return false;
         }
-        let (used, _total) = query_gpu_memory_usage(self.model.device());
-        if used >= limit {
-            // Throttle log: at most once per 5 seconds.
+        if self.tracked_kv_bytes > budget {
             let now = Instant::now();
             if now.duration_since(self.last_mem_warn).as_secs() >= 5 {
                 self.last_mem_warn = now;
                 info!(
-                    "GPU memory pressure: used={} >= limit={}, deferring new prefills",
-                    format_bytes_engine(used),
-                    format_bytes_engine(limit),
+                    "KV cache pressure: used={} > budget={} (limit={} - baseline={}), deferring new prefills",
+                    format_bytes_engine(self.tracked_kv_bytes),
+                    format_bytes_engine(budget),
+                    format_bytes_engine(self.memory_config.gpu_memory_limit_bytes),
+                    format_bytes_engine(self.memory_config.baseline_gpu_bytes),
                 );
             }
             true
         } else {
             false
+        }
+    }
+
+    /// Preempt (evict) running sequences until KV usage is within budget.
+    ///
+    /// Eviction policy: **longest-output-first** — the sequence that has
+    /// generated the most tokens (and therefore holds the largest KV cache)
+    /// is evicted first. Its KV cache is dropped and it is moved back to
+    /// the waiting queue for later re-prefill.
+    ///
+    /// This mirrors sglang's retraction strategy.
+    fn evict_if_needed(&mut self) {
+        let budget = self.kv_budget_bytes();
+        if budget == u64::MAX {
+            return;
+        }
+
+        while self.tracked_kv_bytes > budget && !self.scheduler.running.is_empty() {
+            // Find the running sequence with the most generated tokens (largest KV).
+            let victim_id = self
+                .scheduler
+                .running
+                .iter()
+                .filter_map(|id| {
+                    self.sequences.get(id).map(|seq| (id.clone(), seq.tokens.len()))
+                })
+                .max_by_key(|(_, len)| *len)
+                .map(|(id, _)| id);
+
+            let victim_id = match victim_id {
+                Some(id) => id,
+                None => break,
+            };
+
+            // Compute bytes being freed.
+            let freed = self
+                .sequences
+                .get(&victim_id)
+                .map(|seq| sequence::kv_cache_bytes(&seq.kv_caches))
+                .unwrap_or(0);
+
+            info!(
+                id = %victim_id,
+                freed_bytes = %format_bytes_engine(freed),
+                kv_used = %format_bytes_engine(self.tracked_kv_bytes),
+                kv_budget = %format_bytes_engine(budget),
+                "Preempting sequence (KV cache eviction) — will re-prefill later",
+            );
+
+            // If this sequence's KV is currently loaded in the model, clear it.
+            if self.active_seq_id.as_deref() == Some(&victim_id) {
+                self.model.clear_kv_cache();
+                self.active_seq_id = None;
+            }
+
+            // Drop KV caches and reset sequence state to Waiting.
+            if let Some(seq) = self.sequences.get_mut(&victim_id) {
+                seq.kv_caches = vec![None; self.num_layers];
+                seq.status = SequenceStatus::Waiting;
+                // Reset tokens to just the prompt to allow re-prefill.
+                seq.tokens.truncate(seq.prompt_len);
+            }
+
+            self.tracked_kv_bytes = self.tracked_kv_bytes.saturating_sub(freed);
+
+            // Move from running back to waiting (front, so it gets re-prefilled soon).
+            self.scheduler.running.retain(|id| id != &victim_id);
+            self.scheduler.waiting.push_front(victim_id);
         }
     }
 
@@ -652,7 +746,13 @@ impl InferenceEngine {
             if self.sequences.contains_key(prev_id) {
                 let caches = self.model.get_kv_caches();
                 if let Some(seq) = self.sequences.get_mut(prev_id) {
+                    let old_bytes = sequence::kv_cache_bytes(&seq.kv_caches);
                     seq.kv_caches = caches;
+                    let new_bytes = sequence::kv_cache_bytes(&seq.kv_caches);
+                    self.tracked_kv_bytes = self
+                        .tracked_kv_bytes
+                        .saturating_sub(old_bytes)
+                        .saturating_add(new_bytes);
                 }
             }
             self.model.clear_kv_cache();
@@ -841,10 +941,13 @@ impl InferenceEngine {
                             }
                         }
                     }
+                    // KV caches changed for multiple sequences — recount.
+                    self.recount_kv_bytes();
                 }
                 Err(e) => {
                     error!("Final KV extraction failed: {e}");
                     self.model.clear_kv_cache();
+                    self.recount_kv_bytes();
                 }
             }
         }
@@ -1016,7 +1119,13 @@ impl InferenceEngine {
         if let Some(ref prev_id) = self.active_seq_id.clone() {
             let caches = self.model.get_kv_caches();
             if let Some(prev_seq) = self.sequences.get_mut(prev_id) {
+                let old_bytes = sequence::kv_cache_bytes(&prev_seq.kv_caches);
                 prev_seq.kv_caches = caches;
+                let new_bytes = sequence::kv_cache_bytes(&prev_seq.kv_caches);
+                self.tracked_kv_bytes = self
+                    .tracked_kv_bytes
+                    .saturating_sub(old_bytes)
+                    .saturating_add(new_bytes);
             }
         }
 
@@ -1040,7 +1149,14 @@ impl InferenceEngine {
         if self.active_seq_id.as_deref() == Some(seq_id) {
             let caches = self.model.get_kv_caches();
             if let Some(seq) = self.sequences.get_mut(seq_id) {
+                // Update tracked KV bytes: subtract old, add new.
+                let old_bytes = sequence::kv_cache_bytes(&seq.kv_caches);
                 seq.kv_caches = caches;
+                let new_bytes = sequence::kv_cache_bytes(&seq.kv_caches);
+                self.tracked_kv_bytes = self
+                    .tracked_kv_bytes
+                    .saturating_sub(old_bytes)
+                    .saturating_add(new_bytes);
             }
         }
     }
@@ -1137,20 +1253,19 @@ impl InferenceEngine {
     }
 
     fn cleanup_sequence(&mut self, seq_id: &str) {
+        // Subtract this sequence's KV bytes from the tracked total.
+        if let Some(seq) = self.sequences.get(seq_id) {
+            let freed = sequence::kv_cache_bytes(&seq.kv_caches);
+            self.tracked_kv_bytes = self.tracked_kv_bytes.saturating_sub(freed);
+        }
+
         self.sequences.remove(seq_id);
         self.token_streams.remove(seq_id);
         self.scheduler.remove(seq_id);
 
-        // Always clear model KV cache when a sequence is removed.
-        // In the batch-decode path `active_seq_id` is None (taken at
-        // the start of the step), so the old conditional would skip
-        // clearing — leaving stale KV data in the model.
         if self.active_seq_id.as_deref() == Some(seq_id) {
             self.active_seq_id = None;
         }
-        // Unconditionally clear: extract_batch_kv already sets per-layer
-        // caches to None, but this also resets RoPE caches and ensures
-        // no dangling GPU tensors when the last sequence finishes.
         self.model.clear_kv_cache();
 
         debug!(id = %seq_id, "Sequence cleaned up");
