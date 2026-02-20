@@ -263,19 +263,29 @@ mod tests {
         s.add("r3".into());
         assert_eq!(s.active_count(), 3);
 
-        // Prefill r1.
+        // Step 1: Prefill r1 (nothing running, so prefill is fine).
         let out = s.schedule().unwrap();
         assert!(out.is_prefill);
         assert_eq!(out.batch[0], "r1");
         s.promote_to_running("r1".into());
 
-        // Prefill r2.
+        // Step 2: Interleave — last was prefill, running=[r1] → force decode.
+        let out = s.schedule().unwrap();
+        assert!(!out.is_prefill);
+        assert_eq!(out.batch, vec!["r1"]);
+
+        // Step 3: Now prefill r2 (interleave flag reset).
         let out = s.schedule().unwrap();
         assert!(out.is_prefill);
         assert_eq!(out.batch[0], "r2");
         s.promote_to_running("r2".into());
 
-        // At max_running=2, r3 waits; decode r1+r2.
+        // Step 4: Interleave — force decode [r1, r2].
+        let out = s.schedule().unwrap();
+        assert!(!out.is_prefill);
+        assert_eq!(out.batch.len(), 2);
+
+        // Step 5: At max_running=2 with r3 waiting → can't prefill, decode.
         let out = s.schedule().unwrap();
         assert!(!out.is_prefill);
         assert_eq!(out.batch.len(), 2);
@@ -285,5 +295,85 @@ mod tests {
         let out = s.schedule().unwrap();
         assert!(out.is_prefill);
         assert_eq!(out.batch[0], "r3");
+    }
+
+    #[test]
+    fn interleave_prefill_decode() {
+        let mut s = Scheduler::new(8);
+        // Simulate 4 requests arriving at once.
+        s.add("a".into());
+        s.add("b".into());
+        s.add("c".into());
+        s.add("d".into());
+
+        // Step 1: prefill "a" (nothing running).
+        let out = s.schedule().unwrap();
+        assert!(out.is_prefill);
+        assert_eq!(out.batch[0], "a");
+        s.promote_to_running("a".into());
+
+        // Step 2: forced decode [a] (last was prefill).
+        let out = s.schedule().unwrap();
+        assert!(!out.is_prefill);
+        assert_eq!(out.batch, vec!["a"]);
+
+        // Step 3: prefill "b".
+        let out = s.schedule().unwrap();
+        assert!(out.is_prefill);
+        assert_eq!(out.batch[0], "b");
+        s.promote_to_running("b".into());
+
+        // Step 4: forced decode [a, b].
+        let out = s.schedule().unwrap();
+        assert!(!out.is_prefill);
+        assert_eq!(out.batch.len(), 2);
+
+        // Step 5: prefill "c".
+        let out = s.schedule().unwrap();
+        assert!(out.is_prefill);
+        assert_eq!(out.batch[0], "c");
+        s.promote_to_running("c".into());
+
+        // Step 6: forced decode [a, b, c].
+        let out = s.schedule().unwrap();
+        assert!(!out.is_prefill);
+        assert_eq!(out.batch.len(), 3);
+
+        // Step 7: prefill "d".
+        let out = s.schedule().unwrap();
+        assert!(out.is_prefill);
+        assert_eq!(out.batch[0], "d");
+        s.promote_to_running("d".into());
+
+        // Step 8: forced decode [a, b, c, d].
+        let out = s.schedule().unwrap();
+        assert!(!out.is_prefill);
+        assert_eq!(out.batch.len(), 4);
+
+        // Step 9: nothing waiting, running has items → decode.
+        let out = s.schedule().unwrap();
+        assert!(!out.is_prefill);
+        assert_eq!(out.batch.len(), 4);
+    }
+
+    #[test]
+    fn reset_prefill_flag_allows_immediate_retry() {
+        let mut s = Scheduler::new(4);
+        s.add("r1".into());
+        s.add("r2".into());
+
+        // Prefill r1.
+        let out = s.schedule().unwrap();
+        assert!(out.is_prefill);
+        s.promote_to_running("r1".into());
+
+        // Normally would force decode, but reset flag simulates
+        // budget-gate deferring + manual decode.
+        s.reset_prefill_flag();
+
+        // Now prefill r2 immediately (no forced decode).
+        let out = s.schedule().unwrap();
+        assert!(out.is_prefill);
+        assert_eq!(out.batch[0], "r2");
     }
 }
