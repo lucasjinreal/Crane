@@ -8,11 +8,14 @@ pub struct SchedulerOutput {
     pub is_prefill: bool,
 }
 
-/// Simple FIFO scheduler with prefill-decode interleaving.
+/// Simple FIFO scheduler with prefill-priority batching.
 ///
 /// Invariants:
-///   - After a prefill step, if there are running sequences, the next
-///     step is always a decode (prevents prefill-starvation under load).
+///   - Prefills are prioritized: waiting sequences are prefilled as fast as
+///     possible (one at a time) to build up the decode batch quickly. This
+///     maximizes GPU utilization since larger batch decodes are more efficient.
+///   - Once `running` reaches `max_running` (or `effective_max_running`),
+///     no more prefills are admitted — the scheduler only decodes.
 ///   - A prefill step processes exactly ONE new sequence (its full prompt).
 ///   - A decode step processes ALL running sequences (one token each).
 ///   - `max_running` limits how many sequences can be in decode phase
@@ -24,10 +27,6 @@ pub struct Scheduler {
     pub running: VecDeque<String>,
     /// Maximum concurrent decode sequences.
     pub max_running: usize,
-    /// Whether the last scheduled step was a prefill.
-    /// Used to interleave decode between consecutive prefills
-    /// so running sequences are not starved.
-    last_was_prefill: bool,
     /// Dynamic cap on running sequences, set after eviction.
     ///
     /// When eviction occurs, the current running count (post-eviction) is
@@ -43,7 +42,6 @@ impl Scheduler {
             waiting: VecDeque::new(),
             running: VecDeque::new(),
             max_running,
-            last_was_prefill: false,
             effective_max_running: None,
         }
     }
@@ -63,20 +61,13 @@ impl Scheduler {
     ///
     /// Returns `None` if there is no work (engine should wait for new requests).
     ///
-    /// Uses prefill-decode interleaving: after a prefill, if there are running
-    /// sequences, always do a decode step before the next prefill. This prevents
-    /// running sequences from being starved under high concurrency.
+    /// Prioritizes prefilling waiting sequences up to `max_running` (or `effective_max_running`)
+    /// to build up the batch size for efficient decoding.
     pub fn schedule(&mut self) -> Option<SchedulerOutput> {
-        // If the last step was a prefill and we have running sequences,
-        // force a decode step to avoid starving running sequences.
-        let force_decode = self.last_was_prefill && !self.running.is_empty();
-
-        // Priority 1: Prefill a waiting sequence if there's capacity
-        // and we're not forcing decode.
+        // Priority 1: Prefill a waiting sequence if there's capacity.
         let max = self.effective_max_running.unwrap_or(self.max_running);
-        if !force_decode && !self.waiting.is_empty() && self.running.len() < max {
+        if !self.waiting.is_empty() && self.running.len() < max {
             let seq_id = self.waiting.pop_front().unwrap();
-            self.last_was_prefill = true;
             return Some(SchedulerOutput {
                 batch: vec![seq_id],
                 is_prefill: true,
@@ -85,7 +76,6 @@ impl Scheduler {
 
         // Priority 2: Decode all running sequences.
         if !self.running.is_empty() {
-            self.last_was_prefill = false;
             let batch: Vec<String> = self.running.iter().cloned().collect();
             return Some(SchedulerOutput {
                 batch,
@@ -94,9 +84,9 @@ impl Scheduler {
         }
 
         // Priority 3: Nothing running but waiting has items — prefill.
+        // (This happens if max is 0, which shouldn't normally happen, but just in case).
         if !self.waiting.is_empty() {
             let seq_id = self.waiting.pop_front().unwrap();
-            self.last_was_prefill = true;
             return Some(SchedulerOutput {
                 batch: vec![seq_id],
                 is_prefill: true,
@@ -104,12 +94,6 @@ impl Scheduler {
         }
 
         None // No work.
-    }
-
-    /// Reset the interleave flag (e.g. when the engine defers a prefill
-    /// and manually forces a decode step).
-    pub fn reset_prefill_flag(&mut self) {
-        self.last_was_prefill = false;
     }
 
     /// Move a sequence from waiting state to running state (called after prefill).
@@ -272,29 +256,24 @@ mod tests {
         s.add("r3".into());
         assert_eq!(s.active_count(), 3);
 
-        // Step 1: Prefill r1 (nothing running, so prefill is fine).
+        // Step 1: Prefill r1 (nothing running, capacity available).
         let out = s.schedule().unwrap();
         assert!(out.is_prefill);
         assert_eq!(out.batch[0], "r1");
         s.promote_to_running("r1".into());
 
-        // Step 2: Interleave — last was prefill, running=[r1] → force decode.
-        let out = s.schedule().unwrap();
-        assert!(!out.is_prefill);
-        assert_eq!(out.batch, vec!["r1"]);
-
-        // Step 3: Now prefill r2 (interleave flag reset).
+        // Step 2: Prefill r2 (running=1 < max=2, capacity available).
         let out = s.schedule().unwrap();
         assert!(out.is_prefill);
         assert_eq!(out.batch[0], "r2");
         s.promote_to_running("r2".into());
 
-        // Step 4: Interleave — force decode [r1, r2].
+        // Step 3: At max_running=2 with r3 waiting → can't prefill, decode.
         let out = s.schedule().unwrap();
         assert!(!out.is_prefill);
         assert_eq!(out.batch.len(), 2);
 
-        // Step 5: At max_running=2 with r3 waiting → can't prefill, decode.
+        // Step 4: Still at capacity → decode.
         let out = s.schedule().unwrap();
         assert!(!out.is_prefill);
         assert_eq!(out.batch.len(), 2);
@@ -307,7 +286,7 @@ mod tests {
     }
 
     #[test]
-    fn interleave_prefill_decode() {
+    fn consecutive_prefills_then_decode() {
         let mut s = Scheduler::new(8);
         // Simulate 4 requests arriving at once.
         s.add("a".into());
@@ -321,69 +300,28 @@ mod tests {
         assert_eq!(out.batch[0], "a");
         s.promote_to_running("a".into());
 
-        // Step 2: forced decode [a] (last was prefill).
-        let out = s.schedule().unwrap();
-        assert!(!out.is_prefill);
-        assert_eq!(out.batch, vec!["a"]);
-
-        // Step 3: prefill "b".
+        // Step 2: prefill "b" (capacity available, no interleaving).
         let out = s.schedule().unwrap();
         assert!(out.is_prefill);
         assert_eq!(out.batch[0], "b");
         s.promote_to_running("b".into());
 
-        // Step 4: forced decode [a, b].
-        let out = s.schedule().unwrap();
-        assert!(!out.is_prefill);
-        assert_eq!(out.batch.len(), 2);
-
-        // Step 5: prefill "c".
+        // Step 3: prefill "c".
         let out = s.schedule().unwrap();
         assert!(out.is_prefill);
         assert_eq!(out.batch[0], "c");
         s.promote_to_running("c".into());
 
-        // Step 6: forced decode [a, b, c].
-        let out = s.schedule().unwrap();
-        assert!(!out.is_prefill);
-        assert_eq!(out.batch.len(), 3);
-
-        // Step 7: prefill "d".
+        // Step 4: prefill "d".
         let out = s.schedule().unwrap();
         assert!(out.is_prefill);
         assert_eq!(out.batch[0], "d");
         s.promote_to_running("d".into());
 
-        // Step 8: forced decode [a, b, c, d].
+        // Step 5: nothing waiting, running has items → decode.
         let out = s.schedule().unwrap();
         assert!(!out.is_prefill);
         assert_eq!(out.batch.len(), 4);
-
-        // Step 9: nothing waiting, running has items → decode.
-        let out = s.schedule().unwrap();
-        assert!(!out.is_prefill);
-        assert_eq!(out.batch.len(), 4);
-    }
-
-    #[test]
-    fn reset_prefill_flag_allows_immediate_retry() {
-        let mut s = Scheduler::new(4);
-        s.add("r1".into());
-        s.add("r2".into());
-
-        // Prefill r1.
-        let out = s.schedule().unwrap();
-        assert!(out.is_prefill);
-        s.promote_to_running("r1".into());
-
-        // Normally would force decode, but reset flag simulates
-        // budget-gate deferring + manual decode.
-        s.reset_prefill_flag();
-
-        // Now prefill r2 immediately (no forced decode).
-        let out = s.schedule().unwrap();
-        assert!(out.is_prefill);
-        assert_eq!(out.batch[0], "r2");
     }
 
     #[test]
