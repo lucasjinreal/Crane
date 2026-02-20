@@ -241,15 +241,19 @@ async fn main() -> Result<()> {
 
     // ── Parse memory config ──
 
-    let memory_config = MemoryConfig::parse(
+    let mut memory_config = MemoryConfig::parse(
         args.max_seq_len,
         args.gpu_memory_limit.as_deref(),
         &device,
     );
+    // Record baseline GPU memory usage after model load + warmup, before KV caches.
+    memory_config.record_baseline(&device);
+    let baseline_gpu = memory_config.baseline_gpu_bytes;
     info!(
-        "Memory config: max_seq_len={}, gpu_memory_limit_bytes={}",
+        "Memory config: max_seq_len={}, gpu_limit={}, baseline_gpu={}",
         if memory_config.max_seq_len == 0 { "unlimited".to_string() } else { memory_config.max_seq_len.to_string() },
         if memory_config.gpu_memory_limit_bytes == 0 { "unlimited".to_string() } else { format_bytes(memory_config.gpu_memory_limit_bytes) },
+        format_bytes(baseline_gpu),
     );
     let gpu_memory_limit_display = args.gpu_memory_limit.clone().unwrap_or_else(|| "unlimited".to_string());
     let gpu_limit_bytes = memory_config.gpu_memory_limit_bytes;
@@ -307,7 +311,16 @@ async fn main() -> Result<()> {
     println!("  Listen  : http://{local_addr}");
     if args.max_seq_len > 0 || gpu_limit_bytes > 0 {
         let seq_str = if args.max_seq_len == 0 { "unlimited".to_string() } else { args.max_seq_len.to_string() };
-        let mem_str = if gpu_limit_bytes == 0 { "unlimited".to_string() } else { format_bytes(gpu_limit_bytes) };
+        let mem_str = if gpu_limit_bytes == 0 {
+            "unlimited".to_string()
+        } else {
+            let budget = gpu_limit_bytes.saturating_sub(baseline_gpu);
+            format!("{} (baseline={}, kv_budget={})",
+                format_bytes(gpu_limit_bytes),
+                format_bytes(baseline_gpu),
+                if budget == 0 { "0 ⚠".to_string() } else { format_bytes(budget) },
+            )
+        };
         println!("  Memory  : seq_len={seq_str}  gpu_limit={mem_str}");
     }
     println!("  Batch   : max_concurrent={}  decode_tokens_per_seq={}", args.max_concurrent, args.decode_tokens_per_seq);

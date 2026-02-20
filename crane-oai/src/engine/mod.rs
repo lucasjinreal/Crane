@@ -64,7 +64,13 @@ pub struct MemoryConfig {
     /// Maximum tokens per sequence (prompt + completion). 0 = unlimited.
     pub max_seq_len: usize,
     /// GPU memory limit in bytes. 0 = unlimited.
+    /// This is an **absolute** limit on total GPU memory usage.
     pub gpu_memory_limit_bytes: u64,
+    /// Baseline GPU memory recorded after model load + warmup.
+    /// The memory gate compares `(current_used - baseline)` against
+    /// `(gpu_memory_limit_bytes - baseline)` so that the limit represents
+    /// the *total* allowed usage, not just KV-cache growth.
+    pub baseline_gpu_bytes: u64,
 }
 
 impl MemoryConfig {
@@ -81,6 +87,7 @@ impl MemoryConfig {
         Self {
             max_seq_len,
             gpu_memory_limit_bytes,
+            baseline_gpu_bytes: 0,
         }
     }
 
@@ -119,6 +126,12 @@ impl MemoryConfig {
 
         tracing::warn!("Could not parse gpu_memory_limit '{}', ignoring", s);
         0
+    }
+
+    /// Record baseline GPU memory (call after model load + warmup).
+    pub fn record_baseline(&mut self, device: &Device) {
+        let (used, _total) = query_gpu_memory_usage(device);
+        self.baseline_gpu_bytes = used;
     }
 
     /// Query total GPU memory (bytes). Returns 0 if unavailable.
@@ -190,6 +203,8 @@ pub struct InferenceEngine {
     sampling_buffers: SamplingBuffers,
     /// Memory configuration for VRAM limits.
     memory_config: MemoryConfig,
+    /// Timestamp of last memory-limit warning (to throttle log spam).
+    last_mem_warn: Instant,
 }
 
 impl InferenceEngine {
@@ -231,6 +246,7 @@ impl InferenceEngine {
             step_counter: 0,
             sampling_buffers: SamplingBuffers::new(),
             memory_config,
+            last_mem_warn: Instant::now() - std::time::Duration::from_secs(60),
         };
         let handle = EngineHandle {
             request_tx,
@@ -245,12 +261,32 @@ impl InferenceEngine {
 
     /// Run the engine loop (blocking — call from a dedicated thread).
     pub fn run(mut self) {
+        // Log effective memory budget.
+        let baseline = self.memory_config.baseline_gpu_bytes;
+        let limit = self.memory_config.gpu_memory_limit_bytes;
+        if limit > 0 {
+            if limit <= baseline {
+                warn!(
+                    "gpu_memory_limit ({}) <= model baseline ({}). \
+                     KV-cache budget is 0 — memory gate will only fire when \
+                     other sequences are running.",
+                    format_bytes_engine(limit),
+                    format_bytes_engine(baseline),
+                );
+            } else {
+                info!(
+                    "Memory budget: total_limit={}, model_baseline={}, kv_budget={}",
+                    format_bytes_engine(limit),
+                    format_bytes_engine(baseline),
+                    format_bytes_engine(limit - baseline),
+                );
+            }
+        }
         info!(
-            "Engine started (max_concurrent={}, decode_tokens_per_seq={}, max_seq_len={}, gpu_memory_limit={})",
+            "Engine started (max_concurrent={}, decode_tokens_per_seq={}, max_seq_len={})",
             self.scheduler.max_running,
             self.decode_tokens_per_seq,
             if self.memory_config.max_seq_len == 0 { "unlimited".to_string() } else { self.memory_config.max_seq_len.to_string() },
-            if self.memory_config.gpu_memory_limit_bytes == 0 { "unlimited".to_string() } else { format_bytes_engine(self.memory_config.gpu_memory_limit_bytes) },
         );
 
         loop {
@@ -356,17 +392,23 @@ impl InferenceEngine {
     // ─────────────────────────────────────────────────────────
 
     /// Check whether current GPU memory usage exceeds the configured limit.
-    fn is_over_memory_limit(&self) -> bool {
-        if self.memory_config.gpu_memory_limit_bytes == 0 {
+    fn is_over_memory_limit(&mut self) -> bool {
+        let limit = self.memory_config.gpu_memory_limit_bytes;
+        if limit == 0 {
             return false;
         }
         let (used, _total) = query_gpu_memory_usage(self.model.device());
-        if used >= self.memory_config.gpu_memory_limit_bytes {
-            debug!(
-                "GPU memory limit reached: used={:.1}G >= limit={:.1}G, deferring prefill",
-                used as f64 / (1u64 << 30) as f64,
-                self.memory_config.gpu_memory_limit_bytes as f64 / (1u64 << 30) as f64,
-            );
+        if used >= limit {
+            // Throttle log: at most once per 5 seconds.
+            let now = Instant::now();
+            if now.duration_since(self.last_mem_warn).as_secs() >= 5 {
+                self.last_mem_warn = now;
+                info!(
+                    "GPU memory pressure: used={} >= limit={}, deferring new prefills",
+                    format_bytes_engine(used),
+                    format_bytes_engine(limit),
+                );
+            }
             true
         } else {
             false
