@@ -153,6 +153,17 @@ fn query_gpu_memory_usage(_device: &Device) -> (u64, u64) {
     (0, 0)
 }
 
+/// Format a byte count as a human-readable string (used in engine log messages).
+fn format_bytes_engine(bytes: u64) -> String {
+    if bytes >= 1 << 30 {
+        format!("{:.1}G", bytes as f64 / (1u64 << 30) as f64)
+    } else if bytes >= 1 << 20 {
+        format!("{:.0}M", bytes as f64 / (1u64 << 20) as f64)
+    } else {
+        format!("{}B", bytes)
+    }
+}
+
 // ─────────────────────────────────────────────────────────────
 //  InferenceEngine
 // ─────────────────────────────────────────────────────────────
@@ -239,7 +250,7 @@ impl InferenceEngine {
             self.scheduler.max_running,
             self.decode_tokens_per_seq,
             if self.memory_config.max_seq_len == 0 { "unlimited".to_string() } else { self.memory_config.max_seq_len.to_string() },
-            if self.memory_config.gpu_memory_limit_bytes == 0 { "unlimited".to_string() } else { format!("{}B", self.memory_config.gpu_memory_limit_bytes) },
+            if self.memory_config.gpu_memory_limit_bytes == 0 { "unlimited".to_string() } else { format_bytes_engine(self.memory_config.gpu_memory_limit_bytes) },
         );
 
         loop {
@@ -260,24 +271,27 @@ impl InferenceEngine {
                     // GPU memory gate: if a prefill is scheduled but we're over the
                     // memory limit, defer it — only allow decode steps to finish
                     // existing sequences and free memory.
-                    if output.is_prefill && self.is_over_memory_limit() {
+                    //
+                    // Safety valve: if nothing is currently running we cannot free
+                    // any memory by waiting, so admit the request unconditionally
+                    // (CUDA allocators cache freed blocks; the "high" reading is
+                    // usually the allocator pool, not live data).
+                    let over_limit = output.is_prefill
+                        && !self.scheduler.running.is_empty()
+                        && self.is_over_memory_limit();
+                    if over_limit {
                         // Put the sequence back into the waiting queue.
                         for seq_id in &output.batch {
                             self.scheduler.waiting.push_front(seq_id.clone());
                         }
-                        // If there are running sequences, do a decode step instead.
-                        if !self.scheduler.running.is_empty() {
-                            let decode_batch: Vec<String> =
-                                self.scheduler.running.iter().cloned().collect();
-                            let decode_output = SchedulerOutput {
-                                batch: decode_batch,
-                                is_prefill: false,
-                            };
-                            self.execute_step(decode_output);
-                        } else {
-                            // Nothing running, nothing we can do — wait briefly.
-                            std::thread::sleep(std::time::Duration::from_millis(100));
-                        }
+                        // Drain existing sequences to reduce memory.
+                        let decode_batch: Vec<String> =
+                            self.scheduler.running.iter().cloned().collect();
+                        let decode_output = SchedulerOutput {
+                            batch: decode_batch,
+                            is_prefill: false,
+                        };
+                        self.execute_step(decode_output);
                     } else {
                         self.execute_step(output);
                     }
