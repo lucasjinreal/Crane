@@ -181,6 +181,19 @@ fn format_bytes_engine(bytes: u64) -> String {
 //  InferenceEngine
 // ─────────────────────────────────────────────────────────────
 
+/// KV-to-GPU overhead factor.
+///
+/// `tracked_kv_bytes` only captures live per-sequence KV cache tensors, which
+/// is roughly 15-20% of the *real* GPU memory consumed.  Batch-decode setup
+/// creates padded copies, the CUDA caching allocator retains freed blocks,
+/// and forward-pass intermediates add extra pressure.  Empirically the ratio
+/// between actual GPU growth over baseline and tracked KV bytes is 5-8×.
+///
+/// We use 6× so that `kv_budget = (limit - baseline) / 6`.  This gives the
+/// engine a realistic estimate of how much KV it can afford before the GPU
+/// runs out of memory.
+const KV_GPU_OVERHEAD_FACTOR: u64 = 6;
+
 /// Continuous-batching inference engine.
 ///
 /// Runs on a dedicated OS thread (model forward passes are synchronous).
@@ -208,6 +221,11 @@ pub struct InferenceEngine {
     /// Tracked total KV cache bytes across all sequences (not relying on
     /// `cuMemGetInfo` which includes CUDA allocator pool bloat).
     tracked_kv_bytes: u64,
+    /// Steps remaining before cuMemGetInfo checks are re-enabled after eviction.
+    /// The CUDA caching allocator doesn't instantly reflect freed memory, so we
+    /// grant a short cooldown after preemption to avoid a deadlock where
+    /// cuMemGetInfo always reports over-limit.
+    eviction_cooldown: u32,
 }
 
 impl InferenceEngine {
@@ -251,6 +269,7 @@ impl InferenceEngine {
             memory_config,
             last_mem_warn: Instant::now() - std::time::Duration::from_secs(60),
             tracked_kv_bytes: 0,
+            eviction_cooldown: 0,
         };
         let handle = EngineHandle {
             request_tx,
@@ -279,10 +298,11 @@ impl InferenceEngine {
                 );
             } else {
                 info!(
-                    "Memory budget: total_limit={}, model_baseline={}, kv_budget={} (tracked, not cuMemGetInfo)",
+                    "Memory budget: total_limit={}, model_baseline={}, kv_budget={} (overhead={}x, also checked by cuMemGetInfo)",
                     format_bytes_engine(limit),
                     format_bytes_engine(baseline),
                     format_bytes_engine(kv_budget),
+                    KV_GPU_OVERHEAD_FACTOR,
                 );
             }
         }
@@ -296,6 +316,9 @@ impl InferenceEngine {
         loop {
             self.drain_requests();
             self.check_cancelled();
+
+            // Decrement eviction cooldown (cuMemGetInfo grace period).
+            self.eviction_cooldown = self.eviction_cooldown.saturating_sub(1);
 
             self.stats
                 .active_sequences
@@ -359,16 +382,23 @@ impl InferenceEngine {
         let snap = self.stats.snapshot();
         let uptime = self.start_time.elapsed().as_secs();
         let (gpu_used, gpu_total) = query_gpu_memory_usage(self.model.device());
+        let budget = self.kv_budget_bytes();
+        let budget_info = if budget < u64::MAX {
+            format!(" kv_budget: {}", format_bytes_engine(budget))
+        } else {
+            String::new()
+        };
         let gpu_info = if gpu_total > 0 {
             format!(
-                " | gpu_mem: {:.1}G/{:.1}G ({:.0}%) | kv_cache: {}",
+                " | gpu_mem: {:.1}G/{:.1}G ({:.0}%) | kv_cache: {}{}",
                 gpu_used as f64 / (1u64 << 30) as f64,
                 gpu_total as f64 / (1u64 << 30) as f64,
                 gpu_used as f64 / gpu_total as f64 * 100.0,
                 format_bytes_engine(self.tracked_kv_bytes),
+                budget_info,
             )
         } else {
-            format!(" | kv_cache: {}", format_bytes_engine(self.tracked_kv_bytes))
+            format!(" | kv_cache: {}{}", format_bytes_engine(self.tracked_kv_bytes), budget_info)
         };
         info!(
             "Engine stats | uptime={}s | requests: total={} completed={} cancelled={} failed={} | \
@@ -406,39 +436,85 @@ impl InferenceEngine {
             .sum();
     }
 
-    /// KV cache budget (bytes). If gpu_memory_limit is configured, the budget
-    /// is `gpu_memory_limit - baseline`. Otherwise unlimited (u64::MAX).
+    /// KV cache budget **in KV-cache bytes** (not raw GPU bytes).
+    ///
+    /// Each byte of live KV cache costs roughly `KV_GPU_OVERHEAD_FACTOR` bytes
+    /// of real GPU memory (due to padded batch copies, CUDA pool bloat, and
+    /// forward-pass intermediates).  The budget is therefore:
+    ///
+    /// ```text
+    /// kv_budget = (gpu_limit - baseline) / KV_GPU_OVERHEAD_FACTOR
+    /// ```
+    ///
+    /// Returns `u64::MAX` when no limit is configured.
     fn kv_budget_bytes(&self) -> u64 {
         let limit = self.memory_config.gpu_memory_limit_bytes;
         if limit == 0 {
             return u64::MAX;
         }
-        limit.saturating_sub(self.memory_config.baseline_gpu_bytes)
+        let raw = limit.saturating_sub(self.memory_config.baseline_gpu_bytes);
+        raw / KV_GPU_OVERHEAD_FACTOR
     }
 
-    /// Check whether the *tracked* KV cache bytes exceed the budget.
-    /// Unlike `cuMemGetInfo`, this is not affected by CUDA allocator pool bloat.
+    /// Check whether the engine should block new prefills due to memory
+    /// pressure.  Two complementary checks:
+    ///
+    /// 1. **KV budget** — `tracked_kv_bytes > kv_budget_bytes()`.  This is the
+    ///    primary admission control, using an overhead factor to estimate real
+    ///    GPU cost from the tracked KV cache bytes.
+    ///
+    /// 2. **cuMemGetInfo hard safety** — if actual GPU memory (as reported by
+    ///    the driver) exceeds the configured limit, block prefills.  This
+    ///    catches cases where the overhead factor underestimates.  The check
+    ///    is skipped during `eviction_cooldown` to avoid a deadlock (the CUDA
+    ///    caching allocator doesn't instantly reflect freed memory).
     fn is_over_kv_budget(&mut self) -> bool {
-        let budget = self.kv_budget_bytes();
-        if budget == u64::MAX {
+        let limit = self.memory_config.gpu_memory_limit_bytes;
+        if limit == 0 {
             return false;
         }
+
+        let budget = self.kv_budget_bytes();
+        if budget == 0 {
+            return true; // limit <= baseline
+        }
+
+        // Check 1: tracked KV bytes vs overhead-adjusted budget.
         if self.tracked_kv_bytes > budget {
             let now = Instant::now();
             if now.duration_since(self.last_mem_warn).as_secs() >= 5 {
                 self.last_mem_warn = now;
-                info!(
-                    "KV cache pressure: used={} > budget={} (limit={} - baseline={}), deferring new prefills",
+                warn!(
+                    "KV budget exceeded: kv_used={} > kv_budget={} (limit={} baseline={} overhead={}x)",
                     format_bytes_engine(self.tracked_kv_bytes),
                     format_bytes_engine(budget),
-                    format_bytes_engine(self.memory_config.gpu_memory_limit_bytes),
+                    format_bytes_engine(limit),
                     format_bytes_engine(self.memory_config.baseline_gpu_bytes),
+                    KV_GPU_OVERHEAD_FACTOR,
                 );
             }
-            true
-        } else {
-            false
+            return true;
         }
+
+        // Check 2: cuMemGetInfo hard safety (skip during cooldown).
+        if self.eviction_cooldown == 0 {
+            let (gpu_used, _) = query_gpu_memory_usage(self.model.device());
+            if gpu_used > 0 && gpu_used > limit {
+                let now = Instant::now();
+                if now.duration_since(self.last_mem_warn).as_secs() >= 5 {
+                    self.last_mem_warn = now;
+                    warn!(
+                        "GPU memory hard limit exceeded: gpu_used={} > limit={} (kv_tracked={})",
+                        format_bytes_engine(gpu_used),
+                        format_bytes_engine(limit),
+                        format_bytes_engine(self.tracked_kv_bytes),
+                    );
+                }
+                return true;
+            }
+        }
+
+        false
     }
 
     /// Preempt (evict) running sequences until KV usage is within budget.
@@ -507,6 +583,10 @@ impl InferenceEngine {
             self.scheduler.running.retain(|id| id != &victim_id);
             self.scheduler.waiting.push_front(victim_id);
         }
+
+        // Grant a cooldown period so the cuMemGetInfo hard-safety check
+        // doesn't immediately re-trigger (CUDA pool retains freed blocks).
+        self.eviction_cooldown = 5;
     }
 
     /// Effective max_tokens for a request, taking server-level max_seq_len into account.

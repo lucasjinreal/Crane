@@ -57,7 +57,7 @@ struct Args {
     cpu: bool,
 
     /// Max concurrent sequences in decode phase
-    #[arg(long, default_value_t = 32)]
+    #[arg(long, default_value_t = 16)]
     max_concurrent: usize,
 
     /// Tokens to decode per sequence before switching (higher = fewer KV swaps)
@@ -314,11 +314,13 @@ async fn main() -> Result<()> {
         let mem_str = if gpu_limit_bytes == 0 {
             "unlimited".to_string()
         } else {
-            let budget = gpu_limit_bytes.saturating_sub(baseline_gpu);
-            format!("{} (baseline={}, kv_budget={})",
+            let raw_budget = gpu_limit_bytes.saturating_sub(baseline_gpu);
+            // KV budget = raw_budget / overhead_factor (see KV_GPU_OVERHEAD_FACTOR in engine)
+            let kv_budget = raw_budget / 6; // must match KV_GPU_OVERHEAD_FACTOR
+            format!("{} (baseline={}, kv_budget={}, overhead=6x)",
                 format_bytes(gpu_limit_bytes),
                 format_bytes(baseline_gpu),
-                if budget == 0 { "0 ⚠".to_string() } else { format_bytes(budget) },
+                if kv_budget == 0 { "0 ⚠".to_string() } else { format_bytes(kv_budget) },
             )
         };
         println!("  Memory  : seq_len={seq_str}  gpu_limit={mem_str}");
