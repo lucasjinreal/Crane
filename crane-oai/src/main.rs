@@ -19,7 +19,7 @@ use tracing::info;
 
 use chat_template::ChatTemplateProcessor;
 use engine::model_factory::{ModelFormat, ModelType};
-use engine::{EngineHandle, InferenceEngine};
+use engine::{EngineHandle, InferenceEngine, MemoryConfig};
 use openai_api::ErrorResponse;
 
 // ═════════════════════════════════════════════════════════════
@@ -57,7 +57,7 @@ struct Args {
     cpu: bool,
 
     /// Max concurrent sequences in decode phase
-    #[arg(long, default_value_t = 32)]
+    #[arg(long, default_value_t = 16)]
     max_concurrent: usize,
 
     /// Tokens to decode per sequence before switching (higher = fewer KV swaps)
@@ -67,6 +67,19 @@ struct Args {
     /// Model weight format: auto, safetensors, or gguf
     #[arg(long, default_value = "auto")]
     format: String,
+
+    /// Maximum sequence length (prompt + completion tokens).
+    /// Limits KV cache growth per sequence. 0 = unlimited (model default).
+    #[arg(long, default_value_t = 0)]
+    max_seq_len: usize,
+
+    /// GPU memory limit. Accepts:
+    ///   - Absolute size: "5G", "8G", "5120M", "5368709120" (bytes)
+    ///   - Utilization fraction: "0.7" (70% of total GPU memory)
+    /// When the limit is reached, the engine stops admitting new sequences
+    /// until existing ones complete and free memory.
+    #[arg(long)]
+    gpu_memory_limit: Option<String>,
 }
 
 // ═════════════════════════════════════════════════════════════
@@ -93,6 +106,8 @@ pub struct AppState {
     pub port: u16,
     pub max_concurrent: usize,
     pub decode_tokens_per_seq: usize,
+    pub max_seq_len: usize,
+    pub gpu_memory_limit: String,
 }
 
 // ═════════════════════════════════════════════════════════════
@@ -104,6 +119,17 @@ pub fn now_epoch() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// Format a byte count as a human-readable string.
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1 << 30 {
+        format!("{:.1}G", bytes as f64 / (1u64 << 30) as f64)
+    } else if bytes >= 1 << 20 {
+        format!("{:.0}M", bytes as f64 / (1u64 << 20) as f64)
+    } else {
+        format!("{}B", bytes)
+    }
 }
 
 pub fn make_error(
@@ -213,10 +239,29 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| resolved_type.display_name().to_string())
     });
 
+    // ── Parse memory config ──
+
+    let mut memory_config = MemoryConfig::parse(
+        args.max_seq_len,
+        args.gpu_memory_limit.as_deref(),
+        &device,
+    );
+    // Record baseline GPU memory usage after model load + warmup, before KV caches.
+    memory_config.record_baseline(&device);
+    let baseline_gpu = memory_config.baseline_gpu_bytes;
+    info!(
+        "Memory config: max_seq_len={}, gpu_limit={}, baseline_gpu={}",
+        if memory_config.max_seq_len == 0 { "unlimited".to_string() } else { memory_config.max_seq_len.to_string() },
+        if memory_config.gpu_memory_limit_bytes == 0 { "unlimited".to_string() } else { format_bytes(memory_config.gpu_memory_limit_bytes) },
+        format_bytes(baseline_gpu),
+    );
+    let gpu_memory_limit_display = args.gpu_memory_limit.clone().unwrap_or_else(|| "unlimited".to_string());
+    let gpu_limit_bytes = memory_config.gpu_memory_limit_bytes;
+
     // ── Start engine on dedicated thread ──
 
     let (engine, handle) =
-        InferenceEngine::new(backend, args.max_concurrent, args.decode_tokens_per_seq);
+        InferenceEngine::new(backend, args.max_concurrent, args.decode_tokens_per_seq, memory_config);
 
     std::thread::Builder::new()
         .name("inference-engine".into())
@@ -244,33 +289,64 @@ async fn main() -> Result<()> {
         port: args.port,
         max_concurrent: args.max_concurrent,
         decode_tokens_per_seq: args.decode_tokens_per_seq,
+        max_seq_len: args.max_seq_len,
+        gpu_memory_limit: gpu_memory_limit_display,
     });
 
-    let app = build_router(state);
+    let app = build_router(state.clone());
 
     let addr = format!("{}:{}", args.host, args.port);
-    info!("Starting server on {addr}");
-    info!("  ── OpenAI-compatible ──");
-    info!("  POST http://{addr}/v1/chat/completions");
-    info!("  POST http://{addr}/v1/completions");
-    info!("  GET  http://{addr}/v1/models");
-    info!("  GET  http://{addr}/v1/models/{{model_id}}");
-    info!("  POST http://{addr}/v1/tokenize");
-    info!("  POST http://{addr}/v1/detokenize");
-    info!("  ── SGLang-compatible ──");
-    info!("  POST http://{addr}/generate");
-    info!("  GET  http://{addr}/model_info");
-    info!("  GET  http://{addr}/server_info");
-    info!("  GET  http://{addr}/health_generate");
-    info!("  POST http://{addr}/flush_cache");
-    info!("  POST http://{addr}/abort_request");
-    info!("  ── Management ──");
-    info!("  GET  http://{addr}/health");
-    info!("  GET  http://{addr}/v1/stats");
-    info!("  POST http://{addr}/tokenize");
-    info!("  POST http://{addr}/detokenize");
-
     let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let local_addr = listener.local_addr()?;
+
+    // ── Startup banner (printed after successful bind) ──
+
+    let sep  = "═".repeat(60);
+    let sep2 = "─".repeat(60);
+    println!("\n  {sep}");
+    println!("  🚀  crane-oai  v{}  ready", env!("CARGO_PKG_VERSION"));
+    println!("  {sep}");
+    println!("  Model   : {} ({})", model_name, resolved_type.display_name());
+    println!("  Device  : {}  │  dtype: {}", state.device_name, state.dtype_name);
+    println!("  Listen  : http://{local_addr}");
+    if args.max_seq_len > 0 || gpu_limit_bytes > 0 {
+        let seq_str = if args.max_seq_len == 0 { "unlimited".to_string() } else { args.max_seq_len.to_string() };
+        let mem_str = if gpu_limit_bytes == 0 {
+            "unlimited".to_string()
+        } else {
+            let raw_budget = gpu_limit_bytes.saturating_sub(baseline_gpu);
+            // KV budget = raw_budget / overhead_factor (see KV_GPU_OVERHEAD_FACTOR in engine)
+            let kv_budget = raw_budget / 6; // must match KV_GPU_OVERHEAD_FACTOR
+            format!("{} (baseline={}, kv_budget={}, overhead=6x)",
+                format_bytes(gpu_limit_bytes),
+                format_bytes(baseline_gpu),
+                if kv_budget == 0 { "0 ⚠".to_string() } else { format_bytes(kv_budget) },
+            )
+        };
+        println!("  Memory  : seq_len={seq_str}  gpu_limit={mem_str}");
+    }
+    println!("  Batch   : max_concurrent={}  decode_tokens_per_seq={}", args.max_concurrent, args.decode_tokens_per_seq);
+    println!("  {sep2}");
+    println!("  OpenAI-compatible API");
+    println!("    POST  http://{local_addr}/v1/chat/completions");
+    println!("    POST  http://{local_addr}/v1/completions");
+    println!("    GET   http://{local_addr}/v1/models");
+    println!("    POST  http://{local_addr}/v1/tokenize");
+    println!("    POST  http://{local_addr}/v1/detokenize");
+    println!("  {sep2}");
+    println!("  SGLang-compatible API");
+    println!("    POST  http://{local_addr}/generate");
+    println!("    GET   http://{local_addr}/model_info");
+    println!("    GET   http://{local_addr}/server_info");
+    println!("    GET   http://{local_addr}/health_generate");
+    println!("    POST  http://{local_addr}/flush_cache");
+    println!("    POST  http://{local_addr}/abort_request");
+    println!("  {sep2}");
+    println!("  Management");
+    println!("    GET   http://{local_addr}/health");
+    println!("    GET   http://{local_addr}/v1/stats");
+    println!("  {sep}\n");
+
     axum::serve(listener, app).await?;
 
     Ok(())

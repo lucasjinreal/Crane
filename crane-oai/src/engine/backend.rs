@@ -68,6 +68,13 @@ pub trait ModelBackend: Send + 'static {
     /// Restore per-layer KV caches into the model.
     fn set_kv_caches(&mut self, _caches: Vec<Option<(Tensor, Tensor)>>) {}
 
+    /// Compute bytes held by the model's active KV caches without copying.
+    /// Used for memory tracking without the overhead of `get_kv_caches()`.
+    fn active_kv_cache_bytes(&self) -> u64 {
+        0
+    }
+
+
     // ── Batch decode (GPU-efficient concurrent serving) ───────
 
     /// Whether this backend supports batched decoding.
@@ -184,6 +191,10 @@ impl ModelBackend for HunyuanBackend {
 
     fn set_kv_caches(&mut self, caches: Vec<Option<(Tensor, Tensor)>>) {
         self.model.set_kv_caches(caches);
+    }
+
+    fn active_kv_cache_bytes(&self) -> u64 {
+        self.model.active_kv_cache_bytes()
     }
 
     // ── Batch decode ──
@@ -371,6 +382,10 @@ impl ModelBackend for Qwen3Backend {
 
     fn set_kv_caches(&mut self, caches: Vec<Option<(Tensor, Tensor)>>) {
         self.model.set_kv_caches(caches);
+    }
+
+    fn active_kv_cache_bytes(&self) -> u64 {
+        self.model.active_kv_cache_bytes()
     }
 
     // ── Batch decode ──

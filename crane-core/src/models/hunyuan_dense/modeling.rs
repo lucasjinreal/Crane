@@ -159,20 +159,45 @@ impl Config {
     }
 }
 
+// ── Event-tracking RAII guard ────────────────────────────────────────────
+//
+// Candle defaults to tracking per-tensor CudaEvents for multi-stream safety.
+// Crane uses a single CUDA stream — those events are pure overhead.
+// This guard disables event tracking on first use and leaves it disabled.
+
+#[cfg(feature = "cuda")]
+struct EventTrackingGuard;
+
+#[cfg(feature = "cuda")]
+impl EventTrackingGuard {
+    fn disable(device: &candle_core::Device) -> Self {
+        if let candle_core::Device::Cuda(ref dev) = device {
+            if dev.is_event_tracking() {
+                unsafe { dev.disable_event_tracking() };
+            }
+        }
+        Self
+    }
+}
+
 // RoPE is applied via candle's fused `rope()` kernel (1 CUDA launch per tensor)
 // instead of manual rotate_half + broadcast_mul (~5 launches per tensor).
+//
+// Pre-computes the full [max_position_embeddings, dim/2] cos/sin table once
+// at construction time. `forward()` returns zero-copy `narrow` views.
 
 struct RotaryEmbedding {
-    inv_freq: Tensor,
-    cos_cache: Option<Tensor>,
-    sin_cache: Option<Tensor>,
-    cached_len: usize,
+    /// Pre-computed cos table: [max_pos, dim/2]
+    cos_table: Tensor,
+    /// Pre-computed sin table: [max_pos, dim/2]
+    sin_table: Tensor,
 }
 
 impl RotaryEmbedding {
     fn new(config: &Config, device: &Device) -> Result<Self> {
         let dim = config.head_dim();
         let rope_theta = config.rope_theta();
+        let max_pos = config.max_position_embeddings;
 
         let inv_freq = if let Some(ref scaling) = config.rope_scaling {
             if let Some(alpha) = scaling.alpha {
@@ -193,12 +218,16 @@ impl RotaryEmbedding {
             Self::default_inv_freq(dim, rope_theta, device)?
         };
 
-        Ok(Self {
-            inv_freq,
-            cos_cache: None,
-            sin_cache: None,
-            cached_len: 0,
-        })
+        // Pre-compute full cos/sin tables: [max_pos, dim/2]
+        let positions: Vec<f32> = (0..max_pos).map(|i| i as f32).collect();
+        let positions = Tensor::new(positions.as_slice(), device)?;
+        let freqs = positions
+            .unsqueeze(1)?
+            .matmul(&inv_freq.unsqueeze(0)?)?; // [max_pos, dim/2]
+        let cos_table = freqs.cos()?.contiguous()?;
+        let sin_table = freqs.sin()?.contiguous()?;
+
+        Ok(Self { cos_table, sin_table })
     }
 
     fn default_inv_freq(dim: usize, base: f64, device: &Device) -> Result<Tensor> {
@@ -209,29 +238,12 @@ impl RotaryEmbedding {
         Tensor::new(inv.as_slice(), device)
     }
 
-    fn forward(&mut self, seq_len: usize, device: &Device) -> Result<(Tensor, Tensor)> {
-        if seq_len <= self.cached_len {
-            if let (Some(ref cos), Some(ref sin)) = (&self.cos_cache, &self.sin_cache) {
-                return Ok((cos.narrow(0, 0, seq_len)?, sin.narrow(0, 0, seq_len)?));
-            }
-        }
-
-        // Pre-grow the cache so decode steps don't recompute cos/sin each time.
-        let alloc_len = seq_len.max(self.cached_len.saturating_mul(2)).max(512);
-        let positions: Vec<f32> = (0..alloc_len).map(|i| i as f32).collect();
-        let positions = Tensor::new(positions.as_slice(), device)?;
-        // positions: [alloc_len], inv_freq: [dim/2]
-        let freqs = positions
-            .unsqueeze(1)?
-            .matmul(&self.inv_freq.unsqueeze(0)?)?; // [alloc_len, dim/2]
-        let cos = freqs.cos()?;
-        let sin = freqs.sin()?;
-
-        self.cos_cache = Some(cos.clone());
-        self.sin_cache = Some(sin.clone());
-        self.cached_len = alloc_len;
-
-        Ok((cos.narrow(0, 0, seq_len)?, sin.narrow(0, 0, seq_len)?))
+    /// Return cos/sin slices for positions [0..seq_len].
+    /// Both narrow() calls are zero-copy views — no CUDA kernel launched.
+    fn forward(&self, seq_len: usize) -> Result<(Tensor, Tensor)> {
+        let cos = self.cos_table.narrow(0, 0, seq_len)?;
+        let sin = self.sin_table.narrow(0, 0, seq_len)?;
+        Ok((cos, sin))
     }
 }
 
@@ -240,11 +252,16 @@ struct Attention {
     k_proj: LinearLayer,
     v_proj: LinearLayer,
     o_proj: LinearLayer,
+    /// Merged QKV weight [q_dim + 2*kv_dim, hidden_size] — one gemv instead of 3.
+    /// Only set for Standard (non-quantized) weights.
+    qkv_proj: Option<Linear>,
     query_layernorm: Option<RmsNorm>,
     key_layernorm: Option<RmsNorm>,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
+    q_dim: usize,
+    kv_dim: usize,
     /// Pre-allocated KV cache buffer. May be larger than `cache_seq_len` to
     /// allow in-place `slice_set` writes without reallocation.
     kv_cache: Option<(Tensor, Tensor)>,
@@ -329,16 +346,37 @@ impl Attention {
             (None, None)
         };
 
+        // Create merged QKV projection for Standard weights:
+        // Concatenate [q_weight; k_weight; v_weight] along dim 0 so one gemv
+        // replaces three.  `narrow` splits are zero-copy views.
+        let q_dim = num_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+        let qkv_proj = if let (LinearLayer::Standard(ref q), LinearLayer::Standard(ref k), LinearLayer::Standard(ref v)) =
+            (&q_proj, &k_proj, &v_proj)
+        {
+            let qkv_w = Tensor::cat(&[q.weight(), k.weight(), v.weight()], 0)?;
+            let qkv_b = match (q.bias(), k.bias(), v.bias()) {
+                (Some(qb), Some(kb), Some(vb)) => Some(Tensor::cat(&[qb, kb, vb], 0)?),
+                _ => None,
+            };
+            Some(Linear::new(qkv_w, qkv_b))
+        } else {
+            None
+        };
+
         Ok(Self {
             q_proj,
             k_proj,
             v_proj,
             o_proj,
+            qkv_proj,
             query_layernorm,
             key_layernorm,
             num_heads,
             num_kv_heads,
             head_dim,
+            q_dim,
+            kv_dim,
             kv_cache: None,
             cache_seq_len: 0,
         })
@@ -374,11 +412,14 @@ impl Attention {
             k_proj,
             v_proj,
             o_proj,
+            qkv_proj: None, // GGUF quantized — cannot merge
             query_layernorm,
             key_layernorm,
             num_heads,
             num_kv_heads,
             head_dim,
+            q_dim: num_heads * head_dim,
+            kv_dim: num_kv_heads * head_dim,
             kv_cache: None,
             cache_seq_len: 0,
         })
@@ -421,7 +462,7 @@ impl Attention {
                     drop(cur_k);
                     drop(cur_v);
                     let total = full_k.dim(2)?;
-                    let room = total.max(256);
+                    let room = 256; // fixed small room — avoids 2x over-allocation
                     let (b, h, _, d) = full_k.dims4()?;
                     let new_buf_k = Tensor::zeros((b, h, total + room, d), k.dtype(), k.device())?;
                     let new_buf_v = Tensor::zeros((b, h, total + room, d), v.dtype(), v.device())?;
@@ -435,7 +476,7 @@ impl Attention {
             None => {
                 // First use: allocate buffer with extra room.
                 let (b, h, s, d) = k.dims4()?;
-                let room = s.max(256);
+                let room = 256; // fixed small room — avoids 2x over-allocation
                 let buf_k = Tensor::zeros((b, h, s + room, d), k.dtype(), k.device())?;
                 let buf_v = Tensor::zeros((b, h, s + room, d), v.dtype(), v.device())?;
                 buf_k.slice_set(&k, 2, 0)?;
@@ -453,12 +494,38 @@ impl Attention {
         cos: &Tensor,
         sin: &Tensor,
         attention_mask: Option<&Tensor>,
+        shared_kv: Option<(Tensor, Tensor)>,
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _) = hidden_states.dims3()?;
 
-        let q = self.q_proj.forward(hidden_states)?;
-        let k = self.k_proj.forward(hidden_states)?;
-        let v = self.v_proj.forward(hidden_states)?;
+        // ── CLA shared path: only compute Q, reuse anchor's KV cache ──
+        if let Some((k, v)) = shared_kv {
+            let q = self.q_proj.forward(hidden_states)?;
+            let q = q
+                .reshape((b_sz, seq_len, self.num_heads, self.head_dim))?
+                .transpose(1, 2)?;
+            let q = rope(&q.contiguous()?, cos, sin)?;
+            let q = if let Some(ref norm) = self.query_layernorm {
+                norm.forward(&q)?
+            } else {
+                q
+            };
+            return self.compute_attention(q, k, v, attention_mask, b_sz, seq_len);
+        }
+
+        // ── QKV projection: merged (1 gemv) or separate (3 gemv) ──
+        let (q, k, v) = if let Some(ref qkv_proj) = self.qkv_proj {
+            let qkv = qkv_proj.forward(hidden_states)?; // [B, S, q_dim+2*kv_dim]
+            let q = qkv.narrow(D::Minus1, 0, self.q_dim)?;
+            let k = qkv.narrow(D::Minus1, self.q_dim, self.kv_dim)?;
+            let v = qkv.narrow(D::Minus1, self.q_dim + self.kv_dim, self.kv_dim)?;
+            (q, k, v)
+        } else {
+            let q = self.q_proj.forward(hidden_states)?;
+            let k = self.k_proj.forward(hidden_states)?;
+            let v = self.v_proj.forward(hidden_states)?;
+            (q, k, v)
+        };
 
         // Reshape: [B, S, num_heads * head_dim] -> [B, num_heads, S, head_dim]
         let q = q
@@ -472,11 +539,10 @@ impl Attention {
             .transpose(1, 2)?;
 
         // Apply rotary embeddings via fused kernel.
-        // rope() expects xs [B, H, S, D] contiguous, cos/sin [S, D/2] or [B, S, D/2].
         let q = rope(&q.contiguous()?, cos, sin)?;
         let k = rope(&k.contiguous()?, cos, sin)?;
 
-        // Apply QK norm after RoPE
+        // Apply QK norm after RoPE (HunyuanDense convention)
         let q = if let Some(ref norm) = self.query_layernorm {
             norm.forward(&q)?
         } else {
@@ -490,10 +556,19 @@ impl Attention {
 
         let (k, v) = self.update_kv_cache(k, v)?;
 
-        // ── Manual SDPA fallback (with mask support) ──
-        // Use grouped query attention: reshape Q into [B*kv_heads, n_rep, S, D]
-        // and use broadcasting with K/V [B*kv_heads, S, D] to avoid the expensive
-        // 7x KV head expansion (repeat_kv).
+        self.compute_attention(q, k, v, attention_mask, b_sz, seq_len)
+    }
+
+    /// Shared attention computation used by both normal and CLA paths.
+    fn compute_attention(
+        &self,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        attention_mask: Option<&Tensor>,
+        b_sz: usize,
+        seq_len: usize,
+    ) -> Result<Tensor> {
         let n_rep = self.num_heads / self.num_kv_heads;
         let kv_s = k.dim(2)?;
 
@@ -576,52 +651,46 @@ impl Attention {
     }
 }
 
+/// Gate+up projection: either a merged [2*I, H] weight (Standard) or separate quantized projections.
+enum MlpGateUp {
+    /// Merged gate+up weight — one gemv instead of two. Standard (BF16/F16/F32) only.
+    Merged { gate_up_proj: Linear, intermediate_size: usize },
+    /// Separate quantized gate and up projections (GGUF).
+    Separate { gate_proj: LinearLayer, up_proj: LinearLayer, intermediate_size: usize },
+}
+
 struct Mlp {
-    gate_proj: LinearLayer,
-    up_proj: LinearLayer,
+    gate_up: MlpGateUp,
     down_proj: LinearLayer,
-    /// Merged gate+up weight [2*intermediate_size, hidden_size] — one gemv instead of two.
-    /// Only set for Standard (non-quantized) weights.
-    gate_up_proj: Option<Linear>,
-    intermediate_size: usize,
 }
 
 impl Mlp {
     fn new(config: &Config, vb: VarBuilder) -> Result<Self> {
-        let gate_proj = LinearLayer::Standard(linear_no_bias(
+        let gate_proj = linear_no_bias(
             config.hidden_size,
             config.intermediate_size,
             vb.pp("gate_proj"),
-        )?);
-        let up_proj = LinearLayer::Standard(linear_no_bias(
+        )?;
+        let up_proj = linear_no_bias(
             config.hidden_size,
             config.intermediate_size,
             vb.pp("up_proj"),
-        )?);
+        )?;
         let down_proj = LinearLayer::Standard(linear_no_bias(
             config.intermediate_size,
             config.hidden_size,
             vb.pp("down_proj"),
         )?);
 
-        // Create merged gate+up projection for Standard weights.
-        let gate_up_proj =
-            if let (LinearLayer::Standard(ref g), LinearLayer::Standard(ref u)) =
-                (&gate_proj, &up_proj)
-            {
-                let gate_up_w = Tensor::cat(&[g.weight(), u.weight()], 0)?;
-                Some(Linear::new(gate_up_w, None))
-            } else {
-                None
-            };
-
-        Ok(Self {
-            gate_proj,
-            up_proj,
-            down_proj,
-            gate_up_proj,
+        // Merge gate+up into a single weight, then drop the originals to save ~1.2 GB VRAM.
+        let gate_up_w = Tensor::cat(&[gate_proj.weight(), up_proj.weight()], 0)?;
+        // gate_proj and up_proj are dropped here — their VRAM is freed.
+        let gate_up = MlpGateUp::Merged {
+            gate_up_proj: Linear::new(gate_up_w, None),
             intermediate_size: config.intermediate_size,
-        })
+        };
+
+        Ok(Self { gate_up, down_proj })
     }
 
     fn new_from_gguf<R: Read + Seek>(gg: &mut Gguf<R>, layer_idx: usize, intermediate_size: usize) -> Result<Self> {
@@ -630,40 +699,44 @@ impl Mlp {
         let up_proj = gg.linear(&format!("{prefix}.ffn_up.weight"))?;
         let down_proj = gg.linear(&format!("{prefix}.ffn_down.weight"))?;
         Ok(Self {
-            gate_proj,
-            up_proj,
+            gate_up: MlpGateUp::Separate {
+                gate_proj,
+                up_proj,
+                intermediate_size,
+            },
             down_proj,
-            gate_up_proj: None, // GGUF quantized — cannot merge
-            intermediate_size,
         })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        if let Some(ref gate_up) = self.gate_up_proj {
-            // Merged path: one gemv → fused SiLU(gate) * up
-            let gu = gate_up.forward(x)?; // [B, S, 2*intermediate_size]
+        match &self.gate_up {
+            MlpGateUp::Merged { gate_up_proj, intermediate_size } => {
+                let gu = gate_up_proj.forward(x)?; // [B, S, 2*intermediate_size]
 
-            #[cfg(feature = "cuda")]
-            {
-                if gu.device().is_cuda() {
-                    let activated = crate::fused_ops::fused_silu_mul(
-                        &gu.contiguous()?,
-                        self.intermediate_size,
-                    )?;
-                    return self.down_proj.forward(&activated);
+                #[cfg(feature = "cuda")]
+                {
+                    if gu.device().is_cuda() {
+                        let activated = crate::fused_ops::fused_silu_mul(
+                            &gu.contiguous()?,
+                            *intermediate_size,
+                        )?;
+                        return self.down_proj.forward(&activated);
+                    }
                 }
-            }
 
-            // CPU fallback
-            let gate = gu.narrow(D::Minus1, 0, self.intermediate_size)?;
-            let up = gu.narrow(D::Minus1, self.intermediate_size, self.intermediate_size)?;
-            let gate = candle_nn::Activation::Silu.forward(&gate)?;
-            return self.down_proj.forward(&(gate * up)?);
+                // CPU fallback
+                let gate = gu.narrow(D::Minus1, 0, *intermediate_size)?;
+                let up = gu.narrow(D::Minus1, *intermediate_size, *intermediate_size)?;
+                let gate = candle_nn::Activation::Silu.forward(&gate)?;
+                self.down_proj.forward(&(gate * up)?)
+            }
+            MlpGateUp::Separate { gate_proj, up_proj, .. } => {
+                let gate = gate_proj.forward(x)?;
+                let gate = candle_nn::Activation::Silu.forward(&gate)?;
+                let up = up_proj.forward(x)?;
+                self.down_proj.forward(&(gate * up)?)
+            }
         }
-        let gate = self.gate_proj.forward(x)?;
-        let gate = candle_nn::Activation::Silu.forward(&gate)?;
-        let up = self.up_proj.forward(x)?;
-        self.down_proj.forward(&(gate * up)?)
     }
 }
 
@@ -722,11 +795,12 @@ impl DecoderLayer {
         cos: &Tensor,
         sin: &Tensor,
         attention_mask: Option<&Tensor>,
+        shared_kv: Option<(Tensor, Tensor)>,
     ) -> Result<Tensor> {
         let residual = hidden_states;
         let hidden_states = self.input_layernorm.forward(hidden_states)?;
         let hidden_states =
-            self.self_attn.forward(&hidden_states, cos, sin, attention_mask)?;
+            self.self_attn.forward(&hidden_states, cos, sin, attention_mask, shared_kv)?;
         let hidden_states = (residual + hidden_states)?;
 
         let residual = &hidden_states;
@@ -914,13 +988,17 @@ impl HunYuanDenseV1 {
     }
 
     pub fn forward(&mut self, input_ids: &Tensor, start_pos: usize) -> Result<Tensor> {
+        // Disable per-tensor CUDA event tracking — Crane uses a single stream.
+        #[cfg(feature = "cuda")]
+        let _event_guard = EventTrackingGuard::disable(input_ids.device());
+
         let (_b_sz, seq_len) = input_ids.dims2()?;
         // Cast embedding output to the target dtype — the safetensors file may store
         // weights in BF16 which is unsupported for CPU matmul.
         let hidden_states = self.embed_tokens.forward(input_ids)?.to_dtype(self.dtype)?;
 
         let total_len = start_pos + seq_len;
-        let (full_cos, full_sin) = self.rotary_emb.forward(total_len, input_ids.device())?;
+        let (full_cos, full_sin) = self.rotary_emb.forward(total_len)?;
         // Slice for current positions; cast to model dtype (RoPE computes in F32)
         // cos/sin: [seq_len, dim/2] — rope() handles broadcasting.
         let cos = full_cos
@@ -954,10 +1032,30 @@ impl HunYuanDenseV1 {
             None
         };
 
+        // CLA (Cross-Layer Attention): anchor layers compute K,V and update their
+        // cache; shared layers reuse the anchor's cache (cheap Arc clone).
+        let use_cla = self.config.use_cla.unwrap_or(false);
+        let cla_factor = self.config.cla_share_factor.unwrap_or(1);
+
         let mut hidden_states = hidden_states;
-        for layer in self.layers.iter_mut() {
+        let mut anchor_kv: Option<(Tensor, Tensor)> = None;
+
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            let shared_kv = if use_cla && cla_factor > 1 && i % cla_factor != 0 {
+                anchor_kv.clone() // Arc clone — no data copy
+            } else {
+                None
+            };
             hidden_states =
-                layer.forward(&hidden_states, &cos, &sin, attention_mask.as_ref())?;
+                layer.forward(&hidden_states, &cos, &sin, attention_mask.as_ref(), shared_kv)?;
+
+            // After an anchor layer, save its KV cache for shared layers.
+            if use_cla && cla_factor > 1 && i % cla_factor == 0 {
+                anchor_kv = layer.self_attn.kv_cache.as_ref().map(|(k, v)| {
+                    let len = layer.self_attn.cache_seq_len;
+                    (k.narrow(2, 0, len).unwrap(), v.narrow(2, 0, len).unwrap())
+                });
+            }
         }
 
         let hidden_states = self.norm.forward(&hidden_states)?;
@@ -971,9 +1069,28 @@ impl HunYuanDenseV1 {
         for layer in self.layers.iter_mut() {
             layer.clear_kv_cache();
         }
-        self.rotary_emb.cos_cache = None;
-        self.rotary_emb.sin_cache = None;
-        self.rotary_emb.cached_len = 0;
+        // rotary_emb tables are static and reusable — do not clear.
+    }
+
+    /// Compute the total bytes held by the model's KV caches without any
+    /// GPU copies. Uses `elem_count()` which is pure arithmetic on dims.
+    pub fn active_kv_cache_bytes(&self) -> u64 {
+        self.layers
+            .iter()
+            .map(|l| {
+                l.self_attn
+                    .kv_cache
+                    .as_ref()
+                    .map(|(k, v)| {
+                        let k_bytes =
+                            k.elem_count() as u64 * k.dtype().size_in_bytes() as u64;
+                        let v_bytes =
+                            v.elem_count() as u64 * v.dtype().size_in_bytes() as u64;
+                        k_bytes + v_bytes
+                    })
+                    .unwrap_or(0)
+            })
+            .sum()
     }
 
     /// Number of transformer layers.
@@ -981,9 +1098,12 @@ impl HunYuanDenseV1 {
         self.layers.len()
     }
 
-    /// Extract per-layer KV caches. Returns only the valid (filled) portion,
-    /// **not** the pre-allocated buffer. Per-sequence storage should keep these
-    /// compactly; `setup_batch_decode` will re-create a pre-allocated buffer.
+    /// Extract per-layer KV caches (valid portion only, zero-copy narrow views).
+    ///
+    /// The returned views still reference the pre-allocated buffer.  Callers
+    /// that need to free the buffer (e.g. batch-decode extract) should use
+    /// `Tensor::contiguous()` on their side, or clear `seq.kv_caches` after
+    /// consuming the views.
     pub fn get_kv_caches(&self) -> Vec<Option<(Tensor, Tensor)>> {
         self.layers
             .iter()
@@ -991,7 +1111,6 @@ impl HunYuanDenseV1 {
                 l.self_attn.kv_cache.as_ref().map(|(k, v)| {
                     let len = l.self_attn.cache_seq_len;
                     if len > 0 && len < k.dim(2).unwrap_or(0) {
-                        // Narrow to valid data — still a zero-copy view.
                         (
                             k.narrow(2, 0, len).unwrap_or_else(|_| k.clone()),
                             v.narrow(2, 0, len).unwrap_or_else(|_| v.clone()),
@@ -1114,7 +1233,7 @@ impl HunYuanDenseV1 {
 
         let max_pos = positions.iter().copied().max().unwrap_or(0) + 1;
         let device = input_ids.device();
-        let (full_cos, full_sin) = self.rotary_emb.forward(max_pos, device)?;
+        let (full_cos, full_sin) = self.rotary_emb.forward(max_pos)?;
 
         let pos_ids: Vec<u32> = positions.iter().map(|&p| p as u32).collect();
         let pos_tensor = Tensor::new(pos_ids.as_slice(), device)?;
@@ -1132,7 +1251,7 @@ impl HunYuanDenseV1 {
 
         let mut hidden_states = hidden_states;
         for layer in self.layers.iter_mut() {
-            hidden_states = layer.forward(&hidden_states, &cos, &sin, attention_mask)?;
+            hidden_states = layer.forward(&hidden_states, &cos, &sin, attention_mask, None)?;
         }
 
         let hidden_states = self.norm.forward(&hidden_states)?;
@@ -1171,9 +1290,11 @@ impl HunYuanDenseV1 {
                     // decode at [max_kv .. max_kv + rounds_done].
                     let total = kv_lens[i] + rounds_done;
                     let offset = original_max_kv - kv_lens[i];
+                    // Contiguous copy — breaks reference to the large padded
+                    // batch buffer so it can be freed immediately.
                     let clean = Some((
-                        row_k.narrow(2, offset, total)?,
-                        row_v.narrow(2, offset, total)?,
+                        row_k.narrow(2, offset, total)?.contiguous()?,
+                        row_v.narrow(2, offset, total)?.contiguous()?,
                     ));
                     result[i].push(clean);
                 }
