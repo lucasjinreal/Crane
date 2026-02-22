@@ -53,7 +53,70 @@ pub struct ChatCompletionRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
-    pub content: String,
+    pub content: ChatMessageContent,
+}
+
+impl ChatMessage {
+    /// Extract the plain text content from the message.
+    /// For multimodal messages, concatenates all text parts.
+    pub fn text_content(&self) -> String {
+        match &self.content {
+            ChatMessageContent::Text(s) => s.clone(),
+            ChatMessageContent::Parts(parts) => parts
+                .iter()
+                .filter_map(|p| match p {
+                    ContentPart::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(""),
+        }
+    }
+
+    /// Extract image URLs from multimodal content.
+    pub fn image_urls(&self) -> Vec<String> {
+        match &self.content {
+            ChatMessageContent::Text(_) => vec![],
+            ChatMessageContent::Parts(parts) => parts
+                .iter()
+                .filter_map(|p| match p {
+                    ContentPart::ImageUrl { image_url } => Some(image_url.url.clone()),
+                    _ => None,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Chat message content — either a plain string or structured multimodal parts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ChatMessageContent {
+    /// Plain text content (backward compatible).
+    Text(String),
+    /// Structured content with text and/or image_url parts.
+    Parts(Vec<ContentPart>),
+}
+
+/// A single content part in a multimodal message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ContentPart {
+    /// Text content.
+    #[serde(rename = "text")]
+    Text { text: String },
+    /// Image URL content.
+    #[serde(rename = "image_url")]
+    ImageUrl { image_url: ImageUrl },
+    /// Image content (alternative key used by some OpenAI clients).
+    #[serde(rename = "image")]
+    Image { image_url: Option<ImageUrl> },
+}
+
+/// An image URL reference.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageUrl {
+    pub url: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

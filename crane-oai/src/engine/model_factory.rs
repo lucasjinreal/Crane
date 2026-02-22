@@ -22,6 +22,7 @@ pub enum ModelType {
     HunyuanDense,
     Qwen25,
     Qwen3,
+    PaddleOcrVl,
 }
 
 impl ModelType {
@@ -30,6 +31,7 @@ impl ModelType {
             "hunyuan" | "hunyuan_dense" | "hunyuandense" => Self::HunyuanDense,
             "qwen25" | "qwen2.5" | "qwen2" => Self::Qwen25,
             "qwen3" => Self::Qwen3,
+            "paddleocr_vl" | "paddleocrv" | "paddleocr" | "paddle_ocr_vl" | "paddleocrvl" => Self::PaddleOcrVl,
             _ => Self::Auto,
         }
     }
@@ -40,7 +42,13 @@ impl ModelType {
             Self::HunyuanDense => "hunyuan",
             Self::Qwen25 => "qwen25",
             Self::Qwen3 => "qwen3",
+            Self::PaddleOcrVl => "paddleocr_vl",
         }
+    }
+
+    /// Whether this model type is a vision-language model.
+    pub fn is_vlm(&self) -> bool {
+        matches!(self, Self::PaddleOcrVl)
     }
 }
 
@@ -93,6 +101,7 @@ pub fn detect_model_type(model_path: &str) -> ModelType {
                         "qwen2" | "qwen2.5" => return ModelType::Qwen25,
                         "qwen3" => return ModelType::Qwen3,
                         m if m.contains("hunyuan") => return ModelType::HunyuanDense,
+                        m if m.contains("paddleocr") => return ModelType::PaddleOcrVl,
                         _ => {}
                     }
                 }
@@ -101,6 +110,9 @@ pub fn detect_model_type(model_path: &str) -> ModelType {
                 if let Some(ref archs) = config.architectures {
                     for arch in archs {
                         let a = arch.to_lowercase();
+                        if a.contains("paddleocr") {
+                            return ModelType::PaddleOcrVl;
+                        }
                         if a.contains("hunyuan") {
                             return ModelType::HunyuanDense;
                         }
@@ -118,7 +130,9 @@ pub fn detect_model_type(model_path: &str) -> ModelType {
 
     // 3. Heuristic: check the model path name
     let path_lower = model_path.to_lowercase();
-    if path_lower.contains("hunyuan") {
+    if path_lower.contains("paddleocr") {
+        ModelType::PaddleOcrVl
+    } else if path_lower.contains("hunyuan") {
         ModelType::HunyuanDense
     } else if path_lower.contains("qwen3") {
         ModelType::Qwen3
@@ -167,6 +181,9 @@ pub fn create_backend(
         }
         ModelType::Qwen25 => Ok(Box::new(Qwen25Backend::new(model_path, device, dtype)?)),
         ModelType::Qwen3 => Ok(Box::new(Qwen3Backend::new(model_path, device, dtype)?)),
+        ModelType::PaddleOcrVl => {
+            anyhow::bail!("PaddleOCR-VL is a VLM model — use create_vlm_model() instead of create_backend()")
+        }
         ModelType::Auto => unreachable!(),
     }
 }
@@ -194,6 +211,16 @@ pub fn create_chat_template(
             }
         },
     }
+}
+
+/// Create a PaddleOCR-VL model for VLM inference.
+pub fn create_vlm_model(
+    model_path: &str,
+    use_cpu: bool,
+    use_bf16: bool,
+) -> Result<crane_core::models::paddleocr_vl::PaddleOcrVL> {
+    tracing::info!("Creating PaddleOCR-VL model from: {}", model_path);
+    crane_core::models::paddleocr_vl::PaddleOcrVL::from_local(model_path, use_cpu, use_bf16)
 }
 
 #[cfg(test)]

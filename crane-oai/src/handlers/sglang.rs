@@ -26,6 +26,7 @@ use crate::sglang_api::*;
 use crate::{make_error, AppState};
 
 use super::sse;
+use super::vlm;
 
 // ─────────────────────────────────────────────────────────────
 //  /generate
@@ -39,6 +40,11 @@ pub async fn generate(
     State(state): State<Arc<AppState>>,
     Json(req): Json<GenerateRequest>,
 ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    // If VLM model is loaded, delegate to VLM handler.
+    if state.vlm_tx.is_some() {
+        return vlm::vlm_generate(state, req).await;
+    }
+
     // Resolve input tokens.
     let input_ids = if let Some(ids) = req.input_ids {
         ids
@@ -61,8 +67,11 @@ pub async fn generate(
         .rid
         .unwrap_or_else(|| format!("gen-{}", uuid::Uuid::new_v4()));
 
-    let response_rx = state
-        .engine
+    let engine = state.engine.as_ref().ok_or_else(|| {
+        make_error(StatusCode::SERVICE_UNAVAILABLE, "Text engine not available (VLM model loaded)")
+    })?;
+
+    let response_rx = engine
         .submit(
             request_id.clone(),
             input_ids,
@@ -145,7 +154,7 @@ pub async fn model_info(State(state): State<Arc<AppState>>) -> impl IntoResponse
 
 /// `GET /server_info` — server configuration + live stats.
 pub async fn server_info(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let stats = state.engine.stats.snapshot();
+    let stats = state.engine.as_ref().map(|e| e.stats.snapshot()).unwrap_or_default();
     Json(ServerInfoResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
         model_path: state.model_path.clone(),
@@ -174,8 +183,11 @@ pub async fn health_generate(
     let probe_tokens = state.eos_token_id.clone(); // minimal input (already a Vec)
     let request_id = format!("health-{}", uuid::Uuid::new_v4());
 
-    let response_rx = state
-        .engine
+    let engine = state.engine.as_ref().ok_or_else(|| {
+        make_error(StatusCode::SERVICE_UNAVAILABLE, "Text engine not available (VLM model loaded)")
+    })?;
+
+    let response_rx = engine
         .submit(
             request_id,
             probe_tokens,

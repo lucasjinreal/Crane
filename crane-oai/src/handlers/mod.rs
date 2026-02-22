@@ -10,3 +10,4 @@ pub mod common;
 pub mod openai;
 pub mod sglang;
 pub mod sse;
+pub mod vlm;
