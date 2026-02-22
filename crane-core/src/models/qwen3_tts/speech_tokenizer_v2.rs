@@ -265,20 +265,33 @@ impl TokenizerAttention {
             .to_dtype(target_dtype)?
             .unsqueeze(0)?
             .unsqueeze(0)?;
-        let q = (q.broadcast_mul(&cos)? + rotate_half(&q)?.broadcast_mul(&sin)?)?;
-        let k = (k.broadcast_mul(&cos)? + rotate_half(&k)?.broadcast_mul(&sin)?)?;
+        let q = (q.broadcast_mul(&cos)? + rotate_half(&q)?.broadcast_mul(&sin)?)?.contiguous()?;
+        let k = (k.broadcast_mul(&cos)? + rotate_half(&k)?.broadcast_mul(&sin)?)?.contiguous()?;
 
         let rep = self.num_heads / self.num_kv_heads;
-        let k = repeat_kv(&k, rep)?;
-        let v = repeat_kv(&v, rep)?;
+        let k = repeat_kv(&k, rep)?.contiguous()?;
+        let v = repeat_kv(&v, rep)?.contiguous()?;
+        let k_t = k.transpose(2, 3)?.contiguous()?;
 
         let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
+        let scores = (q
+            .matmul(&k_t)
+            .map_err(|e| anyhow::anyhow!(
+                "TokenizerAttention q@k^T matmul failed (q={:?}, k_t={:?}): {e}",
+                q.dims(),
+                k_t.dims()
+            ))?
+            * scale)?;
         let mask = causal_sliding_mask(t, self.sliding_window, hidden.device())?.to_dtype(scores.dtype())?;
         let scores = scores.broadcast_add(&mask)?;
-        let probs = candle_nn::ops::softmax_last_dim(&scores)?;
+        let probs = candle_nn::ops::softmax_last_dim(&scores)?.contiguous()?;
         let out = probs
-            .matmul(&v)?
+            .matmul(&v)
+            .map_err(|e| anyhow::anyhow!(
+                "TokenizerAttention attn@v matmul failed (attn={:?}, v={:?}): {e}",
+                probs.dims(),
+                v.dims()
+            ))?
             .transpose(1, 2)?
             .reshape((b, t, c))?
             .apply(&self.o_proj)?;

@@ -113,6 +113,12 @@ pub struct Model {
 }
 
 impl Model {
+    fn tts_debug_enabled() -> bool {
+        std::env::var("CRANE_TTS_DEBUG")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false)
+    }
+
     fn normalize_codec_id(&self, code: u32) -> u32 {
         let codebook_size = self.config.talker_config.code_predictor_config.vocab_size as u32;
         if codebook_size == 0 {
@@ -282,6 +288,16 @@ impl Model {
             .iter()
             .flat_map(|frame| frame.iter().map(|&c| self.normalize_codec_id(c) as i64))
             .collect();
+
+        if Self::tts_debug_enabled() {
+            let (min_id, max_id) = flat
+                .iter()
+                .fold((i64::MAX, i64::MIN), |(mn, mx), &v| (mn.min(v), mx.max(v)));
+            eprintln!(
+                "[CRANE_TTS_DEBUG] decode input codes shape=[1,{num_groups},{num_steps}] min_id={min_id} max_id={max_id}"
+            );
+        }
+
         let codes_tensor = Tensor::new(flat.as_slice(), &self.device)?
             .reshape((num_steps, num_groups))?
             .transpose(0, 1)?
