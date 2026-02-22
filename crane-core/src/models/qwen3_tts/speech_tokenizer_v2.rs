@@ -805,8 +805,9 @@ impl NativeSpeechTokenizerDecoder {
 
         let filenames = crate::utils::utils::get_safetensors_files(model_dir)?;
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, device) }?;
+        let decoder_vb = vb.pp("decoder");
 
-        let quantizer = SplitResidualVectorQuantizer::new(&dcfg, vb.pp("quantizer"))?;
+        let quantizer = SplitResidualVectorQuantizer::new(&dcfg, decoder_vb.pp("quantizer"))?;
         let pre_conv = CausalConvNet::new(
             dcfg.codebook_dim,
             dcfg.latent_dim,
@@ -814,9 +815,9 @@ impl NativeSpeechTokenizerDecoder {
             1,
             1,
             1,
-            vb.pp("pre_conv"),
+            decoder_vb.pp("pre_conv"),
         )?;
-        let pre_transformer = TokenizerTransformer::new(&dcfg, vb.pp("pre_transformer"))?;
+        let pre_transformer = TokenizerTransformer::new(&dcfg, decoder_vb.pp("pre_transformer"))?;
 
         let mut upsample = Vec::with_capacity(dcfg.upsampling_ratios.len());
         for (i, &factor) in dcfg.upsampling_ratios.iter().enumerate() {
@@ -825,9 +826,9 @@ impl NativeSpeechTokenizerDecoder {
                 dcfg.latent_dim,
                 factor,
                 factor,
-                vb.pp("upsample").pp(i).pp(0),
+                decoder_vb.pp("upsample").pp(i).pp(0),
             )?;
-            let block = ConvNeXtBlock::new(dcfg.latent_dim, vb.pp("upsample").pp(i).pp(1))?;
+            let block = ConvNeXtBlock::new(dcfg.latent_dim, decoder_vb.pp("upsample").pp(i).pp(1))?;
             upsample.push((up, block));
         }
 
@@ -839,21 +840,21 @@ impl NativeSpeechTokenizerDecoder {
             1,
             1,
             1,
-            vb.pp("decoder").pp(0),
+            decoder_vb.pp("decoder").pp(0),
         )?));
 
         for i in 0..dcfg.upsample_rates.len() {
             decoder.push(DecoderTailLayer::DecoderBlock(DecoderBlock::new(
                 &dcfg,
                 i,
-                vb.pp("decoder").pp(i + 1),
+                decoder_vb.pp("decoder").pp(i + 1),
             )?));
         }
 
         let output_dim = dcfg.decoder_dim / (1usize << dcfg.upsample_rates.len());
         decoder.push(DecoderTailLayer::Snake(SnakeBeta::new(
             output_dim,
-            vb.pp("decoder").pp(dcfg.upsample_rates.len() + 1),
+            decoder_vb.pp("decoder").pp(dcfg.upsample_rates.len() + 1),
         )?));
         decoder.push(DecoderTailLayer::CausalConv(CausalConvNet::new(
             output_dim,
@@ -862,7 +863,7 @@ impl NativeSpeechTokenizerDecoder {
             1,
             1,
             1,
-            vb.pp("decoder").pp(dcfg.upsample_rates.len() + 2),
+            decoder_vb.pp("decoder").pp(dcfg.upsample_rates.len() + 2),
         )?));
 
         Ok(Self {

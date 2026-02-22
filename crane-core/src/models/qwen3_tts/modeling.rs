@@ -629,14 +629,22 @@ impl CodePredictor {
         codec_embedding: &Embedding,
         device: &Device,
     ) -> Result<Vec<u32>> {
+        fn as_btd(x: &Tensor) -> Result<Tensor> {
+            match x.dims().len() {
+                1 => x.unsqueeze(0)?.unsqueeze(0),
+                2 => x.unsqueeze(1),
+                3 => Ok(x.clone()),
+                n => candle_core::bail!("Unexpected hidden rank in code predictor: {n} ({:?})", x.dims()),
+            }
+        }
+
         self.clear_kv_cache();
         let n_groups = self.num_code_groups - 1;
         let mut codes = Vec::with_capacity(n_groups);
 
         // Build initial input: [talker_hidden, embed(first_code)]
-        let first_embed = codec_embedding.forward(&Tensor::new(&[first_code], device)?)?
-            .unsqueeze(0)?; // [1, 1, D]
-        let hidden = talker_hidden.unsqueeze(0)?; // [1, 1, D]
+        let first_embed = as_btd(&codec_embedding.forward(&Tensor::new(&[first_code], device)?)?)?;
+        let hidden = as_btd(talker_hidden)?;
         let inputs_embeds = Tensor::cat(&[&hidden, &first_embed], 1)?; // [1, 2, D]
 
         // Project if needed
@@ -673,9 +681,9 @@ impl CodePredictor {
 
         // Remaining groups
         for g in 1..n_groups {
-            let embed = self.codec_embeddings[g - 1].forward(
+            let embed = as_btd(&self.codec_embeddings[g - 1].forward(
                 &Tensor::new(&[codes[g - 1]], device)?,
-            )?.unsqueeze(0)?;
+            )?)?;
             let embed = match &self.small_to_mtp_projection {
                 Some(proj) => proj.forward(&embed)?,
                 None => embed,
