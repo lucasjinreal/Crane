@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Example script to demonstrate PaddleOCR-VL-1.5 multimodal inference using crane-oai
 
-HOST="http://127.0.0.1:8889"
+HOST="http://127.0.0.1:8000"
 IMAGE_URL="https://i0.hdslb.com/bfs/new_dyn/1824ac967aca31d7ac9da4fdda678c4639471072.png"
 
 echo "=================================================="
