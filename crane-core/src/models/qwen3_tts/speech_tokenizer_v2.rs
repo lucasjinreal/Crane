@@ -648,12 +648,15 @@ impl EuclideanCodebook {
     }
 
     fn decode(&self, codes: &Tensor) -> Result<Tensor> {
+        let (b, t) = codes.dims2()?;
         let usage = self
             .cluster_usage
             .clamp(self.epsilon, f64::INFINITY)?
             .reshape((self.cluster_usage.dims1()?, 1))?;
         let embedding = self.embedding_sum.broadcast_div(&usage)?;
-        Ok(embedding.embedding(codes)?)
+        let flat_codes = codes.flatten_all()?;
+        let quantized = embedding.embedding(&flat_codes)?;
+        Ok(quantized.reshape((b, t, self.embedding_sum.dims2()?.1))?)
     }
 }
 
