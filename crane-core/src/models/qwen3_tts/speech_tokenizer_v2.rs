@@ -293,7 +293,7 @@ impl TokenizerAttention {
                 v.dims()
             ))?
             .transpose(1, 2)?
-            .reshape((b, t, c))?
+            .reshape((b, t, self.num_heads * self.head_dim))?
             .apply(&self.o_proj)?;
         Ok(out)
     }
