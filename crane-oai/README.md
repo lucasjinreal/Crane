@@ -80,8 +80,8 @@ cargo build -p crane-oai --release
 # CUDA
 cargo build -p crane-oai --release --features "cuda"
 
-# macOS Metal
-cargo build -p crane-oai --release --features "metal onnx"
+# macOS Metal (auto-enabled by target)
+cargo build -p crane-oai --release
 
 # Start the TTS server (auto-detected from config.json)
 ./target/release/crane-oai \
@@ -126,7 +126,7 @@ Crane implements a full **Qwen3-TTS** inference pipeline in pure Rust + Candle, 
 Text input
   │
   ▼
-Tokenizer (Qwen chat tokenizer, tokenizer.json)
+Tokenizer (Qwen chat tokenizer: tokenizer.json OR vocab.json + merges.txt)
   │
   ▼
 ┌──────────────────────────────────────────────────┐
@@ -180,8 +180,8 @@ cargo build -p crane-oai --release
 # CUDA
 cargo build -p crane-oai --release --features "cuda"
 
-# macOS Metal
-cargo build -p crane-oai --release --features "metal onnx"
+# macOS Metal (auto-enabled by target)
+cargo build -p crane-oai --release
 ```
 
 **3. Start the server:**
@@ -229,13 +229,13 @@ Common built-in speakers include: `Chelsie`, `Ethan`, `Cherry`, `Serena`, `Dylan
 
 ### Troubleshooting
 
-**`Speech tokenizer ONNX not found`** — Run the export script again and confirm the file exists at `<model_dir>/speech_tokenizer/speech_tokenizer_decoder.onnx`.
+**`native speech tokenizer load failed`** — Check `<model_dir>/speech_tokenizer/config.json` and safetensors files are complete. You can optionally export ONNX as a fallback decoder.
 
 **`TTS model not loaded`** — The server was started with an LLM model (not TTS). Restart with `--model-type qwen3_tts`.
 
 **Garbled audio / silence** — Try lowering `temperature` to `0.5`–`0.7` and ensure `language` matches the input text.
 
-**Build error: `candle_onnx not found`** — The `onnx` feature was not passed at build time. Add `--features onnx`.
+**`Speech tokenizer ONNX not found` (fallback path only)** — This appears only when native decoder load fails and ONNX fallback is requested; run export script and place ONNX at `<model_dir>/speech_tokenizer/speech_tokenizer_decoder.onnx`.
 
 ## CUDA Usage
 

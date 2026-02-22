@@ -117,7 +117,7 @@ impl Model {
     ///
     /// Expects:
     ///   - `config.json` (Qwen3TTSConfig)
-    ///   - `tokenizer.json`
+    ///   - `tokenizer.json` (or `vocab.json` + `merges.txt`)
     ///   - `model.safetensors` / `model-*.safetensors` (talker weights)
     ///   - `speech_tokenizer/config.json` + `speech_tokenizer/model.safetensors` (preferred)
     ///   - `speech_tokenizer/speech_tokenizer_decoder.onnx` (optional fallback)
@@ -128,12 +128,8 @@ impl Model {
         let config_data = std::fs::read(model_dir.join("config.json"))?;
         let config: Qwen3TTSConfig = serde_json::from_slice(&config_data)?;
 
-        // Tokenizer
-        let tokenizer_path = model_dir.join("tokenizer.json");
-        if !tokenizer_path.exists() {
-            anyhow::bail!("tokenizer.json not found at {}", tokenizer_path.display());
-        }
-        let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(E::msg)?;
+        // Tokenizer (tokenizer.json preferred, fallback to vocab.json + merges.txt)
+        let tokenizer = crate::utils::tokenizer_utils::load_tokenizer_from_model_dir(model_dir)?;
 
         // Safetensors
         let filenames = utils::get_safetensors_files(model_path)?;

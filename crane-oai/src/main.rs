@@ -318,8 +318,7 @@ async fn main() -> Result<()> {
         info!("TTS model routing established (type: {:?})", resolved_type);
 
         // Use tokenizer from the TTS model for API compatibility.
-        let tok_path = std::path::Path::new(&args.model_path).join("tokenizer.json");
-        let tokenizer = tokenizers::Tokenizer::from_file(&tok_path)
+        let tokenizer = crane_core::utils::tokenizer_utils::load_tokenizer_from_model_dir(&args.model_path)
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
 
         let eos_id = tokenizer
