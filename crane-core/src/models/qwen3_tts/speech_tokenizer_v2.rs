@@ -694,17 +694,25 @@ impl ResidualVectorQuantization {
     }
 
     fn decode(&self, codes: &Tensor) -> Result<Tensor> {
-        let (b, k, t) = codes.dims3()?;
+        let (_, k, _) = codes.dims3()?;
         if k > self.layers.len() {
             anyhow::bail!("Too many quantizers: got {k}, model has {}", self.layers.len());
         }
-        let mut sum = Tensor::zeros((b, self.dim, t), DType::F32, codes.device())?;
+        let mut sum: Option<Tensor> = None;
         for idx in 0..k {
             let layer_codes = codes.i((.., idx, ..))?;
-            let q = self.layers[idx].decode(&layer_codes)?;
-            sum = (sum + q)?;
+            let mut q = self.layers[idx].decode(&layer_codes)?;
+            sum = Some(match sum {
+                Some(acc) => {
+                    if q.dtype() != acc.dtype() {
+                        q = q.to_dtype(acc.dtype())?;
+                    }
+                    (acc + q)?
+                }
+                None => q,
+            });
         }
-        Ok(sum)
+        sum.ok_or_else(|| anyhow::anyhow!("No quantizer outputs to decode"))
     }
 }
 

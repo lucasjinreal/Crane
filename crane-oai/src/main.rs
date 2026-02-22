@@ -310,6 +310,15 @@ async fn main() -> Result<()> {
                         })
                     })();
 
+                    if let Err(ref e) = result {
+                        tracing::error!(
+                            "TTS generation failed: {e} (language={}, voice={:?}, input_len={})",
+                            req.language,
+                            req.voice,
+                            req.input.chars().count()
+                        );
+                    }
+
                     let _ = req.tx.send(result);
                 }
             })
