@@ -30,6 +30,10 @@ pub struct TtsGenerateRequest {
     pub top_p: Option<f64>,
     pub repetition_penalty: f32,
     pub max_tokens: usize,
+    /// Reference audio path for voice cloning (Base model only).
+    pub reference_audio: Option<String>,
+    /// Transcript of the reference audio.
+    pub reference_text: Option<String>,
     /// Channel to send back the result.
     pub tx: tokio::sync::oneshot::Sender<Result<TtsResult, String>>,
 }
@@ -81,6 +85,8 @@ pub async fn speech(
         top_p: req.top_p,
         repetition_penalty,
         max_tokens: req.max_tokens,
+        reference_audio: req.reference_audio,
+        reference_text: req.reference_text,
         tx,
     };
 

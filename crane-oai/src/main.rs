@@ -261,8 +261,27 @@ async fn main() -> Result<()> {
 
                 while let Some(req) = tts_rx.blocking_recv() {
                     let result = (|| -> Result<handlers::tts::TtsResult, String> {
-                        let (audio, sr) = tts
-                            .generate_speech(
+                        // Choose voice-clone vs normal TTS based on reference_audio field
+                        let (audio, sr) = if let Some(ref ref_audio_path) = req.reference_audio {
+                            let ref_text = req.reference_text.as_deref().unwrap_or("");
+                            tracing::info!(
+                                "TTS voice-clone mode: ref_audio={}, ref_text_len={}",
+                                ref_audio_path,
+                                ref_text.len()
+                            );
+                            tts.generate_voice_clone(
+                                &req.input,
+                                &req.language,
+                                ref_audio_path,
+                                ref_text,
+                                req.max_tokens,
+                                req.temperature,
+                                req.top_p,
+                                req.repetition_penalty,
+                            )
+                            .map_err(|e| e.to_string())?
+                        } else {
+                            tts.generate_speech(
                                 &req.input,
                                 &req.language,
                                 req.voice.as_deref(),
@@ -271,7 +290,8 @@ async fn main() -> Result<()> {
                                 req.top_p,
                                 req.repetition_penalty,
                             )
-                            .map_err(|e| e.to_string())?;
+                            .map_err(|e| e.to_string())?
+                        };
 
                         // Build WAV bytes in memory.
                         tracing::info!("TTS audio tensor shape: {:?}, sr={sr}", audio.dims());

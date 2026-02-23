@@ -37,11 +37,11 @@ fn main() -> anyhow::Result<()> {
     let mut model = crane_core::models::qwen3_tts::Model::new(&model_path, &device, &dtype)?;
 
     // List available speakers
-    let speakers: Vec<&String> = model.config.talker_config.spk_id.keys().collect();
+    let speakers: Vec<String> = model.config.talker_config.spk_id.keys().cloned().collect();
     println!("Available speakers: {speakers:?}");
 
-    let speaker = speakers.first().map(|s| s.as_str());
-    println!("Using speaker: {}", speaker.unwrap_or("(none)"));
+    let speaker = speakers.first().cloned();
+    println!("Using speaker: {}", speaker.as_deref().unwrap_or("(none)"));
 
     let examples: &[(&str, &str, &str)] = &[
         (
@@ -62,14 +62,14 @@ fn main() -> anyhow::Result<()> {
     ];
 
     for (i, (text, lang, filename)) in examples.iter().enumerate() {
-        println!("\n[{}/{}] lang={lang}  speaker={}", i + 1, examples.len(), speaker.unwrap_or("(none)"));
+        println!("\n[{}/{}] lang={lang}  speaker={}", i + 1, examples.len(), speaker.as_deref().unwrap_or("(none)"));
         println!("  Text: {text}");
 
         let start = std::time::Instant::now();
         let (audio, sr) = model.generate_speech(
             text,
             lang,
-            speaker,
+            speaker.as_deref(),
             2048,      // max codec tokens
             0.9,       // temperature
             Some(1.0), // top_p
