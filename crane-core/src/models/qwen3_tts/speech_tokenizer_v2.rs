@@ -742,7 +742,7 @@ impl ConvNeXtBlock {
         let hidden = self.dwconv.forward(hidden)?;
         let hidden = hidden.transpose(1, 2)?;
         let hidden = hidden.apply(&self.norm)?;
-        let hidden = hidden.apply(&self.pwconv1)?.gelu()?;
+        let hidden = hidden.apply(&self.pwconv1)?.gelu_erf()?;
         let hidden = hidden.apply(&self.pwconv2)?;
         let c = self.gamma.dims1()?;
         let hidden = hidden.broadcast_mul(&self.gamma.reshape((1, 1, c))?)?;
@@ -1374,9 +1374,13 @@ impl MimiEncoder {
 
     /// Encode audio [B, 1, N] → codes [B, T, valid_n_q].
     pub fn encode(&self, audio: &Tensor) -> Result<Tensor> {
-        // audio: [B, 1, N] → squeeze channel → [B, N] → unsqueeze → [B, 1, N]
-        // Actually CausalConvNet expects [B, C, T]
-        let mut x = audio.clone(); // [B, 1, N]
+        // audio: [B, 1, N], CausalConvNet expects [B, C, T]
+        // Ensure audio is F32 to match encoder weights (loaded in F32)
+        let mut x = if audio.dtype() != DType::F32 {
+            audio.to_dtype(DType::F32)?
+        } else {
+            audio.clone()
+        };
 
         // First conv
         x = self.first_conv.forward(&x)?.elu(1.0)?;
@@ -1425,7 +1429,11 @@ pub struct NativeSpeechTokenizerDecoder {
 }
 
 impl NativeSpeechTokenizerDecoder {
-    pub fn new(model_dir: &str, device: &Device, dtype: DType) -> Result<Self> {
+    pub fn new(model_dir: &str, device: &Device, _dtype: DType) -> Result<Self> {
+        // Always load speech tokenizer weights in F32 for numerical stability.
+        // The decoder pipeline uses SnakeBeta (exp/sin/sqr), LayerNorm, and GELU
+        // which require F32 precision to produce correct audio waveforms.
+        let dtype = DType::F32;
         let config_path = std::path::Path::new(model_dir).join("config.json");
         let cfg_data = std::fs::read(&config_path)?;
         let cfg: TokenizerV2Config = serde_json::from_slice(&cfg_data)?;
@@ -1546,7 +1554,12 @@ impl NativeSpeechTokenizerDecoder {
         }
         if debug { eprintln!("[DECODER] input codes: {:?}", codes.dims()); }
 
+        // Ensure codes are on the right device (I64 indices don't need dtype cast)
         let mut hidden = self.quantizer.decode(codes)?;
+        // Force F32 for the entire decoder pipeline for numerical stability
+        if hidden.dtype() != DType::F32 {
+            hidden = hidden.to_dtype(DType::F32)?;
+        }
         if debug { eprintln!("[DECODER] after quantizer.decode: {:?}", hidden.dims()); }
 
         hidden = self.pre_conv.forward(&hidden)?;
