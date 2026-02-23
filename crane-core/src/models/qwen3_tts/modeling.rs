@@ -641,7 +641,14 @@ impl CodePredictor {
         }
 
         let mut sub_logits_processor =
-            candle_transformers::generation::LogitsProcessor::new(42, Some(temperature), top_p);
+            candle_transformers::generation::LogitsProcessor::from_sampling(
+                42,
+                candle_transformers::generation::Sampling::TopKThenTopP {
+                    k: 50,
+                    p: top_p.unwrap_or(1.0),
+                    temperature,
+                },
+            );
 
         self.clear_kv_cache();
         let n_groups = self.num_code_groups - 1;
@@ -661,6 +668,22 @@ impl CodePredictor {
         let seq_len = inputs_embeds.dim(1)?;
         let (cos, sin) = self.rotary_emb.forward(seq_len)?;
 
+        // Build causal mask for the 2-token prefill (matching Python's create_causal_mask)
+        let causal_mask = if seq_len > 1 {
+            let mut mask_data = vec![0f32; seq_len * seq_len];
+            for i in 0..seq_len {
+                for j in (i + 1)..seq_len {
+                    mask_data[i * seq_len + j] = f32::NEG_INFINITY;
+                }
+            }
+            let mask = Tensor::new(mask_data.as_slice(), device)?
+                .reshape((1, 1, seq_len, seq_len))?
+                .to_dtype(inputs_embeds.dtype())?;
+            Some(mask)
+        } else {
+            None
+        };
+
         // Forward through layers
         let mut hidden_states = inputs_embeds;
         for layer in &mut self.layers {
@@ -668,7 +691,7 @@ impl CodePredictor {
                 &hidden_states,
                 &cos,
                 &sin,
-                None,
+                causal_mask.as_ref(),
                 false,
                 &[],
                 false,
@@ -1135,16 +1158,30 @@ impl Qwen3TTSModel {
         let eos_token_id = self.config.talker_config.codec_eos_token_id as u32;
         let mut all_codes = Vec::new();
         let mut logits_processor =
-            candle_transformers::generation::LogitsProcessor::new(42, Some(temperature), top_p);
+            candle_transformers::generation::LogitsProcessor::from_sampling(
+                42,
+                candle_transformers::generation::Sampling::TopKThenTopP {
+                    k: 50,
+                    p: top_p.unwrap_or(1.0),
+                    temperature,
+                },
+            );
 
-        // Build suppress_tokens mask: suppress [vocab_size-1024, vocab_size) except EOS
-        // These are special tokens (pad, bos, eos, language, speaker, etc.) that should
-        // not be generated as speech codes.
+        // Build suppress_tokens mask as a GPU tensor: suppress [vocab_size-1024, vocab_size) except EOS.
+        // 0.0 for allowed, -inf for suppressed.
         let vocab_size = self.config.talker_config.vocab_size;
         let suppress_start = vocab_size.saturating_sub(1024);
-        let suppress_tokens: Vec<usize> = (suppress_start..vocab_size)
-            .filter(|&i| i as u32 != eos_token_id)
-            .collect();
+        let mut suppress_mask_data = vec![0f32; vocab_size];
+        for i in suppress_start..vocab_size {
+            if i as u32 != eos_token_id {
+                suppress_mask_data[i] = f32::NEG_INFINITY;
+            }
+        }
+        let suppress_mask = Tensor::new(suppress_mask_data.as_slice(), &self.device)?;
+        // EOS-suppress mask for min_new_tokens=2
+        let mut eos_suppress_data = vec![0f32; vocab_size];
+        eos_suppress_data[eos_token_id as usize] = f32::NEG_INFINITY;
+        let eos_suppress_mask = Tensor::new(eos_suppress_data.as_slice(), &self.device)?;
 
         // Last hidden state from prefill
         let seq_len = hidden_states.dim(1)?;
@@ -1170,29 +1207,11 @@ impl Qwen3TTSModel {
                 logits
             };
 
-            // Suppress special tokens (except EOS) to prevent them from being sampled
-            let logits = if !suppress_tokens.is_empty() {
-                let mut logits_vec = logits.to_vec1::<f32>()?;
-                for &idx in &suppress_tokens {
-                    if idx < logits_vec.len() {
-                        logits_vec[idx] = f32::NEG_INFINITY;
-                    }
-                }
-                Tensor::new(logits_vec.as_slice(), logits.device())?
-            } else {
-                logits
-            };
-
-            // Enforce min_new_tokens=2 (matching Python reference):
-            // suppress EOS for the first 2 steps.
+            // Suppress special tokens (GPU-side) + EOS for first 2 steps (min_new_tokens=2)
             let logits = if step < 2 {
-                let mut lv = logits.to_vec1::<f32>()?;
-                if (eos_token_id as usize) < lv.len() {
-                    lv[eos_token_id as usize] = f32::NEG_INFINITY;
-                }
-                Tensor::new(lv.as_slice(), logits.device())?
+                (logits + &suppress_mask + &eos_suppress_mask)?
             } else {
-                logits
+                (logits + &suppress_mask)?
             };
 
             let first_code = logits_processor.sample(&logits)?;
