@@ -99,7 +99,7 @@ curl http://localhost:8080/v1/audio/speech \
   -d '{
     "model": "Qwen3-TTS",
     "input": "今天天气真好，我们去公园吧！",
-    "voice": "Chelsie",
+    "voice": "Serena",
     "language": "chinese"
   }' \
   --output speech.wav
@@ -110,7 +110,7 @@ curl http://localhost:8080/v1/audio/speech \
   -d '{
     "model": "Qwen3-TTS",
     "input": "Hello, this is a test of the Qwen3-TTS model.",
-    "voice": "Chelsie",
+    "voice": "Ryan",
     "language": "english"
   }' \
   --output speech.wav
@@ -215,17 +215,17 @@ for name in sorted(c['talker_config']['spk_id']):
 "
 ```
 
-Common built-in speakers include: `Chelsie`, `Ethan`, `Cherry`, `Serena`, `Dylan`, `Brenda`, and many more covering Chinese, English, Japanese, and Korean.
+Built-in speakers for the CustomVoice model include: `Serena`, `Vivian`, `Uncle_fu`, `Ryan`, `Aiden`, `Ono_anna`, `Sohee`, `Eric`, `Dylan`. Larger model variants may include additional speakers. Check your model's `config.json` for the full list.
 
 ### Generation parameters
 
-| Parameter | Recommended | Notes |
-|-----------|-------------|-------|
-| `temperature` | `0.6`–`0.9` | Lower = more stable prosody; higher = more expressive |
-| `max_tokens` | `1024`–`4096` | 12 tokens ≈ 1 second of audio at 12 Hz |
-| `repetition_penalty` | `1.0`–`1.05` | Helps avoid repeating codec tokens |
-| `top_p` | `null` or `0.95` | Nucleus sampling; usually not needed for TTS |
-| `language` | match input | Wrong language hint degrades quality |
+| Parameter | Default | Recommended | Notes |
+|-----------|---------|-------------|-------|
+| `temperature` | `0.9` | `0.7`–`0.9` | Lower = more stable prosody; higher = more expressive |
+| `max_tokens` | `8192` | `2048`–`8192` | 12 tokens ≈ 1 second of audio at 12 Hz |
+| `repetition_penalty` | `1.05` | `1.0`–`1.1` | Helps avoid repeating codec tokens |
+| `top_p` | `null` | `null` or `1.0` | Nucleus sampling; `1.0` matches reference defaults |
+| `language` | `auto` | match input | Wrong language hint degrades quality |
 
 ### Troubleshooting
 

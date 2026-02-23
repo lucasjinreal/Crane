@@ -65,8 +65,8 @@ pub async fn speech(
         return (status, json).into_response();
     }
 
-    let temperature = req.temperature.unwrap_or(0.7);
-    let repetition_penalty = req.repetition_penalty.unwrap_or(1.0);
+    let temperature = req.temperature.unwrap_or(0.9);
+    let repetition_penalty = req.repetition_penalty.unwrap_or(1.05);
     let language = req.language.clone().unwrap_or_else(|| "auto".to_string());
 
     let (tx, rx) = tokio::sync::oneshot::channel();

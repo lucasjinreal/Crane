@@ -621,13 +621,15 @@ impl CodePredictor {
     }
 
     /// Given the talker hidden state and the first codebook token, predict the
-    /// remaining `num_code_groups - 1` codebook tokens using greedy decoding.
+    /// remaining `num_code_groups - 1` codebook tokens using sampling.
     pub fn predict(
         &mut self,
         talker_hidden: &Tensor,
         first_code: u32,
         codec_embedding: &Embedding,
         device: &Device,
+        temperature: f64,
+        top_p: Option<f64>,
     ) -> Result<Vec<u32>> {
         fn as_btd(x: &Tensor) -> Result<Tensor> {
             match x.dims().len() {
@@ -637,6 +639,9 @@ impl CodePredictor {
                 n => candle_core::bail!("Unexpected hidden rank in code predictor: {n} ({:?})", x.dims()),
             }
         }
+
+        let mut sub_logits_processor =
+            candle_transformers::generation::LogitsProcessor::new(42, Some(temperature), top_p);
 
         self.clear_kv_cache();
         let n_groups = self.num_code_groups - 1;
@@ -671,12 +676,12 @@ impl CodePredictor {
         }
         hidden_states = self.norm.forward(&hidden_states)?;
 
-        // First head prediction
+        // First head prediction (with sampling)
         let logits = self.lm_heads[0].forward(
             &hidden_states.narrow(1, seq_len - 1, 1)?,
         )?;
-        let next_token = logits.squeeze(0)?.squeeze(0)?.argmax(D::Minus1)?
-            .to_scalar::<u32>()?;
+        let logits_f32 = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
+        let next_token = sub_logits_processor.sample(&logits_f32)?;
         codes.push(next_token);
 
         // Remaining groups
@@ -699,8 +704,8 @@ impl CodePredictor {
             }
             hs = self.norm.forward(&hs)?;
             let logits = self.lm_heads[g].forward(&hs)?;
-            let next_token = logits.squeeze(0)?.squeeze(0)?.argmax(D::Minus1)?
-                .to_scalar::<u32>()?;
+            let logits_f32 = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
+            let next_token = sub_logits_processor.sample(&logits_f32)?;
             codes.push(next_token);
         }
 
@@ -1000,18 +1005,24 @@ impl TalkerModel {
     }
 
     /// Run the talker transformer forward on input embeddings.
+    ///
+    /// `seq_offset`: the position offset for RoPE. During prefill this is 0;
+    /// during autoregressive generation step N this is `prefill_len + N`.
     pub fn forward_embeds(
         &mut self,
         inputs_embeds: &Tensor,
         attention_mask: Option<&Tensor>,
+        seq_offset: usize,
     ) -> Result<Tensor> {
         let seq_len = inputs_embeds.dim(1)?;
-        let (cos, sin) = self.rotary_emb.forward(seq_len)?;
+        // Compute cos/sin for positions [seq_offset .. seq_offset + seq_len]
+        let total_pos = seq_offset + seq_len;
+        let (cos_full, sin_full) = self.rotary_emb.forward(total_pos)?;
+        let cos = cos_full.narrow(0, seq_offset, seq_len)?;
+        let sin = sin_full.narrow(0, seq_offset, seq_len)?;
 
-        let use_mrope = !self.mrope_section.is_empty();
-
-        // For MRoPE we need 3D cos/sin, but for simplicity we'll use 1D RoPE
-        // (the 3 position dimensions are identical for pure text)
+        // For TTS all 3 MRoPE position dimensions are identical,
+        // so standard 1D RoPE is equivalent.
         let mut hidden_states = inputs_embeds.clone();
         for layer in &mut self.layers {
             hidden_states = layer.forward(
@@ -1019,7 +1030,7 @@ impl TalkerModel {
                 &cos,
                 &sin,
                 attention_mask,
-                false, // use standard RoPE for now (positions are 1D for TTS)
+                false,
                 &self.mrope_section,
                 self.mrope_interleaved,
             )?;
@@ -1070,6 +1081,21 @@ impl Qwen3TTSModel {
         self.talker.clear_kv_cache();
     }
 
+    /// Build a lower-triangular causal attention mask.
+    /// Shape: `[1, 1, seq_len, seq_len]`, with 0.0 for allowed and -inf for blocked.
+    fn build_causal_mask(seq_len: usize, device: &Device, dtype: DType) -> Result<Tensor> {
+        let mut mask_data = vec![0f32; seq_len * seq_len];
+        for i in 0..seq_len {
+            for j in (i + 1)..seq_len {
+                mask_data[i * seq_len + j] = f32::NEG_INFINITY;
+            }
+        }
+        let mask = Tensor::new(mask_data.as_slice(), device)?
+            .reshape((1, 1, seq_len, seq_len))?
+            .to_dtype(dtype)?;
+        Ok(mask)
+    }
+
     /// Generate speech codec tokens from text.
     ///
     /// Returns a Vec of (num_code_groups) tokens per time step.
@@ -1097,8 +1123,14 @@ impl Qwen3TTSModel {
                 self.dtype,
             )?;
 
-        // Prefill
-        let hidden_states = self.talker.forward_embeds(&prefill_embeds, None)?;
+        // Build causal attention mask for prefill
+        let prefill_len = prefill_embeds.dim(1)?;
+        let causal_mask = Self::build_causal_mask(prefill_len, &self.device, self.dtype)?;
+
+        // Prefill with causal mask, positions start at 0
+        let hidden_states =
+            self.talker
+                .forward_embeds(&prefill_embeds, Some(&causal_mask), 0)?;
 
         let eos_token_id = self.config.talker_config.codec_eos_token_id as u32;
         let mut all_codes = Vec::new();
@@ -1151,19 +1183,33 @@ impl Qwen3TTSModel {
                 logits
             };
 
+            // Enforce min_new_tokens=2 (matching Python reference):
+            // suppress EOS for the first 2 steps.
+            let logits = if step < 2 {
+                let mut lv = logits.to_vec1::<f32>()?;
+                if (eos_token_id as usize) < lv.len() {
+                    lv[eos_token_id as usize] = f32::NEG_INFINITY;
+                }
+                Tensor::new(lv.as_slice(), logits.device())?
+            } else {
+                logits
+            };
+
             let first_code = logits_processor.sample(&logits)?;
 
             if first_code == eos_token_id {
                 break;
             }
 
-            // Predict remaining codebooks using code predictor
+            // Predict remaining codebooks using code predictor (with sampling)
             let talker_hidden_1d = past_hidden.squeeze(0)?.squeeze(0)?; // [D]
             let remaining_codes = self.talker.code_predictor.predict(
                 &talker_hidden_1d,
                 first_code,
                 &self.talker.codec_embedding,
                 &self.device,
+                temperature,
+                top_p,
             )?;
 
             let mut frame_codes = vec![first_code];
@@ -1190,8 +1236,9 @@ impl Qwen3TTSModel {
             };
             let next_input = (sum_embed + text_contrib)?.unsqueeze(0)?;
 
-            // Forward one step
-            let hs = self.talker.forward_embeds(&next_input, None)?;
+            // Forward one step with correct position offset (no mask needed for single token with KV cache)
+            let pos_offset = prefill_len + step;
+            let hs = self.talker.forward_embeds(&next_input, None, pos_offset)?;
             past_hidden = hs.narrow(1, hs.dim(1)? - 1, 1)?;
         }
 

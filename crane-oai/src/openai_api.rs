@@ -319,7 +319,7 @@ fn default_speed() -> f64 {
 }
 
 fn default_audio_max_tokens() -> usize {
-    4096
+    8192
 }
 
 #[derive(Debug, Clone, Deserialize)]
