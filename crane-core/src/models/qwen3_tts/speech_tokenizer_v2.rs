@@ -1,10 +1,14 @@
 use anyhow::Result;
 use candle_core::{DType, Device, IndexOp, Tensor, D};
+use candle_core::{Module, StreamingModule};
 use candle_nn::{
     conv1d, conv1d_no_bias, conv_transpose1d, layer_norm, linear, linear_no_bias, Conv1d,
     Conv1dConfig, ConvTranspose1d, ConvTranspose1dConfig, LayerNorm, Linear, RmsNorm, VarBuilder,
 };
+use candle_transformers::models::mimi;
 use serde::Deserialize;
+use std::cell::RefCell;
+use std::collections::HashMap;
 
 fn default_codebook_size() -> usize {
     2048
@@ -1436,8 +1440,100 @@ pub struct NativeSpeechTokenizerDecoder {
     upsample: Vec<(CausalTransConvNet, ConvNeXtBlock)>,
     decoder: Vec<DecoderTailLayer>,
     encoder: Option<MimiEncoder>,
+    encoder_hf: Option<HfMimiEncoder>,
     device: Device,
     dtype: DType,
+}
+
+/// HF Mimi encoder path (official-style): audio [B,1,N] -> codes [B,T,valid_n_q].
+/// This implementation mirrors the vendor qwen3-tts-rs-3 encoder for ref-code extraction.
+struct HfMimiEncoder {
+    encoder: mimi::seanet::SeaNetEncoder,
+    encoder_transformer: RefCell<mimi::transformer::ProjectedTransformer>,
+    downsample: mimi::conv::ConvDownsample1d,
+    quantizer: mimi::quantization::SplitResidualVectorQuantizer,
+    device: Device,
+    valid_num_quantizers: usize,
+}
+
+impl HfMimiEncoder {
+    fn from_safetensors(path: &std::path::Path, device: &Device, valid_n_q: usize) -> Result<Self> {
+        let raw_tensors: HashMap<String, Tensor> = candle_core::safetensors::load(path, device)?;
+        let encoder_tensors: HashMap<String, Tensor> = raw_tensors
+            .iter()
+            .filter_map(|(k, v)| {
+                k.strip_prefix("encoder.")
+                    .map(|stripped| (stripped.to_string(), v.clone()))
+            })
+            .collect();
+
+        if encoder_tensors.is_empty() {
+            anyhow::bail!("No encoder keys found in {}", path.display());
+        }
+
+        let cfg = mimi::Config::v0_1(Some(valid_n_q));
+        let vb = candle_nn::VarBuilder::from_tensors(encoder_tensors, DType::F32, device);
+
+        let encoder = mimi::seanet::SeaNetEncoder::new(&cfg.seanet, vb.pp("encoder"))?;
+        let encoder_transformer = mimi::transformer::ProjectedTransformer::new(
+            cfg.seanet.dimension,
+            &[cfg.seanet.dimension],
+            &cfg.transformer,
+            vb.pp("encoder_transformer"),
+        )?;
+
+        let encoder_frame_rate = cfg.sample_rate / cfg.seanet.ratios.iter().product::<usize>() as f64;
+        let downsample_stride = (encoder_frame_rate / cfg.frame_rate) as usize;
+        let downsample = mimi::conv::ConvDownsample1d::new(
+            downsample_stride,
+            cfg.seanet.dimension,
+            true,
+            true,
+            vb.pp("downsample"),
+        )?;
+
+        let quantizer = mimi::quantization::SplitResidualVectorQuantizer::new(
+            cfg.quantizer_dim,
+            Some(cfg.seanet.dimension),
+            Some(cfg.seanet.dimension),
+            cfg.quantizer_n_q,
+            cfg.quantizer_bins,
+            vb.pp("quantizer"),
+        )?;
+
+        Ok(Self {
+            encoder,
+            encoder_transformer: RefCell::new(encoder_transformer),
+            downsample,
+            quantizer,
+            device: device.clone(),
+            valid_num_quantizers: valid_n_q,
+        })
+    }
+
+    fn encode(&self, audio: &Tensor) -> Result<Tensor> {
+        let input = if audio.dtype() != DType::F32 {
+            audio.to_dtype(DType::F32)?
+        } else {
+            audio.clone()
+        };
+
+        let xs = self.encoder.forward(&input)?;
+        let mut transformer = self.encoder_transformer.borrow_mut();
+        transformer.reset_state();
+        let xs = transformer.forward(&xs)?;
+        let xs = &xs[0];
+        let xs = xs.apply(&self.downsample)?;
+
+        let mut codes = self.quantizer.encode(&xs)?; // [B, n_q, T]
+        let n_q = codes.dim(1)?;
+        let valid = self.valid_num_quantizers.min(n_q);
+        codes = codes.narrow(1, 0, valid)?;
+
+        // [B, n_q, T] -> [B, T, n_q]
+        let codes = codes.transpose(1, 2)?;
+        Ok(codes)
+    }
 }
 
 impl NativeSpeechTokenizerDecoder {
@@ -1514,6 +1610,17 @@ impl NativeSpeechTokenizerDecoder {
             decoder_vb.pp("decoder").pp(dcfg.upsample_rates.len() + 2),
         )?));
 
+        let encoder_hf = match filenames.first() {
+            Some(path) => match HfMimiEncoder::from_safetensors(path, device, cfg.encoder_valid_num_quantizers) {
+                Ok(enc) => Some(enc),
+                Err(e) => {
+                    eprintln!("[speech_tokenizer] Warning: HF-style encoder not loaded: {e}");
+                    None
+                }
+            },
+            None => None,
+        };
+
         let encoder = match MimiEncoder::new(&cfg.encoder_config, cfg.encoder_valid_num_quantizers, vb.pp("encoder")) {
             Ok(enc) => Some(enc),
             Err(e) => {
@@ -1532,6 +1639,7 @@ impl NativeSpeechTokenizerDecoder {
             upsample,
             decoder,
             encoder,
+            encoder_hf,
             device: device.clone(),
             dtype,
         })
@@ -1539,7 +1647,12 @@ impl NativeSpeechTokenizerDecoder {
 
     /// Encode audio `[B, 1, N]` → codes `[B, T, n_q]`.
     pub fn encode(&self, audio: &Tensor) -> Result<Tensor> {
-        let enc = self.encoder.as_ref()
+        if let Some(enc) = &self.encoder_hf {
+            return enc.encode(audio);
+        }
+        let enc = self
+            .encoder
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Speech tokenizer encoder not loaded"))?;
         enc.encode(audio)
     }

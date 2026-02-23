@@ -104,7 +104,6 @@ impl SpeechTokenizerDecoder {
 // ── Qwen3-TTS Model ────────────────────────────────────────────────────
 
 pub struct Model {
-    model_path: String,
     pub tokenizer: Tokenizer,
     pub device: Device,
     pub dtype: DType,
@@ -129,75 +128,6 @@ impl Model {
         // (tokens >= codebook_size are suppressed during generation).
         // Just clamp to be safe.
         code.min(codebook_size.saturating_sub(1))
-    }
-
-    fn maybe_encode_ref_codes_with_python(&self, ref_audio_path: &str) -> Result<Option<Tensor>> {
-        let model_dir = std::path::Path::new(&self.model_path);
-        let qwen_py_dir = model_dir
-            .parent()
-            .map(|p| p.join("Qwen3-TTS"))
-            .unwrap_or_else(|| std::path::PathBuf::from("vendor/Qwen3-TTS"));
-        if !qwen_py_dir.exists() {
-            return Ok(None);
-        }
-
-        let abs_model = std::fs::canonicalize(model_dir).unwrap_or_else(|_| model_dir.to_path_buf());
-        let abs_audio = std::fs::canonicalize(ref_audio_path)
-            .unwrap_or_else(|_| std::path::PathBuf::from(ref_audio_path));
-
-        let script = r#"
-import os, json
-from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
-
-model = Qwen3TTSModel.from_pretrained(os.environ['MODEL_PATH'], torch_dtype='auto')
-items = model.create_voice_clone_prompt(
-    ref_audio=os.environ['REF_AUDIO'],
-    ref_text='placeholder',
-    x_vector_only_mode=False,
-)
-vp = model._prompt_items_to_voice_clone_prompt(items)
-codes = vp['ref_code'][0].cpu().tolist()
-print(json.dumps(codes, ensure_ascii=False))
-"#;
-
-        let output = std::process::Command::new("python3.11")
-            .arg("-c")
-            .arg(script)
-            .env("PYTHONPATH", qwen_py_dir.as_os_str())
-            .env("MODEL_PATH", abs_model.as_os_str())
-            .env("REF_AUDIO", abs_audio.as_os_str())
-            .output();
-
-        let output = match output {
-            Ok(o) => o,
-            Err(_) => return Ok(None),
-        };
-        if !output.status.success() {
-            return Ok(None);
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let json_line = stdout
-            .lines()
-            .rev()
-            .find(|l| l.trim_start().starts_with("[[") && l.trim_end().ends_with("]]"));
-        let Some(json_line) = json_line else {
-            return Ok(None);
-        };
-
-        let codes: Vec<Vec<u32>> = match serde_json::from_str(json_line) {
-            Ok(v) => v,
-            Err(_) => return Ok(None),
-        };
-        if codes.is_empty() || codes[0].is_empty() {
-            return Ok(None);
-        }
-
-        let t = codes.len();
-        let q = codes[0].len();
-        let flat: Vec<u32> = codes.into_iter().flatten().collect();
-        let tensor = Tensor::new(flat.as_slice(), &self.device)?.reshape((t, q))?;
-        Ok(Some(tensor))
     }
 
     fn validate_tts_generation_mode(&self) -> Result<()> {
@@ -283,7 +213,6 @@ print(json.dumps(codes, ensure_ascii=False))
         };
 
         Ok(Self {
-            model_path: model_path.to_string(),
             tokenizer,
             device: device.clone(),
             dtype: *dtype,
@@ -723,21 +652,7 @@ print(json.dumps(codes, ensure_ascii=False))
                     // Encode: samples [1, 1, N] → codes [1, T, n_q] → squeeze → [T, n_q]
                     let ref_tensor = Tensor::new(ref_samples_spk.as_slice(), &self.device)?
                         .unsqueeze(0)?.unsqueeze(0)?; // [1, 1, N]
-                    let native_codes = native.encode(&ref_tensor)?.squeeze(0)?; // [T, n_q]
-                    let codes = match self.maybe_encode_ref_codes_with_python(ref_audio_path)? {
-                        Some(py_codes) => {
-                            if Self::tts_debug_enabled() {
-                                eprintln!("[CRANE_TTS_DEBUG] ref_codes source=python3.11-official");
-                            }
-                            py_codes
-                        }
-                        None => {
-                            if Self::tts_debug_enabled() {
-                                eprintln!("[CRANE_TTS_DEBUG] ref_codes source=native-rust");
-                            }
-                            native_codes
-                        }
-                    };
+                    let codes = native.encode(&ref_tensor)?.squeeze(0)?; // [T, n_q]
                     if Self::tts_debug_enabled() {
                         eprintln!(
                             "[CRANE_TTS_DEBUG] ref_codes: shape={:?}, dtype={:?}",
