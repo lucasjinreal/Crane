@@ -1,34 +1,24 @@
-//! Qwen3-TTS Simple Example
+//! Qwen3-TTS Simple Example (unified entry point)
 //!
-//! Demonstrates text-to-speech synthesis using crane-core's Qwen3-TTS model.
-//!
-//! # Model variants
-//!
-//! | Model | Type | Speaker control |
-//! |-------|------|----------------|
-//! | `Qwen3-TTS-12Hz-0.6B-Base` | `base` | Voice cloning (needs reference audio + text) |
-//! | `Qwen3-TTS-12Hz-0.6B-CustomVoice` | `custom_voice` | Predefined speakers (e.g. `serena`) |
+//! Auto-detects Base vs CustomVoice model and runs the appropriate demo.
+//! For dedicated examples, see:
+//! - `tts_custom_voice` — CustomVoice model with predefined speakers
+//! - `tts_voice_clone`  — Base model with reference-audio voice cloning
 //!
 //! # Usage
 //!
 //! ```bash
-//! # Voice cloning with Base model (default):
+//! # Auto-detect model variant:
 //! cargo run --bin tts_simple --release -- vendor/Qwen3-TTS-12Hz-0.6B-Base
-//!
-//! # CustomVoice model:
 //! cargo run --bin tts_simple --release -- vendor/Qwen3-TTS-12Hz-0.6B-CustomVoice
 //! ```
-//!
-//! For voice cloning, place reference audio at `data/audio/kinsenka_3.wav` and
-//! its transcript at `data/audio/kinsenka_3.txt`.
 
 fn main() -> anyhow::Result<()> {
     use crane_core::models::{DType, Device};
 
-    // ── Choose model path ──────────────────────────────────────────
     let model_path = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "vendor/Qwen3-TTS-12Hz-0.6B-Base".into());
+        .unwrap_or_else(|| "vendor/Qwen3-TTS-12Hz-0.6B-CustomVoice".into());
 
     let device = {
         #[cfg(feature = "cuda")]
@@ -79,31 +69,35 @@ fn run_voice_clone(model: &mut crane_core::models::qwen3_tts::Model) -> anyhow::
     println!("Reference text  : {ref_text}");
 
     let examples: &[(&str, &str, &str)] = &[
-        ("今天天气真好，我们去公园吧！",                                    "japanese", "output_vc_zh"),
-        ("Hello! I am Crane, an ultra-fast inference engine in Rust.", "japanese", "output_vc_en"),
+        (
+            "こうして君に直接ありがとうを言える時間をくれたこと それが多分一番私は嬉しい",
+            "japanese",
+            "output_vc_1.wav",
+        ),
+        (
+            "そんな何もない今日が 少しだけでもいい日になったと思えたら",
+            "japanese",
+            "output_vc_2.wav",
+        ),
     ];
 
-    for (i, (text, lang, stem)) in examples.iter().enumerate() {
+    for (i, (text, lang, filename)) in examples.iter().enumerate() {
         println!("\n[{}/{}] lang={lang}", i + 1, examples.len());
         println!("  Text: {text}");
 
+        let start = std::time::Instant::now();
         let (audio, sr) = model.generate_voice_clone(
-            text,
-            lang,
-            ref_audio,
-            ref_text,
-            2048,      // max codec tokens
-            0.9,       // temperature
-            Some(1.0), // top_p
-            1.05,      // repetition_penalty
+            text, lang, ref_audio, ref_text,
+            2048, 0.9, Some(1.0), 1.05,
         )?;
+        let elapsed = start.elapsed();
 
-        let wav_path = format!("{stem}.wav");
         let audio_f32 = audio.to_dtype(crane_core::models::DType::F32)?.flatten_all()?;
         let samples = audio_f32.to_vec1::<f32>()?;
-        println!("  Generated {:.1}s ({} samples @ {sr} Hz)", samples.len() as f32 / sr as f32, samples.len());
-        write_wav(&wav_path, &samples, sr)?;
-        println!("  Saved {wav_path}");
+        let duration = samples.len() as f32 / sr as f32;
+        println!("  Generated {duration:.1}s ({} samples @ {sr} Hz) in {elapsed:.1?}", samples.len());
+        write_wav(filename, &samples, sr)?;
+        println!("  Saved {filename}");
     }
     Ok(())
 }
@@ -118,30 +112,27 @@ fn run_custom_voice(model: &mut crane_core::models::qwen3_tts::Model) -> anyhow:
     println!("Using speaker: {:?}", speaker);
 
     let examples: &[(&str, &str, &str)] = &[
-        ("今天天气真好，我们去公园吧！",                                    "chinese", "output_tts_zh"),
-        ("Hello! I am Crane, an ultra-fast inference engine in Rust.", "english", "output_tts_en"),
+        ("今天天气真好，我们去公园吧！", "chinese", "output_tts_zh.wav"),
+        ("Hello! I am Crane, an ultra-fast inference engine in Rust.", "english", "output_tts_en.wav"),
+        ("こんにちは、今日はいい天気ですね。", "japanese", "output_tts_ja.wav"),
     ];
 
-    for (i, (text, lang, stem)) in examples.iter().enumerate() {
+    for (i, (text, lang, filename)) in examples.iter().enumerate() {
         println!("\n[{}/{}] lang={lang}  speaker={}", i + 1, examples.len(), speaker.as_deref().unwrap_or("(none)"));
         println!("  Text: {text}");
 
+        let start = std::time::Instant::now();
         let (audio, sr) = model.generate_speech(
-            text,
-            lang,
-            speaker.as_deref(),
-            2048,
-            0.9,
-            Some(1.0),
-            1.05,
+            text, lang, speaker.as_deref(), 2048, 0.9, Some(1.0), 1.05,
         )?;
+        let elapsed = start.elapsed();
 
-        let wav_path = format!("{stem}.wav");
         let audio_f32 = audio.to_dtype(crane_core::models::DType::F32)?.flatten_all()?;
         let samples = audio_f32.to_vec1::<f32>()?;
-        println!("  Generated {:.1}s ({} samples @ {sr} Hz)", samples.len() as f32 / sr as f32, samples.len());
-        write_wav(&wav_path, &samples, sr)?;
-        println!("  Saved {wav_path}");
+        let duration = samples.len() as f32 / sr as f32;
+        println!("  Generated {duration:.1}s ({} samples @ {sr} Hz) in {elapsed:.1?}", samples.len());
+        write_wav(filename, &samples, sr)?;
+        println!("  Saved {filename}");
     }
     Ok(())
 }
@@ -151,23 +142,20 @@ fn write_wav(path: &str, samples: &[f32], sample_rate: u32) -> anyhow::Result<()
     use std::io::Write;
 
     let num_samples = samples.len() as u32;
-    let data_len = num_samples * 2; // 16-bit = 2 bytes per sample
+    let data_len = num_samples * 2;
     let mut f = std::fs::File::create(path)?;
 
-    // RIFF header
     f.write_all(b"RIFF")?;
     f.write_all(&(36 + data_len).to_le_bytes())?;
     f.write_all(b"WAVE")?;
-    // fmt chunk
     f.write_all(b"fmt ")?;
     f.write_all(&16u32.to_le_bytes())?;
-    f.write_all(&1u16.to_le_bytes())?;    // PCM
-    f.write_all(&1u16.to_le_bytes())?;    // mono
+    f.write_all(&1u16.to_le_bytes())?;
+    f.write_all(&1u16.to_le_bytes())?;
     f.write_all(&sample_rate.to_le_bytes())?;
-    f.write_all(&(sample_rate * 2).to_le_bytes())?; // byte rate
-    f.write_all(&2u16.to_le_bytes())?;    // block align
-    f.write_all(&16u16.to_le_bytes())?;   // bits per sample
-    // data chunk
+    f.write_all(&(sample_rate * 2).to_le_bytes())?;
+    f.write_all(&2u16.to_le_bytes())?;
+    f.write_all(&16u16.to_le_bytes())?;
     f.write_all(b"data")?;
     f.write_all(&data_len.to_le_bytes())?;
 
