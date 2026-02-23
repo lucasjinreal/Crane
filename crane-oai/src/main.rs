@@ -293,7 +293,6 @@ async fn main() -> Result<()> {
                             .map_err(|e| e.to_string())?
                         };
 
-                        // Build WAV bytes in memory.
                         tracing::info!("TTS audio tensor shape: {:?}, sr={sr}", audio.dims());
                         let audio_f32 = audio
                             .to_dtype(candle_core::DType::F32)
@@ -303,30 +302,51 @@ async fn main() -> Result<()> {
                         let samples = audio_f32
                             .to_vec1::<f32>()
                             .map_err(|e| e.to_string())?;
-                        tracing::info!("TTS writing {} samples to WAV", samples.len());
+                        tracing::info!("TTS writing {} samples", samples.len());
 
-                        let mut wav_buf = std::io::Cursor::new(Vec::new());
-                        {
-                            let spec = hound::WavSpec {
-                                channels: 1,
-                                sample_rate: sr,
-                                bits_per_sample: 16,
-                                sample_format: hound::SampleFormat::Int,
-                            };
-                            let mut writer = hound::WavWriter::new(&mut wav_buf, spec)
-                                .map_err(|e| e.to_string())?;
-                            for &s in &samples {
-                                let s16 = (s * 32767.0).clamp(-32768.0, 32767.0) as i16;
-                                writer.write_sample(s16).map_err(|e| e.to_string())?;
+                        match req.response_format {
+                            openai_api::AudioResponseFormat::Wav => {
+                                let mut wav_buf = std::io::Cursor::new(Vec::new());
+                                {
+                                    let spec = hound::WavSpec {
+                                        channels: 1,
+                                        sample_rate: sr,
+                                        bits_per_sample: 16,
+                                        sample_format: hound::SampleFormat::Int,
+                                    };
+                                    let mut writer = hound::WavWriter::new(&mut wav_buf, spec)
+                                        .map_err(|e| e.to_string())?;
+                                    for &s in &samples {
+                                        let s16 = (s * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                                        writer.write_sample(s16).map_err(|e| e.to_string())?;
+                                    }
+                                    writer.finalize().map_err(|e| e.to_string())?;
+                                }
+
+                                Ok(handlers::tts::TtsResult {
+                                    audio_bytes: wav_buf.into_inner(),
+                                    content_type: "audio/wav",
+                                    file_name: "speech.wav".to_string(),
+                                    sample_rate: sr,
+                                })
                             }
-                            writer.finalize().map_err(|e| e.to_string())?;
+                            openai_api::AudioResponseFormat::Pcm => {
+                                let mut pcm = Vec::with_capacity(samples.len() * 2);
+                                for &s in &samples {
+                                    let s16 = (s * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                                    pcm.extend_from_slice(&s16.to_le_bytes());
+                                }
+                                Ok(handlers::tts::TtsResult {
+                                    audio_bytes: pcm,
+                                    content_type: "audio/pcm",
+                                    file_name: "speech.pcm".to_string(),
+                                    sample_rate: sr,
+                                })
+                            }
+                            other => Err(format!(
+                                "Unsupported response_format '{other:?}'. Supported: wav, pcm"
+                            )),
                         }
-
-                        Ok(handlers::tts::TtsResult {
-                            audio_bytes: wav_buf.into_inner(),
-                            content_type: "audio/wav",
-                            sample_rate: sr,
-                        })
                     })();
 
                     if let Err(ref e) = result {

@@ -42,6 +42,8 @@ fn main() -> anyhow::Result<()> {
     println!("Device: {device:?}  dtype: {dtype:?}");
 
     let mut model = crane_core::models::qwen3_tts::Model::new(&model_path, &device, &dtype)?;
+    let output_dir = "data/audio/output";
+    std::fs::create_dir_all(output_dir)?;
 
     // ── Reference audio & transcript ───────────────────────────────
     let ref_audio = "data/audio/kinsenka_3.wav";
@@ -62,12 +64,12 @@ fn main() -> anyhow::Result<()> {
         (
             "こうして君に直接ありがとうを言える時間をくれたこと それが多分一番私は嬉しい",
             "japanese",
-            "output_vc_1.wav",
+            "vc1_base.wav",
         ),
         (
             "そんな何もない今日が 少しだけでもいい日になったと思えたら",
             "japanese",
-            "output_vc_2.wav",
+            "vc2_base.wav",
         ),
     ];
 
@@ -76,7 +78,8 @@ fn main() -> anyhow::Result<()> {
         println!("  Text: {text}");
 
         let start = std::time::Instant::now();
-        let (audio, sr) = model.generate_voice_clone(
+        let output_path = format!("{output_dir}/{filename}");
+        let saved_path = model.generate_voice_clone_to_file(
             text,
             lang,
             ref_audio,
@@ -85,51 +88,12 @@ fn main() -> anyhow::Result<()> {
             0.9,       // temperature
             Some(1.0), // top_p (matching official Python default)
             1.05,      // repetition_penalty (matching official Python default)
+            &output_path,
         )?;
         let elapsed = start.elapsed();
-
-        let audio_f32 = audio.to_dtype(DType::F32)?.flatten_all()?;
-        let samples = audio_f32.to_vec1::<f32>()?;
-        let duration = samples.len() as f32 / sr as f32;
-        println!("  Generated {duration:.1}s ({} samples @ {sr} Hz) in {elapsed:.1?}", samples.len());
-
-        write_wav(filename, &samples, sr)?;
-        println!("  Saved {filename}");
+        println!("  Saved {saved_path} in {elapsed:.1?}");
     }
 
     println!("\nDone!");
-    Ok(())
-}
-
-/// Write a 16-bit mono WAV file from f32 samples.
-fn write_wav(path: &str, samples: &[f32], sample_rate: u32) -> anyhow::Result<()> {
-    use std::io::Write;
-
-    let num_samples = samples.len() as u32;
-    let data_len = num_samples * 2;
-    let mut f = std::fs::File::create(path)?;
-
-    // RIFF header
-    f.write_all(b"RIFF")?;
-    f.write_all(&(36 + data_len).to_le_bytes())?;
-    f.write_all(b"WAVE")?;
-    // fmt chunk
-    f.write_all(b"fmt ")?;
-    f.write_all(&16u32.to_le_bytes())?;
-    f.write_all(&1u16.to_le_bytes())?;    // PCM
-    f.write_all(&1u16.to_le_bytes())?;    // mono
-    f.write_all(&sample_rate.to_le_bytes())?;
-    f.write_all(&(sample_rate * 2).to_le_bytes())?;
-    f.write_all(&2u16.to_le_bytes())?;    // block align
-    f.write_all(&16u16.to_le_bytes())?;   // bits per sample
-    // data chunk
-    f.write_all(b"data")?;
-    f.write_all(&data_len.to_le_bytes())?;
-
-    for &s in samples {
-        let scaled = (s * 32767.0).clamp(-32768.0, 32767.0) as i16;
-        f.write_all(&scaled.to_le_bytes())?;
-    }
-
     Ok(())
 }

@@ -50,6 +50,8 @@ cargo run --bin tts_voice_clone --release -- vendor/Qwen3-TTS-12Hz-0.6B-Base
 cargo run --bin tts_simple --release -- vendor/Qwen3-TTS-12Hz-0.6B-CustomVoice
 ```
 
+TTS examples write generated audio to `data/audio/output`.
+
 ## Prerequisites
 
 Before running these examples, make sure you have:

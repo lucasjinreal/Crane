@@ -41,6 +41,7 @@ pub struct TtsGenerateRequest {
 pub struct TtsResult {
     pub audio_bytes: Vec<u8>,
     pub content_type: &'static str,
+    pub file_name: String,
     pub sample_rate: u32,
 }
 
@@ -67,6 +68,17 @@ pub async fn speech(
     if req.input.trim().is_empty() {
         let (status, json) = make_error(StatusCode::BAD_REQUEST, "Input text cannot be empty.");
         return (status, json).into_response();
+    }
+
+    match req.response_format {
+        AudioResponseFormat::Wav | AudioResponseFormat::Pcm => {}
+        _ => {
+            let (status, json) = make_error(
+                StatusCode::BAD_REQUEST,
+                "Unsupported response_format. Currently supported: wav, pcm.",
+            );
+            return (status, json).into_response();
+        }
     }
 
     let temperature = req.temperature.unwrap_or(0.9);
@@ -106,7 +118,7 @@ pub async fn speech(
                 .header(header::CONTENT_TYPE, result.content_type)
                 .header(
                     header::CONTENT_DISPOSITION,
-                    "attachment; filename=\"speech.wav\"",
+                    format!("attachment; filename=\"{}\"", result.file_name),
                 )
                 .body(axum::body::Body::from(result.audio_bytes))
                 .unwrap_or_else(|_| {

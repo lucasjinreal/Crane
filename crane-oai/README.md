@@ -424,7 +424,7 @@ curl http://localhost:8080/v1/audio/speech \
 | `voice` | string | `null` | Speaker name (CustomVoice model). See speaker list below. `null` uses default voice |
 | `language` | string | `"auto"` | Language hint: `"chinese"`, `"english"`, `"japanese"`, `"korean"`, `"auto"` |
 | `instructions` | string | `null` | Optional system-level prompt to guide speaking style |
-| `response_format` | string | `"wav"` | Output audio format: `"wav"` or `"pcm"` (raw 16-bit LE at 24 kHz). `"mp3"`, `"opus"`, `"aac"`, `"flac"` accepted but return WAV |
+| `response_format` | string | `"wav"` | Output audio format: `"wav"` or `"pcm"` (raw 16-bit LE at 24 kHz). `"mp3"`, `"opus"`, `"aac"`, `"flac"` currently return `400` |
 | `speed` | float | `1.0` | Speaking speed multiplier (reserved, not yet applied to generation) |
 | `temperature` | float | `0.9` | Sampling temperature. Lower = more deterministic |
 | `top_p` | float | `null` | Nucleus sampling threshold (default `null` = no nucleus filtering, equivalent to `1.0`) |
@@ -433,7 +433,7 @@ curl http://localhost:8080/v1/audio/speech \
 | `reference_audio` | string | `null` | Local path to reference WAV audio for voice cloning (Base model only) |
 | `reference_text` | string | `null` | Transcript of the reference audio (required when `reference_audio` is set) |
 
-**Response:** Binary audio bytes with `Content-Type: audio/wav`. Save directly to a `.wav` file.
+**Response:** Binary audio bytes with `Content-Type: audio/wav` (`response_format="wav"`) or `audio/pcm` (`response_format="pcm"`). Save WAV as `.wav`, or raw PCM as `.pcm`.
 
 **Approximate duration cap:** `max_tokens / 12` seconds (e.g. `8192` tokens ≈ 683 seconds, `2048` ≈ 171 seconds).
 

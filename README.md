@@ -244,7 +244,7 @@ Supported endpoints:
 | Mgmt   | `GET /health` | Health check |
 | Mgmt   | `GET /v1/stats` | Engine statistics |
 
-✨ **Text-to-Speech (Qwen3-TTS)**: For TTS models, the server adds a `/v1/audio/speech` endpoint (OpenAI-compatible). Both **CustomVoice** (predefined speakers) and **Base** (voice cloning via reference audio) models are supported. See [crane-oai/README.md](crane-oai/README.md) for full TTS API documentation.
+✨ **Text-to-Speech (Qwen3-TTS)**: For TTS models, the server adds a `/v1/audio/speech` endpoint (OpenAI-compatible). Both **CustomVoice** (predefined speakers) and **Base** (voice cloning via reference audio) models are supported. `response_format` currently supports `wav` and `pcm` (other formats return `400`). See [crane-oai/README.md](crane-oai/README.md) for full TTS API documentation.
 
 ### TTS Examples
 
@@ -258,6 +258,8 @@ cargo run --bin tts_voice_clone --release -- vendor/Qwen3-TTS-12Hz-0.6B-Base
 # Auto-detect model type
 cargo run --bin tts_simple --release -- vendor/Qwen3-TTS-12Hz-0.6B-Base
 ```
+
+All TTS examples save generated audio files to `data/audio/output`.
 
 ✨ **Multimodal & Vision support**: For models like PaddleOCR-VL, the endpoints accept OpenAI's structured `messages.[]content.[{type: "image_url", image_url: {url: "..."}}]` payload or SGLang's `image_url` field. See [crane-oai/README.md](crane-oai/README.md) for full API documentation with request/response examples.
 

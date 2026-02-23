@@ -39,13 +39,15 @@ fn main() -> anyhow::Result<()> {
     println!("Device: {device:?}  dtype: {dtype:?}");
 
     let mut model = crane_core::models::qwen3_tts::Model::new(&model_path, &device, &dtype)?;
+    let output_dir = "data/audio/output";
+    std::fs::create_dir_all(output_dir)?;
 
     let model_type = model.config.tts_model_type.as_deref().unwrap_or("base").to_string();
     println!("Model type: {model_type}");
 
     match model_type.as_str() {
-        "base" => run_voice_clone(&mut model)?,
-        "custom_voice" => run_custom_voice(&mut model)?,
+        "base" => run_voice_clone(&mut model, output_dir)?,
+        "custom_voice" => run_custom_voice(&mut model, output_dir)?,
         other => anyhow::bail!("Unknown model type: {other}"),
     }
 
@@ -54,7 +56,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 /// Voice-clone mode: Base model + reference audio.
-fn run_voice_clone(model: &mut crane_core::models::qwen3_tts::Model) -> anyhow::Result<()> {
+fn run_voice_clone(model: &mut crane_core::models::qwen3_tts::Model, output_dir: &str) -> anyhow::Result<()> {
     let ref_audio = "data/audio/kinsenka_3.wav";
     let ref_text_path = "data/audio/kinsenka_3.txt";
 
@@ -72,12 +74,12 @@ fn run_voice_clone(model: &mut crane_core::models::qwen3_tts::Model) -> anyhow::
         (
             "こうして君に直接ありがとうを言える時間をくれたこと それが多分一番私は嬉しい",
             "japanese",
-            "output_vc_1.wav",
+            "simple_vc_1.wav",
         ),
         (
             "そんな何もない今日が 少しだけでもいい日になったと思えたら",
             "japanese",
-            "output_vc_2.wav",
+            "simple_vc_2.wav",
         ),
     ];
 
@@ -86,24 +88,20 @@ fn run_voice_clone(model: &mut crane_core::models::qwen3_tts::Model) -> anyhow::
         println!("  Text: {text}");
 
         let start = std::time::Instant::now();
-        let (audio, sr) = model.generate_voice_clone(
+        let output_path = format!("{output_dir}/{filename}");
+        let saved_path = model.generate_voice_clone_to_file(
             text, lang, ref_audio, ref_text,
             2048, 0.9, Some(1.0), 1.05,
+            &output_path,
         )?;
         let elapsed = start.elapsed();
-
-        let audio_f32 = audio.to_dtype(crane_core::models::DType::F32)?.flatten_all()?;
-        let samples = audio_f32.to_vec1::<f32>()?;
-        let duration = samples.len() as f32 / sr as f32;
-        println!("  Generated {duration:.1}s ({} samples @ {sr} Hz) in {elapsed:.1?}", samples.len());
-        write_wav(filename, &samples, sr)?;
-        println!("  Saved {filename}");
+        println!("  Saved {saved_path} in {elapsed:.1?}");
     }
     Ok(())
 }
 
 /// CustomVoice mode: predefined speaker.
-fn run_custom_voice(model: &mut crane_core::models::qwen3_tts::Model) -> anyhow::Result<()> {
+fn run_custom_voice(model: &mut crane_core::models::qwen3_tts::Model, output_dir: &str) -> anyhow::Result<()> {
     let speaker = model.config.talker_config.spk_id
         .keys()
         .next()
@@ -112,9 +110,9 @@ fn run_custom_voice(model: &mut crane_core::models::qwen3_tts::Model) -> anyhow:
     println!("Using speaker: {:?}", speaker);
 
     let examples: &[(&str, &str, &str)] = &[
-        ("今天天气真好，我们去公园吧！", "chinese", "output_tts_zh.wav"),
-        ("Hello! I am Crane, an ultra-fast inference engine in Rust.", "english", "output_tts_en.wav"),
-        ("こんにちは、今日はいい天気ですね。", "japanese", "output_tts_ja.wav"),
+        ("今天天气真好，我们去公园吧！", "chinese", "simple_tts_zh.wav"),
+        ("Hello! I am Crane, an ultra-fast inference engine in Rust.", "english", "simple_tts_en.wav"),
+        ("こんにちは、今日はいい天気ですね。", "japanese", "simple_tts_ja.wav"),
     ];
 
     for (i, (text, lang, filename)) in examples.iter().enumerate() {
@@ -122,47 +120,13 @@ fn run_custom_voice(model: &mut crane_core::models::qwen3_tts::Model) -> anyhow:
         println!("  Text: {text}");
 
         let start = std::time::Instant::now();
-        let (audio, sr) = model.generate_speech(
+        let output_path = format!("{output_dir}/{filename}");
+        let saved_path = model.generate_speech_to_file(
             text, lang, speaker.as_deref(), 2048, 0.9, Some(1.0), 1.05,
+            &output_path,
         )?;
         let elapsed = start.elapsed();
-
-        let audio_f32 = audio.to_dtype(crane_core::models::DType::F32)?.flatten_all()?;
-        let samples = audio_f32.to_vec1::<f32>()?;
-        let duration = samples.len() as f32 / sr as f32;
-        println!("  Generated {duration:.1}s ({} samples @ {sr} Hz) in {elapsed:.1?}", samples.len());
-        write_wav(filename, &samples, sr)?;
-        println!("  Saved {filename}");
+        println!("  Saved {saved_path} in {elapsed:.1?}");
     }
-    Ok(())
-}
-
-/// Write a 16-bit mono WAV file from f32 samples.
-fn write_wav(path: &str, samples: &[f32], sample_rate: u32) -> anyhow::Result<()> {
-    use std::io::Write;
-
-    let num_samples = samples.len() as u32;
-    let data_len = num_samples * 2;
-    let mut f = std::fs::File::create(path)?;
-
-    f.write_all(b"RIFF")?;
-    f.write_all(&(36 + data_len).to_le_bytes())?;
-    f.write_all(b"WAVE")?;
-    f.write_all(b"fmt ")?;
-    f.write_all(&16u32.to_le_bytes())?;
-    f.write_all(&1u16.to_le_bytes())?;
-    f.write_all(&1u16.to_le_bytes())?;
-    f.write_all(&sample_rate.to_le_bytes())?;
-    f.write_all(&(sample_rate * 2).to_le_bytes())?;
-    f.write_all(&2u16.to_le_bytes())?;
-    f.write_all(&16u16.to_le_bytes())?;
-    f.write_all(b"data")?;
-    f.write_all(&data_len.to_le_bytes())?;
-
-    for &s in samples {
-        let scaled = (s * 32767.0).clamp(-32768.0, 32767.0) as i16;
-        f.write_all(&scaled.to_le_bytes())?;
-    }
-
     Ok(())
 }
