@@ -549,7 +549,7 @@ impl Model {
     }
 
     /// Load a WAV file and return f32 samples normalized to [-1, 1].
-    /// Resamples to `target_sr` if needed (simple linear interpolation).
+    /// Resamples to `target_sr` if needed (high-quality sinc resampling).
     fn load_wav_f32(path: &str, target_sr: u32) -> Result<Vec<f32>> {
         let mut reader = hound::WavReader::open(path)?;
         let spec = reader.spec();
@@ -574,18 +574,56 @@ impl Model {
         if raw_sr == target_sr {
             return Ok(mono);
         }
-        let ratio = raw_sr as f64 / target_sr as f64;
-        let out_len = (mono.len() as f64 / ratio) as usize;
-        let resampled: Vec<f32> = (0..out_len)
-            .map(|i| {
-                let src = i as f64 * ratio;
-                let lo = src.floor() as usize;
-                let hi = (lo + 1).min(mono.len() - 1);
-                let frac = src - lo as f64;
-                mono[lo] * (1.0 - frac as f32) + mono[hi] * frac as f32
-            })
-            .collect();
-        Ok(resampled)
+
+        use audioadapter_buffers::direct::SequentialSliceOfVecs;
+        use rubato::{
+            audioadapter::Adapter, Async, FixedAsync, Resampler as RubatoResampler,
+            SincInterpolationParameters, SincInterpolationType, WindowFunction,
+        };
+
+        let ratio = target_sr as f64 / raw_sr as f64;
+        let chunk_size = 1024usize;
+        let params = SincInterpolationParameters {
+            sinc_len: 128,
+            f_cutoff: 0.95,
+            interpolation: SincInterpolationType::Linear,
+            oversampling_factor: 128,
+            window: WindowFunction::BlackmanHarris2,
+        };
+        let mut resampler = Async::<f32>::new_sinc(
+            ratio,
+            1.0,
+            &params,
+            chunk_size,
+            1,
+            FixedAsync::Input,
+        )?;
+
+        let mut output = Vec::new();
+        let mut pos = 0usize;
+        while pos < mono.len() {
+            let end = (pos + chunk_size).min(mono.len());
+            let chunk = &mono[pos..end];
+            let data = if chunk.len() < chunk_size {
+                let mut padded = chunk.to_vec();
+                padded.resize(chunk_size, 0.0);
+                padded
+            } else {
+                chunk.to_vec()
+            };
+
+            let input_vecs = vec![data];
+            let input = SequentialSliceOfVecs::new(&input_vecs, 1, chunk_size)?;
+            let result = resampler.process(&input, 0, None)?;
+
+            let frames = result.frames();
+            for i in 0..frames {
+                output.push(result.read_sample(0, i).unwrap_or(0.0));
+            }
+            pos += chunk_size;
+        }
+
+        Ok(output)
     }
 
     /// Voice-clone: synthesize `text` in the voice of the speaker from `ref_audio_path`.
