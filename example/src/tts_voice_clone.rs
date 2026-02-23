@@ -83,8 +83,8 @@ fn main() -> anyhow::Result<()> {
             ref_text,
             2048,      // max codec tokens
             0.9,       // temperature
-            Some(1.0), // top_p
-            1.05,      // repetition_penalty
+            Some(0.9), // top_p (nucleus sampling)
+            1.05,      // repetition_penalty (ICL mode auto-raises to ≥1.5)
         )?;
         let elapsed = start.elapsed();
 

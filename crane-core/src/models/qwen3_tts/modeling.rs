@@ -1655,7 +1655,7 @@ impl Qwen3TTSModel {
                 42,
                 candle_transformers::generation::Sampling::TopKThenTopP {
                     k: 50,
-                    p: top_p.unwrap_or(1.0),
+                    p: top_p.unwrap_or(0.9),
                     temperature,
                 },
             );
@@ -1756,9 +1756,14 @@ impl Qwen3TTSModel {
 
         if std::env::var("CRANE_TTS_DEBUG").map(|v| v == "1" || v == "true").unwrap_or(false) {
             eprintln!(
-                "[CRANE_TTS_DEBUG] generate_speech_codes: generated {} frames, max_new_tokens={}",
+                "[CRANE_TTS_DEBUG] generate_speech_codes: generated {} frames, max_new_tokens={}, \
+                 trailing_text_len={}, top_p={}, temperature={}, repetition_penalty={}",
                 all_codes.len(),
                 max_new_tokens,
+                trailing_len,
+                top_p.unwrap_or(0.9),
+                temperature,
+                repetition_penalty,
             );
             if let Some(first_frame) = all_codes.first() {
                 eprintln!(
@@ -1804,6 +1809,17 @@ impl Qwen3TTSModel {
         repetition_penalty: f32,
     ) -> Result<(Vec<Vec<u32>>, usize)> {
         self.clear_kv_cache();
+
+        // ── ICL generation adjustments (matching vendor/mlx-audio) ─────
+        // Voice-clone (ICL) needs stronger repetition penalty to prevent
+        // degenerate loops, and a proportional frame cap to avoid runaway.
+        const ICL_MIN_REP_PENALTY: f32 = 1.5;
+        const ICL_MIN_FRAMES: usize = 75;
+        const ICL_FRAMES_PER_TOKEN: usize = 6;
+
+        let repetition_penalty = repetition_penalty.max(ICL_MIN_REP_PENALTY);
+        let max_new_tokens = max_new_tokens
+            .min(ICL_MIN_FRAMES.max(text_token_ids.len() * ICL_FRAMES_PER_TOKEN));
 
         // ── Phase 1: Base prefill (9 positions) ────────────────────────
         let (prefill_embeds, tts_pad_embed) =
@@ -1867,7 +1883,7 @@ impl Qwen3TTSModel {
                 42,
                 candle_transformers::generation::Sampling::TopKThenTopP {
                     k: 50,
-                    p: top_p.unwrap_or(1.0),
+                    p: top_p.unwrap_or(0.9),
                     temperature,
                 },
             );
@@ -1947,6 +1963,27 @@ impl Qwen3TTSModel {
         }
 
         self.clear_kv_cache();
+
+        if std::env::var("CRANE_TTS_DEBUG").map(|v| v == "1" || v == "true").unwrap_or(false) {
+            eprintln!(
+                "[CRANE_TTS_DEBUG] generate_voice_clone_codes: generated {} frames, \
+                 max_new_tokens={}, trailing_text_len={}, rep_penalty={:.2}, \
+                 ref_code_len={}, text_tokens={}, ref_text_tokens={}",
+                all_codes.len(),
+                max_new_tokens,
+                trailing_len,
+                repetition_penalty,
+                ref_codes.dim(0).unwrap_or(0),
+                text_token_ids.len(),
+                ref_token_ids.len(),
+            );
+            if let Some(first_frame) = all_codes.first() {
+                eprintln!("[CRANE_TTS_DEBUG]   first frame codes: {:?}", first_frame);
+            }
+            if let Some(last_frame) = all_codes.last() {
+                eprintln!("[CRANE_TTS_DEBUG]   last frame codes: {:?}", last_frame);
+            }
+        }
 
         // ref_code_len: number of reference frames in ref_codes (for trimming after decode)
         let ref_code_len = ref_codes.dim(0)?;

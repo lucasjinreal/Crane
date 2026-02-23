@@ -88,7 +88,7 @@ fn run_voice_clone(model: &mut crane_core::models::qwen3_tts::Model) -> anyhow::
         let start = std::time::Instant::now();
         let (audio, sr) = model.generate_voice_clone(
             text, lang, ref_audio, ref_text,
-            2048, 0.9, Some(1.0), 1.05,
+            2048, 0.9, Some(0.9), 1.05,
         )?;
         let elapsed = start.elapsed();
 
@@ -123,7 +123,7 @@ fn run_custom_voice(model: &mut crane_core::models::qwen3_tts::Model) -> anyhow:
 
         let start = std::time::Instant::now();
         let (audio, sr) = model.generate_speech(
-            text, lang, speaker.as_deref(), 2048, 0.9, Some(1.0), 1.05,
+            text, lang, speaker.as_deref(), 2048, 0.9, Some(0.9), 1.05,
         )?;
         let elapsed = start.elapsed();
 
