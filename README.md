@@ -162,8 +162,6 @@ Above is all the codes you need to run end2end chat in Qwen2.5 in pure Rust, not
 
 Then, your LLM inference is 6X faster on mac without Quantization! Enabling Quantization could be even faster!
 
-![](data/aa.gif)
-
 For cli chat, run:
 
 ```
