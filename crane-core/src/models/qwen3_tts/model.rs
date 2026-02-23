@@ -104,6 +104,7 @@ impl SpeechTokenizerDecoder {
 // ── Qwen3-TTS Model ────────────────────────────────────────────────────
 
 pub struct Model {
+    model_path: String,
     pub tokenizer: Tokenizer,
     pub device: Device,
     pub dtype: DType,
@@ -128,6 +129,75 @@ impl Model {
         // (tokens >= codebook_size are suppressed during generation).
         // Just clamp to be safe.
         code.min(codebook_size.saturating_sub(1))
+    }
+
+    fn maybe_encode_ref_codes_with_python(&self, ref_audio_path: &str) -> Result<Option<Tensor>> {
+        let model_dir = std::path::Path::new(&self.model_path);
+        let qwen_py_dir = model_dir
+            .parent()
+            .map(|p| p.join("Qwen3-TTS"))
+            .unwrap_or_else(|| std::path::PathBuf::from("vendor/Qwen3-TTS"));
+        if !qwen_py_dir.exists() {
+            return Ok(None);
+        }
+
+        let abs_model = std::fs::canonicalize(model_dir).unwrap_or_else(|_| model_dir.to_path_buf());
+        let abs_audio = std::fs::canonicalize(ref_audio_path)
+            .unwrap_or_else(|_| std::path::PathBuf::from(ref_audio_path));
+
+        let script = r#"
+import os, json
+from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
+
+model = Qwen3TTSModel.from_pretrained(os.environ['MODEL_PATH'], torch_dtype='auto')
+items = model.create_voice_clone_prompt(
+    ref_audio=os.environ['REF_AUDIO'],
+    ref_text='placeholder',
+    x_vector_only_mode=False,
+)
+vp = model._prompt_items_to_voice_clone_prompt(items)
+codes = vp['ref_code'][0].cpu().tolist()
+print(json.dumps(codes, ensure_ascii=False))
+"#;
+
+        let output = std::process::Command::new("python3.11")
+            .arg("-c")
+            .arg(script)
+            .env("PYTHONPATH", qwen_py_dir.as_os_str())
+            .env("MODEL_PATH", abs_model.as_os_str())
+            .env("REF_AUDIO", abs_audio.as_os_str())
+            .output();
+
+        let output = match output {
+            Ok(o) => o,
+            Err(_) => return Ok(None),
+        };
+        if !output.status.success() {
+            return Ok(None);
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let json_line = stdout
+            .lines()
+            .rev()
+            .find(|l| l.trim_start().starts_with("[[") && l.trim_end().ends_with("]]"));
+        let Some(json_line) = json_line else {
+            return Ok(None);
+        };
+
+        let codes: Vec<Vec<u32>> = match serde_json::from_str(json_line) {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+        if codes.is_empty() || codes[0].is_empty() {
+            return Ok(None);
+        }
+
+        let t = codes.len();
+        let q = codes[0].len();
+        let flat: Vec<u32> = codes.into_iter().flatten().collect();
+        let tensor = Tensor::new(flat.as_slice(), &self.device)?.reshape((t, q))?;
+        Ok(Some(tensor))
     }
 
     fn validate_tts_generation_mode(&self) -> Result<()> {
@@ -213,6 +283,7 @@ impl Model {
         };
 
         Ok(Self {
+            model_path: model_path.to_string(),
             tokenizer,
             device: device.clone(),
             dtype: *dtype,
@@ -652,12 +723,42 @@ impl Model {
                     // Encode: samples [1, 1, N] → codes [1, T, n_q] → squeeze → [T, n_q]
                     let ref_tensor = Tensor::new(ref_samples_spk.as_slice(), &self.device)?
                         .unsqueeze(0)?.unsqueeze(0)?; // [1, 1, N]
-                    let codes = native.encode(&ref_tensor)?.squeeze(0)?; // [T, n_q]
+                    let native_codes = native.encode(&ref_tensor)?.squeeze(0)?; // [T, n_q]
+                    let codes = match self.maybe_encode_ref_codes_with_python(ref_audio_path)? {
+                        Some(py_codes) => {
+                            if Self::tts_debug_enabled() {
+                                eprintln!("[CRANE_TTS_DEBUG] ref_codes source=python3.11-official");
+                            }
+                            py_codes
+                        }
+                        None => {
+                            if Self::tts_debug_enabled() {
+                                eprintln!("[CRANE_TTS_DEBUG] ref_codes source=native-rust");
+                            }
+                            native_codes
+                        }
+                    };
                     if Self::tts_debug_enabled() {
                         eprintln!(
                             "[CRANE_TTS_DEBUG] ref_codes: shape={:?}, dtype={:?}",
                             codes.dims(), codes.dtype(),
                         );
+                        if let Ok(v) = codes.to_dtype(DType::U32).and_then(|t| t.to_vec2::<u32>()) {
+                            if !v.is_empty() {
+                                let head: Vec<Vec<u32>> = v.iter().take(2).cloned().collect();
+                                let tail: Vec<Vec<u32>> = v
+                                    .iter()
+                                    .rev()
+                                    .take(2)
+                                    .cloned()
+                                    .collect::<Vec<_>>()
+                                    .into_iter()
+                                    .rev()
+                                    .collect();
+                                eprintln!("[CRANE_TTS_DEBUG] ref_codes first2={head:?}");
+                                eprintln!("[CRANE_TTS_DEBUG] ref_codes last2={tail:?}");
+                            }
+                        }
                     }
                     codes
                 }
@@ -693,9 +794,19 @@ impl Model {
         let speech_decoder = self.speech_decoder.as_ref()
             .ok_or_else(|| anyhow::anyhow!("Speech tokenizer decoder not loaded"))?;
 
-        // 7. Prepend ref_codes to generated codes, decode, then trim ref portion
+        // 7. Prepend ref_codes to generated codes, decode, then trim ref portion.
+        //    This matches the official Python implementation: ref_codes provide
+        //    decoder continuity context, and the proportional trim removes
+        //    the reference audio from the output, keeping only target speech.
         let num_groups = new_codes[0].len();
         let ref_t = ref_codes.dim(0)?;
+
+        if Self::tts_debug_enabled() {
+            eprintln!(
+                "[CRANE_TTS_DEBUG] voice_clone decode: generated={}, prepend_ref={}",
+                new_codes.len(), ref_t,
+            );
+        }
 
         // Build combined codes: [ref_codes; new_codes] → [total_T, num_groups]
         let ref_flat: Vec<i64> = ref_codes.to_dtype(DType::I64)?.to_vec2::<i64>()?
@@ -714,13 +825,32 @@ impl Model {
 
         let audio_full = speech_decoder.decode(&codes_tensor)?;
 
-        // 8. Trim the reference portion from the decoded audio
+        // Trim the reference portion from decoded audio.
+        // Use exact sample count from decoding ref_codes alone; this is more
+        // robust than proportional trimming when the decoder introduces a
+        // fixed leading latency (which otherwise leaves silence/ref leakage).
+        let ref_only_flat: Vec<i64> = ref_codes
+            .to_dtype(DType::I64)?
+            .to_vec2::<i64>()?
+            .into_iter()
+            .flatten()
+            .collect();
+        let ref_only_tensor = Tensor::new(ref_only_flat.as_slice(), &self.device)?
+            .reshape((ref_t, num_groups))?
+            .transpose(0, 1)?
+            .unsqueeze(0)?; // [1, num_groups, ref_T]
+        let ref_audio = speech_decoder.decode(&ref_only_tensor)?;
+
         let total_samples = audio_full.dim(2)?;
-        let cut = (ref_t as f64 / total_t.max(1) as f64 * total_samples as f64) as usize;
-        let cut = cut.min(total_samples.saturating_sub(1));
+        let ref_samples = ref_audio.dim(2)?;
+        let mut cut = ref_samples.min(total_samples.saturating_sub(1));
+        if cut == 0 {
+            let proportional = (ref_t as f64 / total_t.max(1) as f64 * total_samples as f64) as usize;
+            cut = proportional.min(total_samples.saturating_sub(1));
+        }
         let audio = audio_full.narrow(2, cut, total_samples - cut)?;
 
-        let _ = ref_code_len; // already used ref_t directly
+        let _ = ref_code_len;
         Ok((audio, speech_decoder.sample_rate()))
     }
 

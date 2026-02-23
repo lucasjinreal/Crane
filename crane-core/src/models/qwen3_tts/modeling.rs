@@ -1189,13 +1189,15 @@ impl TalkerModel {
 
     /// Build ICL (in-context learning) prompt for voice cloning (streaming mode).
     ///
-    /// Matches the vendor `build_icl_prompt(non_streaming=false)`:
+    /// Matches the official Python `generate_icl_prompt(non_streaming_mode=False)`
+    /// and the vendor Rust-3 `build_icl_prompt(non_streaming=false)`:
     ///
     /// Text = text_proj([ref_text, target_text, tts_eos])
     /// Codec = codec_embed([codec_bos, ref_codec_embeds])
     ///
-    /// Streaming: element-wise overlay. If text is longer than codec,
-    /// excess text becomes trailing text fed during generation.
+    /// Streaming overlay:
+    ///   If text > codec → overlay first n_codec text with codec, remaining text as trailing
+    ///   If text ≤ codec → pad text with tts_pad, overlay all, trailing = tts_pad
     ///
     /// Returns `(icl_embed, trailing_text_hidden)`.
     pub fn build_icl_prompt(
@@ -1205,6 +1207,8 @@ impl TalkerModel {
         ref_codec_embeds: &Tensor, // [1, T_ref, hidden] — summed codec embeddings
         tts_eos_token_id: u32,
         tts_pad_token_id: u32,
+        codec_pad_token_id: u32,
+        non_streaming_mode: bool,
         device: &Device,
         dtype: DType,
     ) -> Result<(Tensor, Tensor)> {
@@ -1224,7 +1228,7 @@ impl TalkerModel {
         // Codec: [codec_bos, ref_codec_embeds]
         let bos_id = Tensor::new(&[cfg.codec_bos_id as u32], device)?;
         let bos_embed = self.codec_embedding.forward(&bos_id)?.unsqueeze(0)?; // [1, 1, D]
-        let codec_embed = Tensor::cat(&[&bos_embed, ref_codec_embeds], 1)?; // [1, T_ref+1, D]
+        let codec_embed = Tensor::cat(&[&bos_embed, ref_codec_embeds], 1)?; // [1, n_codec, D]
         let n_codec = codec_embed.dim(1)?;
 
         // TTS pad embed
@@ -1232,22 +1236,40 @@ impl TalkerModel {
         let tts_pad_raw = self.text_embedding.forward(&tts_pad_id)?;
         let tts_pad_embed = self.text_projection.forward(&tts_pad_raw)?; // [1, 1, D]
 
-        // Non-streaming mode (matching Python non_streaming_mode=True):
-        // Text and codec are kept as separate sequential blocks, giving the
-        // model complete text context before any codec tokens.
-        //   [text + codec_pad_embed || codec + tts_pad_embed]
-        // Trailing is just tts_pad_embed since all text is in the prefix.
-        let cfg = &self.config;
-        let codec_pad_id = Tensor::new(&[cfg.codec_pad_id as u32], device)?;
-        let codec_pad_embed = self.codec_embedding.forward(&codec_pad_id)?.unsqueeze(0)?; // [1, 1, D]
-        let codec_pad_broadcast = codec_pad_embed.expand((1, n_text, codec_pad_embed.dim(2)?))?;
-        let text_with_codec_pad = (&text_embed + &codec_pad_broadcast)?;
+        let d = tts_pad_embed.dim(2)?;
+        let (icl_embed, trailing) = if non_streaming_mode {
+            // Non-streaming ICL (vendor rs-2 / mlx-style):
+            // [text + codec_pad] || [codec + tts_pad], trailing = tts_pad
+            let codec_pad_id = Tensor::new(&[codec_pad_token_id], device)?;
+            let codec_pad_embed = self.codec_embedding.forward(&codec_pad_id)?.unsqueeze(0)?; // [1, 1, D]
+            let codec_pad_broadcast = codec_pad_embed.expand((1, n_text, d))?;
+            let text_with_codec_pad = (&text_embed + &codec_pad_broadcast)?;
 
-        let tts_pad_broadcast = tts_pad_embed.expand((1, n_codec, tts_pad_embed.dim(2)?))?;
-        let codec_with_tts_pad = (&codec_embed + &tts_pad_broadcast)?;
+            let tts_pad_broadcast = tts_pad_embed.expand((1, n_codec, d))?;
+            let codec_with_tts_pad = (&codec_embed + &tts_pad_broadcast)?;
 
-        let icl_embed = Tensor::cat(&[&text_with_codec_pad, &codec_with_tts_pad], 1)?;
-        let trailing = tts_pad_embed.clone();
+            let icl = Tensor::cat(&[&text_with_codec_pad, &codec_with_tts_pad], 1)?;
+            (icl, tts_pad_embed.clone())
+        } else {
+            // Streaming overlay (matching Python and vendor Rust-3)
+            if n_text > n_codec {
+                // Text longer: first n_codec text overlaid with codec, rest as trailing
+                let text_head = text_embed.narrow(1, 0, n_codec)?;
+                let icl = (&text_head + &codec_embed)?;
+                let text_tail = text_embed.narrow(1, n_codec, n_text - n_codec)?;
+                (icl, text_tail)
+            } else {
+                // Codec longer or equal: pad text with tts_pad, overlay, trailing=tts_pad
+                let padded_text = if n_codec > n_text {
+                    let pad = tts_pad_embed.expand((1, n_codec - n_text, d))?;
+                    Tensor::cat(&[&text_embed, &pad], 1)?
+                } else {
+                    text_embed
+                };
+                let icl = (&padded_text + &codec_embed)?;
+                (icl, tts_pad_embed.clone())
+            }
+        };
 
         let icl_embed = icl_embed.to_dtype(dtype)?;
         let trailing = trailing.to_dtype(dtype)?;
@@ -1832,11 +1854,17 @@ impl Qwen3TTSModel {
     ) -> Result<(Vec<Vec<u32>>, usize)> {
         self.clear_kv_cache();
 
-        // Use caller-provided parameters directly, matching official Python
-        // (no ICL-specific capping or penalty floor).
-        // Python default: max_new_tokens=8192, repetition_penalty=1.05
-        let repetition_penalty = repetition_penalty;
-        let max_new_tokens = max_new_tokens;
+        // ICL guardrails (CPU/F32 safety):
+        //   - Keep caller repetition penalty (official default 1.05)
+        //   - Max new tokens cap: min(caller, max(75, text_tokens * 6))
+        // The length cap prevents runaway loops while avoiding excessive
+        // repetition penalty that can destabilize codec quality.
+        const ICL_MIN_REP_PENALTY: f32 = 1.05;
+        const ICL_MIN_FRAMES: usize = 75;
+        const ICL_FRAMES_PER_TOKEN: usize = 6;
+        let repetition_penalty = repetition_penalty.max(ICL_MIN_REP_PENALTY);
+        let max_new_tokens = max_new_tokens
+            .min(ICL_MIN_FRAMES.max(text_token_ids.len() * ICL_FRAMES_PER_TOKEN));
 
         // ── Phase 1: Build prefill (9 positions) ───────────────────────
         let (prefill_embeds, tts_pad_embed) =
@@ -1866,13 +1894,20 @@ impl Qwen3TTSModel {
             ref_codec_sum = (ref_codec_sum + g_embed.unsqueeze(0)?)?;
         }
 
-        // Build ICL prompt (streaming mode)
+        // Build ICL prompt.
+        // Default to streaming mode (official Python behavior).
+        // Set CRANE_TTS_ICL_NON_STREAMING=1 to opt into non-streaming mode.
+        let use_non_streaming_icl = std::env::var("CRANE_TTS_ICL_NON_STREAMING")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false);
         let (icl_embed, trailing_text_hidden) = self.talker.build_icl_prompt(
             text_token_ids,
             ref_token_ids,
             &ref_codec_sum,
             self.config.tts_eos_token_id,
             self.config.tts_pad_token_id,
+            self.config.talker_config.codec_pad_id as u32,
+            use_non_streaming_icl,
             &self.device,
             self.dtype,
         )?;
@@ -1932,8 +1967,9 @@ impl Qwen3TTSModel {
         if tts_debug {
             eprintln!(
                 "[CRANE_TTS_DEBUG] voice_clone gen starting: eos_token_id={}, vocab_size={}, \
-                 suppress_start={}, offset={}, trailing_len={}, max_new_tokens={}, rep_penalty={:.2}",
-                eos_token_id, vocab_size, suppress_start, offset, trailing_len, max_new_tokens, repetition_penalty
+                 suppress_start={}, offset={}, trailing_len={}, max_new_tokens={}, rep_penalty={:.2}, icl_mode={}",
+                eos_token_id, vocab_size, suppress_start, offset, trailing_len, max_new_tokens, repetition_penalty,
+                if use_non_streaming_icl { "non_streaming" } else { "streaming" },
             );
         }
 
