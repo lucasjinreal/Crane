@@ -11,7 +11,7 @@ use tokenizers::Tokenizer;
 use crate::utils::image_utils;
 
 pub struct PaddleOcrVL {
-    model: Arc<PaddleOCRVLModel>,
+    model: PaddleOCRVLModel,
     tokenizer: Tokenizer,
     pub device: Device,
     dtype: DType,
@@ -168,7 +168,7 @@ impl PaddleOcrVL {
             .unwrap_or(2);
 
         Ok(Self {
-            model: Arc::new(model),
+            model,
             tokenizer,
             device,
             dtype,
@@ -213,7 +213,7 @@ impl PaddleOcrVL {
             .unwrap_or(2);
 
         Ok(Self {
-            model: Arc::new(model),
+            model,
             tokenizer,
             device,
             dtype,
@@ -250,16 +250,19 @@ impl PaddleOcrVL {
             &self.device,
         )?;
 
-        let model = Arc::get_mut(&mut self.model).expect("recognize called while model is shared");
-        model.clear_kv_cache();
+        println!("Starting recognize! Input IDs shape: {:?}", input_ids.shape());
 
-        let generated = model.generate(
+        self.model.clear_kv_cache();
+
+        let generated = self.model.generate(
             &input_ids,
             &pixel_values,
             &grid_thw,
             max_new_tokens,
             self.eos_token_id,
         )?;
+
+        println!("Generated {} tokens", generated.len());
 
         let output: Vec<u32> = generated
             .into_iter()
@@ -319,10 +322,7 @@ impl PaddleOcrVL {
         let mut text = String::new();
         let mut tokens_generated = 0usize;
 
-        let model =
-            Arc::get_mut(&mut self.model).expect("recognize_stream called while model is shared");
-
-        let tokens = model.generate_stream(
+        let tokens = self.model.generate_stream(
             &input_ids,
             &pixel_values,
             &grid_thw,

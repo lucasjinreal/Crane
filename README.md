@@ -17,8 +17,8 @@ A high-performance inference framework leveraging Rust's Candle for maximum spee
 - [x] PaddleOCR VL 0.9B / 1.5
 - [x] Moonshine ASR
 - [x] Silero VAD
+- [x] 🎙️ Qwen3-TTS (12Hz, 24kHz, 16-codebook RVQGAN + native Candle decoder)
 - [ ] 🎙️ TTS: [Spark-TTS](https://github.com/SparkAudio/Spark-TTS) | [Orpheus-TTS](https://github.com/canopyai/Orpheus-TTS) (WIP)
-- [ ] Qwen3-TTS (Highest Priority, PR welcomed)
 
 
 submit your models make other users use it easier!
@@ -55,6 +55,7 @@ We include:
 
 ## 🔥 Updates
 
+- **`2026.02.23`**: 🎙️ Qwen3-TTS support added — full Talker + Code Predictor transformer in Candle, native speech-tokenizer decoder (ONNX fallback), OpenAI `/v1/audio/speech` endpoint in crane-oai;
 - **`2026.02.18`**: ⚡ Qwen3 & Hunyuan Dense inference optimization: pre-allocated KV cache, GQA 4D matmul, fused RoPE with cache pre-growth, GGUF quantization, batched decode, smart sampling fallback for large vocabularies;
 - **`2026.01.30`**: PaddleOCR-VL-1.5 supported now! model: https://huggingface.co/PaddlePaddle/PaddleOCR-VL-1.5/;
 - **`2025.03.21`**: 🔥 Qwen2.5 a more transformers liked Rust interface were supported, you now use Crane just like in your python;
@@ -232,6 +233,7 @@ Supported endpoints:
 |--------|----------|-------------|
 | OpenAI | `POST /v1/chat/completions` | Chat completions (streaming & non-streaming) |
 | OpenAI | `POST /v1/completions` | Text completions |
+| OpenAI | `POST /v1/audio/speech` | Text-to-speech (Qwen3-TTS) |
 | OpenAI | `GET /v1/models` | List models |
 | OpenAI | `POST /v1/tokenize` | Tokenize text |
 | OpenAI | `POST /v1/detokenize` | Detokenize tokens |
@@ -242,7 +244,9 @@ Supported endpoints:
 | Mgmt   | `GET /health` | Health check |
 | Mgmt   | `GET /v1/stats` | Engine statistics |
 
-See [crane-oai/README.md](crane-oai/README.md) for full API documentation with request/response examples.
+✨ **Text-to-Speech (Qwen3-TTS)**: For TTS models, the server adds a `/v1/audio/speech` endpoint (OpenAI-compatible). See [crane-oai/README.md](crane-oai/README.md) for full TTS API documentation.
+
+✨ **Multimodal & Vision support**: For models like PaddleOCR-VL, the endpoints accept OpenAI's structured `messages.[]content.[{type: "image_url", image_url: {url: "..."}}]` payload or SGLang's `image_url` field. See [crane-oai/README.md](crane-oai/README.md) for full API documentation with request/response examples.
 
 Now you can run LLM extremly fast (about 6x faster than vanilla transformers on M1)!
 

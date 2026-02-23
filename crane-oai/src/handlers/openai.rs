@@ -24,6 +24,7 @@ use crate::openai_api::*;
 use crate::{make_error, now_epoch, AppState};
 
 use super::sse;
+use super::vlm;
 
 // ─────────────────────────────────────────────────────────────
 //  Chat Completions
@@ -34,6 +35,11 @@ pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    // If VLM model is loaded, delegate to VLM handler.
+    if state.vlm_tx.is_some() {
+        return vlm::vlm_chat_completions(state, req).await;
+    }
+
     // Apply chat template.
     let formatted = state
         .chat_template
@@ -54,8 +60,11 @@ pub async fn chat_completions(
         .as_ref()
         .map_or(false, |so| so.include_usage);
 
-    let response_rx = state
-        .engine
+    let engine = state.engine.as_ref().ok_or_else(|| {
+        make_error(StatusCode::SERVICE_UNAVAILABLE, "Text engine not available (VLM model loaded)")
+    })?;
+
+    let response_rx = engine
         .submit(
             request_id.clone(),
             input_ids,
@@ -88,7 +97,7 @@ pub async fn chat_completions(
                 index: 0,
                 message: ChatMessage {
                     role: "assistant".into(),
-                    content: full_text,
+                    content: ChatMessageContent::Text(full_text),
                 },
                 finish_reason: Some(finish_reason),
             }],
@@ -126,8 +135,11 @@ pub async fn completions(
 
     let request_id = format!("cmpl-{}", uuid::Uuid::new_v4());
 
-    let response_rx = state
-        .engine
+    let engine = state.engine.as_ref().ok_or_else(|| {
+        make_error(StatusCode::SERVICE_UNAVAILABLE, "Text engine not available (VLM model loaded)")
+    })?;
+
+    let response_rx = engine
         .submit(
             request_id.clone(),
             input_ids,

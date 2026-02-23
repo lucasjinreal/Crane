@@ -34,6 +34,10 @@ name = "ocr_simple"
 path = "src/ocr_simple.rs"
 
 [[bin]]
+name = "tts_simple"
+path = "src/tts_simple.rs"
+
+[[bin]]
 name = "hunyuan_simple"
 path = "src/hunyuan_simple.rs"
 
