@@ -44,7 +44,7 @@ impl ChatTemplateProcessor for AutoChatTemplate {
             .map(|m| {
                 serde_json::json!({
                     "role": m.role,
-                    "content": m.content,
+                    "content": m.text_content(),
                 })
             })
             .collect();
@@ -74,13 +74,13 @@ impl ChatTemplateProcessor for HunyuanChatTemplate {
         result.push_str(BOS);
 
         let (system_msg, loop_messages) = if !messages.is_empty() && messages[0].role == "system" {
-            (Some(&messages[0].content), &messages[1..])
+            (Some(messages[0].text_content()), &messages[1..])
         } else {
             (None, &messages[..])
         };
 
         if let Some(sys) = system_msg {
-            result.push_str(sys);
+            result.push_str(&sys);
             result.push_str(SEP);
         }
 
@@ -88,11 +88,11 @@ impl ChatTemplateProcessor for HunyuanChatTemplate {
             match msg.role.as_str() {
                 "user" => {
                     result.push_str(USER);
-                    result.push_str(&msg.content);
+                    result.push_str(&msg.text_content());
                 }
                 "assistant" => {
                     result.push_str(ASSISTANT);
-                    result.push_str(&msg.content);
+                    result.push_str(&msg.text_content());
                     result.push_str(EOS);
                 }
                 _ => {}
@@ -106,14 +106,14 @@ impl ChatTemplateProcessor for HunyuanChatTemplate {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::openai_api::ChatMessageContent;
 
     fn make_messages(pairs: &[(&str, &str)]) -> Vec<ChatMessage> {
         pairs
             .iter()
             .map(|(role, content)| ChatMessage {
                 role: role.to_string(),
-                content: content.to_string(),
+                content: ChatMessageContent::Text(content.to_string()),
             })
             .collect()
     }

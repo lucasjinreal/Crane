@@ -68,7 +68,7 @@ impl EngineStats {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct StatsSnapshot {
     pub total_requests: u64,
     pub completed_requests: u64,

@@ -25,6 +25,8 @@ pub struct GenerateRequest {
     pub text: Option<String>,
     /// Pre-tokenized input. Mutually exclusive with `text`.
     pub input_ids: Option<Vec<u32>>,
+    /// Image URL for vision-language models.
+    pub image_url: Option<String>,
     /// Sampling parameters.
     #[serde(default)]
     pub sampling_params: SamplingParams,

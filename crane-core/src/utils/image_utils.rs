@@ -74,7 +74,7 @@ pub fn load_and_resize_image_to_tensor(
 pub fn load_image_and_smart_resize(
     path: &Path,
     device: &Device,
-    _dtype: DType,
+    dtype: DType,
     mode: ResizeMode,
 ) -> Result<(Tensor, Tensor)> {
     let img = image::ImageReader::open(path)
@@ -125,7 +125,7 @@ pub fn load_image_and_smart_resize(
     let w_patches = (resized_w / PATCH_SIZE) as u32;
     let grid_thw = Tensor::new(&[[1u32, h_patches, w_patches]], device)?;
 
-    Ok((tensor, grid_thw))
+    Ok((tensor.to_dtype(dtype)?, grid_thw))
 }
 
 pub fn smart_resize(
