@@ -30,6 +30,10 @@ pub struct TtsGenerateRequest {
     pub top_p: Option<f64>,
     pub repetition_penalty: f32,
     pub max_tokens: usize,
+    /// Reference audio path for voice cloning (Base model only).
+    pub reference_audio: Option<String>,
+    /// Transcript of the reference audio.
+    pub reference_text: Option<String>,
     /// Channel to send back the result.
     pub tx: tokio::sync::oneshot::Sender<Result<TtsResult, String>>,
 }
@@ -37,6 +41,7 @@ pub struct TtsGenerateRequest {
 pub struct TtsResult {
     pub audio_bytes: Vec<u8>,
     pub content_type: &'static str,
+    pub file_name: String,
     pub sample_rate: u32,
 }
 
@@ -65,8 +70,19 @@ pub async fn speech(
         return (status, json).into_response();
     }
 
-    let temperature = req.temperature.unwrap_or(0.7);
-    let repetition_penalty = req.repetition_penalty.unwrap_or(1.0);
+    match req.response_format {
+        AudioResponseFormat::Wav | AudioResponseFormat::Pcm => {}
+        _ => {
+            let (status, json) = make_error(
+                StatusCode::BAD_REQUEST,
+                "Unsupported response_format. Currently supported: wav, pcm.",
+            );
+            return (status, json).into_response();
+        }
+    }
+
+    let temperature = req.temperature.unwrap_or(0.9);
+    let repetition_penalty = req.repetition_penalty.unwrap_or(1.05);
     let language = req.language.clone().unwrap_or_else(|| "auto".to_string());
 
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -81,6 +97,8 @@ pub async fn speech(
         top_p: req.top_p,
         repetition_penalty,
         max_tokens: req.max_tokens,
+        reference_audio: req.reference_audio,
+        reference_text: req.reference_text,
         tx,
     };
 
@@ -100,7 +118,7 @@ pub async fn speech(
                 .header(header::CONTENT_TYPE, result.content_type)
                 .header(
                     header::CONTENT_DISPOSITION,
-                    "attachment; filename=\"speech.wav\"",
+                    format!("attachment; filename=\"{}\"", result.file_name),
                 )
                 .body(axum::body::Body::from(result.audio_bytes))
                 .unwrap_or_else(|_| {

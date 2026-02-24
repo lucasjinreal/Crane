@@ -319,7 +319,7 @@ fn default_speed() -> f64 {
 }
 
 fn default_audio_max_tokens() -> usize {
-    4096
+    8192
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -329,10 +329,10 @@ pub struct SpeechRequest {
     pub model: String,
     /// The text to synthesize.
     pub input: String,
-    /// Voice name (speaker ID or preset).
+    /// Voice name (speaker ID or preset for CustomVoice models).
     #[serde(default)]
     pub voice: Option<String>,
-    /// Language hint (e.g. "chinese", "english", "auto").
+    /// Language hint (e.g. "chinese", "english", "japanese", "auto").
     #[serde(default)]
     pub language: Option<String>,
     /// Optional system-level instructions.
@@ -353,6 +353,16 @@ pub struct SpeechRequest {
     /// Max codec tokens to generate (controls max duration).
     #[serde(default = "default_audio_max_tokens")]
     pub max_tokens: usize,
+
+    // ── Voice-clone fields (Base model only) ──────────────────
+
+    /// URL or local path to reference audio for voice cloning.
+    /// When set, triggers voice-clone mode (requires Base model).
+    #[serde(default)]
+    pub reference_audio: Option<String>,
+    /// Transcript of the reference audio (required for voice cloning).
+    #[serde(default)]
+    pub reference_text: Option<String>,
 }
 
 // ═════════════════════════════════════════════════════════════

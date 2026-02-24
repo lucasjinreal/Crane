@@ -93,13 +93,13 @@ cargo build -p crane-oai --release
 **Step 4 — Synthesize speech**
 
 ```bash
-# Generate WAV audio from text (saves to speech.wav)
+# Generate WAV audio from text (CustomVoice model — predefined speakers)
 curl http://localhost:8080/v1/audio/speech \
   -H "Content-Type: application/json" \
   -d '{
     "model": "Qwen3-TTS",
     "input": "今天天气真好，我们去公园吧！",
-    "voice": "Chelsie",
+    "voice": "Serena",
     "language": "chinese"
   }' \
   --output speech.wav
@@ -110,10 +110,22 @@ curl http://localhost:8080/v1/audio/speech \
   -d '{
     "model": "Qwen3-TTS",
     "input": "Hello, this is a test of the Qwen3-TTS model.",
-    "voice": "Chelsie",
+    "voice": "Ryan",
     "language": "english"
   }' \
   --output speech.wav
+
+# Voice cloning (Base model — reference audio + transcript)
+curl http://localhost:8080/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3-TTS",
+    "input": "そんな何もない今日が 少しだけでもいい日になったと思えたら",
+    "language": "japanese",
+    "reference_audio": "/path/to/reference.wav",
+    "reference_text": "Reference audio transcript goes here"
+  }' \
+  --output voice_clone.wav
 ```
 
 ## Qwen3-TTS
@@ -197,10 +209,37 @@ The model type is auto-detected from `config.json` — `--model-type qwen3_tts` 
 
 ### Model variants
 
-| Variant | HuggingFace ID | Description |
-|---------|---------------|-------------|
-| Base | `Qwen/Qwen3-TTS-12Hz-0.6B-Base` | Multi-speaker; select via `voice` field |
-| CustomVoice | `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` | Accepts custom speaker embeddings |
+| Variant | HuggingFace ID | Description | Voice selection |
+|---------|---------------|-------------|-----------------|
+| CustomVoice | `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` | Predefined speakers | `voice` field (e.g. "Serena") |
+| Base | `Qwen/Qwen3-TTS-12Hz-0.6B-Base` | Voice cloning via reference audio | `reference_audio` + `reference_text` |
+
+#### Voice cloning (Base model)
+
+The Base model supports in-context learning (ICL) voice cloning: given a reference audio clip and its transcript, the model synthesizes new text in the same voice.
+
+```bash
+# Voice-clone a Japanese sentence using a reference audio clip
+curl http://localhost:8080/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3-TTS",
+    "input": "こうして君に直接ありがとうを言える時間をくれたこと それが多分一番私は嬉しい",
+    "language": "japanese",
+    "reference_audio": "data/audio/kinsenka_3.wav",
+    "reference_text": "こうして君に直接ありがとうを言える時間をくれたこと それが多分一番私は嬉しい"
+  }' \
+  --output voice_clone.wav
+```
+
+**Voice-clone fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `reference_audio` | string | Local file path to reference WAV audio |
+| `reference_text` | string | Transcript of the reference audio (required) |
+
+> **Note:** When `reference_audio` is set, the model runs in voice-clone mode regardless of the `voice` field. The reference audio must be a WAV file. The `language` field should match the target text language.
 
 ### Speaker list (Base model)
 
@@ -215,17 +254,17 @@ for name in sorted(c['talker_config']['spk_id']):
 "
 ```
 
-Common built-in speakers include: `Chelsie`, `Ethan`, `Cherry`, `Serena`, `Dylan`, `Brenda`, and many more covering Chinese, English, Japanese, and Korean.
+Built-in speakers for the CustomVoice model include: `Serena`, `Vivian`, `Uncle_fu`, `Ryan`, `Aiden`, `Ono_anna`, `Sohee`, `Eric`, `Dylan`. Larger model variants may include additional speakers. Check your model's `config.json` for the full list.
 
 ### Generation parameters
 
-| Parameter | Recommended | Notes |
-|-----------|-------------|-------|
-| `temperature` | `0.6`–`0.9` | Lower = more stable prosody; higher = more expressive |
-| `max_tokens` | `1024`–`4096` | 12 tokens ≈ 1 second of audio at 12 Hz |
-| `repetition_penalty` | `1.0`–`1.05` | Helps avoid repeating codec tokens |
-| `top_p` | `null` or `0.95` | Nucleus sampling; usually not needed for TTS |
-| `language` | match input | Wrong language hint degrades quality |
+| Parameter | Default | Recommended | Notes |
+|-----------|---------|-------------|-------|
+| `temperature` | `0.9` | `0.7`–`0.9` | Lower = more stable prosody; higher = more expressive |
+| `max_tokens` | `8192` | `2048`–`8192` | 12 tokens ≈ 1 second of audio at 12 Hz |
+| `repetition_penalty` | `1.05` | `1.0`–`1.1` | Helps avoid repeating codec tokens |
+| `top_p` | `null` | `null` or `1.0` | Nucleus sampling; `1.0` matches reference defaults |
+| `language` | `auto` | match input | Wrong language hint degrades quality |
 
 ### Troubleshooting
 
@@ -329,7 +368,7 @@ Currently crane-oai runs on a single CUDA device (device 0). Multi-GPU tensor pa
 Synthesizes speech from text. Returns a WAV audio file (or raw PCM, depending on `response_format`).
 
 ```bash
-# Basic Chinese TTS
+# Basic Chinese TTS (CustomVoice)
 curl http://localhost:8080/v1/audio/speech \
   -H "Content-Type: application/json" \
   -d '{
@@ -353,6 +392,18 @@ curl http://localhost:8080/v1/audio/speech \
   }' \
   --output hello.wav
 
+# Voice cloning (Base model)
+curl http://localhost:8080/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3-TTS",
+    "input": "そんな何もない今日が 少しだけでもいい日になったと思えたら",
+    "language": "japanese",
+    "reference_audio": "data/audio/kinsenka_3.wav",
+    "reference_text": "こうして君に直接ありがとうを言える時間をくれたこと それが多分一番私は嬉しい"
+  }' \
+  --output voice_clone.wav
+
 # Auto-detect language
 curl http://localhost:8080/v1/audio/speech \
   -H "Content-Type: application/json" \
@@ -362,18 +413,6 @@ curl http://localhost:8080/v1/audio/speech \
     "language": "auto"
   }' \
   --output bilingual.wav
-
-# Custom system instructions
-curl http://localhost:8080/v1/audio/speech \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "Qwen3-TTS",
-    "input": "Welcome to our service.",
-    "voice": "Chelsie",
-    "language": "english",
-    "instructions": "Speak slowly and clearly with a warm, professional tone."
-  }' \
-  --output welcome.wav
 ```
 
 **Request fields:**
@@ -382,19 +421,21 @@ curl http://localhost:8080/v1/audio/speech \
 |-------|------|---------|-------------|
 | `model` | string | — | Model name (e.g. `"Qwen3-TTS"`) |
 | `input` | string | — | The text to synthesize. UTF-8, up to a few thousand characters |
-| `voice` | string | `null` | Speaker name. See speaker list below. `null` uses default voice |
+| `voice` | string | `null` | Speaker name (CustomVoice model). See speaker list below. `null` uses default voice |
 | `language` | string | `"auto"` | Language hint: `"chinese"`, `"english"`, `"japanese"`, `"korean"`, `"auto"` |
 | `instructions` | string | `null` | Optional system-level prompt to guide speaking style |
-| `response_format` | string | `"wav"` | Output audio format: `"wav"` or `"pcm"` (raw 16-bit LE at 24 kHz). `"mp3"`, `"opus"`, `"aac"`, `"flac"` accepted but return WAV |
+| `response_format` | string | `"wav"` | Output audio format: `"wav"` or `"pcm"` (raw 16-bit LE at 24 kHz). `"mp3"`, `"opus"`, `"aac"`, `"flac"` currently return `400` |
 | `speed` | float | `1.0` | Speaking speed multiplier (reserved, not yet applied to generation) |
-| `temperature` | float | `0.7` | Sampling temperature. Lower = more deterministic |
-| `top_p` | float | `null` | Nucleus sampling threshold |
-| `repetition_penalty` | float | `1.0` | Repetition penalty for codec token generation |
-| `max_tokens` | int | `4096` | Max codec tokens to generate. Controls maximum audio duration (~83 ms per token at 12 Hz) |
+| `temperature` | float | `0.9` | Sampling temperature. Lower = more deterministic |
+| `top_p` | float | `null` | Nucleus sampling threshold (default `null` = no nucleus filtering, equivalent to `1.0`) |
+| `repetition_penalty` | float | `1.05` | Repetition penalty for codec token generation |
+| `max_tokens` | int | `8192` | Max codec tokens to generate. Controls maximum audio duration (~83 ms per token at 12 Hz) |
+| `reference_audio` | string | `null` | Local path to reference WAV audio for voice cloning (Base model only) |
+| `reference_text` | string | `null` | Transcript of the reference audio (required when `reference_audio` is set) |
 
-**Response:** Binary audio bytes with `Content-Type: audio/wav`. Save directly to a `.wav` file.
+**Response:** Binary audio bytes with `Content-Type: audio/wav` (`response_format="wav"`) or `audio/pcm` (`response_format="pcm"`). Save WAV as `.wav`, or raw PCM as `.pcm`.
 
-**Approximate duration cap:** `max_tokens / 12` seconds (e.g. `4096` tokens ≈ 341 seconds).
+**Approximate duration cap:** `max_tokens / 12` seconds (e.g. `8192` tokens ≈ 683 seconds, `2048` ≈ 171 seconds).
 
 **Available speakers (Qwen3-TTS-12Hz-0.6B-Base):**
 
@@ -623,6 +664,8 @@ for chunk in stream:
 
 > Start crane-oai with `--model-type qwen3_tts` and a Qwen3-TTS checkpoint.
 
+**CustomVoice model (predefined speakers):**
+
 ```python
 from openai import OpenAI
 import pathlib
@@ -649,15 +692,31 @@ response = client.audio.speech.create(
     extra_body={"language": "english", "temperature": 0.7},
 )
 response.stream_to_file("english.wav")
+```
 
-# --- Access raw bytes directly ---
-wav_bytes = client.audio.speech.create(
+**Base model (voice cloning):**
+
+```python
+from openai import OpenAI
+import pathlib
+
+client = OpenAI(
+    base_url="http://localhost:8080/v1",
+    api_key="not-needed",
+)
+
+# --- Voice clone: synthesize new text in the reference speaker's voice ---
+response = client.audio.speech.create(
     model="Qwen3-TTS",
-    voice="Chelsie",
-    input="Hello world!",
-    extra_body={"language": "english"},
-).content  # bytes
-pathlib.Path("hello.wav").write_bytes(wav_bytes)
+    voice="clone",  # voice field is ignored in voice-clone mode
+    input="そんな何もない今日が 少しだけでもいい日になったと思えたら",
+    extra_body={
+        "language": "japanese",
+        "reference_audio": "data/audio/kinsenka_3.wav",
+        "reference_text": "こうして君に直接ありがとうを言える時間をくれたこと それが多分一番私は嬉しい",
+    },
+)
+response.stream_to_file("voice_clone.wav")
 ```
 
 **Low-level requests (requests library):**
@@ -665,6 +724,7 @@ pathlib.Path("hello.wav").write_bytes(wav_bytes)
 ```python
 import requests, pathlib
 
+# CustomVoice
 r = requests.post(
     "http://localhost:8080/v1/audio/speech",
     json={
@@ -679,6 +739,21 @@ r = requests.post(
 r.raise_for_status()
 pathlib.Path("speech.wav").write_bytes(r.content)
 print(f"Saved {len(r.content):,} bytes")
+
+# Voice clone
+r = requests.post(
+    "http://localhost:8080/v1/audio/speech",
+    json={
+        "model": "Qwen3-TTS",
+        "input": "こんにちは、今日はいい天気ですね。",
+        "language": "japanese",
+        "reference_audio": "data/audio/kinsenka_3.wav",
+        "reference_text": "Reference transcript here",
+        "max_tokens": 2048,
+    },
+)
+r.raise_for_status()
+pathlib.Path("voice_clone.wav").write_bytes(r.content)
 ```
 
 ## Source Structure

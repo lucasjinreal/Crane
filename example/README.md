@@ -11,6 +11,9 @@ This directory contains simple, user-friendly examples showing how to use the Cr
 
 ### Audio Examples
 - `asr_simple.rs`: Automatic Speech Recognition — transcribe audio to text (requires ONNX feature)
+- `tts_simple.rs`: TTS unified entry — auto-detects Base vs CustomVoice model
+- `tts_custom_voice.rs`: TTS with predefined speakers (CustomVoice model)
+- `tts_voice_clone.rs`: TTS voice cloning from reference audio (Base model)
 
 ### Vision Examples
 - `vision_simple.rs`: Vision capabilities — image analysis and OCR
@@ -36,7 +39,18 @@ cargo run --bin ocr_simple --release
 
 # Hunyuan Dense
 cargo run --bin hunyuan_simple --release
+
+# TTS — CustomVoice (predefined speakers)
+cargo run --bin tts_custom_voice --release -- vendor/Qwen3-TTS-12Hz-0.6B-CustomVoice
+
+# TTS — Voice Clone (reference audio)
+cargo run --bin tts_voice_clone --release -- vendor/Qwen3-TTS-12Hz-0.6B-Base
+
+# TTS — Auto-detect model type
+cargo run --bin tts_simple --release -- vendor/Qwen3-TTS-12Hz-0.6B-CustomVoice
 ```
+
+TTS examples write generated audio to `data/audio/output`.
 
 ## Prerequisites
 
@@ -53,13 +67,14 @@ Each example is designed to be simple and self-explanatory. Start with `chat_sim
 ```rust
 use crane::prelude::*;
 use crane::common::config::{CommonConfig, DataType, DeviceConfig};
-use crane::llm::GenerationConfig;
+use crane::llm::{GenerationConfig, LlmModelType};
 
 fn main() -> CraneResult<()> {
     // Create a simple chat configuration
     let config = ChatConfig {
         common: CommonConfig {
             model_path: "checkpoints/Qwen2.5-0.5B-Instruct".to_string(), // Update this path to your model
+            model_type: LlmModelType::Qwen25,
             device: DeviceConfig::Cpu, // Use DeviceConfig::Cuda(0) for GPU
             dtype: DataType::F16,
             max_memory: None,

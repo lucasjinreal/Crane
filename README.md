@@ -17,7 +17,7 @@ A high-performance inference framework leveraging Rust's Candle for maximum spee
 - [x] PaddleOCR VL 0.9B / 1.5
 - [x] Moonshine ASR
 - [x] Silero VAD
-- [x] 🎙️ Qwen3-TTS (12Hz, 24kHz, 16-codebook RVQGAN + native Candle decoder)
+- [x] 🎙️ Qwen3-TTS (12Hz, 24kHz, 16-codebook RVQGAN + native Candle decoder, voice cloning)
 - [ ] 🎙️ TTS: [Spark-TTS](https://github.com/SparkAudio/Spark-TTS) | [Orpheus-TTS](https://github.com/canopyai/Orpheus-TTS) (WIP)
 
 
@@ -55,7 +55,7 @@ We include:
 
 ## 🔥 Updates
 
-- **`2026.02.23`**: 🎙️ Qwen3-TTS support added — full Talker + Code Predictor transformer in Candle, native speech-tokenizer decoder (ONNX fallback), OpenAI `/v1/audio/speech` endpoint in crane-oai;
+- **`2026.02.23`**: 🎙️ Qwen3-TTS support added — full Talker + Code Predictor transformer in Candle, native speech-tokenizer decoder (ONNX fallback), voice cloning (Base model ICL), OpenAI `/v1/audio/speech` endpoint in crane-oai;
 - **`2026.02.18`**: ⚡ Qwen3 & Hunyuan Dense inference optimization: pre-allocated KV cache, GQA 4D matmul, fused RoPE with cache pre-growth, GGUF quantization, batched decode, smart sampling fallback for large vocabularies;
 - **`2026.01.30`**: PaddleOCR-VL-1.5 supported now! model: https://huggingface.co/PaddlePaddle/PaddleOCR-VL-1.5/;
 - **`2025.03.21`**: 🔥 Qwen2.5 a more transformers liked Rust interface were supported, you now use Crane just like in your python;
@@ -162,8 +162,6 @@ Above is all the codes you need to run end2end chat in Qwen2.5 in pure Rust, not
 
 Then, your LLM inference is 6X faster on mac without Quantization! Enabling Quantization could be even faster!
 
-![](data/aa.gif)
-
 For cli chat, run:
 
 ```
@@ -244,7 +242,27 @@ Supported endpoints:
 | Mgmt   | `GET /health` | Health check |
 | Mgmt   | `GET /v1/stats` | Engine statistics |
 
-✨ **Text-to-Speech (Qwen3-TTS)**: For TTS models, the server adds a `/v1/audio/speech` endpoint (OpenAI-compatible). See [crane-oai/README.md](crane-oai/README.md) for full TTS API documentation.
+✨ **Text-to-Speech (Qwen3-TTS)**: For TTS models, the server adds a `/v1/audio/speech` endpoint (OpenAI-compatible). Both **CustomVoice** (predefined speakers) and **Base** (voice cloning via reference audio) models are supported. `response_format` currently supports `wav` and `pcm` (other formats return `400`). See [crane-oai/README.md](crane-oai/README.md) for full TTS API documentation.
+
+### TTS Examples
+
+```bash
+# CustomVoice — predefined speakers
+cargo run --bin tts_custom_voice --release -- vendor/Qwen3-TTS-12Hz-0.6B-CustomVoice
+
+# Voice Clone — clone speech from reference audio (Base model)
+cargo run --bin tts_voice_clone --release -- vendor/Qwen3-TTS-12Hz-0.6B-Base
+
+# Auto-detect model type
+cargo run --bin tts_simple --release -- vendor/Qwen3-TTS-12Hz-0.6B-Base
+```
+
+All TTS examples save generated audio files to `data/audio/output`.
+
+### TTS Audio Samples
+
+- Base (voice clone): [vc1_base.wav](data/audio/output/vc1_base.wav), [vc2_base.wav](data/audio/output/vc2_base.wav)
+- CustomVoice: [custom_voice_zh.wav](data/audio/output/custom_voice_zh.wav), [custom_voice_en.wav](data/audio/output/custom_voice_en.wav), [custom_voice_ja.wav](data/audio/output/custom_voice_ja.wav)
 
 ✨ **Multimodal & Vision support**: For models like PaddleOCR-VL, the endpoints accept OpenAI's structured `messages.[]content.[{type: "image_url", image_url: {url: "..."}}]` payload or SGLang's `image_url` field. See [crane-oai/README.md](crane-oai/README.md) for full API documentation with request/response examples.
 
@@ -264,7 +282,7 @@ Crane/
 │       ├── openai_api.rs # OpenAI request/response types
 │       ├── sglang_api.rs # SGLang API types
 │       └── main.rs      # CLI entry point & router
-├── example/             # Example binaries (chat, ASR, vision, OCR)
+├── example/             # Example binaries (chat, ASR, vision, OCR, TTS)
 ├── vendor/              # Vendored references (llama.cpp, sglang, vllm)
 └── scripts/             # Utility scripts
 ```
