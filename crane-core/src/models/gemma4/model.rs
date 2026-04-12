@@ -19,6 +19,17 @@ use crate::generation::GenerationConfig;
 use crate::utils::token_output_stream::TokenOutputStream;
 use crate::utils::utils;
 
+/// Format of model weights on disk.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ModelFormat {
+    /// Auto-detect from path (default).
+    Auto,
+    /// Standard HuggingFace safetensors.
+    Safetensors,
+    /// GGUF quantized format.
+    Gguf,
+}
+
 pub struct Model {
     pub tokenizer: TokenOutputStream,
     pub device: Device,
@@ -28,7 +39,35 @@ pub struct Model {
 
 impl Model {
     pub fn new(model_path: &str, device: &Device, dtype: &DType) -> Result<Self> {
-        Self::from_pretrained(model_path, device, dtype)
+        Self::new_with_format(model_path, device, dtype, ModelFormat::Auto)
+    }
+
+    pub fn new_with_format(
+        model_path: &str,
+        device: &Device,
+        dtype: &DType,
+        format: ModelFormat,
+    ) -> Result<Self> {
+        let format = match format {
+            ModelFormat::Auto => {
+                let p = std::path::Path::new(model_path);
+                if p.is_file()
+                    && p.extension()
+                        .map(|e| e == "gguf")
+                        .unwrap_or(false)
+                {
+                    ModelFormat::Gguf
+                } else {
+                    ModelFormat::Safetensors
+                }
+            }
+            other => other,
+        };
+
+        match format {
+            ModelFormat::Gguf | ModelFormat::Auto => Self::from_gguf(model_path, device),
+            ModelFormat::Safetensors => Self::from_pretrained(model_path, device, dtype),
+        }
     }
 
     fn forward(&mut self, xs: &Tensor, s: usize) -> candle_core::Result<Tensor> {
@@ -67,6 +106,56 @@ impl Model {
             tokenizer: TokenOutputStream::new(tokenizer),
             device: device.clone(),
             dtype: *dtype,
+            inner,
+        })
+    }
+
+    /// Load a GGUF quantized model file.
+    fn from_gguf(model_path: &str, device: &Device) -> Result<Model> {
+        let gguf_path = std::path::Path::new(model_path);
+
+        let tokenizer_path = {
+            let same_dir = gguf_path
+                .parent()
+                .unwrap_or(gguf_path)
+                .join("tokenizer.json");
+            if same_dir.exists() {
+                same_dir
+            } else {
+                let parent = gguf_path
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .unwrap_or(gguf_path)
+                    .join("tokenizer.json");
+                if parent.exists() {
+                    parent
+                } else {
+                    anyhow::bail!(
+                        "Cannot find tokenizer.json near {}. \
+                         Place tokenizer.json in the same directory as the GGUF file.",
+                        gguf_path.display()
+                    );
+                }
+            }
+        };
+        let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(E::msg)?;
+
+        let mut file = std::fs::File::open(gguf_path)?;
+        let ct = candle_core::quantized::gguf_file::Content::read(&mut file)?;
+
+        eprintln!(
+            "GGUF loaded: {} tensors, {} metadata entries",
+            ct.tensor_infos.len(),
+            ct.metadata.len(),
+        );
+
+        let inner = Gemma4Model::from_gguf(ct, &mut file, device)?;
+        let dtype = inner.model_dtype();
+
+        Ok(Self {
+            tokenizer: TokenOutputStream::new(tokenizer),
+            device: device.clone(),
+            dtype,
             inner,
         })
     }

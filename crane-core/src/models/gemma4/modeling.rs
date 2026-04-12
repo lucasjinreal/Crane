@@ -14,12 +14,19 @@
 //! 6. **Logit softcapping** — `tanh(logits / cap) * cap` before output.
 //! 7. **Pre-allocated KV cache** with in-place `slice_set` writes.
 //! 8. **GQA-grouped SDPA** for decode (seq_len=1).
+//! 9. **GGUF quantization** via the polymorphic `LinearLayer` enum
+//!    — Same model code serves both safetensors (f16/f32/bf16) and GGUF weights.
 
+use candle_core::quantized::gguf_file;
 use candle_core::{DType, Device, Module, Result, Tensor, D};
 use candle_nn::rotary_emb::rope;
 use candle_nn::{linear_no_bias, Embedding, Linear, RmsNorm, VarBuilder};
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::io::{Read, Seek};
+
+// Reuse the polymorphic linear layer and GGUF loader from the shared Hunyuan module.
+pub use crate::models::hunyuan_dense::modeling::{Gguf, LinearLayer};
 
 // ── Event-tracking RAII guard ────────────────────────────────────────────
 
@@ -121,7 +128,7 @@ impl Gemma4TextConfig {
     }
 
     /// First shared layer index.
-    fn first_kv_shared_layer(&self) -> usize {
+    pub fn first_kv_shared_layer(&self) -> usize {
         let n_shared = self.num_kv_shared_layers.unwrap_or(0);
         self.num_hidden_layers.saturating_sub(n_shared)
     }
@@ -229,10 +236,10 @@ fn apply_partial_rope(
 // ── Attention ───────────────────────────────────────────────────────────
 
 struct Attention {
-    q_proj: Linear,
-    k_proj: Option<Linear>,
-    v_proj: Option<Linear>,
-    o_proj: Linear,
+    q_proj: LinearLayer,
+    k_proj: Option<LinearLayer>,
+    v_proj: Option<LinearLayer>,
+    o_proj: LinearLayer,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -256,17 +263,33 @@ impl Attention {
         let num_heads = config.num_attention_heads;
         let num_kv_heads = config.num_key_value_heads;
 
-        let q_proj = linear_no_bias(config.hidden_size, num_heads * head_dim, vb.pp("q_proj"))?;
+        let q_proj = LinearLayer::Standard(linear_no_bias(
+            config.hidden_size,
+            num_heads * head_dim,
+            vb.pp("q_proj"),
+        )?);
 
         let (k_proj, v_proj) = if is_shared {
             (None, None)
         } else {
-            let k = linear_no_bias(config.hidden_size, num_kv_heads * head_dim, vb.pp("k_proj"))?;
-            let v = linear_no_bias(config.hidden_size, num_kv_heads * head_dim, vb.pp("v_proj"))?;
+            let k = LinearLayer::Standard(linear_no_bias(
+                config.hidden_size,
+                num_kv_heads * head_dim,
+                vb.pp("k_proj"),
+            )?);
+            let v = LinearLayer::Standard(linear_no_bias(
+                config.hidden_size,
+                num_kv_heads * head_dim,
+                vb.pp("v_proj"),
+            )?);
             (Some(k), Some(v))
         };
 
-        let o_proj = linear_no_bias(num_heads * head_dim, config.hidden_size, vb.pp("o_proj"))?;
+        let o_proj = LinearLayer::Standard(linear_no_bias(
+            num_heads * head_dim,
+            config.hidden_size,
+            vb.pp("o_proj"),
+        )?);
 
         Ok(Self {
             q_proj,
@@ -277,7 +300,45 @@ impl Attention {
             num_kv_heads,
             head_dim,
             is_shared,
-            kv_shared_layer_index: None, // set by Model after construction
+            kv_shared_layer_index: None,
+            kv_cache: None,
+            cache_seq_len: 0,
+        })
+    }
+
+    /// Construct from GGUF quantized weights.
+    fn new_from_gguf<R: Read + Seek>(
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        is_shared: bool,
+        gg: &mut Gguf<R>,
+        layer_idx: usize,
+    ) -> Result<Self> {
+        let prefix = format!("blk.{layer_idx}");
+
+        let q_proj = gg.linear(&format!("{prefix}.attn_q.weight"))?;
+
+        let (k_proj, v_proj) = if is_shared {
+            (None, None)
+        } else {
+            let k = gg.linear(&format!("{prefix}.attn_k.weight"))?;
+            let v = gg.linear(&format!("{prefix}.attn_v.weight"))?;
+            (Some(k), Some(v))
+        };
+
+        let o_proj = gg.linear(&format!("{prefix}.attn_output.weight"))?;
+
+        Ok(Self {
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            is_shared,
+            kv_shared_layer_index: None,
             kv_cache: None,
             cache_seq_len: 0,
         })
@@ -476,29 +537,44 @@ impl Attention {
 // ── MLP ─────────────────────────────────────────────────────────────────
 
 struct Mlp {
-    gate_proj: Linear,
-    up_proj: Linear,
-    down_proj: Linear,
+    gate_proj: LinearLayer,
+    up_proj: LinearLayer,
+    down_proj: LinearLayer,
 }
 
 impl Mlp {
     fn new(config: &Gemma4TextConfig, vb: VarBuilder) -> Result<Self> {
-        let gate_proj = linear_no_bias(
+        let gate_proj = LinearLayer::Standard(linear_no_bias(
             config.hidden_size,
             config.intermediate_size,
             vb.pp("gate_proj"),
-        )?;
-        let up_proj = linear_no_bias(
+        )?);
+        let up_proj = LinearLayer::Standard(linear_no_bias(
             config.hidden_size,
             config.intermediate_size,
             vb.pp("up_proj"),
-        )?;
-        let down_proj = linear_no_bias(
+        )?);
+        let down_proj = LinearLayer::Standard(linear_no_bias(
             config.intermediate_size,
             config.hidden_size,
             vb.pp("down_proj"),
-        )?;
+        )?);
 
+        Ok(Self {
+            gate_proj,
+            up_proj,
+            down_proj,
+        })
+    }
+
+    fn new_from_gguf<R: Read + Seek>(
+        gg: &mut Gguf<R>,
+        layer_idx: usize,
+    ) -> Result<Self> {
+        let prefix = format!("blk.{layer_idx}");
+        let gate_proj = gg.linear(&format!("{prefix}.ffn_gate.weight"))?;
+        let up_proj = gg.linear(&format!("{prefix}.ffn_up.weight"))?;
+        let down_proj = gg.linear(&format!("{prefix}.ffn_down.weight"))?;
         Ok(Self {
             gate_proj,
             up_proj,
@@ -522,8 +598,8 @@ struct DecoderLayer {
     input_layernorm: RmsNorm,
     post_attention_layernorm: RmsNorm,
     // PLE components (per-layer)
-    per_layer_input_gate: Linear,
-    per_layer_projection: Linear,
+    per_layer_input_gate: LinearLayer,
+    per_layer_projection: LinearLayer,
     post_per_layer_input_norm: RmsNorm,
     layer_type: LayerType,
 }
@@ -551,12 +627,63 @@ impl DecoderLayer {
 
         let ple_dim = config.hidden_size_per_layer_input.unwrap_or(256);
 
-        let per_layer_input_gate =
-            linear_no_bias(config.hidden_size, ple_dim, vb.pp("per_layer_input_gate"))?;
-        let per_layer_projection =
-            linear_no_bias(ple_dim, config.hidden_size, vb.pp("per_layer_projection"))?;
+        let per_layer_input_gate = LinearLayer::Standard(linear_no_bias(
+            config.hidden_size,
+            ple_dim,
+            vb.pp("per_layer_input_gate"),
+        )?);
+        let per_layer_projection = LinearLayer::Standard(linear_no_bias(
+            ple_dim,
+            config.hidden_size,
+            vb.pp("per_layer_projection"),
+        )?);
         let post_per_layer_input_norm =
             candle_nn::rms_norm(ple_dim, config.rms_norm_eps, vb.pp("post_per_layer_input_norm"))?;
+
+        Ok(Self {
+            self_attn,
+            mlp,
+            input_layernorm,
+            post_attention_layernorm,
+            per_layer_input_gate,
+            per_layer_projection,
+            post_per_layer_input_norm,
+            layer_type,
+        })
+    }
+
+    fn new_from_gguf<R: Read + Seek>(
+        config: &Gemma4TextConfig,
+        layer_type: LayerType,
+        is_shared: bool,
+        head_dim: usize,
+        gg: &mut Gguf<R>,
+        layer_idx: usize,
+    ) -> Result<Self> {
+        let self_attn = Attention::new_from_gguf(
+            config.num_attention_heads,
+            config.num_key_value_heads,
+            head_dim,
+            is_shared,
+            gg,
+            layer_idx,
+        )?;
+        let mlp = Mlp::new_from_gguf(gg, layer_idx)?;
+        let prefix = format!("blk.{layer_idx}");
+
+        let input_layernorm =
+            gg.rms_norm(&format!("{prefix}.attn_norm.weight"), config.rms_norm_eps)?;
+        let post_attention_layernorm =
+            gg.rms_norm(&format!("{prefix}.ffn_norm.weight"), config.rms_norm_eps)?;
+
+        // PLE components
+        let per_layer_input_gate = gg.linear(&format!("{prefix}.inp_gate.weight"))?;
+        let per_layer_projection = gg.linear(&format!("{prefix}.proj.weight"))?;
+        let ple_dim = config.hidden_size_per_layer_input.unwrap_or(256);
+        let post_per_layer_input_norm =
+            gg.rms_norm(&format!("{prefix}.post_norm.weight"), config.rms_norm_eps)?;
+
+        let _ = ple_dim; // used for documentation only in GGUF path
 
         Ok(Self {
             self_attn,
@@ -625,7 +752,7 @@ pub struct Gemma4Model {
     embed_tokens_per_layer: Embedding,
     layers: Vec<DecoderLayer>,
     norm: RmsNorm,
-    lm_head: Linear,
+    lm_head: LinearLayer,
     rotary_sliding: RotaryEmbedding,
     rotary_full: RotaryEmbedding,
     layer_types: Vec<LayerType>,
@@ -638,6 +765,7 @@ pub struct Gemma4Model {
 }
 
 impl Gemma4Model {
+    /// Construct from safetensors / HuggingFace checkpoint.
     pub fn new(config: &Gemma4TextConfig, vb: VarBuilder) -> Result<Self> {
         let dtype = vb.dtype();
         let model_vb = vb.pp("model");
@@ -668,7 +796,6 @@ impl Gemma4Model {
             let lt = layer_types[i];
             let is_shared = i >= first_shared;
             layers.push(DecoderLayer::new(config, lt, is_shared, layers_vb.pp(i))?);
-            // Set the KV shared layer index
             if let Some(source) = kv_sharing_map[i] {
                 layers[i].self_attn.kv_shared_layer_index = Some(source);
             }
@@ -682,12 +809,280 @@ impl Gemma4Model {
 
         // Tied embeddings: lm_head uses embed_tokens weights
         let lm_head = if config.tie_word_embeddings {
-            Linear::new(embed_tokens.embeddings().clone(), None)
+            LinearLayer::Standard(Linear::new(embed_tokens.embeddings().clone(), None))
         } else {
-            linear_no_bias(config.hidden_size, config.vocab_size, vb.pp("lm_head"))?
+            LinearLayer::Standard(linear_no_bias(
+                config.hidden_size,
+                config.vocab_size,
+                vb.pp("lm_head"),
+            )?)
         };
 
-        // Dual RoPE
+        let (rotary_sliding, rotary_full, full_rotated_dim) =
+            Self::build_rotary_embeddings(config, vb.device())?;
+
+        let embed_scale = (config.hidden_size as f64).sqrt();
+        let sliding_window = config.sliding_window.unwrap_or(512);
+
+        Ok(Self {
+            embed_tokens,
+            embed_tokens_per_layer,
+            layers,
+            norm,
+            lm_head,
+            rotary_sliding,
+            rotary_full,
+            layer_types,
+            kv_sharing_map,
+            config: config.clone(),
+            dtype,
+            embed_scale,
+            sliding_window,
+            full_rotated_dim,
+        })
+    }
+
+    /// Construct from a GGUF file.
+    pub fn from_gguf<R: Read + Seek>(
+        ct: gguf_file::Content,
+        reader: &mut R,
+        device: &Device,
+    ) -> Result<Self> {
+        let dtype = if device.is_cuda() {
+            DType::BF16
+        } else {
+            DType::F32
+        };
+        let mut gg = Gguf::new(ct, reader, device.clone(), dtype);
+        let md_get = |s: &str| match gg.metadata().get(s) {
+            None => candle_core::bail!("cannot find {s} in GGUF metadata"),
+            Some(v) => Ok(v.clone()),
+        };
+
+        let arch = gg
+            .metadata()
+            .get("general.architecture")
+            .and_then(|v| v.to_string().ok())
+            .map(|s| s.clone())
+            .unwrap_or_else(|| "gemma4".to_string());
+
+        // ── Read config from GGUF metadata ──
+        let num_attention_heads =
+            md_get(&format!("{arch}.attention.head_count"))?.to_u32()? as usize;
+        let num_kv_heads =
+            md_get(&format!("{arch}.attention.head_count_kv"))?.to_u32()? as usize;
+        let num_hidden_layers = md_get(&format!("{arch}.block_count"))?.to_u32()? as usize;
+        let hidden_size = md_get(&format!("{arch}.embedding_length"))?.to_u32()? as usize;
+        let intermediate_size =
+            md_get(&format!("{arch}.feed_forward_length"))?.to_u32()? as usize;
+        let max_position_embeddings = gg
+            .metadata()
+            .get(&format!("{arch}.context_length"))
+            .and_then(|v| v.to_u32().ok())
+            .unwrap_or(131072) as usize;
+        let rms_norm_eps = gg
+            .metadata()
+            .get(&format!("{arch}.attention.layer_norm_rms_epsilon"))
+            .and_then(|v| v.to_f32().ok())
+            .unwrap_or(1e-6) as f64;
+        let rope_theta = gg
+            .metadata()
+            .get(&format!("{arch}.rope.freq_base"))
+            .and_then(|v| v.to_f32().ok())
+            .unwrap_or(1_000_000.0) as f64;
+
+        // Gemma4-specific: dual head_dim
+        let global_head_dim = gg
+            .metadata()
+            .get(&format!("{arch}.attention.key_length"))
+            .and_then(|v| v.to_u32().ok())
+            .unwrap_or(512) as usize;
+        let swa_head_dim = gg
+            .metadata()
+            .get(&format!("{arch}.attention.key_length_swa"))
+            .and_then(|v| v.to_u32().ok())
+            .unwrap_or(256) as usize;
+
+        // KV sharing
+        let num_kv_shared_layers = gg
+            .metadata()
+            .get(&format!("{arch}.attention.shared_kv_layers"))
+            .and_then(|v| v.to_u32().ok())
+            .unwrap_or(0) as usize;
+
+        // PLE dimension
+        let ple_dim = gg
+            .metadata()
+            .get(&format!("{arch}.embedding_length_per_layer_input"))
+            .and_then(|v| v.to_u32().ok())
+            .unwrap_or(256) as usize;
+
+        // Sliding window
+        let sliding_window = gg
+            .metadata()
+            .get(&format!("{arch}.attention.sliding_window"))
+            .and_then(|v| v.to_u32().ok())
+            .unwrap_or(512) as usize;
+
+        // Logit softcapping
+        let final_logit_softcapping = gg
+            .metadata()
+            .get(&format!("{arch}.final_logit_softcapping"))
+            .and_then(|v| v.to_f32().ok());
+
+        // Layer types from sliding_window_pattern (bool array: true=sliding, false=full)
+        let layer_types_str: Vec<String> = if let Some(gguf_file::Value::Array(arr)) = gg
+            .metadata()
+            .get(&format!("{arch}.attention.sliding_window_pattern"))
+        {
+            arr.iter()
+                .map(|v| {
+                    let is_swa = match v {
+                        gguf_file::Value::Bool(b) => *b,
+                        gguf_file::Value::U8(n) => *n != 0,
+                        gguf_file::Value::I8(n) => *n != 0,
+                        _ => true,
+                    };
+                    if is_swa {
+                        "sliding_attention".to_string()
+                    } else {
+                        "full_attention".to_string()
+                    }
+                })
+                .collect()
+        } else {
+            // Fallback: infer from E2B pattern [S,S,S,S,F] repeating
+            (0..num_hidden_layers)
+                .map(|i| {
+                    if i % 5 == 4 {
+                        "full_attention".to_string()
+                    } else {
+                        "sliding_attention".to_string()
+                    }
+                })
+                .collect()
+        };
+
+        let tie_word_embeddings = !gg.ct.tensor_infos.contains_key("output.weight");
+
+        // Build config
+        let config = Gemma4TextConfig {
+            vocab_size: 0, // updated below
+            hidden_size,
+            intermediate_size,
+            num_hidden_layers,
+            num_attention_heads,
+            num_key_value_heads: num_kv_heads,
+            head_dim: swa_head_dim,
+            global_head_dim: Some(global_head_dim),
+            max_position_embeddings,
+            rms_norm_eps,
+            hidden_activation: Some("gelu_pytorch_tanh".to_string()),
+            use_double_wide_mlp: false,
+            tie_word_embeddings,
+            sliding_window: Some(sliding_window),
+            final_logit_softcapping,
+            hidden_size_per_layer_input: Some(ple_dim),
+            vocab_size_per_layer_input: None, // set from actual embedding
+            num_kv_shared_layers: Some(num_kv_shared_layers),
+            layer_types: layer_types_str,
+            rope_parameters: None, // RoPE is configured via GGUF metadata directly
+            eos_token_id: None,
+        };
+
+        // ── Load weights ──
+        let embed_tokens = gg.embedding("token_embd.weight", hidden_size)?;
+        let actual_vocab_size = embed_tokens.embeddings().dim(0)?;
+
+        let ple_total_dim = num_hidden_layers * ple_dim;
+        let embed_tokens_per_layer = gg.embedding("per_layer_token_embd.weight", ple_total_dim)?;
+        let ple_vocab = embed_tokens_per_layer.embeddings().dim(0)?;
+
+        let config = Gemma4TextConfig {
+            vocab_size: actual_vocab_size,
+            vocab_size_per_layer_input: Some(ple_vocab),
+            ..config
+        };
+
+        let layer_types = config.parsed_layer_types();
+        let kv_sharing_map = config.kv_sharing_map();
+        let first_shared = config.first_kv_shared_layer();
+
+        let mut layers = Vec::with_capacity(num_hidden_layers);
+        for i in 0..num_hidden_layers {
+            let lt = layer_types[i];
+            let is_shared = i >= first_shared;
+            let head_dim = match lt {
+                LayerType::SlidingAttention => swa_head_dim,
+                LayerType::FullAttention => global_head_dim,
+            };
+            layers.push(DecoderLayer::new_from_gguf(
+                &config, lt, is_shared, head_dim, &mut gg, i,
+            )?);
+            if let Some(source) = kv_sharing_map[i] {
+                layers[i].self_attn.kv_shared_layer_index = Some(source);
+            }
+        }
+
+        let norm = gg.rms_norm("output_norm.weight", rms_norm_eps)?;
+
+        let lm_head = if tie_word_embeddings {
+            LinearLayer::Standard(Linear::new(embed_tokens.embeddings().clone(), None))
+        } else {
+            gg.linear("output.weight")?
+        };
+
+        // ── Dual RoPE ──
+        // For GGUF, rope_theta from metadata is the full-attention theta.
+        // Sliding attention theta defaults to 10K.
+        let sliding_theta = 10_000.0;
+        let full_theta = rope_theta;
+
+        // Partial rotation for full-attention: from rope_dimension_count metadata
+        let full_rotated_dim = gg
+            .metadata()
+            .get(&format!("{arch}.rope.dimension_count"))
+            .and_then(|v| v.to_u32().ok())
+            .unwrap_or((global_head_dim / 4) as u32) as usize;
+
+        let rotary_sliding = RotaryEmbedding::new(
+            sliding_theta,
+            swa_head_dim,
+            max_position_embeddings,
+            device,
+        )?;
+        let rotary_full = RotaryEmbedding::new(
+            full_theta,
+            full_rotated_dim,
+            max_position_embeddings,
+            device,
+        )?;
+
+        let embed_scale = (hidden_size as f64).sqrt();
+
+        Ok(Self {
+            embed_tokens,
+            embed_tokens_per_layer,
+            layers,
+            norm,
+            lm_head,
+            rotary_sliding,
+            rotary_full,
+            layer_types,
+            kv_sharing_map,
+            config,
+            dtype,
+            embed_scale,
+            sliding_window,
+            full_rotated_dim,
+        })
+    }
+
+    /// Build dual rotary embeddings from config.
+    fn build_rotary_embeddings(
+        config: &Gemma4TextConfig,
+        device: &Device,
+    ) -> Result<(RotaryEmbedding, RotaryEmbedding, usize)> {
         let sliding_theta = config
             .rope_parameters
             .as_ref()
@@ -711,35 +1106,19 @@ impl Gemma4Model {
             sliding_theta,
             config.head_dim,
             config.max_position_embeddings,
-            vb.device(),
+            device,
         )?;
         let rotary_full = RotaryEmbedding::new(
             full_theta,
             full_rotated_dim,
             config.max_position_embeddings,
-            vb.device(),
+            device,
         )?;
 
-        let embed_scale = (config.hidden_size as f64).sqrt();
-        let sliding_window = config.sliding_window.unwrap_or(512);
-
-        Ok(Self {
-            embed_tokens,
-            embed_tokens_per_layer,
-            layers,
-            norm,
-            lm_head,
-            rotary_sliding,
-            rotary_full,
-            layer_types,
-            kv_sharing_map,
-            config: config.clone(),
-            dtype,
-            embed_scale,
-            sliding_window,
-            full_rotated_dim,
-        })
+        Ok((rotary_sliding, rotary_full, full_rotated_dim))
     }
+
+    // ── Forward ─────────────────────────────────────────────────────────
 
     pub fn forward(&mut self, input_ids: &Tensor, start_pos: usize) -> Result<Tensor> {
         let (_b_sz, seq_len) = input_ids.dims2()?;
@@ -757,7 +1136,6 @@ impl Gemma4Model {
             .embed_tokens_per_layer
             .forward(input_ids)?
             .to_dtype(self.dtype)?;
-        // Shape: [B, S, num_layers * ple_dim] → we'll narrow per layer
 
         // RoPE tables
         let total_len = start_pos + seq_len;
@@ -790,15 +1168,13 @@ impl Gemma4Model {
             None
         };
 
-        // Collect shared KV states from non-shared layers
-        // We need to do the forward pass layer by layer, collecting KV states as we go
+        // Forward pass through layers, collecting shared KV states as we go
         let mut hidden_states = hidden_states;
         let mut shared_kv_states: HashMap<usize, (Tensor, Tensor)> = HashMap::new();
 
         for i in 0..self.layers.len() {
             let lt = self.layer_types[i];
 
-            // Select RoPE and mask based on layer type
             let (cos, sin, mask) = match lt {
                 LayerType::SlidingAttention => {
                     (&cos_sliding, &sin_sliding, sliding_mask.as_ref())
@@ -811,10 +1187,8 @@ impl Gemma4Model {
                 LayerType::SlidingAttention => None,
             };
 
-            // Get shared KV if this is a shared layer
             let shared_kv = self.kv_sharing_map[i].and_then(|src| shared_kv_states.get(&src));
 
-            // PLE input for this layer
             let ple_input = per_layer_embeds.narrow(D::Minus1, i * ple_dim, ple_dim)?;
 
             hidden_states = self.layers[i].forward(
@@ -827,7 +1201,7 @@ impl Gemma4Model {
                 shared_kv,
             )?;
 
-            // Store KV state from non-shared layers for later shared layers to use
+            // Store KV state from non-shared layers for later shared layers
             if self.kv_sharing_map[i].is_none() {
                 if let Some((ref buf_k, ref buf_v)) = self.layers[i].self_attn.kv_cache {
                     let len = self.layers[i].self_attn.cache_seq_len;

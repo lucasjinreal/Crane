@@ -133,8 +133,14 @@ pub struct Gemma4Backend {
 }
 
 impl Gemma4Backend {
-    pub fn new(model_path: &str, device: &Device, dtype: &DType) -> Result<Self> {
-        let model = crane_core::models::gemma4::Model::new(model_path, device, dtype)?;
+    pub fn new(
+        model_path: &str,
+        device: &Device,
+        dtype: &DType,
+        format: crane_core::models::gemma4::ModelFormat,
+    ) -> Result<Self> {
+        let model =
+            crane_core::models::gemma4::Model::new_with_format(model_path, device, dtype, format)?;
         Ok(Self {
             model,
             dtype: *dtype,

@@ -202,7 +202,14 @@ pub fn create_backend(
             };
             Ok(Box::new(HunyuanBackend::new(model_path, device, dtype, hy_fmt)?))
         }
-        ModelType::Gemma4 => Ok(Box::new(Gemma4Backend::new(model_path, device, dtype)?)),
+        ModelType::Gemma4 => {
+            let g4_fmt = match format {
+                ModelFormat::Safetensors => crane_core::models::gemma4::ModelFormat::Safetensors,
+                ModelFormat::Gguf => crane_core::models::gemma4::ModelFormat::Gguf,
+                ModelFormat::Auto => crane_core::models::gemma4::ModelFormat::Auto,
+            };
+            Ok(Box::new(Gemma4Backend::new(model_path, device, dtype, g4_fmt)?))
+        }
         ModelType::Qwen25 => Ok(Box::new(Qwen25Backend::new(model_path, device, dtype)?)),
         ModelType::Qwen3 => Ok(Box::new(Qwen3Backend::new(model_path, device, dtype)?)),
         ModelType::PaddleOcrVl => {
