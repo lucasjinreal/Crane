@@ -242,6 +242,16 @@ fn apply_partial_rope(
     ))
 }
 
+/// RMS normalization without learnable scale (Gemma4's v_norm uses with_scale=False).
+fn rms_normalize(x: &Tensor, eps: f64) -> Result<Tensor> {
+    let dtype = x.dtype();
+    let x_f32 = x.to_dtype(DType::F32)?;
+    let variance = x_f32.sqr()?.mean_keepdim(D::Minus1)?;
+    let rms = (variance + eps)?.sqrt()?;
+    let normed = x_f32.broadcast_div(&rms)?;
+    normed.to_dtype(dtype)
+}
+
 // ── Attention ───────────────────────────────────────────────────────────
 
 struct Attention {
@@ -251,6 +261,7 @@ struct Attention {
     o_proj: LinearLayer,
     q_norm: RmsNorm,
     k_norm: Option<RmsNorm>,
+    rms_norm_eps: f64,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -313,6 +324,7 @@ impl Attention {
             o_proj,
             q_norm,
             k_norm,
+            rms_norm_eps: config.rms_norm_eps,
             num_heads,
             num_kv_heads,
             head_dim,
@@ -355,6 +367,7 @@ impl Attention {
             o_proj,
             q_norm,
             k_norm,
+            rms_norm_eps,
             num_heads,
             num_kv_heads,
             head_dim,
@@ -454,6 +467,8 @@ impl Attention {
                 .transpose(1, 2)?;
             // k_norm applied before RoPE
             let k = self.k_norm.as_ref().unwrap().forward(&k)?;
+            // v_norm: RMS normalization without learnable scale (with_scale=False in HF)
+            let v = rms_normalize(&v, self.rms_norm_eps)?;
             (k, v)
         };
 
