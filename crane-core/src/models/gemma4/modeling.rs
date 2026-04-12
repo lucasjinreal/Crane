@@ -30,28 +30,22 @@ use std::io::{Read, Seek};
 // Reuse the polymorphic linear layer and GGUF loader from the shared Hunyuan module.
 pub use crate::models::hunyuan_dense::modeling::{Gguf, LinearLayer};
 
-/// Create an RmsNorm with Gemma-style weight shift.
+/// Create an RmsNorm for Gemma 4.
 ///
-/// Gemma's RMSNorm uses `output = x * (1 + weight)` instead of `output = x * weight`.
-/// Weights in HF checkpoints are stored as the raw trained values (initialized near 0),
-/// so we add 1.0 to convert them for candle's standard `x * weight` formula.
+/// Gemma 3 RMSNorm uses `output = x * (1 + weight)` with weights initialized near 0.
+/// Gemma 4 stores weights that already include any shift (norm_shift=0 in GGUF converter),
+/// so we use standard `x * weight` — no additional shift needed.
 fn gemma_rms_norm(size: usize, eps: f64, vb: VarBuilder) -> Result<RmsNorm> {
-    let weight = vb.get(size, "weight")?;
-    let shifted = (weight + 1.0)?;
-    Ok(RmsNorm::new(shifted, eps))
+    candle_nn::rms_norm(size, eps, vb)
 }
 
-/// Same shift for GGUF norms: Gemma4 stores raw weights (norm_shift=0),
-/// so we must add 1.0 for the `x * weight` formula.
+/// GGUF variant — weights are stored as-is, no shift needed for Gemma 4.
 fn gemma_rms_norm_gguf<R: Read + Seek>(
     gg: &mut Gguf<R>,
     name: &str,
     eps: f64,
 ) -> Result<RmsNorm> {
-    let norm = gg.rms_norm(name, eps)?;
-    let weight = norm.into_inner().weight().clone();
-    let shifted = (weight + 1.0)?;
-    Ok(RmsNorm::new(shifted, eps))
+    gg.rms_norm(name, eps)
 }
 
 // ── Event-tracking RAII guard ────────────────────────────────────────────
