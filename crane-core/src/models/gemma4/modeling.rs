@@ -731,14 +731,14 @@ impl DecoderLayer {
         let input_layernorm =
             gemma_rms_norm_gguf(gg, &format!("{prefix}.attn_norm.weight"), config.rms_norm_eps)?;
         let post_attention_layernorm =
-            gemma_rms_norm_gguf(gg, &format!("{prefix}.attn_post_norm.weight"), config.rms_norm_eps)?;
+            gemma_rms_norm_gguf(gg, &format!("{prefix}.post_attention_norm.weight"), config.rms_norm_eps)?;
         let pre_feedforward_layernorm =
             gemma_rms_norm_gguf(gg, &format!("{prefix}.ffn_norm.weight"), config.rms_norm_eps)?;
         let post_feedforward_layernorm =
-            gemma_rms_norm_gguf(gg, &format!("{prefix}.ffn_post_norm.weight"), config.rms_norm_eps)?;
+            gemma_rms_norm_gguf(gg, &format!("{prefix}.post_ffw_norm.weight"), config.rms_norm_eps)?;
 
         // Layer scalar: GGUF stores it as a tensor
-        let layer_scalar = match gg.tensor(&format!("{prefix}.layer_output_scale")) {
+        let layer_scalar = match gg.tensor(&format!("{prefix}.layer_output_scale.weight")) {
             Ok(qt) => qt.dequantize(&Device::Cpu).unwrap_or_else(|_| {
                 Tensor::ones(1, DType::F32, &Device::Cpu).unwrap()
             }),
@@ -986,8 +986,26 @@ impl Gemma4Model {
             md_get(&format!("{arch}.attention.head_count_kv"))?.to_u32()? as usize;
         let num_hidden_layers = md_get(&format!("{arch}.block_count"))?.to_u32()? as usize;
         let hidden_size = md_get(&format!("{arch}.embedding_length"))?.to_u32()? as usize;
-        let intermediate_size =
-            md_get(&format!("{arch}.feed_forward_length"))?.to_u32()? as usize;
+        // feed_forward_length can be a single u32 or a per-layer i32 array (Gemma4 uses
+        // different sizes for non-shared vs shared layers due to use_double_wide_mlp).
+        let ff_value = md_get(&format!("{arch}.feed_forward_length"))?;
+        let (intermediate_size, per_layer_ff) = match &ff_value {
+            gguf_file::Value::U32(v) => (*v as usize, None),
+            gguf_file::Value::I32(v) => (*v as usize, None),
+            gguf_file::Value::Array(arr) => {
+                let sizes: Vec<usize> = arr
+                    .iter()
+                    .map(|v| match v {
+                        gguf_file::Value::I32(n) => *n as usize,
+                        gguf_file::Value::U32(n) => *n as usize,
+                        _ => 6144,
+                    })
+                    .collect();
+                let first = sizes.first().copied().unwrap_or(6144);
+                (first, Some(sizes))
+            }
+            _ => candle_core::bail!("unexpected type for feed_forward_length"),
+        };
         let max_position_embeddings = gg
             .metadata()
             .get(&format!("{arch}.context_length"))
@@ -1144,11 +1162,11 @@ impl Gemma4Model {
         let sliding_theta = 10_000.0;
         let full_theta = rope_theta;
 
-        let full_rotated_dim = gg
-            .metadata()
-            .get(&format!("{arch}.rope.dimension_count"))
-            .and_then(|v| v.to_u32().ok())
-            .unwrap_or((global_head_dim / 4) as u32) as usize;
+        // rope.dimension_count stores the full head_dim for full-attention layers.
+        // For partial RoPE (Gemma4), the actual rotated dim is global_head_dim * partial_rotary_factor.
+        // The partial_rotary_factor (0.25) is not stored in GGUF, so we derive it:
+        // rotated_dim = global_head_dim / 4 = 512 / 4 = 128
+        let full_rotated_dim = global_head_dim / 4;
 
         let rotary_sliding = RotaryEmbedding::new(
             sliding_theta,
