@@ -545,19 +545,19 @@ struct Mlp {
 }
 
 impl Mlp {
-    fn new(config: &Gemma4TextConfig, vb: VarBuilder) -> Result<Self> {
+    fn new(config: &Gemma4TextConfig, intermediate_size: usize, vb: VarBuilder) -> Result<Self> {
         let gate_proj = LinearLayer::Standard(linear_no_bias(
             config.hidden_size,
-            config.intermediate_size,
+            intermediate_size,
             vb.pp("gate_proj"),
         )?);
         let up_proj = LinearLayer::Standard(linear_no_bias(
             config.hidden_size,
-            config.intermediate_size,
+            intermediate_size,
             vb.pp("up_proj"),
         )?);
         let down_proj = LinearLayer::Standard(linear_no_bias(
-            config.intermediate_size,
+            intermediate_size,
             config.hidden_size,
             vb.pp("down_proj"),
         )?);
@@ -613,10 +613,11 @@ impl DecoderLayer {
         config: &Gemma4TextConfig,
         layer_type: LayerType,
         is_shared: bool,
+        intermediate_size: usize,
         vb: VarBuilder,
     ) -> Result<Self> {
         let self_attn = Attention::new(config, layer_type, is_shared, vb.pp("self_attn"))?;
-        let mlp = Mlp::new(config, vb.pp("mlp"))?;
+        let mlp = Mlp::new(config, intermediate_size, vb.pp("mlp"))?;
 
         let input_layernorm = candle_nn::rms_norm(
             config.hidden_size,
@@ -657,7 +658,7 @@ impl DecoderLayer {
             vb.pp("per_layer_projection"),
         )?);
         let post_per_layer_input_norm =
-            candle_nn::rms_norm(ple_dim, config.rms_norm_eps, vb.pp("post_per_layer_input_norm"))?;
+            candle_nn::rms_norm(config.hidden_size, config.rms_norm_eps, vb.pp("post_per_layer_input_norm"))?;
 
         Ok(Self {
             self_attn,
@@ -860,7 +861,13 @@ impl Gemma4Model {
         for i in 0..config.num_hidden_layers {
             let lt = layer_types[i];
             let is_shared = i >= first_shared;
-            layers.push(DecoderLayer::new(config, lt, is_shared, layers_vb.pp(i))?);
+            // Shared layers use double-wide MLP when use_double_wide_mlp is set
+            let intermediate_size = if is_shared && config.use_double_wide_mlp {
+                config.intermediate_size * 2
+            } else {
+                config.intermediate_size
+            };
+            layers.push(DecoderLayer::new(config, lt, is_shared, intermediate_size, layers_vb.pp(i))?);
             if let Some(source) = kv_sharing_map[i] {
                 layers[i].self_attn.kv_shared_layer_index = Some(source);
             }
