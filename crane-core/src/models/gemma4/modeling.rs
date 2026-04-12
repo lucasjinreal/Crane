@@ -1222,14 +1222,38 @@ impl Gemma4Model {
     // ── Forward ─────────────────────────────────────────────────────────
 
     pub fn forward(&mut self, input_ids: &Tensor, start_pos: usize) -> Result<Tensor> {
+        let hidden_states = self.embed_tokens.forward(input_ids)?.to_dtype(self.dtype)?;
+        let hidden_states = (hidden_states * self.embed_scale)?;
+        self.forward_inner(input_ids, hidden_states, start_pos)
+    }
+
+    /// Forward pass with pre-computed embeddings (for VLM: vision features spliced into text embeddings).
+    /// `input_ids` is still needed for PLE token embedding lookup.
+    pub fn forward_embeds(
+        &mut self,
+        input_ids: &Tensor,
+        hidden_states: Tensor,
+        start_pos: usize,
+    ) -> Result<Tensor> {
+        self.forward_inner(input_ids, hidden_states, start_pos)
+    }
+
+    /// Expose embed_tokens for VLM use (embed + scale).
+    pub fn embed(&self, input_ids: &Tensor) -> Result<Tensor> {
+        let hidden_states = self.embed_tokens.forward(input_ids)?.to_dtype(self.dtype)?;
+        hidden_states * self.embed_scale
+    }
+
+    fn forward_inner(
+        &mut self,
+        input_ids: &Tensor,
+        hidden_states: Tensor,
+        start_pos: usize,
+    ) -> Result<Tensor> {
         let (_b_sz, seq_len) = input_ids.dims2()?;
 
         #[cfg(feature = "cuda")]
         let _event_guard = EventTrackingGuard::disable(input_ids.device());
-
-        // Embed + scale by sqrt(hidden_size)
-        let hidden_states = self.embed_tokens.forward(input_ids)?.to_dtype(self.dtype)?;
-        let hidden_states = (hidden_states * self.embed_scale)?;
 
         // PLE preparation: combine token embeddings + model projection
         let ple_dim = self.config.hidden_size_per_layer_input.unwrap_or(256);
@@ -1275,12 +1299,12 @@ impl Gemma4Model {
 
         // Attention masks
         let sliding_mask = if seq_len > 1 {
-            Some(self.build_sliding_mask(seq_len, total_len, start_pos, input_ids.device())?)
+            Some(self.build_sliding_mask(seq_len, total_len, start_pos, hidden_states.device())?)
         } else {
             None
         };
         let causal_mask = if seq_len > 1 {
-            Some(self.build_causal_mask(seq_len, total_len, start_pos, input_ids.device())?)
+            Some(self.build_causal_mask(seq_len, total_len, start_pos, hidden_states.device())?)
         } else {
             None
         };
