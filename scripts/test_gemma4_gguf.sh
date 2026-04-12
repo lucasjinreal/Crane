@@ -3,10 +3,6 @@
 #
 # Usage:
 #   ./scripts/test_gemma4_gguf.sh <gguf_file_path> [prompt] [max_tokens]
-#
-# Examples:
-#   ./scripts/test_gemma4_gguf.sh /home/emre/models/gemma4/gemma-4-E2B-it-Q4_K_M.gguf
-#   ./scripts/test_gemma4_gguf.sh /path/to/model.gguf "The capital of France is" 30
 
 GGUF_PATH="${1:?Usage: $0 <gguf_file_path> [prompt] [max_tokens]}"
 PROMPT="${2:-The capital of France is}"

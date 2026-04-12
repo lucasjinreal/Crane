@@ -2,14 +2,10 @@
 # Test script for Gemma4 model — starts server, makes a request, captures debug output.
 #
 # Usage:
-#   ./scripts/test_gemma4.sh [model_path] [prompt]
-#
-# Examples:
-#   ./scripts/test_gemma4.sh /home/emre/models/gemma-4-E2B/
-#   ./scripts/test_gemma4.sh /home/emre/models/gemma-4-E2B/ "The capital of France is"
+#   ./scripts/test_gemma4.sh <model_path> [prompt] [max_tokens]
 
-MODEL_PATH="${1:-/home/emre/models/gemma-4-E2B/}"
-PROMPT="${2:-Hello}"
+MODEL_PATH="${1:?Usage: $0 <model_path> [prompt] [max_tokens]}"
+PROMPT="${2:-What is a sun?}"
 PORT=8080
 MAX_TOKENS="${3:-20}"
 LOG_FILE="/tmp/crane-gemma4-debug.log"
