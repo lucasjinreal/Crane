@@ -495,9 +495,9 @@ impl Attention {
         let n_rep = self.num_heads / self.num_kv_heads;
 
         if n_rep > 1 && seq_len == 1 {
-            let scale = 1.0 / (self.head_dim as f64).sqrt();
+            // Gemma4: scaling = 1.0 (QK norms handle normalization)
             let q_g =
-                (q.reshape((b_sz, self.num_kv_heads, n_rep, self.head_dim))? * scale)?;
+                q.reshape((b_sz, self.num_kv_heads, n_rep, self.head_dim))?;
             let k_t = k.transpose(2, 3)?;
             let attn_weights = q_g.matmul(&k_t)?;
 
@@ -531,8 +531,8 @@ impl Attention {
             v
         };
 
-        let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let attn_weights = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?)? * scale)?;
+        // Gemma4: scaling = 1.0 (QK norms handle normalization)
+        let attn_weights = q.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
         let attn_weights = match attention_mask {
             Some(mask) => attn_weights.broadcast_add(mask)?,
             None => attn_weights,
@@ -761,6 +761,7 @@ impl DecoderLayer {
         rotated_dim: Option<usize>,
         shared_kv: Option<&(Tensor, Tensor)>,
     ) -> Result<Tensor> {
+        let seq_len = hidden_states.dim(1)?;
         // Pre-norm → attention → post-norm → residual
         let residual = hidden_states;
         let hidden_states = self.input_layernorm.forward(hidden_states)?;
@@ -773,6 +774,7 @@ impl DecoderLayer {
             rotated_dim,
             shared_kv,
         )?;
+
         let hidden_states = self.post_attention_layernorm.forward(&hidden_states)?;
         let hidden_states = (residual + hidden_states)?;
 
@@ -1337,6 +1339,7 @@ impl Gemma4Model {
         let logits = self
             .lm_head
             .forward(&hidden_states.narrow(1, seq_len - 1, 1)?)?;
+
 
         // Logit softcapping
         if let Some(cap) = self.config.final_logit_softcapping {
