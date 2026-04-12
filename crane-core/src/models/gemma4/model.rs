@@ -92,15 +92,16 @@ impl Model {
         let config_data = std::fs::read(config_file)?;
 
         // Gemma 4 config.json has text_config nested under the top level
-        let text_config: Gemma4TextConfig =
+        // for multimodal checkpoints (Gemma4ForConditionalGeneration).
+        // Text-only checkpoints have a flat config.
+        let (text_config, is_multimodal) =
             if let Ok(outer) = serde_json::from_slice::<Gemma4Config>(&config_data) {
-                outer.text_config
+                (outer.text_config, true)
             } else {
-                // Fallback: try direct deserialization (text-only config)
-                serde_json::from_slice(&config_data)?
+                (serde_json::from_slice(&config_data)?, false)
             };
 
-        let inner = Gemma4Model::new(&text_config, vb)?;
+        let inner = Gemma4Model::new(&text_config, vb, is_multimodal)?;
 
         Ok(Self {
             tokenizer: TokenOutputStream::new(tokenizer),
