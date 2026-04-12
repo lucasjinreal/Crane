@@ -227,7 +227,7 @@ fn apply_partial_rope(
 }
 
 /// RMS normalization without learnable scale (Gemma4's v_norm uses with_scale=False).
-fn rms_normalize(x: &Tensor, eps: f64) -> Result<Tensor> {
+pub fn rms_normalize(x: &Tensor, eps: f64) -> Result<Tensor> {
     let dtype = x.dtype();
     let x_f32 = x.to_dtype(DType::F32)?;
     let variance = x_f32.sqr()?.mean_keepdim(D::Minus1)?;
