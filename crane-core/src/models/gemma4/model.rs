@@ -166,8 +166,7 @@ impl Model {
             .tokenizer
             .tokenizer
             .encode(inputs, true)
-            .map_err(E::msg)
-            .unwrap()
+            .map_err(E::msg)?
             .get_ids()
             .to_vec();
         Ok(input_ids)

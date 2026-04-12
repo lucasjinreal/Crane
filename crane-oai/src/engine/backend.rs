@@ -129,7 +129,6 @@ pub trait ModelBackend: Send + 'static {
 
 pub struct Gemma4Backend {
     pub model: crane_core::models::gemma4::Model,
-    dtype: DType,
 }
 
 impl Gemma4Backend {
@@ -141,10 +140,7 @@ impl Gemma4Backend {
     ) -> Result<Self> {
         let model =
             crane_core::models::gemma4::Model::new_with_format(model_path, device, dtype, format)?;
-        Ok(Self {
-            model,
-            dtype: *dtype,
-        })
+        Ok(Self { model })
     }
 }
 
@@ -168,7 +164,7 @@ impl ModelBackend for Gemma4Backend {
     }
 
     fn dtype(&self) -> DType {
-        self.dtype
+        self.model.dtype
     }
 
     fn tokenizer(&self) -> &tokenizers::Tokenizer {

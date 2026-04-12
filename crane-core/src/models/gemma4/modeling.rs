@@ -24,29 +24,13 @@ use candle_core::{DType, Device, Module, Result, Tensor, D};
 use candle_nn::rotary_emb::rope;
 use candle_nn::{linear_no_bias, Embedding, Linear, RmsNorm, VarBuilder};
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::io::{Read, Seek};
 
 // Reuse the polymorphic linear layer and GGUF loader from the shared Hunyuan module.
 pub use crate::models::hunyuan_dense::modeling::{Gguf, LinearLayer};
 
-/// Create an RmsNorm for Gemma 4.
-///
-/// Gemma 3 RMSNorm uses `output = x * (1 + weight)` with weights initialized near 0.
-/// Gemma 4 stores weights that already include any shift (norm_shift=0 in GGUF converter),
-/// so we use standard `x * weight` — no additional shift needed.
-fn gemma_rms_norm(size: usize, eps: f64, vb: VarBuilder) -> Result<RmsNorm> {
-    candle_nn::rms_norm(size, eps, vb)
-}
-
-/// GGUF variant — weights are stored as-is, no shift needed for Gemma 4.
-fn gemma_rms_norm_gguf<R: Read + Seek>(
-    gg: &mut Gguf<R>,
-    name: &str,
-    eps: f64,
-) -> Result<RmsNorm> {
-    gg.rms_norm(name, eps)
-}
+// Note: Gemma 4 norms use standard `x * weight` (no `+1` shift unlike Gemma 3).
+// Weights are stored in final form. Use candle_nn::rms_norm / gg.rms_norm directly.
 
 // ── Event-tracking RAII guard ────────────────────────────────────────────
 
@@ -211,9 +195,9 @@ impl RotaryEmbedding {
         })
     }
 
-    fn forward(&self, seq_len: usize) -> Result<(Tensor, Tensor)> {
-        let cos = self.cos_table.narrow(0, 0, seq_len)?;
-        let sin = self.sin_table.narrow(0, 0, seq_len)?;
+    fn forward(&self, start_pos: usize, seq_len: usize) -> Result<(Tensor, Tensor)> {
+        let cos = self.cos_table.narrow(0, start_pos, seq_len)?;
+        let sin = self.sin_table.narrow(0, start_pos, seq_len)?;
         Ok((cos, sin))
     }
 }
@@ -266,7 +250,6 @@ struct Attention {
     num_kv_heads: usize,
     head_dim: usize,
     is_shared: bool,
-    kv_shared_layer_index: Option<usize>,
     kv_cache: Option<(Tensor, Tensor)>,
     cache_seq_len: usize,
 }
@@ -292,7 +275,7 @@ impl Attention {
         )?);
 
         // QK norms: q_norm always, k_norm only for non-shared layers
-        let q_norm = gemma_rms_norm(head_dim, config.rms_norm_eps, vb.pp("q_norm"))?;
+        let q_norm = candle_nn::rms_norm(head_dim, config.rms_norm_eps, vb.pp("q_norm"))?;
 
         let (k_proj, v_proj, k_norm) = if is_shared {
             (None, None, None)
@@ -307,7 +290,7 @@ impl Attention {
                 num_kv_heads * head_dim,
                 vb.pp("v_proj"),
             )?);
-            let kn = gemma_rms_norm(head_dim, config.rms_norm_eps, vb.pp("k_norm"))?;
+            let kn = candle_nn::rms_norm(head_dim, config.rms_norm_eps, vb.pp("k_norm"))?;
             (Some(k), Some(v), Some(kn))
         };
 
@@ -329,7 +312,6 @@ impl Attention {
             num_kv_heads,
             head_dim,
             is_shared,
-            kv_shared_layer_index: None,
             kv_cache: None,
             cache_seq_len: 0,
         })
@@ -347,14 +329,14 @@ impl Attention {
         let prefix = format!("blk.{layer_idx}");
 
         let q_proj = gg.linear(&format!("{prefix}.attn_q.weight"))?;
-        let q_norm = gemma_rms_norm_gguf(gg, &format!("{prefix}.attn_q_norm.weight"), rms_norm_eps)?;
+        let q_norm = gg.rms_norm(&format!("{prefix}.attn_q_norm.weight"), rms_norm_eps)?;
 
         let (k_proj, v_proj, k_norm) = if is_shared {
             (None, None, None)
         } else {
             let k = gg.linear(&format!("{prefix}.attn_k.weight"))?;
             let v = gg.linear(&format!("{prefix}.attn_v.weight"))?;
-            let kn = gemma_rms_norm_gguf(gg, &format!("{prefix}.attn_k_norm.weight"), rms_norm_eps)?;
+            let kn = gg.rms_norm(&format!("{prefix}.attn_k_norm.weight"), rms_norm_eps)?;
             (Some(k), Some(v), Some(kn))
         };
 
@@ -372,7 +354,6 @@ impl Attention {
             num_kv_heads,
             head_dim,
             is_shared,
-            kv_shared_layer_index: None,
             kv_cache: None,
             cache_seq_len: 0,
         })
@@ -652,31 +633,31 @@ impl DecoderLayer {
         let self_attn = Attention::new(config, layer_type, is_shared, vb.pp("self_attn"))?;
         let mlp = Mlp::new(config, intermediate_size, vb.pp("mlp"))?;
 
-        let input_layernorm = gemma_rms_norm(
+        let input_layernorm = candle_nn::rms_norm(
             config.hidden_size,
             config.rms_norm_eps,
             vb.pp("input_layernorm"),
         )?;
-        let post_attention_layernorm = gemma_rms_norm(
+        let post_attention_layernorm = candle_nn::rms_norm(
             config.hidden_size,
             config.rms_norm_eps,
             vb.pp("post_attention_layernorm"),
         )?;
-        let pre_feedforward_layernorm = gemma_rms_norm(
+        let pre_feedforward_layernorm = candle_nn::rms_norm(
             config.hidden_size,
             config.rms_norm_eps,
             vb.pp("pre_feedforward_layernorm"),
         )?;
-        let post_feedforward_layernorm = gemma_rms_norm(
+        let post_feedforward_layernorm = candle_nn::rms_norm(
             config.hidden_size,
             config.rms_norm_eps,
             vb.pp("post_feedforward_layernorm"),
         )?;
 
-        // Layer scalar: loaded from checkpoint, shape [1]
+        // Layer scalar: loaded from checkpoint, shape [1]. Pre-cast to model dtype.
         let layer_scalar = vb
             .get(1, "layer_scalar")
-            .unwrap_or_else(|_| Tensor::ones(1, DType::F32, vb.device()).unwrap());
+            .unwrap_or_else(|_| Tensor::ones(1, vb.dtype(), vb.device()).unwrap());
 
         let ple_dim = config.hidden_size_per_layer_input.unwrap_or(256);
 
@@ -691,7 +672,7 @@ impl DecoderLayer {
             vb.pp("per_layer_projection"),
         )?);
         let post_per_layer_input_norm =
-            gemma_rms_norm(config.hidden_size, config.rms_norm_eps, vb.pp("post_per_layer_input_norm"))?;
+            candle_nn::rms_norm(config.hidden_size, config.rms_norm_eps, vb.pp("post_per_layer_input_norm"))?;
 
         Ok(Self {
             self_attn,
@@ -729,13 +710,13 @@ impl DecoderLayer {
         let prefix = format!("blk.{layer_idx}");
 
         let input_layernorm =
-            gemma_rms_norm_gguf(gg, &format!("{prefix}.attn_norm.weight"), config.rms_norm_eps)?;
+            gg.rms_norm(&format!("{prefix}.attn_norm.weight"), config.rms_norm_eps)?;
         let post_attention_layernorm =
-            gemma_rms_norm_gguf(gg, &format!("{prefix}.post_attention_norm.weight"), config.rms_norm_eps)?;
+            gg.rms_norm(&format!("{prefix}.post_attention_norm.weight"), config.rms_norm_eps)?;
         let pre_feedforward_layernorm =
-            gemma_rms_norm_gguf(gg, &format!("{prefix}.ffn_norm.weight"), config.rms_norm_eps)?;
+            gg.rms_norm(&format!("{prefix}.ffn_norm.weight"), config.rms_norm_eps)?;
         let post_feedforward_layernorm =
-            gemma_rms_norm_gguf(gg, &format!("{prefix}.post_ffw_norm.weight"), config.rms_norm_eps)?;
+            gg.rms_norm(&format!("{prefix}.post_ffw_norm.weight"), config.rms_norm_eps)?;
 
         // Layer scalar: GGUF stores it as a tensor
         let layer_scalar = match gg.tensor(&format!("{prefix}.layer_output_scale.weight")) {
@@ -749,7 +730,7 @@ impl DecoderLayer {
         let per_layer_input_gate = gg.linear(&format!("{prefix}.inp_gate.weight"))?;
         let per_layer_projection = gg.linear(&format!("{prefix}.proj.weight"))?;
         let post_per_layer_input_norm =
-            gemma_rms_norm_gguf(gg, &format!("{prefix}.post_norm.weight"), config.rms_norm_eps)?;
+            gg.rms_norm(&format!("{prefix}.post_norm.weight"), config.rms_norm_eps)?;
 
         Ok(Self {
             self_attn,
@@ -776,7 +757,6 @@ impl DecoderLayer {
         rotated_dim: Option<usize>,
         shared_kv: Option<&(Tensor, Tensor)>,
     ) -> Result<Tensor> {
-        let seq_len = hidden_states.dim(1)?;
         // Pre-norm → attention → post-norm → residual
         let residual = hidden_states;
         let hidden_states = self.input_layernorm.forward(hidden_states)?;
@@ -804,9 +784,7 @@ impl DecoderLayer {
         let hidden_states = self.apply_ple(&hidden_states, per_layer_input)?;
 
         // Layer scalar
-        let hidden_states = hidden_states.broadcast_mul(
-            &self.layer_scalar.to_dtype(hidden_states.dtype())?,
-        )?;
+        let hidden_states = hidden_states.broadcast_mul(&self.layer_scalar)?;
 
         Ok(hidden_states)
     }
@@ -881,7 +859,7 @@ impl Gemma4Model {
             ple_total_dim,
             model_vb.pp("per_layer_model_projection"),
         )?);
-        let per_layer_projection_norm = gemma_rms_norm(
+        let per_layer_projection_norm = candle_nn::rms_norm(
             ple_dim,
             config.rms_norm_eps,
             model_vb.pp("per_layer_projection_norm"),
@@ -903,12 +881,9 @@ impl Gemma4Model {
                 config.intermediate_size
             };
             layers.push(DecoderLayer::new(config, lt, is_shared, intermediate_size, layers_vb.pp(i))?);
-            if let Some(source) = kv_sharing_map[i] {
-                layers[i].self_attn.kv_shared_layer_index = Some(source);
-            }
         }
 
-        let norm = gemma_rms_norm(
+        let norm = candle_nn::rms_norm(
             config.hidden_size,
             config.rms_norm_eps,
             model_vb.pp("norm"),
@@ -989,9 +964,9 @@ impl Gemma4Model {
         // feed_forward_length can be a single u32 or a per-layer i32 array (Gemma4 uses
         // different sizes for non-shared vs shared layers due to use_double_wide_mlp).
         let ff_value = md_get(&format!("{arch}.feed_forward_length"))?;
-        let (intermediate_size, per_layer_ff) = match &ff_value {
-            gguf_file::Value::U32(v) => (*v as usize, None),
-            gguf_file::Value::I32(v) => (*v as usize, None),
+        let intermediate_size = match &ff_value {
+            gguf_file::Value::U32(v) => *v as usize,
+            gguf_file::Value::I32(v) => *v as usize,
             gguf_file::Value::Array(arr) => {
                 let sizes: Vec<usize> = arr
                     .iter()
@@ -1001,8 +976,7 @@ impl Gemma4Model {
                         _ => 6144,
                     })
                     .collect();
-                let first = sizes.first().copied().unwrap_or(6144);
-                (first, Some(sizes))
+                sizes.first().copied().unwrap_or(6144)
             }
             _ => candle_core::bail!("unexpected type for feed_forward_length"),
         };
@@ -1123,7 +1097,7 @@ impl Gemma4Model {
         // Model-level PLE projection
         let per_layer_model_projection = gg.linear("per_layer_model_proj.weight")?;
         let per_layer_projection_norm =
-            gemma_rms_norm_gguf(&mut gg, "per_layer_proj_norm.weight", rms_norm_eps)?;
+            gg.rms_norm("per_layer_proj_norm.weight", rms_norm_eps)?;
 
         let config = Gemma4TextConfig {
             vocab_size: actual_vocab_size,
@@ -1146,12 +1120,9 @@ impl Gemma4Model {
             layers.push(DecoderLayer::new_from_gguf(
                 &config, lt, is_shared, head_dim, &mut gg, i,
             )?);
-            if let Some(source) = kv_sharing_map[i] {
-                layers[i].self_attn.kv_shared_layer_index = Some(source);
-            }
         }
 
-        let norm = gemma_rms_norm_gguf(&mut gg, "output_norm.weight", rms_norm_eps)?;
+        let norm = gg.rms_norm("output_norm.weight", rms_norm_eps)?;
 
         let lm_head = if tie_word_embeddings {
             LinearLayer::Standard(Linear::new(embed_tokens.embeddings().clone(), None))
@@ -1279,14 +1250,13 @@ impl Gemma4Model {
         let per_layer_projection = (per_layer_projection * self.ple_projection_scale)?;
         // Shape: [B, S, num_layers * ple_dim]
 
-        // Reshape to [B, S, num_layers, ple_dim] for norm
-        let shape_prefix = per_layer_projection.dims()[..2].to_vec();
+        // Reshape to [B, S, num_layers, ple_dim] for norm, then flatten back
+        let (b_sz, s_len, _) = per_layer_projection.dims3()?;
         let per_layer_projection = per_layer_projection
-            .reshape((shape_prefix[0], shape_prefix[1], num_layers, ple_dim))?;
+            .reshape((b_sz, s_len, num_layers, ple_dim))?;
         let per_layer_projection = self.per_layer_projection_norm.forward(&per_layer_projection)?;
-        // Flatten back to [B, S, num_layers * ple_dim]
         let per_layer_projection = per_layer_projection
-            .reshape((shape_prefix[0], shape_prefix[1], num_layers * ple_dim))?;
+            .reshape((b_sz, s_len, num_layers * ple_dim))?;
 
         // 3. Combine: (projection + token_embeds) * 2^-0.5
         let per_layer_inputs =
@@ -1295,21 +1265,13 @@ impl Gemma4Model {
         // RoPE tables
         let total_len = start_pos + seq_len;
 
-        let (full_cos_sliding, full_sin_sliding) = self.rotary_sliding.forward(total_len)?;
-        let cos_sliding = full_cos_sliding
-            .narrow(0, start_pos, seq_len)?
-            .to_dtype(self.dtype)?;
-        let sin_sliding = full_sin_sliding
-            .narrow(0, start_pos, seq_len)?
-            .to_dtype(self.dtype)?;
+        let (cos_sliding, sin_sliding) = self.rotary_sliding.forward(start_pos, seq_len)?;
+        let cos_sliding = cos_sliding.to_dtype(self.dtype)?;
+        let sin_sliding = sin_sliding.to_dtype(self.dtype)?;
 
-        let (full_cos_full, full_sin_full) = self.rotary_full.forward(total_len)?;
-        let cos_full = full_cos_full
-            .narrow(0, start_pos, seq_len)?
-            .to_dtype(self.dtype)?;
-        let sin_full = full_sin_full
-            .narrow(0, start_pos, seq_len)?
-            .to_dtype(self.dtype)?;
+        let (cos_full, sin_full) = self.rotary_full.forward(start_pos, seq_len)?;
+        let cos_full = cos_full.to_dtype(self.dtype)?;
+        let sin_full = sin_full.to_dtype(self.dtype)?;
 
         // Attention masks
         let sliding_mask = if seq_len > 1 {
@@ -1325,7 +1287,9 @@ impl Gemma4Model {
 
         // Forward pass through layers
         let mut hidden_states = hidden_states;
-        let mut shared_kv_states: HashMap<usize, (Tensor, Tensor)> = HashMap::new();
+        let first_shared = self.config.first_kv_shared_layer();
+        let mut shared_kv_states: Vec<Option<(Tensor, Tensor)>> =
+            vec![None; first_shared];
 
         for i in 0..self.layers.len() {
             let lt = self.layer_types[i];
@@ -1342,7 +1306,7 @@ impl Gemma4Model {
                 LayerType::SlidingAttention => None,
             };
 
-            let shared_kv = self.kv_sharing_map[i].and_then(|src| shared_kv_states.get(&src));
+            let shared_kv = self.kv_sharing_map[i].and_then(|src| shared_kv_states[src].as_ref());
 
             // PLE input for this layer: narrow from combined per_layer_inputs
             let ple_input = per_layer_inputs.narrow(D::Minus1, i * ple_dim, ple_dim)?;
@@ -1357,13 +1321,13 @@ impl Gemma4Model {
                 shared_kv,
             )?;
 
-            // Store KV state from non-shared layers
-            if self.kv_sharing_map[i].is_none() {
+            // Store KV state from non-shared layers that are referenced by shared layers
+            if i < first_shared {
                 if let Some((ref buf_k, ref buf_v)) = self.layers[i].self_attn.kv_cache {
                     let len = self.layers[i].self_attn.cache_seq_len;
                     let k_view = buf_k.narrow(2, 0, len)?;
                     let v_view = buf_v.narrow(2, 0, len)?;
-                    shared_kv_states.insert(i, (k_view, v_view));
+                    shared_kv_states[i] = Some((k_view, v_view));
                 }
             }
         }
