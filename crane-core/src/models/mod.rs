@@ -8,6 +8,7 @@ pub mod qwen25_vit;
 pub mod qwen3;
 pub mod qwen3_tts;
 // pub mod qwen3_vl;
+pub mod gemma4;
 pub mod hunyuan_dense;
 
 #[cfg(feature = "onnx")]
