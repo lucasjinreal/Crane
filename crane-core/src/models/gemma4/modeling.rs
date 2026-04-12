@@ -30,6 +30,30 @@ use std::io::{Read, Seek};
 // Reuse the polymorphic linear layer and GGUF loader from the shared Hunyuan module.
 pub use crate::models::hunyuan_dense::modeling::{Gguf, LinearLayer};
 
+/// Create an RmsNorm with Gemma-style weight shift.
+///
+/// Gemma's RMSNorm uses `output = x * (1 + weight)` instead of `output = x * weight`.
+/// Weights in HF checkpoints are stored as the raw trained values (initialized near 0),
+/// so we add 1.0 to convert them for candle's standard `x * weight` formula.
+fn gemma_rms_norm(size: usize, eps: f64, vb: VarBuilder) -> Result<RmsNorm> {
+    let weight = vb.get(size, "weight")?;
+    let shifted = (weight + 1.0)?;
+    Ok(RmsNorm::new(shifted, eps))
+}
+
+/// Same shift for GGUF norms: Gemma4 stores raw weights (norm_shift=0),
+/// so we must add 1.0 for the `x * weight` formula.
+fn gemma_rms_norm_gguf<R: Read + Seek>(
+    gg: &mut Gguf<R>,
+    name: &str,
+    eps: f64,
+) -> Result<RmsNorm> {
+    let norm = gg.rms_norm(name, eps)?;
+    let weight = norm.into_inner().weight().clone();
+    let shifted = (weight + 1.0)?;
+    Ok(RmsNorm::new(shifted, eps))
+}
+
 // ── Event-tracking RAII guard ────────────────────────────────────────────
 
 #[cfg(feature = "cuda")]
@@ -263,7 +287,7 @@ impl Attention {
         )?);
 
         // QK norms: q_norm always, k_norm only for non-shared layers
-        let q_norm = candle_nn::rms_norm(head_dim, config.rms_norm_eps, vb.pp("q_norm"))?;
+        let q_norm = gemma_rms_norm(head_dim, config.rms_norm_eps, vb.pp("q_norm"))?;
 
         let (k_proj, v_proj, k_norm) = if is_shared {
             (None, None, None)
@@ -278,7 +302,7 @@ impl Attention {
                 num_kv_heads * head_dim,
                 vb.pp("v_proj"),
             )?);
-            let kn = candle_nn::rms_norm(head_dim, config.rms_norm_eps, vb.pp("k_norm"))?;
+            let kn = gemma_rms_norm(head_dim, config.rms_norm_eps, vb.pp("k_norm"))?;
             (Some(k), Some(v), Some(kn))
         };
 
@@ -317,14 +341,14 @@ impl Attention {
         let prefix = format!("blk.{layer_idx}");
 
         let q_proj = gg.linear(&format!("{prefix}.attn_q.weight"))?;
-        let q_norm = gg.rms_norm(&format!("{prefix}.attn_q_norm.weight"), rms_norm_eps)?;
+        let q_norm = gemma_rms_norm_gguf(gg, &format!("{prefix}.attn_q_norm.weight"), rms_norm_eps)?;
 
         let (k_proj, v_proj, k_norm) = if is_shared {
             (None, None, None)
         } else {
             let k = gg.linear(&format!("{prefix}.attn_k.weight"))?;
             let v = gg.linear(&format!("{prefix}.attn_v.weight"))?;
-            let kn = gg.rms_norm(&format!("{prefix}.attn_k_norm.weight"), rms_norm_eps)?;
+            let kn = gemma_rms_norm_gguf(gg, &format!("{prefix}.attn_k_norm.weight"), rms_norm_eps)?;
             (Some(k), Some(v), Some(kn))
         };
 
@@ -619,22 +643,22 @@ impl DecoderLayer {
         let self_attn = Attention::new(config, layer_type, is_shared, vb.pp("self_attn"))?;
         let mlp = Mlp::new(config, intermediate_size, vb.pp("mlp"))?;
 
-        let input_layernorm = candle_nn::rms_norm(
+        let input_layernorm = gemma_rms_norm(
             config.hidden_size,
             config.rms_norm_eps,
             vb.pp("input_layernorm"),
         )?;
-        let post_attention_layernorm = candle_nn::rms_norm(
+        let post_attention_layernorm = gemma_rms_norm(
             config.hidden_size,
             config.rms_norm_eps,
             vb.pp("post_attention_layernorm"),
         )?;
-        let pre_feedforward_layernorm = candle_nn::rms_norm(
+        let pre_feedforward_layernorm = gemma_rms_norm(
             config.hidden_size,
             config.rms_norm_eps,
             vb.pp("pre_feedforward_layernorm"),
         )?;
-        let post_feedforward_layernorm = candle_nn::rms_norm(
+        let post_feedforward_layernorm = gemma_rms_norm(
             config.hidden_size,
             config.rms_norm_eps,
             vb.pp("post_feedforward_layernorm"),
@@ -658,7 +682,7 @@ impl DecoderLayer {
             vb.pp("per_layer_projection"),
         )?);
         let post_per_layer_input_norm =
-            candle_nn::rms_norm(config.hidden_size, config.rms_norm_eps, vb.pp("post_per_layer_input_norm"))?;
+            gemma_rms_norm(config.hidden_size, config.rms_norm_eps, vb.pp("post_per_layer_input_norm"))?;
 
         Ok(Self {
             self_attn,
@@ -696,13 +720,13 @@ impl DecoderLayer {
         let prefix = format!("blk.{layer_idx}");
 
         let input_layernorm =
-            gg.rms_norm(&format!("{prefix}.attn_norm.weight"), config.rms_norm_eps)?;
+            gemma_rms_norm_gguf(gg, &format!("{prefix}.attn_norm.weight"), config.rms_norm_eps)?;
         let post_attention_layernorm =
-            gg.rms_norm(&format!("{prefix}.attn_post_norm.weight"), config.rms_norm_eps)?;
+            gemma_rms_norm_gguf(gg, &format!("{prefix}.attn_post_norm.weight"), config.rms_norm_eps)?;
         let pre_feedforward_layernorm =
-            gg.rms_norm(&format!("{prefix}.ffn_norm.weight"), config.rms_norm_eps)?;
+            gemma_rms_norm_gguf(gg, &format!("{prefix}.ffn_norm.weight"), config.rms_norm_eps)?;
         let post_feedforward_layernorm =
-            gg.rms_norm(&format!("{prefix}.ffn_post_norm.weight"), config.rms_norm_eps)?;
+            gemma_rms_norm_gguf(gg, &format!("{prefix}.ffn_post_norm.weight"), config.rms_norm_eps)?;
 
         // Layer scalar: GGUF stores it as a tensor
         let layer_scalar = match gg.tensor(&format!("{prefix}.layer_output_scale")) {
@@ -716,7 +740,7 @@ impl DecoderLayer {
         let per_layer_input_gate = gg.linear(&format!("{prefix}.inp_gate.weight"))?;
         let per_layer_projection = gg.linear(&format!("{prefix}.proj.weight"))?;
         let post_per_layer_input_norm =
-            gg.rms_norm(&format!("{prefix}.post_norm.weight"), config.rms_norm_eps)?;
+            gemma_rms_norm_gguf(gg, &format!("{prefix}.post_norm.weight"), config.rms_norm_eps)?;
 
         Ok(Self {
             self_attn,
@@ -846,7 +870,7 @@ impl Gemma4Model {
             ple_total_dim,
             model_vb.pp("per_layer_model_projection"),
         )?);
-        let per_layer_projection_norm = candle_nn::rms_norm(
+        let per_layer_projection_norm = gemma_rms_norm(
             ple_dim,
             config.rms_norm_eps,
             model_vb.pp("per_layer_projection_norm"),
@@ -873,7 +897,7 @@ impl Gemma4Model {
             }
         }
 
-        let norm = candle_nn::rms_norm(
+        let norm = gemma_rms_norm(
             config.hidden_size,
             config.rms_norm_eps,
             model_vb.pp("norm"),
@@ -1070,7 +1094,7 @@ impl Gemma4Model {
         // Model-level PLE projection
         let per_layer_model_projection = gg.linear("per_layer_model_proj.weight")?;
         let per_layer_projection_norm =
-            gg.rms_norm("per_layer_proj_norm.weight", rms_norm_eps)?;
+            gemma_rms_norm_gguf(&mut gg, "per_layer_proj_norm.weight", rms_norm_eps)?;
 
         let config = Gemma4TextConfig {
             vocab_size: actual_vocab_size,
@@ -1098,7 +1122,7 @@ impl Gemma4Model {
             }
         }
 
-        let norm = gg.rms_norm("output_norm.weight", rms_norm_eps)?;
+        let norm = gemma_rms_norm_gguf(&mut gg, "output_norm.weight", rms_norm_eps)?;
 
         let lm_head = if tie_word_embeddings {
             LinearLayer::Standard(Linear::new(embed_tokens.embeddings().clone(), None))
