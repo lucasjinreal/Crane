@@ -1,8 +1,7 @@
-//! VLM (Vision-Language Model) handlers for PaddleOCR-VL.
+//! VLM (Vision-Language Model) handlers for PaddleOCR-VL and Gemma4VL.
 //!
-//! These handlers bypass the text-only engine and use PaddleOcrVL directly
-//! for image+text inference. The model processes images and generates OCR
-//! results as streaming or non-streaming text.
+//! These handlers bypass the text-only engine and use VLM models directly
+//! for image+text inference.
 
 use std::sync::Arc;
 
@@ -21,7 +20,7 @@ use crate::sglang_api::*;
 use crate::{make_error, now_epoch, AppState};
 
 // ─────────────────────────────────────────────────────────────
-//  VLM Request Channel Structure
+//  PaddleOCR-VL Request Channel
 // ─────────────────────────────────────────────────────────────
 
 pub enum VlmRequest {
@@ -389,4 +388,99 @@ pub async fn vlm_generate(
 
         Ok(Json(response).into_response())
     }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Gemma4 VLM
+// ─────────────────────────────────────────────────────────────
+
+pub enum Gemma4VlmRequest {
+    /// Non-streaming: image + text → generated text
+    Generate {
+        img_path: std::path::PathBuf,
+        text_prompt: String,
+        max_tokens: usize,
+        tx: tokio::sync::oneshot::Sender<Result<String, String>>,
+    },
+}
+
+/// Gemma4VL chat completions handler.
+pub async fn gemma4_vlm_chat_completions(
+    state: Arc<AppState>,
+    req: ChatCompletionRequest,
+) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    let g4vlm_tx = state.gemma4_vlm_tx.as_ref().ok_or_else(|| {
+        make_error(StatusCode::INTERNAL_SERVER_ERROR, "Gemma4 VLM model not loaded")
+    })?;
+
+    let mut image_urls = Vec::new();
+    let mut text_prompt = String::new();
+
+    for msg in &req.messages {
+        if msg.role == "user" {
+            let urls = msg.image_urls();
+            image_urls.extend(urls);
+            let text = msg.text_content();
+            if !text.is_empty() {
+                text_prompt = text;
+            }
+        }
+    }
+
+    if image_urls.is_empty() {
+        return Err(make_error(
+            StatusCode::BAD_REQUEST,
+            "No image_url found in messages. Gemma4-VL requires at least one image.",
+        ));
+    }
+
+    let image_url = &image_urls[0];
+    let (_temp_dir, img_path) = download_image(image_url)
+        .await
+        .map_err(|e| make_error(StatusCode::BAD_REQUEST, &e))?;
+
+    let max_tokens = req.max_tokens;
+    let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if g4vlm_tx
+        .send(Gemma4VlmRequest::Generate {
+            img_path,
+            text_prompt,
+            max_tokens,
+            tx,
+        })
+        .is_err()
+    {
+        return Err(make_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Gemma4 VLM engine thread crashed",
+        ));
+    }
+
+    let result = rx
+        .await
+        .map_err(|e| make_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("Gemma4 VLM task dropped: {e}")))?
+        .map_err(|e| make_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("Gemma4 VLM inference failed: {e}")))?;
+
+    let response = ChatCompletionResponse {
+        id: request_id,
+        object: "chat.completion".into(),
+        created: now_epoch(),
+        model: state.model_name.clone(),
+        choices: vec![ChatChoice {
+            index: 0,
+            message: ChatMessage {
+                role: "assistant".into(),
+                content: ChatMessageContent::Text(result),
+            },
+            finish_reason: Some("stop".into()),
+        }],
+        usage: Usage {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+        },
+    };
+    Ok(Json(response).into_response())
 }

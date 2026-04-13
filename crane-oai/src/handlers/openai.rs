@@ -36,6 +36,9 @@ pub async fn chat_completions(
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
     // If VLM model is loaded, delegate to VLM handler.
+    if state.gemma4_vlm_tx.is_some() {
+        return vlm::gemma4_vlm_chat_completions(state, req).await;
+    }
     if state.vlm_tx.is_some() {
         return vlm::vlm_chat_completions(state, req).await;
     }
