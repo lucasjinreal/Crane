@@ -47,23 +47,7 @@ pub enum VlmRequest {
 
 /// Download an image from a URL to a temporary file.
 /// Returns the path to the temp file (the file persists until the TempDir is dropped).
-/// Supports `file://` URLs for local files.
 async fn download_image(url: &str) -> Result<(tempfile::TempDir, std::path::PathBuf), String> {
-    // Handle file:// URLs by copying the local file
-    if let Some(path) = url.strip_prefix("file://") {
-        let src = std::path::Path::new(path);
-        if !src.exists() {
-            return Err(format!("Local file not found: {path}"));
-        }
-        let dir = tempfile::TempDir::new()
-            .map_err(|e| format!("Failed to create temp dir: {e}"))?;
-        let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("jpg");
-        let dst = dir.path().join(format!("image.{ext}"));
-        std::fs::copy(src, &dst)
-            .map_err(|e| format!("Failed to copy local file: {e}"))?;
-        return Ok((dir, dst));
-    }
-
     let dir = tempfile::TempDir::new()
         .map_err(|e| format!("Failed to create temp dir: {e}"))?;
 
