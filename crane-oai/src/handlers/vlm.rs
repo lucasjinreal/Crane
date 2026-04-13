@@ -124,6 +124,34 @@ fn detect_ocr_task(text: &str) -> OcrTask {
 //  Chat Completions (VLM)
 // ─────────────────────────────────────────────────────────────
 
+/// Extract the first image URL and text prompt from chat messages.
+fn extract_image_and_text(
+    messages: &[crate::openai_api::ChatMessage],
+    model_name: &str,
+) -> Result<(String, String), (StatusCode, Json<ErrorResponse>)> {
+    let mut image_urls = Vec::new();
+    let mut text_prompt = String::new();
+
+    for msg in messages {
+        if msg.role == "user" {
+            image_urls.extend(msg.image_urls());
+            let text = msg.text_content();
+            if !text.is_empty() {
+                text_prompt = text;
+            }
+        }
+    }
+
+    if image_urls.is_empty() {
+        return Err(make_error(
+            StatusCode::BAD_REQUEST,
+            &format!("No image_url found in messages. {model_name} requires at least one image."),
+        ));
+    }
+
+    Ok((image_urls.swap_remove(0), text_prompt))
+}
+
 /// VLM-aware chat completions handler.
 ///
 /// Extracts image URLs and text from multimodal messages, downloads
@@ -136,30 +164,8 @@ pub async fn vlm_chat_completions(
         make_error(StatusCode::INTERNAL_SERVER_ERROR, "VLM model not loaded")
     })?;
 
-    // Extract image URLs and text from messages.
-    let mut image_urls = Vec::new();
-    let mut text_prompt = String::new();
-
-    for msg in &req.messages {
-        if msg.role == "user" {
-            let urls = msg.image_urls();
-            image_urls.extend(urls);
-            let text = msg.text_content();
-            if !text.is_empty() {
-                text_prompt = text;
-            }
-        }
-    }
-
-    if image_urls.is_empty() {
-        return Err(make_error(
-            StatusCode::BAD_REQUEST,
-            "No image_url found in messages. PaddleOCR-VL requires at least one image.",
-        ));
-    }
-
-    // Use the first image URL.
-    let image_url = &image_urls[0];
+    let (image_url, text_prompt) = extract_image_and_text(&req.messages, "PaddleOCR-VL")?;
+    let image_url = &image_url;
 
     // Download image.
     let (temp_dir, img_path) = download_image(image_url)
@@ -414,29 +420,8 @@ pub async fn gemma4_vlm_chat_completions(
         make_error(StatusCode::INTERNAL_SERVER_ERROR, "Gemma4 VLM model not loaded")
     })?;
 
-    let mut image_urls = Vec::new();
-    let mut text_prompt = String::new();
-
-    for msg in &req.messages {
-        if msg.role == "user" {
-            let urls = msg.image_urls();
-            image_urls.extend(urls);
-            let text = msg.text_content();
-            if !text.is_empty() {
-                text_prompt = text;
-            }
-        }
-    }
-
-    if image_urls.is_empty() {
-        return Err(make_error(
-            StatusCode::BAD_REQUEST,
-            "No image_url found in messages. Gemma4-VL requires at least one image.",
-        ));
-    }
-
-    let image_url = &image_urls[0];
-    let (_temp_dir, img_path) = download_image(image_url)
+    let (image_url, text_prompt) = extract_image_and_text(&req.messages, "Gemma4-VL")?;
+    let (_temp_dir, img_path) = download_image(&image_url)
         .await
         .map_err(|e| make_error(StatusCode::BAD_REQUEST, &e))?;
 
