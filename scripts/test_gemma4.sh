@@ -4,6 +4,10 @@
 # Usage:
 #   ./scripts/test_gemma4.sh <model_path> [prompt] [max_tokens]
 
+# cd to project root (scripts may be run from any directory)
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR/.." || exit 1
+
 MODEL_PATH="${1:?Usage: $0 <model_path> [prompt] [max_tokens]}"
 PROMPT="${2:-What is a sun?}"
 PORT=8080

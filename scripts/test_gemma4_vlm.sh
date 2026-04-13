@@ -8,6 +8,10 @@
 #   ./scripts/test_gemma4_vlm.sh /home/emre/models/gemma-4-E2B/
 #   ./scripts/test_gemma4_vlm.sh /home/emre/models/gemma-4-E2B/ "https://upload.wikimedia.org/wikipedia/commons/thumb/4/47/PNG_transparency_demonstration_1.png/280px-PNG_transparency_demonstration_1.png" "What is in this image?"
 
+# cd to project root (scripts may be run from any directory)
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR/.." || exit 1
+
 MODEL_PATH="${1:-/home/emre/models/gemma-4-E2B/}"
 IMAGE_URL="${2:-https://placecats.com/300/200}"
 PROMPT="${3:-Describe this image in detail.}"
