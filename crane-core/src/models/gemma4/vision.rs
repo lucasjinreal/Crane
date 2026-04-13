@@ -113,8 +113,8 @@ impl VisionRotaryEmbedding {
         }
 
         // Concatenate X and Y: [B, num_patches, freq_dim*2 = head_dim/2]
-        let cos = Tensor::cat(&all_cos, D::Minus1)?;
-        let sin = Tensor::cat(&all_sin, D::Minus1)?;
+        let cos = Tensor::cat(&all_cos, D::Minus1)?.contiguous()?;
+        let sin = Tensor::cat(&all_sin, D::Minus1)?.contiguous()?;
         Ok((cos, sin))
     }
 }
@@ -145,9 +145,9 @@ fn apply_2d_rope(
     let cos_y = cos.narrow(D::Minus1, freq_dim, freq_dim)?;
     let sin_y = sin.narrow(D::Minus1, freq_dim, freq_dim)?;
 
-    // Apply standard RoPE to each half
-    let x_rot = rope(&x_part.contiguous()?, &cos_x, &sin_x)?;
-    let y_rot = rope(&y_part.contiguous()?, &cos_y, &sin_y)?;
+    // Apply standard RoPE to each half (ensure all inputs contiguous for rope kernel)
+    let x_rot = rope(&x_part.contiguous()?, &cos_x.contiguous()?, &sin_x.contiguous()?)?;
+    let y_rot = rope(&y_part.contiguous()?, &cos_y.contiguous()?, &sin_y.contiguous()?)?;
 
     Tensor::cat(&[&x_rot, &y_rot], D::Minus1)
 }
@@ -581,7 +581,6 @@ impl Gemma4VisionModel {
 // ── Multimodal Embedder (vision → text projection) ──────────────────────
 
 pub struct Gemma4MultimodalEmbedder {
-    pre_norm: candle_nn::RmsNorm,
     projection: Linear,
     rms_norm_eps: f64,
 }
@@ -593,15 +592,12 @@ impl Gemma4MultimodalEmbedder {
         rms_norm_eps: f64,
         vb: VarBuilder,
     ) -> Result<Self> {
-        // pre_norm uses with_scale=False → no learnable weight
-        // We create a dummy RmsNorm and will use rms_normalize instead
         let projection = linear_no_bias(
             vision_hidden_size,
             text_hidden_size,
             vb.pp("embedding_projection"),
         )?;
         Ok(Self {
-            pre_norm: candle_nn::rms_norm(vision_hidden_size, rms_norm_eps, vb.pp("embedding_pre_projection_norm"))?,
             projection,
             rms_norm_eps,
         })
