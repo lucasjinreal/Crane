@@ -448,19 +448,21 @@ async fn main() -> Result<()> {
                                     )?;
 
                                     // Build prompt in Gemma4-it chat format:
-                                    // <bos><|turn>user\n<|image|>text<turn|>\n<|turn>model\n
-                                    // where <|image|> (258880) expands to 280 vision tokens
+                                    // <bos><|turn>user\n<|image>{N x img_token}<image|>text<turn|>\n<|turn>model\n
                                     let image_token_id = 258880u32;
                                     let mut prompt_ids: Vec<u32> = vec![
-                                        2,     // <bos>
-                                        105,   // <|turn>
-                                        2364,  // "user"
-                                        107,   // \n
+                                        2,      // <bos>
+                                        105,    // <|turn>
+                                        2364,   // "user"
+                                        107,    // \n
+                                        255999, // <|image> — image start delimiter
                                     ];
                                     // Image placeholder tokens (will be replaced with vision embeddings)
                                     for _ in 0..preprocessed.num_image_tokens {
                                         prompt_ids.push(image_token_id);
                                     }
+                                    // Image end delimiter
+                                    prompt_ids.push(258882); // <image|>
                                     // Text prompt tokens
                                     if !text_prompt.is_empty() {
                                         let text_ids = vlm.tokenizer.tokenizer
