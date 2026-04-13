@@ -5,14 +5,17 @@
 #   ./scripts/test_gemma4_vlm.sh [model_path] [image_url] [prompt] [max_tokens]
 #
 # Examples:
-#   ./scripts/test_gemma4_vlm.sh /home/emre/models/gemma-4-E2B/
-#   ./scripts/test_gemma4_vlm.sh /home/emre/models/gemma-4-E2B/ "https://upload.wikimedia.org/wikipedia/commons/thumb/4/47/PNG_transparency_demonstration_1.png/280px-PNG_transparency_demonstration_1.png" "What is in this image?"
+#   ./scripts/test_gemma4_vlm.sh /home/emre/models/gemma-4-E2B-it/
+#   ./scripts/test_gemma4_vlm.sh /home/emre/models/gemma-4-E2B-it/ "https://upload.wikimedia.org/wikipedia/commons/1/15/Red_Apple.jpg" "What is in this image?"
+#
+# NOTE: Use the instruct model (-it), not the base model. The base model
+# doesn't understand the chat template and will produce garbage output.
 
 # cd to project root (scripts may be run from any directory)
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR/.." || exit 1
 
-MODEL_PATH="${1:-/home/emre/models/gemma-4-E2B/}"
+MODEL_PATH="${1:-/home/emre/models/gemma-4-E2B-it/}"
 IMAGE_URL="${2:-https://placecats.com/300/200}"
 PROMPT="${3:-Describe this image in detail.}"
 MAX_TOKENS="${4:-50}"
