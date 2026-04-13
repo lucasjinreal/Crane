@@ -613,3 +613,187 @@ impl Gemma4MultimodalEmbedder {
         self.projection.forward(&normed)
     }
 }
+
+// ── Image Preprocessing ─────────────────────────────────────────────────
+
+/// Preprocessing parameters for Gemma4 vision.
+pub struct ImagePreprocessConfig {
+    pub patch_size: usize,
+    pub max_soft_tokens: usize,
+    pub pooling_kernel_size: usize,
+    pub rescale_factor: f64,
+}
+
+impl Default for ImagePreprocessConfig {
+    fn default() -> Self {
+        Self {
+            patch_size: 16,
+            max_soft_tokens: 280,
+            pooling_kernel_size: 3,
+            rescale_factor: 1.0 / 255.0,
+        }
+    }
+}
+
+impl ImagePreprocessConfig {
+    pub fn max_patches(&self) -> usize {
+        self.max_soft_tokens * self.pooling_kernel_size * self.pooling_kernel_size
+    }
+}
+
+/// Result of preprocessing an image for Gemma4 vision.
+pub struct PreprocessedImage {
+    /// Flattened patches: [1, num_patches_padded, patch_size² * 3]
+    pub pixel_values: Tensor,
+    /// 2D position IDs: [1, num_patches_padded, 2] as i64
+    pub pixel_position_ids: Tensor,
+    /// Padding mask: [1, num_patches_padded] (1.0 = padding, 0.0 = real)
+    pub padding_positions: Tensor,
+    /// Number of image placeholder tokens to insert in the prompt
+    pub num_image_tokens: usize,
+}
+
+/// Compute target size preserving aspect ratio for Gemma4 vision.
+///
+/// Ensures the image is resized so that:
+/// - Dimensions are multiples of patch_size
+/// - Total patches <= max_patches
+fn get_aspect_ratio_preserving_size(
+    height: usize,
+    width: usize,
+    patch_size: usize,
+    max_patches: usize,
+) -> (usize, usize) {
+    let aspect = width as f64 / height as f64;
+
+    // Start from max_patches and find dimensions
+    let total_pixels = max_patches * patch_size * patch_size;
+    let mut target_h = (total_pixels as f64 / aspect).sqrt();
+    let mut target_w = target_h * aspect;
+
+    // Round to nearest patch_size multiple
+    target_h = ((target_h / patch_size as f64).floor()) * patch_size as f64;
+    target_w = ((target_w / patch_size as f64).floor()) * patch_size as f64;
+
+    let mut h = target_h.max(patch_size as f64) as usize;
+    let mut w = target_w.max(patch_size as f64) as usize;
+
+    // Ensure total patches doesn't exceed max
+    while (h / patch_size) * (w / patch_size) > max_patches {
+        if h >= w {
+            h -= patch_size;
+        } else {
+            w -= patch_size;
+        }
+    }
+
+    (h.max(patch_size), w.max(patch_size))
+}
+
+/// Preprocess an image for the Gemma4 vision encoder.
+///
+/// Takes a raw image tensor [C, H, W] with values in [0, 1] and returns
+/// patchified, padded tensors ready for the vision model.
+pub fn preprocess_image(
+    image: &Tensor, // [3, H, W] float, values in [0, 1]
+    config: &ImagePreprocessConfig,
+    device: &Device,
+) -> Result<PreprocessedImage> {
+    let (channels, height, width) = image.dims3()?;
+    assert_eq!(channels, 3);
+
+    let max_patches = config.max_patches();
+    let ps = config.patch_size;
+
+    // Compute target size
+    let (target_h, target_w) = get_aspect_ratio_preserving_size(height, width, ps, max_patches);
+
+    // Resize to target
+    let resized = image
+        .unsqueeze(0)?
+        .upsample_bilinear2d(target_h, target_w, false)?
+        .squeeze(0)?; // [3, target_h, target_w]
+
+    // Patchify: [3, H, W] → [num_patches, patch_size² * 3]
+    let num_patches_h = target_h / ps;
+    let num_patches_w = target_w / ps;
+    let num_patches = num_patches_h * num_patches_w;
+
+    let patched = resized
+        .reshape((3, num_patches_h, ps, num_patches_w, ps))?
+        .permute((1, 3, 2, 4, 0))? // [H/P, W/P, P, P, 3]
+        .contiguous()?
+        .reshape((num_patches, ps * ps * 3))?; // [num_patches, P²*3]
+
+    // Create 2D position IDs: [num_patches, 2]
+    let mut pos_data = vec![0i64; num_patches * 2];
+    for py in 0..num_patches_h {
+        for px in 0..num_patches_w {
+            let idx = py * num_patches_w + px;
+            pos_data[idx * 2] = px as i64;     // x position
+            pos_data[idx * 2 + 1] = py as i64; // y position
+        }
+    }
+    let positions = Tensor::from_vec(pos_data, (num_patches, 2), device)?;
+
+    // Pad to max_patches
+    let pad_len = max_patches - num_patches;
+    let (padded_patches, padded_positions, padding_mask) = if pad_len > 0 {
+        let patch_pad = Tensor::zeros((pad_len, ps * ps * 3), patched.dtype(), device)?;
+        let padded_patches = Tensor::cat(&[&patched, &patch_pad], 0)?;
+
+        let pos_pad = Tensor::full(-1i64, (pad_len, 2), device)?;
+        let padded_positions = Tensor::cat(&[&positions, &pos_pad], 0)?;
+
+        // Padding mask: 0.0 for real patches, 1.0 for padding
+        let mut mask_data = vec![0f32; max_patches];
+        for i in num_patches..max_patches {
+            mask_data[i] = 1.0;
+        }
+        let padding_mask = Tensor::from_vec(mask_data, max_patches, device)?;
+
+        (padded_patches, padded_positions, padding_mask)
+    } else {
+        let mask = Tensor::zeros(num_patches, DType::F32, device)?;
+        (patched, positions, mask)
+    };
+
+    // Add batch dimension
+    let pixel_values = padded_patches.unsqueeze(0)?;
+    let pixel_position_ids = padded_positions.unsqueeze(0)?;
+    let padding_positions = padding_mask.unsqueeze(0)?;
+
+    // Number of output tokens after pooling
+    let num_image_tokens = config.max_soft_tokens;
+
+    Ok(PreprocessedImage {
+        pixel_values,
+        pixel_position_ids,
+        padding_positions,
+        num_image_tokens,
+    })
+}
+
+/// Load and preprocess an image file for Gemma4 vision.
+pub fn load_and_preprocess_image(
+    path: &std::path::Path,
+    config: &ImagePreprocessConfig,
+    device: &Device,
+) -> Result<PreprocessedImage> {
+    let img = image::ImageReader::open(path)
+        .map_err(|e| candle_core::Error::Msg(format!("Failed to open image: {e}")))?
+        .decode()
+        .map_err(|e| candle_core::Error::Msg(format!("Failed to decode image: {e}")))?
+        .to_rgb8();
+
+    let (w, h) = img.dimensions();
+    let raw = img.into_raw();
+
+    // Convert to [3, H, W] float tensor in [0, 1]
+    let tensor = (Tensor::from_vec(raw, (h as usize, w as usize, 3), device)?
+        .to_dtype(DType::F32)?
+        .permute((2, 0, 1))?
+        * config.rescale_factor)?;
+
+    preprocess_image(&tensor, config, device)
+}
