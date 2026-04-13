@@ -124,6 +124,78 @@ pub trait ModelBackend: Send + 'static {
 }
 
 // ─────────────────────────────────────────────────────────────
+//  Gemma 4 Backend
+// ─────────────────────────────────────────────────────────────
+
+pub struct Gemma4Backend {
+    pub model: crane_core::models::gemma4::Model,
+}
+
+impl Gemma4Backend {
+    pub fn new(
+        model_path: &str,
+        device: &Device,
+        dtype: &DType,
+        format: crane_core::models::gemma4::ModelFormat,
+    ) -> Result<Self> {
+        let model =
+            crane_core::models::gemma4::Model::new_with_format(model_path, device, dtype, format)?;
+        Ok(Self { model })
+    }
+}
+
+impl ModelBackend for Gemma4Backend {
+    fn forward_step(&mut self, input_ids: &[u32], start_pos: usize) -> Result<Tensor> {
+        self.model
+            .forward_step(input_ids, start_pos)
+            .map_err(Into::into)
+    }
+
+    fn clear_kv_cache(&mut self) {
+        self.model.clear_kv_cache();
+    }
+
+    fn num_layers(&self) -> usize {
+        self.model.num_layers()
+    }
+
+    fn device(&self) -> &Device {
+        &self.model.device
+    }
+
+    fn dtype(&self) -> DType {
+        self.model.dtype
+    }
+
+    fn tokenizer(&self) -> &tokenizers::Tokenizer {
+        &self.model.tokenizer.tokenizer
+    }
+
+    fn eos_token_id(&self) -> Vec<u32> {
+        let tok = &self.model.tokenizer.tokenizer;
+        let mut ids = Vec::new();
+        if let Some(id) = tok.token_to_id("<end_of_turn>") {
+            ids.push(id);
+        }
+        if let Some(id) = tok.token_to_id("<eos>") {
+            ids.push(id);
+        }
+        if ids.is_empty() {
+            ids.push(1); // Gemma default EOS
+        }
+        ids
+    }
+
+    fn warmup(&mut self) {
+        self.model.warmup();
+    }
+
+    // KV swap and batch decode not supported due to KV cache sharing architecture.
+    // supports_kv_swap() defaults to false, capping OAI server to 1 concurrent sequence.
+    // supports_batch_decode() defaults to false.
+}
+
+// ─────────────────────────────────────────────────────────────
 //  Hunyuan Dense Backend
 // ─────────────────────────────────────────────────────────────
 

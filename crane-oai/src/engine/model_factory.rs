@@ -8,7 +8,7 @@ use candle_core::{DType, Device};
 use serde::Deserialize;
 use std::path::Path;
 
-use super::backend::{HunyuanBackend, ModelBackend, Qwen25Backend, Qwen3Backend};
+use super::backend::{Gemma4Backend, HunyuanBackend, ModelBackend, Qwen25Backend, Qwen3Backend};
 use crate::chat_template::{AutoChatTemplate, ChatTemplateProcessor, HunyuanChatTemplate};
 
 // ─────────────────────────────────────────────────────────────
@@ -19,6 +19,7 @@ use crate::chat_template::{AutoChatTemplate, ChatTemplateProcessor, HunyuanChatT
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ModelType {
     Auto,
+    Gemma4,
     HunyuanDense,
     Qwen25,
     Qwen3,
@@ -29,6 +30,7 @@ pub enum ModelType {
 impl ModelType {
     pub fn from_str(s: &str) -> Self {
         match s.to_lowercase().as_str() {
+            "gemma4" | "gemma-4" | "gemma4_e2b" => Self::Gemma4,
             "hunyuan" | "hunyuan_dense" | "hunyuandense" => Self::HunyuanDense,
             "qwen25" | "qwen2.5" | "qwen2" => Self::Qwen25,
             "qwen3" => Self::Qwen3,
@@ -41,6 +43,7 @@ impl ModelType {
     pub fn display_name(&self) -> &'static str {
         match self {
             Self::Auto => "auto",
+            Self::Gemma4 => "gemma4",
             Self::HunyuanDense => "hunyuan",
             Self::Qwen25 => "qwen25",
             Self::Qwen3 => "qwen3",
@@ -106,6 +109,7 @@ pub fn detect_model_type(model_path: &str) -> ModelType {
                 // 1. Check `model_type` field
                 if let Some(ref mt) = config.model_type {
                     match mt.to_lowercase().as_str() {
+                        "gemma4" => return ModelType::Gemma4,
                         "qwen2" | "qwen2.5" => return ModelType::Qwen25,
                         "qwen3" => return ModelType::Qwen3,
                         "qwen3_tts" | "qwen3tts" => return ModelType::Qwen3TTS,
@@ -124,6 +128,9 @@ pub fn detect_model_type(model_path: &str) -> ModelType {
                         }
                         if a.contains("hunyuan") {
                             return ModelType::HunyuanDense;
+                        }
+                        if a.contains("gemma4") {
+                            return ModelType::Gemma4;
                         }
                         if a.contains("qwen3ttsforconditional") || a.contains("qwen3_tts") {
                             return ModelType::Qwen3TTS;
@@ -144,6 +151,8 @@ pub fn detect_model_type(model_path: &str) -> ModelType {
     let path_lower = model_path.to_lowercase();
     if path_lower.contains("paddleocr") {
         ModelType::PaddleOcrVl
+    } else if path_lower.contains("gemma4") || path_lower.contains("gemma-4") {
+        ModelType::Gemma4
     } else if path_lower.contains("hunyuan") {
         ModelType::HunyuanDense
     } else if path_lower.contains("qwen3-tts") || path_lower.contains("qwen3_tts") || path_lower.contains("qwen3tts") {
@@ -192,6 +201,14 @@ pub fn create_backend(
                 ModelFormat::Auto => crane_core::models::hunyuan_dense::ModelFormat::Auto,
             };
             Ok(Box::new(HunyuanBackend::new(model_path, device, dtype, hy_fmt)?))
+        }
+        ModelType::Gemma4 => {
+            let g4_fmt = match format {
+                ModelFormat::Safetensors => crane_core::models::gemma4::ModelFormat::Safetensors,
+                ModelFormat::Gguf => crane_core::models::gemma4::ModelFormat::Gguf,
+                ModelFormat::Auto => crane_core::models::gemma4::ModelFormat::Auto,
+            };
+            Ok(Box::new(Gemma4Backend::new(model_path, device, dtype, g4_fmt)?))
         }
         ModelType::Qwen25 => Ok(Box::new(Qwen25Backend::new(model_path, device, dtype)?)),
         ModelType::Qwen3 => Ok(Box::new(Qwen3Backend::new(model_path, device, dtype)?)),

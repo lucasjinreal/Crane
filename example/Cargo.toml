@@ -46,6 +46,10 @@ name = "tts_voice_clone"
 path = "src/tts_voice_clone.rs"
 
 [[bin]]
+name = "gemma4_simple"
+path = "src/gemma4_simple.rs"
+
+[[bin]]
 name = "hunyuan_simple"
 path = "src/hunyuan_simple.rs"
 
