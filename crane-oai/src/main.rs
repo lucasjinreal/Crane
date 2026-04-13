@@ -432,8 +432,8 @@ async fn main() -> Result<()> {
                     let preprocess_config = ImagePreprocessConfig::default();
 
                     while let Some(req) = g4vlm_rx.blocking_recv() {
-                        match req {
-                            Gemma4VlmRequest::Generate { img_path, text_prompt, max_tokens, tx } => {
+                        let Gemma4VlmRequest { img_path, text_prompt, max_tokens, tx } = req;
+                        {
                                 let res = (|| -> anyhow::Result<String> {
                                     // Preprocess image
                                     let preprocessed = load_and_preprocess_image(
@@ -525,7 +525,6 @@ async fn main() -> Result<()> {
                                 })();
 
                                 let _ = tx.send(res.map_err(|e| e.to_string()));
-                            }
                         }
                     }
                 })

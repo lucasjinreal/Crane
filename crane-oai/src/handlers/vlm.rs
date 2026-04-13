@@ -398,14 +398,11 @@ pub async fn vlm_generate(
 //  Gemma4 VLM
 // ─────────────────────────────────────────────────────────────
 
-pub enum Gemma4VlmRequest {
-    /// Non-streaming: image + text → generated text
-    Generate {
-        img_path: std::path::PathBuf,
-        text_prompt: String,
-        max_tokens: usize,
-        tx: tokio::sync::oneshot::Sender<Result<String, String>>,
-    },
+pub struct Gemma4VlmRequest {
+    pub img_path: std::path::PathBuf,
+    pub text_prompt: String,
+    pub max_tokens: usize,
+    pub tx: tokio::sync::oneshot::Sender<Result<String, String>>,
 }
 
 /// Gemma4VL chat completions handler.
@@ -448,7 +445,7 @@ pub async fn gemma4_vlm_chat_completions(
 
     let (tx, rx) = tokio::sync::oneshot::channel();
     if g4vlm_tx
-        .send(Gemma4VlmRequest::Generate {
+        .send(Gemma4VlmRequest {
             img_path,
             text_prompt,
             max_tokens,
