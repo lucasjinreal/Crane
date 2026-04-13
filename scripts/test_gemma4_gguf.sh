@@ -4,6 +4,10 @@
 # Usage:
 #   ./scripts/test_gemma4_gguf.sh <gguf_file_path> [prompt] [max_tokens]
 
+# cd to project root (scripts may be run from any directory)
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR/.." || exit 1
+
 GGUF_PATH="${1:?Usage: $0 <gguf_file_path> [prompt] [max_tokens]}"
 PROMPT="${2:-The capital of France is}"
 MAX_TOKENS="${3:-20}"

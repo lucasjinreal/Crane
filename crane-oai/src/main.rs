@@ -21,7 +21,7 @@ use chat_template::ChatTemplateProcessor;
 use engine::model_factory::{ModelFormat, ModelType};
 use engine::{EngineHandle, InferenceEngine, MemoryConfig};
 use handlers::tts::TtsGenerateRequest;
-use handlers::vlm::VlmRequest;
+use handlers::vlm::{Gemma4VlmRequest, VlmRequest};
 use openai_api::ErrorResponse;
 use crane_core::models::paddleocr_vl::PaddleOcrVL;
 
@@ -100,8 +100,10 @@ pub struct AppState {
     pub eos_token_id: Vec<u32>,
     /// Server start time (epoch seconds).
     pub server_start_time: u64,
-    /// VLM model (PaddleOCR-VL) — present only for VLM model types.
+    /// VLM model (PaddleOCR-VL) — present only for PaddleOCR VLM.
     pub vlm_tx: Option<tokio::sync::mpsc::UnboundedSender<VlmRequest>>,
+    /// VLM model (Gemma4-VL) — present only for Gemma4 VLM.
+    pub gemma4_vlm_tx: Option<tokio::sync::mpsc::UnboundedSender<Gemma4VlmRequest>>,
     /// TTS model (Qwen3-TTS) — present only for TTS model types.
     pub tts_tx: Option<tokio::sync::mpsc::UnboundedSender<TtsGenerateRequest>>,
     // ── Fields for /model_info and /server_info ──
@@ -212,6 +214,10 @@ async fn main() -> Result<()> {
     // Resolve auto-detection early so we know if this is VLM.
     let resolved_type = if model_type == ModelType::Auto {
         engine::model_factory::detect_model_type(&args.model_path)
+    } else if model_type == ModelType::Gemma4 {
+        // For Gemma4, auto-detect VL variant from vision_config presence
+        let detected = engine::model_factory::detect_model_type(&args.model_path);
+        if detected == ModelType::Gemma4VL { detected } else { model_type }
     } else {
         model_type
     };
@@ -221,8 +227,8 @@ async fn main() -> Result<()> {
 
     // ── Branch: VLM model vs TTS model vs standard LLM ──
 
-    let (engine_handle, tokenizer, eos_token_id, chat_template, vlm_tx_opt, tts_tx_opt):
-        (Option<EngineHandle>, tokenizers::Tokenizer, Vec<u32>, Box<dyn ChatTemplateProcessor>, Option<tokio::sync::mpsc::UnboundedSender<VlmRequest>>, Option<tokio::sync::mpsc::UnboundedSender<TtsGenerateRequest>>) = if is_tts {
+    let (engine_handle, tokenizer, eos_token_id, chat_template, vlm_tx_opt, gemma4_vlm_tx_opt, tts_tx_opt):
+        (Option<EngineHandle>, tokenizers::Tokenizer, Vec<u32>, Box<dyn ChatTemplateProcessor>, Option<tokio::sync::mpsc::UnboundedSender<VlmRequest>>, Option<tokio::sync::mpsc::UnboundedSender<Gemma4VlmRequest>>, Option<tokio::sync::mpsc::UnboundedSender<TtsGenerateRequest>>) = if is_tts {
         // TTS path: create Qwen3-TTS on a dedicated thread.
         info!("Loading TTS model (Qwen3-TTS) from: {}", args.model_path);
         let model_path_clone = args.model_path.clone();
@@ -376,10 +382,9 @@ async fn main() -> Result<()> {
 
         let chat_template = engine::model_factory::create_chat_template(model_type, &args.model_path);
 
-        (None, tokenizer, vec![eos_id], chat_template, None, Some(tts_tx))
+        (None, tokenizer, vec![eos_id], chat_template, None, None, Some(tts_tx))
     } else if is_vlm {
-        // VLM path: create PaddleOcrVL on a dedicated thread to avoid Send/Sync issues.
-        info!("Loading VLM model (PaddleOCR-VL) from: {}", args.model_path);
+        // VLM path: create model on a dedicated thread to avoid Send/Sync issues.
 
         let use_cpu = args.cpu || {
             #[cfg(feature = "cuda")]
@@ -393,65 +398,198 @@ async fn main() -> Result<()> {
         #[cfg(not(feature = "cuda"))]
         let use_bf16 = false;
 
-        let model_path_clone = args.model_path.clone();
-        let (vlm_tx, mut vlm_rx) = tokio::sync::mpsc::unbounded_channel::<VlmRequest>();
-
-        std::thread::Builder::new()
-            .name("vlm-engine".into())
-            .spawn(move || {
-                let mut vlm = match engine::model_factory::create_vlm_model(&model_path_clone, use_cpu, use_bf16) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        tracing::error!("Failed to load VLM model: {e}");
-                        return;
-                    }
-                };
-                info!("VLM engine thread started");
-
-                while let Some(req) = vlm_rx.blocking_recv() {
-                    match req {
-                        VlmRequest::Recognize { img_path, task, max_tokens, tx } => {
-                            let res = vlm.recognize(&img_path, task, max_tokens).map(|r| r.text);
-                            if let Err(ref e) = res {
-                                tracing::error!("VLM Recognize failed: {:?}", e);
-                            }
-                            let _ = tx.send(res.map_err(|e| e.to_string()));
-                        }
-                        VlmRequest::RecognizeStream { img_path, task, max_tokens, token_tx, done_tx } => {
-                            let res = vlm.recognize_stream(
-                                &img_path,
-                                task,
-                                max_tokens,
-                                |token_text: &str| {
-                                    let _ = token_tx.send(token_text.to_string());
-                                }
-                            );
-                            if let Err(ref e) = res {
-                                tracing::error!("VLM RecognizeStream failed: {:?}", e);
-                            }
-                            let _ = done_tx.send(res.map(|_| ()).map_err(|e| e.to_string()));
-                        }
-                    }
-                }
-            })
-            .expect("Failed to spawn VLM thread");
-
-        info!("VLM model routing established (type: {:?})", resolved_type);
-
-        // Use tokenizer from the VLM for API compatibility.
         let tok_path = std::path::Path::new(&args.model_path).join("tokenizer.json");
         let tokenizer = tokenizers::Tokenizer::from_file(&tok_path)
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
+        let chat_template = engine::model_factory::create_chat_template(model_type, &args.model_path);
+
+        let mut vlm_tx_opt_inner: Option<tokio::sync::mpsc::UnboundedSender<VlmRequest>> = None;
+        let mut gemma4_vlm_tx_opt_inner: Option<tokio::sync::mpsc::UnboundedSender<Gemma4VlmRequest>> = None;
+
+        if resolved_type == engine::model_factory::ModelType::Gemma4VL {
+            // Gemma4 VLM path
+            info!("Loading Gemma4 VLM model from: {}", args.model_path);
+
+            let model_path_clone = args.model_path.clone();
+            let device_clone = device.clone();
+            let dtype_clone = dtype;
+            let (g4vlm_tx, mut g4vlm_rx) = tokio::sync::mpsc::unbounded_channel::<Gemma4VlmRequest>();
+
+            std::thread::Builder::new()
+                .name("gemma4-vlm-engine".into())
+                .spawn(move || {
+                    use crane_core::models::gemma4::vlm::Gemma4VLModel;
+                    use crane_core::models::gemma4::vision::{load_and_preprocess_image, ImagePreprocessConfig};
+
+                    let mut vlm = match Gemma4VLModel::new(&model_path_clone, &device_clone, &dtype_clone) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            tracing::error!("Failed to load Gemma4 VLM model: {e}");
+                            return;
+                        }
+                    };
+                    info!("Gemma4 VLM engine thread started");
+                    let preprocess_config = ImagePreprocessConfig::default();
+
+                    while let Some(req) = g4vlm_rx.blocking_recv() {
+                        let Gemma4VlmRequest { img_path, text_prompt, max_tokens, tx } = req;
+                        {
+                                let res = (|| -> anyhow::Result<String> {
+                                    // Preprocess image
+                                    let preprocessed = load_and_preprocess_image(
+                                        &img_path, &preprocess_config, &device_clone,
+                                    )?;
+
+                                    // Encode image through vision tower
+                                    let image_embeds = vlm.encode_image(
+                                        &preprocessed.pixel_values,
+                                        &preprocessed.pixel_position_ids,
+                                        &preprocessed.padding_positions,
+                                    )?;
+
+                                    // Build prompt in Gemma4-it chat format:
+                                    // <bos><|turn>user\n<|image>{N x img_token}<image|>text<turn|>\n<|turn>model\n
+                                    let image_token_id = 258880u32;
+                                    let mut prompt_ids: Vec<u32> = vec![
+                                        2,      // <bos>
+                                        105,    // <|turn>
+                                        2364,   // "user"
+                                        107,    // \n
+                                        255999, // <|image> — image start delimiter
+                                    ];
+                                    // Image placeholder tokens (will be replaced with vision embeddings)
+                                    for _ in 0..preprocessed.num_image_tokens {
+                                        prompt_ids.push(image_token_id);
+                                    }
+                                    // Image end delimiter
+                                    prompt_ids.push(258882); // <image|>
+                                    // Text prompt tokens
+                                    if !text_prompt.is_empty() {
+                                        let text_ids = vlm.tokenizer.tokenizer
+                                            .encode(text_prompt.as_str(), false)
+                                            .map_err(|e| anyhow::anyhow!("{e}"))?
+                                            .get_ids()
+                                            .to_vec();
+                                        prompt_ids.extend(text_ids);
+                                    }
+                                    // End user turn, start model turn
+                                    prompt_ids.extend_from_slice(&[
+                                        106,   // <turn|>
+                                        107,   // \n
+                                        105,   // <|turn>
+                                        4368,  // "model"
+                                        107,   // \n
+                                    ]);
+
+                                    // Forward pass
+                                    vlm.clear_kv_cache();
+                                    let input_tensor = candle_core::Tensor::new(
+                                        prompt_ids.as_slice(), &device_clone,
+                                    )?.unsqueeze(0)?;
+
+                                    let logits = vlm.forward(&input_tensor, Some(&image_embeds), 0)?;
+                                    let logits = logits.squeeze(0)?.squeeze(0)?
+                                        .to_dtype(candle_core::DType::F32)?;
+
+                                    // Simple greedy generation loop
+                                    let mut tokens = prompt_ids.clone();
+                                    let mut generated = Vec::new();
+                                    let mut next_token = {
+                                        let probs = candle_nn::ops::softmax_last_dim(&logits)?;
+                                        let next = probs.argmax(candle_core::D::Minus1)?
+                                            .to_scalar::<u32>()?;
+                                        next
+                                    };
+                                    generated.push(next_token);
+                                    tokens.push(next_token);
+
+                                    for _ in 1..max_tokens {
+                                        if next_token == 1 || next_token == 106 { break; } // EOS(1) or <turn|>(106)
+                                        let input = candle_core::Tensor::new(
+                                            &[next_token], &device_clone,
+                                        )?.unsqueeze(0)?;
+                                        let logits = vlm.forward(&input, None, tokens.len() - 1)?;
+                                        let logits = logits.squeeze(0)?.squeeze(0)?
+                                            .to_dtype(candle_core::DType::F32)?;
+                                        next_token = candle_nn::ops::softmax_last_dim(&logits)?
+                                            .argmax(candle_core::D::Minus1)?
+                                            .to_scalar::<u32>()?;
+                                        generated.push(next_token);
+                                        tokens.push(next_token);
+                                    }
+
+                                    let text = vlm.tokenizer.tokenizer
+                                        .decode(&generated, true)
+                                        .unwrap_or_default();
+                                    Ok(text)
+                                })();
+
+                                let _ = tx.send(res.map_err(|e| e.to_string()));
+                        }
+                    }
+                })
+                .expect("Failed to spawn Gemma4 VLM thread");
+
+            gemma4_vlm_tx_opt_inner = Some(g4vlm_tx);
+        } else {
+            // PaddleOCR-VL path
+            info!("Loading VLM model (PaddleOCR-VL) from: {}", args.model_path);
+
+            let model_path_clone = args.model_path.clone();
+            let (vlm_tx, mut vlm_rx) = tokio::sync::mpsc::unbounded_channel::<VlmRequest>();
+
+            std::thread::Builder::new()
+                .name("vlm-engine".into())
+                .spawn(move || {
+                    let mut vlm = match engine::model_factory::create_vlm_model(&model_path_clone, use_cpu, use_bf16) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            tracing::error!("Failed to load VLM model: {e}");
+                            return;
+                        }
+                    };
+                    info!("VLM engine thread started");
+
+                    while let Some(req) = vlm_rx.blocking_recv() {
+                        match req {
+                            VlmRequest::Recognize { img_path, task, max_tokens, tx } => {
+                                let res = vlm.recognize(&img_path, task, max_tokens).map(|r| r.text);
+                                if let Err(ref e) = res {
+                                    tracing::error!("VLM Recognize failed: {:?}", e);
+                                }
+                                let _ = tx.send(res.map_err(|e| e.to_string()));
+                            }
+                            VlmRequest::RecognizeStream { img_path, task, max_tokens, token_tx, done_tx } => {
+                                let res = vlm.recognize_stream(
+                                    &img_path,
+                                    task,
+                                    max_tokens,
+                                    |token_text: &str| {
+                                        let _ = token_tx.send(token_text.to_string());
+                                    }
+                                );
+                                if let Err(ref e) = res {
+                                    tracing::error!("VLM RecognizeStream failed: {:?}", e);
+                                }
+                                let _ = done_tx.send(res.map(|_| ()).map_err(|e| e.to_string()));
+                            }
+                        }
+                    }
+                })
+                .expect("Failed to spawn VLM thread");
+
+            vlm_tx_opt_inner = Some(vlm_tx);
+        }
+
+        info!("VLM model routing established (type: {:?})", resolved_type);
 
         let eos_id = tokenizer
             .token_to_id("</s>")
+            .or_else(|| tokenizer.token_to_id("<end_of_turn>"))
             .or_else(|| tokenizer.token_to_id("<|end_of_sentence|>"))
-            .unwrap_or(2);
+            .unwrap_or(1);
 
-        // Chat template (uses Auto for jinja-based template).
-        let chat_template = engine::model_factory::create_chat_template(model_type, &args.model_path);
-
-        (None, tokenizer, vec![eos_id], chat_template, Some(vlm_tx), None)
+        (None, tokenizer, vec![eos_id], chat_template, vlm_tx_opt_inner, gemma4_vlm_tx_opt_inner, None)
     } else {
         // Standard LLM path.
         let mut backend = engine::model_factory::create_backend(
@@ -501,7 +639,7 @@ async fn main() -> Result<()> {
             args.max_concurrent, args.decode_tokens_per_seq,
         );
 
-        (Some(handle), tokenizer, eos_token_id, chat_template, None, None)
+        (Some(handle), tokenizer, eos_token_id, chat_template, None, None, None)
     };
 
     // ── Model name for API responses ──
@@ -525,6 +663,7 @@ async fn main() -> Result<()> {
         eos_token_id,
         server_start_time: now_epoch(),
         vlm_tx: vlm_tx_opt,
+        gemma4_vlm_tx: gemma4_vlm_tx_opt,
         tts_tx: tts_tx_opt,
         model_path: args.model_path.clone(),
         model_type_name: resolved_type.display_name().to_string(),

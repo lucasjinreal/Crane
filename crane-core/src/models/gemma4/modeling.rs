@@ -227,7 +227,7 @@ fn apply_partial_rope(
 }
 
 /// RMS normalization without learnable scale (Gemma4's v_norm uses with_scale=False).
-fn rms_normalize(x: &Tensor, eps: f64) -> Result<Tensor> {
+pub fn rms_normalize(x: &Tensor, eps: f64) -> Result<Tensor> {
     let dtype = x.dtype();
     let x_f32 = x.to_dtype(DType::F32)?;
     let variance = x_f32.sqr()?.mean_keepdim(D::Minus1)?;
@@ -493,8 +493,8 @@ impl Attention {
         if n_rep > 1 && seq_len == 1 {
             // Gemma4: scaling = 1.0 (QK norms handle normalization)
             let q_g =
-                q.reshape((b_sz, self.num_kv_heads, n_rep, self.head_dim))?;
-            let k_t = k.transpose(2, 3)?;
+                q.reshape((b_sz, self.num_kv_heads, n_rep, self.head_dim))?.contiguous()?;
+            let k_t = k.transpose(2, 3)?.contiguous()?;
             let attn_weights = q_g.matmul(&k_t)?;
 
             let attn_weights = match attention_mask {
@@ -528,6 +528,9 @@ impl Attention {
         };
 
         // Gemma4: scaling = 1.0 (QK norms handle normalization)
+        let q = q.contiguous()?;
+        let k = k.contiguous()?;
+        let v = v.contiguous()?;
         let attn_weights = q.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
         let attn_weights = match attention_mask {
             Some(mask) => attn_weights.broadcast_add(mask)?,
@@ -1222,14 +1225,38 @@ impl Gemma4Model {
     // ── Forward ─────────────────────────────────────────────────────────
 
     pub fn forward(&mut self, input_ids: &Tensor, start_pos: usize) -> Result<Tensor> {
+        let hidden_states = self.embed_tokens.forward(input_ids)?.to_dtype(self.dtype)?;
+        let hidden_states = (hidden_states * self.embed_scale)?;
+        self.forward_inner(input_ids, hidden_states, start_pos)
+    }
+
+    /// Forward pass with pre-computed embeddings (for VLM: vision features spliced into text embeddings).
+    /// `input_ids` is still needed for PLE token embedding lookup.
+    pub fn forward_embeds(
+        &mut self,
+        input_ids: &Tensor,
+        hidden_states: Tensor,
+        start_pos: usize,
+    ) -> Result<Tensor> {
+        self.forward_inner(input_ids, hidden_states, start_pos)
+    }
+
+    /// Expose embed_tokens for VLM use (embed + scale).
+    pub fn embed(&self, input_ids: &Tensor) -> Result<Tensor> {
+        let hidden_states = self.embed_tokens.forward(input_ids)?.to_dtype(self.dtype)?;
+        hidden_states * self.embed_scale
+    }
+
+    fn forward_inner(
+        &mut self,
+        input_ids: &Tensor,
+        hidden_states: Tensor,
+        start_pos: usize,
+    ) -> Result<Tensor> {
         let (_b_sz, seq_len) = input_ids.dims2()?;
 
         #[cfg(feature = "cuda")]
         let _event_guard = EventTrackingGuard::disable(input_ids.device());
-
-        // Embed + scale by sqrt(hidden_size)
-        let hidden_states = self.embed_tokens.forward(input_ids)?.to_dtype(self.dtype)?;
-        let hidden_states = (hidden_states * self.embed_scale)?;
 
         // PLE preparation: combine token embeddings + model projection
         let ple_dim = self.config.hidden_size_per_layer_input.unwrap_or(256);
@@ -1275,12 +1302,12 @@ impl Gemma4Model {
 
         // Attention masks
         let sliding_mask = if seq_len > 1 {
-            Some(self.build_sliding_mask(seq_len, total_len, start_pos, input_ids.device())?)
+            Some(self.build_sliding_mask(seq_len, total_len, start_pos, hidden_states.device())?)
         } else {
             None
         };
         let causal_mask = if seq_len > 1 {
-            Some(self.build_causal_mask(seq_len, total_len, start_pos, input_ids.device())?)
+            Some(self.build_causal_mask(seq_len, total_len, start_pos, hidden_states.device())?)
         } else {
             None
         };
