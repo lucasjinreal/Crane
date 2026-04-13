@@ -9,7 +9,6 @@
 //! - RMSNorm + Linear projection to text hidden_size
 
 use candle_core::{DType, Device, Module, Result, Tensor, D};
-use candle_nn::rotary_emb::rope;
 use candle_nn::{linear_no_bias, Linear, RmsNorm, VarBuilder};
 use serde::Deserialize;
 
@@ -64,10 +63,33 @@ impl Gemma4VisionConfig {
 }
 
 // ── Clipped Linear ──────────────────────────────────────────────────────
-// Weights are at `.linear.weight`; clip bounds are stored but unused at inference.
+// Weights are at `.linear.weight`; clip bounds are applied during forward.
 
-fn clipped_linear(in_d: usize, out_d: usize, vb: VarBuilder) -> Result<Linear> {
-    linear_no_bias(in_d, out_d, vb.pp("linear"))
+struct ClippedLinear {
+    linear: Linear,
+    input_min: f64,
+    input_max: f64,
+    output_min: f64,
+    output_max: f64,
+}
+
+impl ClippedLinear {
+    fn new(in_d: usize, out_d: usize, vb: VarBuilder) -> Result<Self> {
+        let linear = linear_no_bias(in_d, out_d, vb.pp("linear"))?;
+        // Load clip bounds (scalar tensors)
+        let input_min: f64 = vb.get((), "input_min")?.to_dtype(DType::F64)?.to_scalar()?;
+        let input_max: f64 = vb.get((), "input_max")?.to_dtype(DType::F64)?.to_scalar()?;
+        let output_min: f64 = vb.get((), "output_min")?.to_dtype(DType::F64)?.to_scalar()?;
+        let output_max: f64 = vb.get((), "output_max")?.to_dtype(DType::F64)?.to_scalar()?;
+        Ok(Self { linear, input_min, input_max, output_min, output_max })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let x = x.clamp(self.input_min, self.input_max)?;
+        let y = self.linear.forward(&x)?;
+        y.clamp(self.output_min, self.output_max)
+    }
+
 }
 
 // ── 2D RoPE for Vision ─────────────────────────────────────────────────
@@ -91,11 +113,11 @@ impl VisionRotaryEmbedding {
     /// Compute 2D cos/sin from pixel position IDs.
     ///
     /// position_ids: [B, num_patches, 2] (x, y positions as i64)
-    /// Returns: (cos, sin) each [B, num_patches, head_dim//2] per spatial dim,
-    ///          concatenated to [B, num_patches, head_dim//2] for each spatial half.
+    /// Returns: (cos, sin) each [B, num_patches, head_dim].
+    ///
+    /// For each spatial dimension, frequencies are doubled (cat(freqs, freqs))
+    /// before computing cos/sin, matching HF's rotate_half application.
     fn forward(&self, position_ids: &Tensor, dtype: DType) -> Result<(Tensor, Tensor)> {
-        let freq_dim = self.inv_freq.dim(0)?; // spatial_dim / 2
-
         let mut all_cos = Vec::new();
         let mut all_sin = Vec::new();
 
@@ -109,50 +131,61 @@ impl VisionRotaryEmbedding {
             let pos = dim_pos.unsqueeze(D::Minus1)?; // [B, num_patches, 1]
             let freqs = pos.broadcast_mul(&inv)?; // [B, num_patches, freq_dim]
 
-            let cos = freqs.cos()?.to_dtype(dtype)?;
-            let sin = freqs.sin()?.to_dtype(dtype)?;
-            all_cos.push(cos);
-            all_sin.push(sin);
+            // Double the frequencies: emb = cat(freqs, freqs) → [B, S, freq_dim*2]
+            let emb = Tensor::cat(&[&freqs, &freqs], D::Minus1)?;
+
+            all_cos.push(emb.cos()?.to_dtype(dtype)?);
+            all_sin.push(emb.sin()?.to_dtype(dtype)?);
         }
 
-        // Concatenate X and Y: [B, num_patches, freq_dim*2 = head_dim/2]
+        // Concatenate X and Y: [B, num_patches, freq_dim*4 = head_dim]
         let cos = Tensor::cat(&all_cos, D::Minus1)?.contiguous()?;
         let sin = Tensor::cat(&all_sin, D::Minus1)?.contiguous()?;
         Ok((cos, sin))
     }
 }
 
-/// Apply 2D RoPE to Q or K.
+/// Apply rotate_half to a tensor: split last dim in half, negate+swap.
+fn rotate_half(x: &Tensor) -> Result<Tensor> {
+    let half = x.dim(D::Minus1)? / 2;
+    let x1 = x.narrow(D::Minus1, 0, half)?;
+    let x2 = x.narrow(D::Minus1, half, half)?;
+    Tensor::cat(&[&x2.neg()?, &x1], D::Minus1)
+}
+
+/// Apply 2D RoPE to Q or K (multidimensional RoPE).
 ///
 /// x: [B, H, num_patches, head_dim]
-/// cos/sin: [B, num_patches, head_dim/2]
+/// cos/sin: [B, num_patches, head_dim] (concatenated X and Y, each doubled)
 ///
-/// Split head_dim into two halves (X, Y). Apply standard RoPE to each half
-/// independently using the corresponding spatial frequencies.
+/// Splits x and cos/sin into per-spatial-dimension parts and applies
+/// rotate_half independently to each, matching HF's apply_multidimensional_rope.
 fn apply_2d_rope(
     x: &Tensor,
     cos: &Tensor,
     sin: &Tensor,
 ) -> Result<Tensor> {
     let head_dim = x.dim(D::Minus1)?;
-    let half = head_dim / 2;
+    let ndim = 2; // 2D spatial
+    let channels_per_dim = head_dim / ndim; // 32
 
-    // Split into X and Y halves
-    let x_part = x.narrow(D::Minus1, 0, half)?;
-    let y_part = x.narrow(D::Minus1, half, half)?;
+    let mut y_parts = Vec::with_capacity(ndim);
+    for k in 0..ndim {
+        let offset = k * channels_per_dim;
+        // x_part: [B, H, S, channels_per_dim]
+        let x_part = x.narrow(D::Minus1, offset, channels_per_dim)?;
+        // cos_part: [B, S, channels_per_dim] → [B, 1, S, channels_per_dim]
+        let cos_part = cos.narrow(D::Minus1, offset, channels_per_dim)?.unsqueeze(1)?;
+        let sin_part = sin.narrow(D::Minus1, offset, channels_per_dim)?.unsqueeze(1)?;
 
-    // Split cos/sin for each spatial dim: each is [B, S, freq_dim]
-    let freq_dim = cos.dim(D::Minus1)? / 2;
-    let cos_x = cos.narrow(D::Minus1, 0, freq_dim)?;
-    let sin_x = sin.narrow(D::Minus1, 0, freq_dim)?;
-    let cos_y = cos.narrow(D::Minus1, freq_dim, freq_dim)?;
-    let sin_y = sin.narrow(D::Minus1, freq_dim, freq_dim)?;
+        // apply_rotary_pos_emb: (x * cos) + (rotate_half(x) * sin)
+        let rotated = rotate_half(&x_part)?;
+        let y = (x_part.broadcast_mul(&cos_part)? + rotated.broadcast_mul(&sin_part)?)?;
+        y_parts.push(y);
+    }
 
-    // Apply standard RoPE to each half (ensure all inputs contiguous for rope kernel)
-    let x_rot = rope(&x_part.contiguous()?, &cos_x.contiguous()?, &sin_x.contiguous()?)?;
-    let y_rot = rope(&y_part.contiguous()?, &cos_y.contiguous()?, &sin_y.contiguous()?)?;
-
-    Tensor::cat(&[&x_rot, &y_rot], D::Minus1)
+    Tensor::cat(&y_parts.iter().collect::<Vec<_>>(), D::Minus1)?
+        .contiguous()
 }
 
 // ── Patch Embeddings ────────────────────────────────────────────────────
@@ -243,10 +276,10 @@ impl VisionPatchEmbedder {
 // ── Vision Attention ────────────────────────────────────────────────────
 
 struct VisionAttention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
+    q_proj: ClippedLinear,
+    k_proj: ClippedLinear,
+    v_proj: ClippedLinear,
+    o_proj: ClippedLinear,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
     rms_norm_eps: f64,
@@ -261,10 +294,10 @@ impl VisionAttention {
         let nh = config.num_attention_heads;
         let nkv = config.num_key_value_heads;
 
-        let q_proj = clipped_linear(config.hidden_size, nh * hd, vb.pp("q_proj"))?;
-        let k_proj = clipped_linear(config.hidden_size, nkv * hd, vb.pp("k_proj"))?;
-        let v_proj = clipped_linear(config.hidden_size, nkv * hd, vb.pp("v_proj"))?;
-        let o_proj = clipped_linear(nh * hd, config.hidden_size, vb.pp("o_proj"))?;
+        let q_proj = ClippedLinear::new(config.hidden_size, nh * hd, vb.pp("q_proj"))?;
+        let k_proj = ClippedLinear::new(config.hidden_size, nkv * hd, vb.pp("k_proj"))?;
+        let v_proj = ClippedLinear::new(config.hidden_size, nkv * hd, vb.pp("v_proj"))?;
+        let o_proj = ClippedLinear::new(nh * hd, config.hidden_size, vb.pp("o_proj"))?;
 
         let q_norm = candle_nn::rms_norm(hd, config.rms_norm_eps, vb.pp("q_norm"))?;
         let k_norm = candle_nn::rms_norm(hd, config.rms_norm_eps, vb.pp("k_norm"))?;
@@ -347,16 +380,16 @@ impl VisionAttention {
 // ── Vision MLP ──────────────────────────────────────────────────────────
 
 struct VisionMlp {
-    gate_proj: Linear,
-    up_proj: Linear,
-    down_proj: Linear,
+    gate_proj: ClippedLinear,
+    up_proj: ClippedLinear,
+    down_proj: ClippedLinear,
 }
 
 impl VisionMlp {
     fn new(config: &Gemma4VisionConfig, vb: VarBuilder) -> Result<Self> {
-        let gate_proj = clipped_linear(config.hidden_size, config.intermediate_size, vb.pp("gate_proj"))?;
-        let up_proj = clipped_linear(config.hidden_size, config.intermediate_size, vb.pp("up_proj"))?;
-        let down_proj = clipped_linear(config.intermediate_size, config.hidden_size, vb.pp("down_proj"))?;
+        let gate_proj = ClippedLinear::new(config.hidden_size, config.intermediate_size, vb.pp("gate_proj"))?;
+        let up_proj = ClippedLinear::new(config.hidden_size, config.intermediate_size, vb.pp("up_proj"))?;
+        let down_proj = ClippedLinear::new(config.intermediate_size, config.hidden_size, vb.pp("down_proj"))?;
         Ok(Self {
             gate_proj,
             up_proj,
@@ -567,23 +600,29 @@ impl Gemma4VisionModel {
         let (cos, sin) = self.rotary_emb.forward(pixel_position_ids, self.dtype)?;
 
         let mut hidden_states = hidden_states;
-        for layer in &self.layers {
+        for layer in self.layers.iter() {
             hidden_states = layer.forward(&hidden_states, &cos, &sin)?;
         }
 
-        // Pool: output_length = num_real_patches / pooling_kernel²
+        // Pool: output_length = total_patches / pooling_kernel² (matches HF)
         let num_patches = hidden_states.dim(1)?;
+        let pk2 = self.config.pooling_kernel_size.pow(2);
+        let output_length = num_patches / pk2;
         let padding_sum: f32 = padding_positions.sum_all()?.to_scalar()?;
         let num_real = num_patches - padding_sum as usize;
-        let pk2 = self.config.pooling_kernel_size.pow(2);
-        let output_length = num_real / pk2;
 
-        self.pooler.forward(
+        let pooled = self.pooler.forward(
             &hidden_states,
             pixel_position_ids,
             padding_positions,
             output_length,
-        )
+        )?;
+
+        // Strip padding tokens from pooler output: take only the first num_real/pk2 tokens.
+        let real_output_length = num_real / pk2;
+        let pooled = pooled.narrow(1, 0, real_output_length)?;
+
+        Ok(pooled)
     }
 }
 

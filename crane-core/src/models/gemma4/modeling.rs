@@ -493,8 +493,8 @@ impl Attention {
         if n_rep > 1 && seq_len == 1 {
             // Gemma4: scaling = 1.0 (QK norms handle normalization)
             let q_g =
-                q.reshape((b_sz, self.num_kv_heads, n_rep, self.head_dim))?;
-            let k_t = k.transpose(2, 3)?;
+                q.reshape((b_sz, self.num_kv_heads, n_rep, self.head_dim))?.contiguous()?;
+            let k_t = k.transpose(2, 3)?.contiguous()?;
             let attn_weights = q_g.matmul(&k_t)?;
 
             let attn_weights = match attention_mask {
@@ -528,6 +528,9 @@ impl Attention {
         };
 
         // Gemma4: scaling = 1.0 (QK norms handle normalization)
+        let q = q.contiguous()?;
+        let k = k.contiguous()?;
+        let v = v.contiguous()?;
         let attn_weights = q.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
         let attn_weights = match attention_mask {
             Some(mask) => attn_weights.broadcast_add(mask)?,

@@ -214,6 +214,10 @@ async fn main() -> Result<()> {
     // Resolve auto-detection early so we know if this is VLM.
     let resolved_type = if model_type == ModelType::Auto {
         engine::model_factory::detect_model_type(&args.model_path)
+    } else if model_type == ModelType::Gemma4 {
+        // For Gemma4, auto-detect VL variant from vision_config presence
+        let detected = engine::model_factory::detect_model_type(&args.model_path);
+        if detected == ModelType::Gemma4VL { detected } else { model_type }
     } else {
         model_type
     };
