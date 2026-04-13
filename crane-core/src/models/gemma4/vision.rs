@@ -35,6 +35,8 @@ pub struct Gemma4VisionConfig {
     pub use_clipped_linears: bool,
     #[serde(default = "default_output_length")]
     pub default_output_length: usize,
+    #[serde(default = "default_pooling_kernel_size")]
+    pub pooling_kernel_size: usize,
     #[serde(default)]
     pub rope_parameters: Option<VisionRopeParams>,
 }
@@ -49,6 +51,7 @@ fn default_head_dim() -> usize { 64 }
 fn default_position_embedding_size() -> usize { 10240 }
 fn default_rms_norm_eps() -> f64 { 1e-6 }
 fn default_output_length() -> usize { 280 }
+fn default_pooling_kernel_size() -> usize { 3 }
 fn default_rope_theta() -> f64 { 100.0 }
 
 impl Gemma4VisionConfig {
@@ -568,12 +571,18 @@ impl Gemma4VisionModel {
             hidden_states = layer.forward(&hidden_states, &cos, &sin)?;
         }
 
-        // Pool to output_length
+        // Pool: output_length = num_real_patches / pooling_kernel²
+        let num_patches = hidden_states.dim(1)?;
+        let padding_sum: f32 = padding_positions.sum_all()?.to_scalar()?;
+        let num_real = num_patches - padding_sum as usize;
+        let pk2 = self.config.pooling_kernel_size.pow(2);
+        let output_length = num_real / pk2;
+
         self.pooler.forward(
             &hidden_states,
             pixel_position_ids,
             padding_positions,
-            self.config.default_output_length,
+            output_length,
         )
     }
 }
@@ -760,7 +769,9 @@ pub fn preprocess_image(
     let padding_positions = padding_mask.unsqueeze(0)?;
 
     // Number of output tokens after pooling
-    let num_image_tokens = config.max_soft_tokens;
+    // Output tokens = real patches / pooling_kernel² (not max_soft_tokens)
+    let pk2 = config.pooling_kernel_size * config.pooling_kernel_size;
+    let num_image_tokens = num_patches / pk2;
 
     Ok(PreprocessedImage {
         pixel_values,
