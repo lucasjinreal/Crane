@@ -4,7 +4,7 @@
 //! - Patch embedding with learned 2D position table
 //! - 16-layer bidirectional transformer with 2D RoPE
 //! - Gemma-style 4 norms per layer, QK+V norms
-//! - Clipped linears (clip bounds stored but only applied during training)
+//! - Clipped linears (input/output clamping applied at inference)
 //! - Spatial average pooling
 //! - RMSNorm + Linear projection to text hidden_size
 
@@ -30,10 +30,6 @@ pub struct Gemma4VisionConfig {
     pub position_embedding_size: usize,
     #[serde(default = "default_rms_norm_eps")]
     pub rms_norm_eps: f64,
-    #[serde(default)]
-    pub use_clipped_linears: bool,
-    #[serde(default = "default_output_length")]
-    pub default_output_length: usize,
     #[serde(default = "default_pooling_kernel_size")]
     pub pooling_kernel_size: usize,
     #[serde(default)]
@@ -49,7 +45,6 @@ pub struct VisionRopeParams {
 fn default_head_dim() -> usize { 64 }
 fn default_position_embedding_size() -> usize { 10240 }
 fn default_rms_norm_eps() -> f64 { 1e-6 }
-fn default_output_length() -> usize { 280 }
 fn default_pooling_kernel_size() -> usize { 3 }
 fn default_rope_theta() -> f64 { 100.0 }
 
@@ -211,10 +206,6 @@ impl VisionPatchEmbedder {
         })
     }
 
-    /// Compute 2D position embeddings from position IDs.
-    ///
-    /// pixel_position_ids: [B, num_patches, 2] (i64)
-    /// padding_positions: [B, num_patches] (bool)
     /// Compute 2D position embeddings using index_select from the learned table.
     ///
     /// pixel_position_ids: [B, num_patches, 2] (i64)
@@ -697,11 +688,6 @@ pub struct PreprocessedImage {
     pub num_image_tokens: usize,
 }
 
-/// Compute target size preserving aspect ratio for Gemma4 vision.
-///
-/// Ensures the image is resized so that:
-/// - Dimensions are multiples of patch_size
-/// - Total patches <= max_patches
 /// Compute target size preserving aspect ratio for Gemma4 vision.
 ///
 /// Dimensions are rounded down to multiples of `pooling_kernel_size * patch_size`
