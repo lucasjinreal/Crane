@@ -663,36 +663,30 @@ pub struct PreprocessedImage {
 /// Ensures the image is resized so that:
 /// - Dimensions are multiples of patch_size
 /// - Total patches <= max_patches
+/// Compute target size preserving aspect ratio for Gemma4 vision.
+///
+/// Dimensions are rounded down to multiples of `pooling_kernel_size * patch_size`
+/// so the pooler can evenly divide the patches.
 fn get_aspect_ratio_preserving_size(
     height: usize,
     width: usize,
     patch_size: usize,
     max_patches: usize,
+    pooling_kernel_size: usize,
 ) -> (usize, usize) {
-    let aspect = width as f64 / height as f64;
+    let total_px = height * width;
+    let target_px = max_patches * patch_size * patch_size;
+    let factor = (target_px as f64 / total_px as f64).sqrt();
+    let ideal_h = factor * height as f64;
+    let ideal_w = factor * width as f64;
+    let side_mult = (pooling_kernel_size * patch_size) as f64;
 
-    // Start from max_patches and find dimensions
-    let total_pixels = max_patches * patch_size * patch_size;
-    let mut target_h = (total_pixels as f64 / aspect).sqrt();
-    let mut target_w = target_h * aspect;
+    // Round down to nearest multiple of pooling_kernel_size * patch_size
+    let target_h = ((ideal_h / side_mult).floor() * side_mult) as usize;
+    let target_w = ((ideal_w / side_mult).floor() * side_mult) as usize;
 
-    // Round to nearest patch_size multiple
-    target_h = ((target_h / patch_size as f64).floor()) * patch_size as f64;
-    target_w = ((target_w / patch_size as f64).floor()) * patch_size as f64;
-
-    let mut h = target_h.max(patch_size as f64) as usize;
-    let mut w = target_w.max(patch_size as f64) as usize;
-
-    // Ensure total patches doesn't exceed max
-    while (h / patch_size) * (w / patch_size) > max_patches {
-        if h >= w {
-            h -= patch_size;
-        } else {
-            w -= patch_size;
-        }
-    }
-
-    (h.max(patch_size), w.max(patch_size))
+    let min_side = pooling_kernel_size * patch_size;
+    (target_h.max(min_side), target_w.max(min_side))
 }
 
 /// Preprocess an image for the Gemma4 vision encoder.
@@ -711,7 +705,9 @@ pub fn preprocess_image(
     let ps = config.patch_size;
 
     // Compute target size
-    let (target_h, target_w) = get_aspect_ratio_preserving_size(height, width, ps, max_patches);
+    let (target_h, target_w) = get_aspect_ratio_preserving_size(
+        height, width, ps, max_patches, config.pooling_kernel_size,
+    );
 
     // Resize to target
     let resized = image
