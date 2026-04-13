@@ -443,17 +443,21 @@ async fn main() -> Result<()> {
                                         &preprocessed.padding_positions,
                                     )?;
 
-                                    // Build prompt with image tokens
-                                    // Insert image_token_id placeholders for each vision token
+                                    // Build prompt in Gemma4-it chat format:
+                                    // <bos><|turn>user\n<|image|>text<turn|>\n<|turn>model\n
+                                    // where <|image|> (258880) expands to 280 vision tokens
                                     let image_token_id = 258880u32;
-                                    let mut prompt_ids: Vec<u32> = vec![2]; // BOS
-                                    // Add image start, image tokens, image end
-                                    prompt_ids.push(255999); // <boi>
+                                    let mut prompt_ids: Vec<u32> = vec![
+                                        2,     // <bos>
+                                        105,   // <|turn>
+                                        2364,  // "user"
+                                        107,   // \n
+                                    ];
+                                    // Image placeholder tokens (will be replaced with vision embeddings)
                                     for _ in 0..preprocessed.num_image_tokens {
                                         prompt_ids.push(image_token_id);
                                     }
-                                    prompt_ids.push(258882); // <eoi>
-                                    // Add text prompt tokens
+                                    // Text prompt tokens
                                     if !text_prompt.is_empty() {
                                         let text_ids = vlm.tokenizer.tokenizer
                                             .encode(text_prompt.as_str(), false)
@@ -462,6 +466,14 @@ async fn main() -> Result<()> {
                                             .to_vec();
                                         prompt_ids.extend(text_ids);
                                     }
+                                    // End user turn, start model turn
+                                    prompt_ids.extend_from_slice(&[
+                                        106,   // <turn|>
+                                        107,   // \n
+                                        105,   // <|turn>
+                                        4368,  // "model"
+                                        107,   // \n
+                                    ]);
 
                                     // Forward pass
                                     vlm.clear_kv_cache();
@@ -486,7 +498,7 @@ async fn main() -> Result<()> {
                                     tokens.push(next_token);
 
                                     for _ in 1..max_tokens {
-                                        if next_token == 1 || next_token == 107 { break; } // EOS
+                                        if next_token == 1 || next_token == 106 { break; } // EOS(1) or <turn|>(106)
                                         let input = candle_core::Tensor::new(
                                             &[next_token], &device_clone,
                                         )?.unsqueeze(0)?;
