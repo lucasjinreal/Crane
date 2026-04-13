@@ -748,11 +748,15 @@ pub fn preprocess_image(
         height, width, ps, max_patches, config.pooling_kernel_size,
     );
 
-    // Resize to target
-    let resized = image
-        .unsqueeze(0)?
-        .upsample_bilinear2d(target_h, target_w, false)?
-        .squeeze(0)?; // [3, target_h, target_w]
+    // Resize to target (skip if already the right size, e.g., from load_and_preprocess_image)
+    let resized = if height == target_h && width == target_w {
+        image.clone()
+    } else {
+        image
+            .unsqueeze(0)?
+            .upsample_bilinear2d(target_h, target_w, false)?
+            .squeeze(0)? // [3, target_h, target_w]
+    };
 
     // Patchify: [3, H, W] → [num_patches, patch_size² * 3]
     let num_patches_h = target_h / ps;
@@ -817,6 +821,9 @@ pub fn preprocess_image(
 }
 
 /// Load and preprocess an image file for Gemma4 vision.
+///
+/// Uses bicubic interpolation for resizing (matching HF's processor),
+/// then patchifies and pads for the vision encoder.
 pub fn load_and_preprocess_image(
     path: &std::path::Path,
     config: &ImagePreprocessConfig,
@@ -825,14 +832,27 @@ pub fn load_and_preprocess_image(
     let img = image::ImageReader::open(path)
         .map_err(|e| candle_core::Error::Msg(format!("Failed to open image: {e}")))?
         .decode()
-        .map_err(|e| candle_core::Error::Msg(format!("Failed to decode image: {e}")))?
-        .to_rgb8();
+        .map_err(|e| candle_core::Error::Msg(format!("Failed to decode image: {e}")))?;
 
-    let (w, h) = img.dimensions();
-    let raw = img.into_raw();
+    let (w, h) = (img.width() as usize, img.height() as usize);
+
+    // Compute target size
+    let max_patches = config.max_patches();
+    let (target_h, target_w) = get_aspect_ratio_preserving_size(
+        h, w, config.patch_size, max_patches, config.pooling_kernel_size,
+    );
+
+    // Resize using bicubic interpolation (matches HF's Gemma4ImageProcessor resample=BICUBIC)
+    let resized = img.resize_exact(
+        target_w as u32,
+        target_h as u32,
+        image::imageops::FilterType::CatmullRom, // bicubic
+    ).to_rgb8();
+
+    let raw = resized.into_raw();
 
     // Convert to [3, H, W] float tensor in [0, 1]
-    let tensor = (Tensor::from_vec(raw, (h as usize, w as usize, 3), device)?
+    let tensor = (Tensor::from_vec(raw, (target_h, target_w, 3), device)?
         .to_dtype(DType::F32)?
         .permute((2, 0, 1))?
         * config.rescale_factor)?;

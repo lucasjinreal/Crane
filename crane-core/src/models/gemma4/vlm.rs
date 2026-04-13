@@ -112,21 +112,35 @@ impl Gemma4VLModel {
         image_embeds: Option<&Tensor>,
         start_pos: usize,
     ) -> Result<Tensor> {
-        // Get text embeddings
-        let mut hidden_states = self.language_model.embed(input_ids)?;
+        // HF replaces image token IDs with PAD before embedding.
+        // This ensures the PLE (per-layer embeddings) use PAD's embedding
+        // at image positions, not the image placeholder token's embedding.
+        let pad_token_id = 0u32; // Gemma's pad_token_id
+        let llm_input_ids = if image_embeds.is_some() {
+            let ids: Vec<u32> = input_ids.flatten_all()?.to_vec1()?;
+            let masked: Vec<u32> = ids.iter().map(|&t| {
+                if t == self.image_token_id { pad_token_id } else { t }
+            }).collect();
+            Tensor::new(masked.as_slice(), input_ids.device())?.reshape(input_ids.shape())?
+        } else {
+            input_ids.clone()
+        };
+
+        // Get text embeddings using masked IDs (PAD at image positions)
+        let mut hidden_states = self.language_model.embed(&llm_input_ids)?;
 
         // Replace image token positions with vision embeddings
         if let Some(img_emb) = image_embeds {
             hidden_states = self.splice_image_features(
-                input_ids,
+                input_ids, // original IDs to find image token positions
                 &hidden_states,
                 img_emb,
             )?;
         }
 
-        // Run text decoder with the modified embeddings
+        // Run text decoder with masked IDs (for PLE) and modified embeddings
         self.language_model
-            .forward_embeds(input_ids, hidden_states, start_pos)
+            .forward_embeds(&llm_input_ids, hidden_states, start_pos)
             .map_err(Into::into)
     }
 
