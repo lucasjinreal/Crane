@@ -51,7 +51,11 @@ async fn download_image(url: &str) -> Result<(tempfile::TempDir, std::path::Path
     let dir = tempfile::TempDir::new()
         .map_err(|e| format!("Failed to create temp dir: {e}"))?;
 
-    let resp = reqwest::get(url)
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(url)
+        .header("User-Agent", "crane-oai/0.1")
+        .send()
         .await
         .map_err(|e| format!("Failed to download image from '{}': {e}", url))?;
 
