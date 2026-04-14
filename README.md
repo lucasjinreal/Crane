@@ -141,7 +141,7 @@ fn main() {
     println!("prompt templated: {:?}\n", prompt);
 
     let input_ids = model.prepare_inputs(&prompt).unwrap();
-    let _ = model.warnmup();
+    let _ = model.warmup();
 
     let mut streamer = TextStreamer {
         tokenizer: tokenizer.clone(),
