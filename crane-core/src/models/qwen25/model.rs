@@ -72,9 +72,9 @@ impl TextGeneration {
         std::io::stdout().flush()?;
 
         let mut generated_tokens = 0usize;
-        let eos_token = match self.tokenizer.get_token("") {
+        let eos_token = match self.tokenizer.get_token("<|im_end|>") {
             Some(token) => token,
-            None => anyhow::bail!("cannot find the  token"),
+            None => anyhow::bail!("cannot find the <|im_end|> token"),
         };
         let start_gen = std::time::Instant::now();
         for index in 0..sample_len {
@@ -223,9 +223,9 @@ impl ModelForCausalLM for Model {
         let mut tokens = input_ids.to_vec();
         std::io::stdout().flush()?;
         let mut generated_tokens = 0usize;
-        let eos_token = match self.tokenizer.get_token("") {
+        let eos_token = match self.tokenizer.get_token("<|im_end|>") {
             Some(token) => token,
-            None => anyhow::bail!("cannot find the  token"),
+            None => anyhow::bail!("cannot find the <|im_end|> token"),
         };
         let start_gen = std::time::Instant::now();
         for index in 0..config.max_new_tokens {
