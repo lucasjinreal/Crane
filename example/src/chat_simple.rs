@@ -2,17 +2,17 @@
 //!
 //! This example shows how to create a basic chat application using the Crane SDK.
 
-use crane::prelude::*;
 use crane::common::config::{CommonConfig, DataType, DeviceConfig};
 use crane::llm::{GenerationConfig, LlmModelType};
+use crane::prelude::*;
 
 fn main() -> CraneResult<()> {
     // Create a simple chat configuration
     let config = ChatConfig {
         common: CommonConfig {
-            model_path: "checkpoints/Qwen2.5-0.5B-Instruct".to_string(), // Update this path to your model
-            model_type: LlmModelType::Qwen25,
-            device: DeviceConfig::Cpu, // Use DeviceConfig::Cuda(0) for GPU
+            model_path: "checkpoints/Qwen3-0.6B-Instruct".to_string(), // Update this path to your model
+            model_type: LlmModelType::Qwen3,
+            device: DeviceConfig::Metal, // Use DeviceConfig::Cuda(0) for GPU
             dtype: DataType::F16,
             max_memory: None,
         },
@@ -29,7 +29,7 @@ fn main() -> CraneResult<()> {
     let mut chat_client = ChatClient::new(config)?;
 
     // Send a simple message and get a response
-    let response = chat_client.send_message("Hello, introduce yourself briefly.")?;
+    let response = chat_client.send_message("Tell me a joke about Rust.")?;
     println!("AI Response: {}", response);
 
     Ok(())
