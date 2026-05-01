@@ -11,6 +11,10 @@ enum LoadedModel {
         model: crane_core::models::qwen25::Model,
         tokenizer: crane_core::autotokenizer::AutoTokenizer,
     },
+    Qwen3 {
+        model: crane_core::models::qwen3::Model,
+        tokenizer: crane_core::autotokenizer::AutoTokenizer,
+    },
     HunyuanDense {
         model: crane_core::models::hunyuan_dense::Model,
     },
@@ -74,6 +78,18 @@ impl LlmClient {
                 model.warmup();
                 LoadedModel::HunyuanDense { model }
             }
+            LlmModelType::Qwen3 => {
+                let tokenizer = crane_core::autotokenizer::AutoTokenizer::from_pretrained(
+                    &config.model_path,
+                    None,
+                )
+                .map_err(|e| CraneError::TokenizationError(e.to_string()))?;
+
+                let mut model = crane_core::models::qwen3::Model::new(&config.model_path, &device, &dtype)
+                    .map_err(|e| CraneError::ModelError(e.to_string()))?;
+                model.warmup();
+                LoadedModel::Qwen3 { model, tokenizer }
+            }
             _ => {
                 return Err(CraneError::ConfigError(
                     format!("Unsupported model type: {:?}", config.model_type),
@@ -131,6 +147,24 @@ impl LlmClient {
 
         match &mut self.model {
             LoadedModel::Qwen25 { model, tokenizer } => {
+                let prompt = tokenizer
+                    .apply_chat_template(messages, true)
+                    .map_err(|e| CraneError::TokenizationError(e.to_string()))?;
+                let input_ids = model
+                    .prepare_inputs(&prompt)
+                    .map_err(|e| CraneError::ModelError(e.to_string()))?;
+
+                let output_ids = model
+                    .generate(&input_ids, &gen_config, None)
+                    .map_err(|e| CraneError::ModelError(e.to_string()))?;
+
+                let generated_ids = output_ids.get(input_ids.len()..).unwrap_or(&[]);
+                let result = tokenizer
+                    .decode(generated_ids, true)
+                    .map_err(|e| CraneError::TokenizationError(e.to_string()))?;
+                Ok(result)
+            }
+            LoadedModel::Qwen3 { model, tokenizer } => {
                 let prompt = tokenizer
                     .apply_chat_template(messages, true)
                     .map_err(|e| CraneError::TokenizationError(e.to_string()))?;
@@ -207,6 +241,15 @@ impl LlmClient {
                     .map_err(|e| CraneError::ModelError(e.to_string()))?;
                 (input_ids, StreamTokenizer::Auto(tokenizer.clone()))
             }
+            LoadedModel::Qwen3 { tokenizer, model } => {
+                let prompt = tokenizer
+                    .apply_chat_template(messages, true)
+                    .map_err(|e| CraneError::TokenizationError(e.to_string()))?;
+                let input_ids = model
+                    .prepare_inputs(&prompt)
+                    .map_err(|e| CraneError::ModelError(e.to_string()))?;
+                (input_ids, StreamTokenizer::Auto(tokenizer.clone()))
+            }
             LoadedModel::HunyuanDense { model } => {
                 gen_config.eos_token_id = gen_config.eos_token_id.or(Some(120020));
                 let prompt = hunyuan_apply_chat_template(messages);
@@ -226,6 +269,7 @@ impl LlmClient {
         std::thread::scope(|scope| {
             let gen_handle = scope.spawn(|| match &mut self.model {
                 LoadedModel::Qwen25 { model, .. } => model.generate(&input_ids, &gen_config, Some(&mut streamer)),
+                LoadedModel::Qwen3 { model, .. } => model.generate(&input_ids, &gen_config, Some(&mut streamer)),
                 LoadedModel::HunyuanDense { model } => model.generate(&input_ids, &gen_config, Some(&mut streamer)),
             });
 
