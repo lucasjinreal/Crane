@@ -8,7 +8,7 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use tokenizers::Tokenizer;
 
-use super::modeling::{Gemma4Config, Gemma4Model, Gemma4TextConfig};
+use super::modeling::{Gemma4Model, Gemma4TextConfig};
 use super::vision::{Gemma4MultimodalEmbedder, Gemma4VisionConfig, Gemma4VisionModel};
 use crate::utils::token_output_stream::TokenOutputStream;
 use crate::utils::utils;

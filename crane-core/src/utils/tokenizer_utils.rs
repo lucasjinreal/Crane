@@ -129,7 +129,9 @@ fn load_hf_bpe_tokenizer(dir: &Path) -> Result<Tokenizer> {
             }
 
             if !tokens.is_empty() {
-                tokenizer.add_special_tokens(&tokens);
+                tokenizer
+                    .add_special_tokens(tokens)
+                    .map_err(anyhow::Error::msg)?;
             }
         }
     }

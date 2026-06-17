@@ -1,3 +1,10 @@
 [workspace]
-members = ["crane-core", "crane", "crane-oai", "example"]
+members = ["crane-core", "crane", "crane-serve", "example"]
 resolver = "2"
+
+[workspace.dependencies]
+candle-core = "0.10.2"
+candle-nn = "0.10.2"
+candle-transformers = "0.10.2"
+candle-onnx = "0.10.2"
+tokenizers = { version = "0.23.1", default-features = false, features = ["onig"] }
