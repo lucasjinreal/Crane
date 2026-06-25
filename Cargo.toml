@@ -2,6 +2,12 @@
 members = ["crane-core", "crane", "crane-serve", "example"]
 resolver = "2"
 
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/lucasjinreal/Crane"
+authors = ["Nicholas Jela<nicholasjela@gmail.com>"]
+
 [workspace.dependencies]
 candle-core = "0.10.2"
 candle-nn = "0.10.2"
