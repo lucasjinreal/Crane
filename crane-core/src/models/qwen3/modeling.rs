@@ -209,7 +209,7 @@ impl Attention {
         // replaces three.  `narrow` splits are zero-copy views.
         let q_dim = num_heads * head_dim;
         let kv_dim = num_kv_heads * head_dim;
-        let qkv_proj = if let (LinearLayer::Standard(ref q), LinearLayer::Standard(ref k), LinearLayer::Standard(ref v)) =
+        let qkv_proj = if let (LinearLayer::Standard(q), LinearLayer::Standard(k), LinearLayer::Standard(v)) =
             (&q_proj, &k_proj, &v_proj)
         {
             let qkv_w = Tensor::cat(&[q.weight(), k.weight(), v.weight()], 0)?;
