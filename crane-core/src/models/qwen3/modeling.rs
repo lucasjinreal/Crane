@@ -515,7 +515,7 @@ enum MlpGateUp {
     /// Merged gate+up weight — one gemv instead of two. Standard (BF16/F16/F32) only.
     Merged { gate_up_proj: Linear, intermediate_size: usize },
     /// Separate quantized gate and up projections (GGUF).
-    Separate { gate_proj: LinearLayer, up_proj: LinearLayer, intermediate_size: usize },
+    Separate { gate_proj: LinearLayer, up_proj: LinearLayer },
 }
 
 struct Mlp {
@@ -552,7 +552,7 @@ impl Mlp {
         Ok(Self { gate_up, down_proj })
     }
 
-    fn new_from_gguf<R: Read + Seek>(gg: &mut Gguf<R>, layer_idx: usize, intermediate_size: usize) -> Result<Self> {
+    fn new_from_gguf<R: Read + Seek>(gg: &mut Gguf<R>, layer_idx: usize, _intermediate_size: usize) -> Result<Self> {
         let prefix = format!("blk.{layer_idx}");
         let gate_proj = gg.linear(&format!("{prefix}.ffn_gate.weight"))?;
         let up_proj = gg.linear(&format!("{prefix}.ffn_up.weight"))?;
@@ -561,7 +561,6 @@ impl Mlp {
             gate_up: MlpGateUp::Separate {
                 gate_proj,
                 up_proj,
-                intermediate_size,
             },
             down_proj,
         })

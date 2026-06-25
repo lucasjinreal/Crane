@@ -13,7 +13,7 @@ use candle_nn::VarBuilder;
 use candle_transformers::generation::LogitsProcessor;
 use tokenizers::Tokenizer;
 
-use super::modeling::{Gemma4Config, Gemma4Model, Gemma4TextConfig};
+use super::modeling::{Gemma4Config, Gemma4Model};
 use crate::generation::based::ModelForCausalLM;
 use crate::generation::GenerationConfig;
 use crate::utils::token_output_stream::TokenOutputStream;

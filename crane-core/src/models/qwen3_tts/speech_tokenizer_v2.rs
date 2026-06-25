@@ -357,7 +357,7 @@ impl TokenizerAttention {
     }
 
     fn forward(&self, hidden: &Tensor) -> Result<Tensor> {
-        let (b, t, c) = hidden.dims3()?;
+        let (b, t, _c) = hidden.dims3()?;
         let q = hidden
             .apply(&self.q_proj)?
             .reshape((b, t, self.num_heads, self.head_dim))?
@@ -820,6 +820,7 @@ impl VectorQuantization {
 #[derive(Debug, Clone)]
 struct ResidualVectorQuantization {
     layers: Vec<VectorQuantization>,
+    #[allow(dead_code)]
     dim: usize,
 }
 
@@ -1130,6 +1131,7 @@ impl EncoderTransformerLayer {
 
 /// EuclideanCodebook encode: nearest-neighbor lookup.
 impl EuclideanCodebook {
+    #[allow(dead_code)]
     fn encode(&self, x: &Tensor) -> Result<Tensor> {
         // x: [B, T, dim] or [T, dim]
         let usage = self.cluster_usage.clamp(self.epsilon, f64::INFINITY)?
@@ -1162,6 +1164,7 @@ impl EuclideanCodebook {
 }
 
 impl VectorQuantization {
+    #[allow(dead_code)]
     fn encode(&self, x: &Tensor) -> Result<Tensor> {
         // x: [B, D, T] → transpose to [B, T, D] for codebook lookup
         let x_btd = x.transpose(1, 2)?;
@@ -1441,7 +1444,9 @@ pub struct NativeSpeechTokenizerDecoder {
     decoder: Vec<DecoderTailLayer>,
     encoder: Option<MimiEncoder>,
     encoder_hf: Option<HfMimiEncoder>,
+    #[allow(dead_code)]
     device: Device,
+    #[allow(dead_code)]
     dtype: DType,
 }
 
@@ -1452,6 +1457,7 @@ struct HfMimiEncoder {
     encoder_transformer: RefCell<mimi::transformer::ProjectedTransformer>,
     downsample: mimi::conv::ConvDownsample1d,
     quantizer: mimi::quantization::SplitResidualVectorQuantizer,
+    #[allow(dead_code)]
     device: Device,
     valid_num_quantizers: usize,
 }

@@ -4,7 +4,6 @@ use candle_nn::VarBuilder;
 use candle_transformers::models::paddleocr_vl::{Config, PaddleOCRVLModel};
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use std::path::Path;
-use std::sync::Arc;
 use std::time::Instant;
 use tokenizers::Tokenizer;
 
