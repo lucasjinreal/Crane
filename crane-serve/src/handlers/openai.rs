@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
+    extract::State,
     http::StatusCode,
     response::{
         sse::{KeepAlive, Sse},
