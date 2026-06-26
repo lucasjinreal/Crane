@@ -168,7 +168,7 @@ pub async fn vlm_chat_completions(
     let image_url = &image_url;
 
     // Download image.
-    let (temp_dir, img_path) = download_image(image_url)
+    let (_temp_dir, img_path) = download_image(image_url)
         .await
         .map_err(|e| make_error(StatusCode::BAD_REQUEST, &e))?;
 
@@ -179,7 +179,7 @@ pub async fn vlm_chat_completions(
     if req.stream {
         // Streaming mode
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        let (done_tx, _done_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
 
         if vlm_tx.send(VlmRequest::RecognizeStream {
             img_path,
@@ -213,11 +213,8 @@ pub async fn vlm_chat_completions(
             };
             yield Ok::<_, std::convert::Infallible>(Event::default().json_data(&first_chunk).unwrap());
 
-            let mut completion_tokens = 0usize;
-
             // Stream tokens.
             while let Some(text) = rx.recv().await {
-                completion_tokens += 1;
                 let chunk = ChatCompletionChunk {
                     id: request_id.clone(),
                     object: "chat.completion.chunk".into(),
@@ -319,7 +316,7 @@ pub async fn vlm_generate(
     })?;
 
     // Download image.
-    let (temp_dir, img_path) = download_image(image_url)
+    let (_temp_dir, img_path) = download_image(image_url)
         .await
         .map_err(|e| make_error(StatusCode::BAD_REQUEST, &e))?;
 
@@ -332,7 +329,7 @@ pub async fn vlm_generate(
 
     if req.stream {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        let (done_tx, _done_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
 
         if vlm_tx.send(VlmRequest::RecognizeStream {
             img_path,

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Qwen2 model implementation with quantization support.
 //!
 //! Qwen2 is a large language model from Alibaba optimized for efficiency.

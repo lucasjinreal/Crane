@@ -387,6 +387,7 @@ impl ModelBackend for Qwen25Backend {
 
 pub struct Qwen3Backend {
     pub model: crane_core::models::qwen3::Model,
+    #[allow(dead_code)]
     dtype: DType,
 }
 
