@@ -8,7 +8,9 @@ use candle_core::{DType, Device};
 use serde::Deserialize;
 use std::path::Path;
 
-use super::backend::{Gemma4Backend, HunyuanBackend, ModelBackend, Qwen25Backend, Qwen3Backend};
+use super::backend::{
+    Gemma4Backend, HunyuanBackend, ModelBackend, Qwen25Backend, Qwen3Backend, Qwen3_5Backend,
+};
 use crate::chat_template::{AutoChatTemplate, ChatTemplateProcessor, HunyuanChatTemplate};
 
 // ─────────────────────────────────────────────────────────────
@@ -24,6 +26,7 @@ pub enum ModelType {
     HunyuanDense,
     Qwen25,
     Qwen3,
+    Qwen3_5,
     Qwen3TTS,
     PaddleOcrVl,
 }
@@ -36,6 +39,7 @@ impl ModelType {
             "hunyuan" | "hunyuan_dense" | "hunyuandense" => Self::HunyuanDense,
             "qwen25" | "qwen2.5" | "qwen2" => Self::Qwen25,
             "qwen3" => Self::Qwen3,
+            "qwen3_5" | "qwen3.5" | "qwen35" | "qwen3_5_dense" => Self::Qwen3_5,
             "qwen3_tts" | "qwen3tts" | "qwen3-tts" | "tts" => Self::Qwen3TTS,
             "paddleocr_vl" | "paddleocrv" | "paddleocr" | "paddle_ocr_vl" | "paddleocrvl" => Self::PaddleOcrVl,
             _ => Self::Auto,
@@ -50,6 +54,7 @@ impl ModelType {
             Self::HunyuanDense => "hunyuan",
             Self::Qwen25 => "qwen25",
             Self::Qwen3 => "qwen3",
+            Self::Qwen3_5 => "qwen3_5",
             Self::Qwen3TTS => "qwen3_tts",
             Self::PaddleOcrVl => "paddleocr_vl",
         }
@@ -122,6 +127,7 @@ pub fn detect_model_type(model_path: &str) -> ModelType {
                         }
                         "qwen2" | "qwen2.5" => return ModelType::Qwen25,
                         "qwen3" => return ModelType::Qwen3,
+                        "qwen3_5" | "qwen3.5" => return ModelType::Qwen3_5,
                         "qwen3_tts" | "qwen3tts" => return ModelType::Qwen3TTS,
                         m if m.contains("hunyuan") => return ModelType::HunyuanDense,
                         m if m.contains("paddleocr") => return ModelType::PaddleOcrVl,
@@ -144,6 +150,9 @@ pub fn detect_model_type(model_path: &str) -> ModelType {
                         }
                         if a.contains("qwen3ttsforconditional") || a.contains("qwen3_tts") {
                             return ModelType::Qwen3TTS;
+                        }
+                        if a.contains("qwen3_5") || a.contains("qwen3.5") {
+                            return ModelType::Qwen3_5;
                         }
                         if a.contains("qwen3") {
                             return ModelType::Qwen3;
@@ -222,6 +231,7 @@ pub fn create_backend(
         }
         ModelType::Qwen25 => Ok(Box::new(Qwen25Backend::new(model_path, device, dtype)?)),
         ModelType::Qwen3 => Ok(Box::new(Qwen3Backend::new(model_path, device, dtype)?)),
+        ModelType::Qwen3_5 => Ok(Box::new(Qwen3_5Backend::new(model_path, device, dtype)?)),
         ModelType::PaddleOcrVl => {
             anyhow::bail!("PaddleOCR-VL is a VLM model — use create_vlm_model() instead of create_backend()")
         }
