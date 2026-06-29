@@ -1,11 +1,11 @@
 //! Numerical kernels for Gated Delta Net: L2 normalization, softplus, the
 //! gated delta rule recurrence, causal Conv1D, and dispatch.
 //!
-//! The recurrence and Conv1D are written as compositions of Candle tensor ops,
-//! so they run on any device (CPU/CUDA/Metal). On CUDA, an optional fused
-//! kernel is also available (see [`super::cuda_backend`]); set
-//! `CRANE_GDN_PORTABLE=1` to force the op-by-op path for cross-checking
-//! numerics against the reference.
+//! The portable recurrence is a composition of Candle tensor ops, so it runs
+//! on any device (CPU/CUDA/Metal). On CUDA an optional fused kernel is also
+//! available (see [`super::cuda_backend`]) and is used by default; set
+//! `CRANE_GDN_PORTABLE=1` to force the portable op-by-op path for
+//! cross-checking numerics.
 
 use candle_core::{DType, IndexOp, Result, Tensor, D};
 
@@ -47,7 +47,9 @@ pub fn softplus(x: &Tensor) -> Result<Tensor> {
 /// - `state`: `[BH, K, V]` — recurrent state (mutated in place)
 ///
 /// Returns `y: [BH, S, V]`. `state` is updated to the post-final-step value.
-/// Output dtype matches `q.dtype()`.
+///
+/// This is the exact CPU fallback lifted from mistral.rs
+/// (`mistralrs-core/src/gdn/backend.rs:30-81`). Output dtype matches `q.dtype()`.
 pub fn gated_delta_rule_recurrence(
     q: &Tensor,
     k: &Tensor,
@@ -59,11 +61,12 @@ pub fn gated_delta_rule_recurrence(
     let dtype = q.dtype();
 
     // HF's gated delta rule scales Q by `1/sqrt(head_k_dim)` before the
-    // recurrence (`scale = 1 / query.shape[-1]**0.5` in
-    // `torch_recurrent_gated_delta_rule`). Omitting it leaves the recurrence
-    // output a factor of `sqrt(K)` too large, which is not washed out
-    // downstream because the gated RMSNorm eps and the silu gate make it
-    // observable.
+    // recurrence (`scale = 1 / query.shape[-1]**0.5` in both
+    // `torch_chunk_gated_delta_rule` and `torch_recurrent_gated_delta_rule`).
+    // Omitting it leaves the recurrence output a factor of `sqrt(K)` too large
+    // (verified: cos=1.0 vs HF but ~11.3x = sqrt(128) magnitude), which is NOT
+    // washed out downstream because the gated RMSNorm's eps and the silu gate
+    // make it observable. mistral.rs applies the same scale.
     let scale = 1.0 / (q.dim(D::Minus1)? as f64).sqrt();
     let q = (q.affine(scale, 0.0)?).transpose(1, 2)?.contiguous()?.to_dtype(DType::F32)?;
     let k = k.transpose(1, 2)?.contiguous()?.to_dtype(DType::F32)?;
@@ -151,11 +154,10 @@ pub fn compute_beta_g(
 /// Compute β and g, run the gated delta rule recurrence, return the output.
 ///
 /// The recurrence is written in pure-Candle tensor ops, so it runs on any
-/// device (CPU/CUDA/Metal) — every op has a native backend kernel. On CUDA,
-/// a fused single-launch kernel is preferred when available
-/// ([`super::cuda_backend::gdn_recurrence_cuda`]); set
-/// `CRANE_GDN_PORTABLE=1` to force the op-by-op path for cross-checking
-/// numerics.
+/// device (CPU/CUDA/Metal) — every op has a native backend kernel. On CUDA
+/// the fused single-launch kernel (see [`super::cuda_backend`]) is used by
+/// default; set `CRANE_GDN_PORTABLE=1` to force the portable op-by-op path
+/// for cross-checking numerics.
 #[allow(unused_variables)]
 pub fn apply_recurrence(
     q: &Tensor,
@@ -174,6 +176,7 @@ pub fn apply_recurrence(
         return cuda_recurrence(q, k, v, g, beta, dims, batch_size, seq_len, cache, dtype);
     }
 
+    // Device-portable reference (runs on CPU/CUDA/Metal).
     gated_delta_rule_recurrence(q, k, v, g, beta, &mut cache.recurrent_state)
 }
 
@@ -331,9 +334,9 @@ mod tests {
     use candle_core::{Device, Tensor};
 
     /// Smoke test: recurrence runs end-to-end on CPU and produces the right
-    /// output shape. Numerical correctness against HF Transformers is
-    /// exercised by the engine-level smoke tests against a real Qwen 3.5
-    /// checkpoint.
+    /// output shape. Numerical correctness against a reference (HF Transformers
+    /// / mistral.rs) is checked in the integration test that loads a real
+    /// Qwen 3.5 checkpoint.
     #[test]
     fn recurrence_runs_and_returns_correct_shape() {
         let dev = Device::Cpu;

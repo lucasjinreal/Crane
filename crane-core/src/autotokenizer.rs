@@ -259,9 +259,22 @@ fn find_matching_paren(s: &str) -> Option<usize> {
 }
 
 impl AutoTokenizer {
+    /// Render the chat template for `messages` (no tools).
     pub fn apply_chat_template<S: serde::Serialize>(
         &self,
         ctx: S,
+        add_generation_prompt: bool,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        self.apply_chat_template_with_tools(ctx, Option::<&serde_json::Value>::None, add_generation_prompt)
+    }
+
+    /// Render the chat template for `messages`, exposing `tools` to the template
+    /// (OpenAI-style function specs). Needed for agentic models like Ornith
+    /// whose template emits a `# Tools` system block and `<tool_call>` format.
+    pub fn apply_chat_template_with_tools<S: serde::Serialize, T: serde::Serialize>(
+        &self,
+        ctx: S,
+        tools: Option<T>,
         add_generation_prompt: bool,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let template_str = self.config.chat_template.as_deref().ok_or_else(|| {
@@ -306,6 +319,48 @@ impl AutoTokenizer {
             }
         });
 
+        // HF chat templates call `raise_exception(msg)` to abort rendering on
+        // malformed input (e.g. Qwen/Ornith: "System message must be at the
+        // beginning."). Surface it as a render error with the template's message.
+        env.add_function("raise_exception", |msg: String| -> Result<String, minijinja::Error> {
+            Err(minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, msg))
+        });
+
+        // `tojson` (used by tool-calling templates, e.g. `tool | tojson`).
+        // minijinja's built-in needs the `json` feature AND uses compact
+        // separators; HF/Jinja2 emit Python `json.dumps` defaults — `", "` /
+        // `": "` — plus HTML-safe escaping. Match that for byte-parity.
+        env.add_filter("tojson", |v: minijinja::Value| -> Result<minijinja::Value, minijinja::Error> {
+            struct Py;
+            impl serde_json::ser::Formatter for Py {
+                fn begin_array_value<W: ?Sized + std::io::Write>(&mut self, w: &mut W, first: bool) -> std::io::Result<()> {
+                    if first { Ok(()) } else { w.write_all(b", ") }
+                }
+                fn begin_object_key<W: ?Sized + std::io::Write>(&mut self, w: &mut W, first: bool) -> std::io::Result<()> {
+                    if first { Ok(()) } else { w.write_all(b", ") }
+                }
+                fn begin_object_value<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
+                    w.write_all(b": ")
+                }
+            }
+            let mut out = Vec::new();
+            let mut ser = serde_json::Serializer::with_formatter(&mut out, Py);
+            serde::Serialize::serialize(&v, &mut ser)
+                .map_err(|e| minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, format!("tojson: {e}")))?;
+            let s = String::from_utf8(out).unwrap_or_default();
+            let mut rv = String::with_capacity(s.len());
+            for c in s.chars() {
+                match c {
+                    '<' => rv.push_str("\\u003c"),
+                    '>' => rv.push_str("\\u003e"),
+                    '&' => rv.push_str("\\u0026"),
+                    '\'' => rv.push_str("\\u0027"),
+                    _ => rv.push(c),
+                }
+            }
+            Ok(minijinja::Value::from_safe_string(rv))
+        });
+
         env.add_template("default", &template_str).unwrap();
         let tmpl = env.get_template("default").unwrap();
         let eos = if let Some(eos) = &self.config.eos_token {
@@ -343,6 +398,7 @@ impl AutoTokenizer {
 
         match tmpl.render(context! {
             messages=> ctx,
+            tools=> tools,
             unk_token=> *unk,
             pad_token=> *pad,
             bos_token=> *bos,

@@ -224,6 +224,7 @@ impl FullAttention {
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _) = x.dims3()?;
 
+
         let q_out = self.q_proj.forward(x)?;
         let k_proj_out = self.k_proj.forward(x)?;
         let v_proj_out = self.v_proj.forward(x)?;
@@ -251,6 +252,7 @@ impl FullAttention {
         } else {
             (q_out, None)
         };
+
 
         let q = q
             .reshape((b_sz, seq_len, self.num_heads, self.head_dim))?
@@ -299,6 +301,7 @@ impl FullAttention {
         } else {
             v
         };
+
         let k_t = k_rep.transpose(D::Minus2, D::Minus1)?.contiguous()?;
         let attn_logits = (q.matmul(&k_t)? * scale)?;
         let attn_weights = match attention_mask {
@@ -457,15 +460,5 @@ impl DecoderLayer {
         let mlp_out = self.mlp.forward(&normed2)?;
 
         residual2 + mlp_out
-    }
-}
-
-/// Choose between a dedicated `lm_head` weight and the tied `embed_tokens`
-/// weight, based on `tie_word_embeddings`.
-pub fn resolve_tied(tie: bool, embed_weight: Tensor, lm_head_weight: Option<Tensor>) -> Tensor {
-    match lm_head_weight {
-        Some(w) => w,
-        None if tie => embed_weight,
-        None => embed_weight,
     }
 }

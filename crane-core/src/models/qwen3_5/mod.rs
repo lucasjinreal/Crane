@@ -17,6 +17,6 @@ mod model;
 mod modeling;
 
 pub use config::{load_config, Config, LayerType, TextConfig};
-pub use kv_cache::KvCache;
+pub use kv_cache::{KvCache, KvCacheBackend, KvCacheKind};
 pub use model::{Model, ModelFormat, Qwen3_5TextModel};
 pub use modeling::{apply_mrope, DecoderLayer, FullAttention, Mlp, MRotaryEmbedding, Qwen35RmsNorm};

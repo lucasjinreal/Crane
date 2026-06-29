@@ -26,9 +26,12 @@
 //!
 //! # Origin
 //!
-//! Algorithm inspired by [mistral.rs](https://github.com/EricLBuehler/mistral.rs)
-//! (MIT licensed); Crane's implementation uses plain `candle_nn::Linear`
-//! without that project's tensor-parallel / quantization abstractions.
+//! Algorithm ported from [mistral.rs](https://github.com/EricLBuehler/mistral.rs)
+//! (MIT licensed). Original `GatedDeltaNet` / `gdn` module:
+//! `mistralrs-core/src/gdn/{config,cache,projection,norm,layer}.rs` and
+//! `mistralrs-core/src/cuda/gdn.cu`. Crane's implementation drops the
+//! `mistralrs_quant` / `DeviceMapper` / tensor-parallel abstractions and uses
+//! plain `candle_nn::Linear` with single-device state.
 //!
 //! See also the [Gated Delta Net paper](https://arxiv.org/abs/2412.06464)
 //! (Yang et al., 2024) for the original formulation.
@@ -47,6 +50,8 @@ mod projection;
 pub use backend::{
     causal_conv1d, gated_delta_rule_recurrence, l2_norm, softplus, apply_recurrence,
 };
+#[cfg(feature = "cuda")]
+pub use cuda_backend::gdn_recurrence_cuda;
 pub use cache::GdnLayerCache;
 pub use config::{defaults, GdnConfig, GdnDims};
 pub use layer::GatedDeltaNet;

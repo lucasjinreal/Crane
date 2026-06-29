@@ -80,28 +80,60 @@ pub fn gdn_recurrence_cuda(
     let y_buf = unsafe { dev.alloc::<f32>(bh * s * vdim) }?;
     let state_out_buf = unsafe { dev.alloc::<f32>(bh * kdim * vdim) }?;
 
-    let func = dev.get_or_load_custom_func("gdn_recurrence_f32", MODULE_NAME, ptx::GDN)?;
+    // V columns are independent and can be tiled across blocks, but for these
+    // shapes one block per head (V_TILE == V, ~4 warps) hides the serial
+    // inner-loop latency best, so default there. Tunable via CRANE_GDN_VTILE.
+    let v_tile = std::env::var("CRANE_GDN_VTILE")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|t| *t > 0)
+        .unwrap_or(vdim)
+        .min(vdim);
+    let tiles = vdim.div_ceil(v_tile);
     let cfg = LaunchConfig {
-        grid_dim: (bh as u32, 1, 1),
-        block_dim: (vdim as u32, 1, 1),
+        grid_dim: ((bh * tiles) as u32, 1, 1),
+        block_dim: (v_tile as u32, 1, 1),
         shared_mem_bytes: (2 * kdim * std::mem::size_of::<f32>()) as u32,
     };
 
-    let (bh_i, s_i, k_i, v_i) = (bh as i32, s as i32, kdim as i32, vdim as i32);
-    let mut builder = func.builder();
-    builder.arg(&q_v);
-    builder.arg(&k_v);
-    builder.arg(&v_v);
-    builder.arg(&g_v);
-    builder.arg(&beta_v);
-    builder.arg(&state_v);
-    builder.arg(&state_out_buf);
-    builder.arg(&y_buf);
-    builder.arg(&bh_i);
-    builder.arg(&s_i);
-    builder.arg(&k_i);
-    builder.arg(&v_i);
-    unsafe { builder.launch(cfg) }.w()?;
+    // Specialized register-resident kernel for K==128 (state column in
+    // registers); runtime-K fallback otherwise (local memory).
+    let (bh_i, s_i, k_i, v_i, vt_i) = (bh as i32, s as i32, kdim as i32, vdim as i32, v_tile as i32);
+    if kdim == 128 {
+        let func =
+            dev.get_or_load_custom_func("gdn_recurrence_f32_k128", MODULE_NAME, ptx::GDN)?;
+        let mut builder = func.builder();
+        builder.arg(&q_v);
+        builder.arg(&k_v);
+        builder.arg(&v_v);
+        builder.arg(&g_v);
+        builder.arg(&beta_v);
+        builder.arg(&state_v);
+        builder.arg(&state_out_buf);
+        builder.arg(&y_buf);
+        builder.arg(&bh_i);
+        builder.arg(&s_i);
+        builder.arg(&v_i);
+        builder.arg(&vt_i);
+        unsafe { builder.launch(cfg) }.w()?;
+    } else {
+        let func = dev.get_or_load_custom_func("gdn_recurrence_f32", MODULE_NAME, ptx::GDN)?;
+        let mut builder = func.builder();
+        builder.arg(&q_v);
+        builder.arg(&k_v);
+        builder.arg(&v_v);
+        builder.arg(&g_v);
+        builder.arg(&beta_v);
+        builder.arg(&state_v);
+        builder.arg(&state_out_buf);
+        builder.arg(&y_buf);
+        builder.arg(&bh_i);
+        builder.arg(&s_i);
+        builder.arg(&k_i);
+        builder.arg(&v_i);
+        builder.arg(&vt_i);
+        unsafe { builder.launch(cfg) }.w()?;
+    }
 
     let y = Tensor::from_storage(
         Storage::Cuda(CudaStorage::wrap_cuda_slice(y_buf, dev.clone())),

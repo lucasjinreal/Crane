@@ -8,10 +8,15 @@ crane = { path = "../crane" }
 crane-core = { path = "../crane-core" }
 anyhow = "1.0.100"
 image = "0.25.9"
+serde_json = "1.0.140"
 
 [[bin]]
 name = "chat_simple"
 path = "src/chat_simple.rs"
+
+[[bin]]
+name = "ornith_tools"
+path = "src/ornith_tools.rs"
 
 [[bin]]
 name = "chat_streaming"

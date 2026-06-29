@@ -10,8 +10,8 @@ use candle_transformers::generation::LogitsProcessor;
 use tokenizers::Tokenizer;
 
 use super::config::{load_config, Config, TextConfig};
-use super::kv_cache::KvCache;
-use super::modeling::{resolve_tied, DecoderLayer, MRotaryEmbedding, Qwen35RmsNorm};
+use super::kv_cache::{KvCache, KvCacheKind};
+use super::modeling::{DecoderLayer, MRotaryEmbedding, Qwen35RmsNorm};
 use crate::generation::based::ModelForCausalLM;
 use crate::generation::GenerationConfig;
 use crate::utils::token_output_stream::TokenOutputStream;
@@ -70,18 +70,36 @@ impl Qwen3_5TextModel {
 
         let norm = Qwen35RmsNorm::load(text_cfg.hidden_size, text_cfg.rms_norm_eps, vb_lm.pp("norm"))?;
 
+        // Resolve the output projection. With `tie_word_embeddings: true`
+        // (0.8B/4B) it's the embedding table; untied models (e.g. Ornith-9B)
+        // ship a dedicated `lm_head.weight` of shape `[vocab, hidden]`. That
+        // tensor lives at the checkpoint ROOT, not under the `language_model`
+        // prefix, so probe `vb` first and fall back to `vb_lm`.
         let embed_weight = embed_tokens.embeddings().clone();
-        let lm_head_weight = vb_lm.get(text_cfg.vocab_size, "lm_head").ok();
-        // Store `lm_head` already transposed (`[H, V]`) so the per-step matmul
-        // doesn't have to. `resolve_tied` returns either the dedicated lm_head
-        // weight or — when `tie_word_embeddings: true` — the embed table.
-        let lm_head_raw = resolve_tied(cfg.tie_word_embeddings, embed_weight, lm_head_weight);
-        let lm_head = lm_head_raw.t()?.contiguous()?.clone();
+        let lm_head_raw = if cfg.tie_word_embeddings {
+            embed_weight
+        } else {
+            let shape = (text_cfg.vocab_size, text_cfg.hidden_size);
+            vb.get(shape, "lm_head.weight")
+                .or_else(|_| vb_lm.get(shape, "lm_head.weight"))
+                .or_else(|_| {
+                    eprintln!(
+                        "[qwen3_5] tie_word_embeddings=false but no lm_head.weight found; \
+                         falling back to tied embeddings"
+                    );
+                    Ok::<_, candle_core::Error>(embed_weight)
+                })?
+        };
+        // Store `lm_head` already transposed (`[hidden, vocab]`) so the per-step
+        // matmul doesn't have to.
+        let lm_head = lm_head_raw.t()?.contiguous()?;
 
         let rotary = MRotaryEmbedding::new(&text_cfg, device)?;
 
         // Pre-allocate per-layer caches: GDN recurrent state for linear blocks,
         // K/V cache for full-attention blocks (mutually exclusive per layer).
+        // The K/V representation (fp / int8 / …) is chosen once here.
+        let kv_kind = KvCacheKind::from_env();
         let mut gdn_caches = Vec::with_capacity(layers.len());
         let mut attn_caches = Vec::with_capacity(layers.len());
         for layer in &layers {
@@ -92,7 +110,7 @@ impl Qwen3_5TextModel {
                 attn_caches.push(None);
             } else {
                 gdn_caches.push(None);
-                attn_caches.push(Some(KvCache::new()));
+                attn_caches.push(Some(KvCache::new(kv_kind)));
             }
         }
 
@@ -116,6 +134,16 @@ impl Qwen3_5TextModel {
 
     pub fn num_layers(&self) -> usize {
         self.layers.len()
+    }
+
+    /// Total bytes held by the full-attention K/V caches across all layers
+    /// (incl. headroom + quant scales). The context-scaling memory term.
+    pub fn attn_cache_bytes(&self) -> usize {
+        self.attn_caches
+            .iter()
+            .flatten()
+            .map(|c| c.byte_size())
+            .sum()
     }
 
     pub fn device(&self) -> &Device {
@@ -221,10 +249,39 @@ fn build_causal_mask(
     Ok(full.narrow(0, 0, seq_q)?.unsqueeze(0)?.unsqueeze(0)?)
 }
 
-// ─────────────────────────────────────────────────────────────────────
-//  High-level Model wrapper (used by crane-serve's engine)
-// ─────────────────────────────────────────────────────────────────────
+/// Read EOS token id(s) from `generation_config.json` (preferred) then
+/// `config.json`. The field may be a single integer or a list; returns an empty
+/// vec if absent.
+fn read_eos_token_ids(model_path: &str) -> Vec<u32> {
+    fn from_value(v: &serde_json::Value) -> Vec<u32> {
+        match v {
+            serde_json::Value::Number(n) => {
+                n.as_u64().map(|x| vec![x as u32]).unwrap_or_default()
+            }
+            serde_json::Value::Array(a) => {
+                a.iter().filter_map(|e| e.as_u64().map(|x| x as u32)).collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+    for fname in ["generation_config.json", "config.json"] {
+        let path = std::path::Path::new(model_path).join(fname);
+        let Ok(data) = std::fs::read(&path) else { continue };
+        let Ok(json) = serde_json::from_slice::<serde_json::Value>(&data) else { continue };
+        if let Some(eos) = json.get("eos_token_id") {
+            let ids = from_value(eos);
+            if !ids.is_empty() {
+                return ids;
+            }
+        }
+    }
+    Vec::new()
+}
 
+
+/// Public-facing `Model` for Qwen 3.5 text-only inference.
+///
+/// Mirrors the structure of `crane_core::models::qwen3::Model`:
 /// Format of model weights on disk. Qwen 3.5 currently only ships
 /// safetensors; GGUF support is left for a future PR.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -233,22 +290,22 @@ pub enum ModelFormat {
     Safetensors,
 }
 
-/// Public-facing `Model` for Qwen 3.5 text-only inference.
-///
-/// Mirrors the structure of `crane_core::models::qwen3::Model`:
 /// holds a tokenizer, device, dtype, and the inner [`Qwen3_5TextModel`].
 pub struct Model {
     pub tokenizer: TokenOutputStream,
     pub device: Device,
     pub dtype: DType,
+    /// Stop tokens read from `generation_config.json` / `config.json` (Qwen3.5
+    /// and Ornith both use multi-id EOS, e.g. `[248044, 248046]`). Used when the
+    /// caller's `GenerationConfig` doesn't pin its own `eos_token_id`.
+    eos_token_ids: Vec<u32>,
     inner: Qwen3_5TextModel,
 }
 
 impl Model {
     /// Load a Qwen 3.5 model from a HF checkpoint directory.
     ///
-    /// Only the safetensors path is wired. GGUF support is left as a
-    /// follow-up.
+    /// Only the safetensors path is wired. GGUF support is left as a follow-up.
     pub fn new(model_path: &str, device: &Device, dtype: &DType) -> Result<Self> {
         Self::new_with_format(model_path, device, dtype, ModelFormat::Auto)
     }
@@ -265,6 +322,9 @@ impl Model {
         };
         match format {
             ModelFormat::Safetensors => Self::from_pretrained(model_path, device, dtype),
+            // GGUF support is a follow-up — the dense checkpoints ship as
+            // safetensors, and the GDN path's lazy-eviction story is enough
+            // complexity for one PR.
             ModelFormat::Auto => unreachable!("Auto resolves to Safetensors above"),
         }
     }
@@ -282,12 +342,15 @@ impl Model {
         let config_path = std::path::Path::new(model_path).join("config.json");
         let cfg = load_config(config_path.to_str().context("non-UTF8 model path")?)?;
 
+        let eos_token_ids = read_eos_token_ids(model_path);
+
         let inner = Qwen3_5TextModel::new(&cfg, vb, device, *dtype)?;
 
         Ok(Self {
             tokenizer: TokenOutputStream::new(tokenizer),
             device: device.clone(),
             dtype: *dtype,
+            eos_token_ids,
             inner,
         })
     }
@@ -323,6 +386,11 @@ impl Model {
 
     pub fn num_layers(&self) -> usize {
         self.inner.num_layers()
+    }
+
+    /// Total bytes held by the full-attention K/V caches (context-scaling term).
+    pub fn attn_cache_bytes(&self) -> usize {
+        self.inner.attn_cache_bytes()
     }
 
     /// Warm up the model with a small forward pass.
@@ -361,20 +429,37 @@ impl ModelForCausalLM for Model {
         std::io::stdout().flush()?;
 
         let mut generated_tokens = 0usize;
-        let eos_token: Option<u32> = config
-            .eos_token_id
-            .or_else(|| self.tokenizer.get_token(""))
-            .or_else(|| self.tokenizer.get_token(""));
+        // Stop tokens: an explicit `eos_token_id` on the request wins; otherwise
+        // use the model's configured EOS set (Qwen3.5/Ornith use multiple, e.g.
+        // [248044, 248046]); last-resort, look up `<|im_end|>` in the tokenizer.
+        let mut stop_ids: Vec<u32> = match config.eos_token_id {
+            Some(e) => vec![e],
+            None if !self.eos_token_ids.is_empty() => self.eos_token_ids.clone(),
+            None => self
+                .tokenizer
+                .get_token("<|im_end|>")
+                .into_iter()
+                .collect(),
+        };
+        stop_ids.sort_unstable();
+        stop_ids.dedup();
+
+        // Incremental decode: GDN layers carry recurrent state and
+        // full-attention layers carry a K/V cache, so feeding one token per
+        // step is correct. `CRANE_FULL_RECOMPUTE=1` forces the O(n²)
+        // reset-and-reprocess path instead (kept as a debugging cross-check
+        // for the incremental path).
+        let full_recompute = std::env::var("CRANE_FULL_RECOMPUTE").is_ok();
 
         let start_gen = std::time::Instant::now();
         for index in 0..config.max_new_tokens {
-            // After the first step, only feed the freshly decoded token — GDN
-            // layers carry recurrent state and full-attention layers carry a
-            // K/V cache, so incremental decode is correct.
-            let context_size = if index > 0 { 1 } else { tokens.len() };
+            let context_size = if index > 0 && !full_recompute { 1 } else { tokens.len() };
             let start_pos = tokens.len().saturating_sub(context_size);
             let ctxt = &tokens[start_pos..];
 
+            if full_recompute {
+                self.clear_kv_cache();
+            }
             let logits = self.forward_step(ctxt, start_pos)?;
             let logits = logits.squeeze(0)?.to_dtype(DType::F32)?;
 
@@ -393,7 +478,7 @@ impl ModelForCausalLM for Model {
             tokens.push(next_token);
             generated_tokens += 1;
 
-            if eos_token == Some(next_token) {
+            if stop_ids.binary_search(&next_token).is_ok() {
                 if let Some(ref mut s) = streamer {
                     s.finalize()?;
                 }
@@ -415,3 +500,4 @@ impl ModelForCausalLM for Model {
         Ok(tokens)
     }
 }
+

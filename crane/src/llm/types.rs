@@ -44,6 +44,8 @@ impl GenerationConfig {
 pub enum LlmModelType {
     Qwen25,
     Qwen3,
+    /// Qwen 3.5 hybrid (Gated Delta Net + full attention). Runs on CPU, NVIDIA
+    /// CUDA (with a fused recurrence kernel), and Apple Metal.
     Qwen35,
     Qwen3VL,
     DeepSeek,

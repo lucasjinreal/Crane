@@ -6,6 +6,11 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+# CUDA-only micro-benchmark for the fused GDN recurrence kernel.
+[[bin]]
+name = "gdn_bench"
+required-features = ["cuda"]
+
 [dependencies]
 anyhow = "1.0.97"
 
@@ -14,10 +19,12 @@ candle-transformers = { workspace = true }
 candle-onnx = { workspace = true, optional = true }
 clap = { version = "4.5.32", features = ["derive"] }
 hf-hub = "0.5.0"
-minijinja = { version = "2.15.1", features = ["builtins"] }
+minijinja = { version = "2.15.1", features = ["builtins", "preserve_order"] }
 minijinja-contrib = { version = "2.15.1", features = ["pycompat"] }
 serde = "1.0.219"
-serde_json = "1.0.140"
+# preserve_order: JSON object keys keep insertion order (matches Python's
+# json.dumps / HF chat templates — needed for byte-identical tool rendering).
+serde_json = { version = "1.0.140", features = ["preserve_order"] }
 tokenizers = "0.23.1"
 ribo = "0.1.3"
 
