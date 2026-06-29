@@ -105,6 +105,6 @@ The Crane SDK provides a high-level interface for various AI capabilities:
 - **Audio**: ASR, TTS (with ONNX feature)
 - **Multimodal**: Vision-language models
 
-For API server usage (OpenAI / SGLang compatible), see [crane-oai/README.md](../crane-oai/README.md).
+For API server usage (OpenAI / SGLang compatible), see [crane-serve/README.md](../crane-serve/README.md).
 
 For more advanced usage, check the documentation in the main `crane` crate.

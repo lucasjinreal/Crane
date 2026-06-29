@@ -44,6 +44,7 @@ impl GenerationConfig {
 pub enum LlmModelType {
     Qwen25,
     Qwen3,
+    Qwen35,
     Qwen3VL,
     DeepSeek,
     HunyuanDense,

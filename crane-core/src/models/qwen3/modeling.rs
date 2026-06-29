@@ -48,7 +48,7 @@ struct EventTrackingGuard;
 #[cfg(feature = "cuda")]
 impl EventTrackingGuard {
     fn disable(device: &candle_core::Device) -> Self {
-        if let candle_core::Device::Cuda(ref dev) = device {
+        if let candle_core::Device::Cuda(dev) = device {
             if dev.is_event_tracking() {
                 // Safety: we ensure sequential use of a single CUDA stream.
                 unsafe { dev.disable_event_tracking() };

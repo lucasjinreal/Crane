@@ -1,4 +1,4 @@
-# crane-oai
+# crane-serve
 
 An OpenAI & SGLang compatible inference API server built on the [Crane](../README.md) framework, with continuous batching support.
 
@@ -7,7 +7,7 @@ An OpenAI & SGLang compatible inference API server built on the [Crane](../READM
 - **OpenAI-compatible API** — Chat Completions, Text Completions, Text-to-Speech, Models, Tokenize/Detokenize
 - **SGLang native API** — `/generate`, `/model_info`, `/server_info` and related endpoints
 - **Continuous batching** — Dedicated inference thread with prefill-priority scheduling, dynamic KV memory budget, and automatic sequence eviction/recovery
-- **Multi-model support** — Auto-detects and loads Hunyuan Dense, Qwen 2.5, Qwen 3, Qwen3-TTS architectures
+- **Multi-model support** — Auto-detects and loads Hunyuan Dense, Qwen 2.5, Qwen 3, Qwen 3.5 (hybrid GDN + softmax), Qwen3-TTS
 - **Qwen3-TTS** — Full two-level TTS inference (Talker + Code Predictor) with native Candle speech-tokenizer decoder (ONNX optional fallback); exposes OpenAI-compatible `/v1/audio/speech`
 - **Streaming** — SSE (Server-Sent Events) token streaming
 - **Cross-platform acceleration** — CPU / CUDA / Apple Metal, selected automatically
@@ -18,29 +18,29 @@ An OpenAI & SGLang compatible inference API server built on the [Crane](../READM
 
 ```bash
 # CPU only
-cargo build -p crane-oai --release
+cargo build -p crane-serve --release
 
 # CUDA (NVIDIA GPU)
-cargo build -p crane-oai --release --features cuda
+cargo build -p crane-serve --release --features cuda
 ```
 
 ### Run
 
 ```bash
 # Auto-detect model type and device
-crane-oai --model-path /path/to/model
+crane --model-path /path/to/model
 
 # Specify model type and port
-crane-oai --model-path /path/to/Qwen2.5-7B-Instruct \
+crane --model-path /path/to/Qwen2.5-7B-Instruct \
     --model-type qwen25 \
     --port 8000
 
 # GGUF weights
-crane-oai --model-path /path/to/model.gguf \
+crane --model-path /path/to/model.gguf \
     --format gguf
 
 # Force CPU
-crane-oai --model-path /path/to/model --cpu
+crane --model-path /path/to/model --cpu
 ```
 
 ### Qwen3-TTS Quick Start
@@ -75,16 +75,16 @@ python scripts/export_qwen_tts_tokenizer_onnx.py \
 
 ```bash
 # CPU (always available)
-cargo build -p crane-oai --release
+cargo build -p crane-serve --release
 
 # CUDA
-cargo build -p crane-oai --release --features "cuda"
+cargo build -p crane-serve --release --features "cuda"
 
 # macOS Metal (auto-enabled by target)
-cargo build -p crane-oai --release
+cargo build -p crane-serve --release
 
 # Start the TTS server (auto-detected from config.json)
-./target/release/crane-oai \
+./target/release/crane \
     --model-path checkpoints/Qwen3-TTS-12Hz-0.6B-Base \
     --model-type qwen3_tts \
     --port 8080
@@ -187,19 +187,19 @@ python scripts/export_qwen_tts_tokenizer_onnx.py \
 
 ```bash
 # CPU
-cargo build -p crane-oai --release
+cargo build -p crane-serve --release
 
 # CUDA
-cargo build -p crane-oai --release --features "cuda"
+cargo build -p crane-serve --release --features "cuda"
 
 # macOS Metal (auto-enabled by target)
-cargo build -p crane-oai --release
+cargo build -p crane-serve --release
 ```
 
 **3. Start the server:**
 
 ```bash
-./target/release/crane-oai \
+./target/release/crane \
     --model-path checkpoints/Qwen3-TTS-12Hz-0.6B-Base \
     --model-type qwen3_tts \
     --port 8080
@@ -283,7 +283,7 @@ Built-in speakers for the CustomVoice model include: `Serena`, `Vivian`, `Uncle_
 ### Basic CUDA inference
 
 ```bash
-crane-oai --model-path /path/to/Qwen3-8B-Instruct
+crane-serve --model-path /path/to/Qwen3-8B-Instruct
 ```
 
 On CUDA, `model_info` will report the device as `Cuda(0)` (or `Cuda(1)`, etc.).
@@ -294,18 +294,18 @@ GPU memory grows as KV caches accumulate. Use `--gpu-memory-limit` to keep usage
 
 ```bash
 # Hard cap at 8 GB — recommended starting point for a 12 GB GPU
-crane-oai --model-path /path/to/model \
+crane-serve --model-path /path/to/model \
     --gpu-memory-limit 8G \
     --max-seq-len 4096
 
 # Cap at 5 GB for 8 GB VRAM cards
-crane-oai --model-path /path/to/model \
+crane-serve --model-path /path/to/model \
     --gpu-memory-limit 5G \
     --max-seq-len 2048 \
     --max-concurrent 4
 
 # Use 75% of total VRAM
-crane-oai --model-path /path/to/model \
+crane-serve --model-path /path/to/model \
     --gpu-memory-limit 0.75
 ```
 
@@ -325,21 +325,21 @@ When the KV memory budget is exceeded, the engine evicts the longest-output sequ
 GGUF quantization roughly halves VRAM usage compared to FP16:
 
 ```bash
-crane-oai --model-path /path/to/Qwen3-8B-Q4_K_M.gguf \
+crane-serve --model-path /path/to/Qwen3-8B-Q4_K_M.gguf \
     --format gguf \
     --gpu-memory-limit 8G
 ```
 
 ### Multi-GPU note
 
-Currently crane-oai runs on a single CUDA device (device 0). Multi-GPU tensor parallelism is not yet supported.
+Currently crane-serve runs on a single CUDA device (device 0). Multi-GPU tensor parallelism is not yet supported.
 
 ## CLI Parameters
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--model-path` | *(required)* | Path to model directory or GGUF file |
-| `--model-type` | `auto` | Architecture: `auto`, `hunyuan`, `qwen25`, `qwen3`, `qwen3_tts` |
+| `--model-type` | `auto` | Architecture: `auto`, `hunyuan`, `qwen25`, `qwen3`, `qwen3_5`, `qwen3_tts` |
 | `--model-name` | directory name | Model name shown in API responses |
 | `--host` | `0.0.0.0` | Bind address |
 | `--port` | `8080` | Bind port |
@@ -639,7 +639,7 @@ from openai import OpenAI
 
 client = OpenAI(
     base_url="http://localhost:8080/v1",
-    api_key="not-needed",  # crane-oai does not require an API key
+    api_key="not-needed",  # crane-serve does not require an API key
 )
 
 response = client.chat.completions.create(
@@ -662,7 +662,7 @@ for chunk in stream:
 
 ### Text-to-Speech (Qwen3-TTS)
 
-> Start crane-oai with `--model-type qwen3_tts` and a Qwen3-TTS checkpoint.
+> Start crane-serve with `--model-type qwen3_tts` and a Qwen3-TTS checkpoint.
 
 **CustomVoice model (predefined speakers):**
 
@@ -759,7 +759,7 @@ pathlib.Path("voice_clone.wav").write_bytes(r.content)
 ## Source Structure
 
 ```
-crane-oai/src/
+crane-serve/src/
 ├── main.rs              # CLI entry point, AppState, route registration
 ├── openai_api.rs        # OpenAI request/response types (incl. SpeechRequest)
 ├── sglang_api.rs        # SGLang native API types
@@ -788,6 +788,7 @@ crane-oai/src/
 |-------|-------------|---------|---------|-------|
 | Hunyuan Dense | ✅ | ✅ | Safetensors / GGUF | KV pre-alloc, GQA 4D matmul, RoPE cache growth |
 | Qwen 3 | ✅ | ✅ | Safetensors / GGUF | + QK Norm 4D, GGUF quantization |
+| Qwen 3.5 | ❌ | ❌ | Safetensors | Hybrid GDN + softmax attention; CUDA fused recurrence kernel; `max_concurrent=1` |
 | Qwen 2.5 | sequential | ❌ | Safetensors | — |
 | **Qwen3-TTS** | N/A | N/A | Safetensors (ONNX fallback optional) | Dedicated thread; no continuous batching |
 
@@ -804,7 +805,7 @@ Model type is auto-detected from `config.json` (`model_type` / `architectures`) 
 
 ## Notes
 
-- **No API key required** — crane-oai does not authenticate requests.
+- **No API key required** — crane-serve does not authenticate requests.
 - **Single CUDA device** — The server uses CUDA device 0. Multi-GPU tensor parallelism is not yet supported.
 - **KV eviction is lossless** — Evicted sequences preserve their full state and resume automatically; in-flight requests are not dropped or errored.
 - **`--max-seq-len 0`** means no limit. On constrained hardware, always set an explicit value to avoid runaway memory growth.
@@ -817,14 +818,14 @@ Model type is auto-detected from `config.json` (`model_type` / `architectures`) 
 ## Testing
 
 ```bash
-# All unit tests (125 crane-oai + 11 crane-core)
-cargo test -p crane-oai
+# All unit tests
+cargo test -p crane-serve
 cargo test -p crane-core
 
 # Specific modules
-cargo test -p crane-oai engine::scheduler
-cargo test -p crane-oai openai_api::tests
-cargo test -p crane-oai sglang_api::tests
+cargo test -p crane-serve engine::scheduler
+cargo test -p crane-serve openai_api::tests
+cargo test -p crane-serve sglang_api::tests
 cargo test -p crane-core autotokenizer
 ```
 

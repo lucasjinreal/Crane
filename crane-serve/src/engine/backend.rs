@@ -382,6 +382,86 @@ impl ModelBackend for Qwen25Backend {
 }
 
 // ─────────────────────────────────────────────────────────────
+//  Qwen 3.5 Backend
+// ─────────────────────────────────────────────────────────────
+
+/// Engine wrapper around `crane_core::models::qwen3_5::Model`.
+///
+/// Only single-sequence forward is supported (no KV swap, no batch decode).
+/// The hybrid full-attention / GDN layers share a single set of caches; the
+/// engine treats them as opaque per-request state.
+pub struct Qwen3_5Backend {
+    pub model: crane_core::models::qwen3_5::Model,
+    #[allow(dead_code)]
+    dtype: DType,
+}
+
+impl Qwen3_5Backend {
+    pub fn new(model_path: &str, device: &Device, dtype: &DType) -> Result<Self> {
+        let model = crane_core::models::qwen3_5::Model::new(model_path, device, dtype)?;
+        Ok(Self {
+            model,
+            dtype: *dtype,
+        })
+    }
+}
+
+impl ModelBackend for Qwen3_5Backend {
+    fn forward_step(&mut self, input_ids: &[u32], start_pos: usize) -> Result<Tensor> {
+        self.model
+            .forward_step(input_ids, start_pos)
+            .map_err(Into::into)
+    }
+
+    fn clear_kv_cache(&mut self) {
+        self.model.clear_kv_cache();
+    }
+
+    fn num_layers(&self) -> usize {
+        // The KV-cache vector sizing is a no-op for this backend — we always
+        // reset full-attention state implicitly via GDN-cache reset, and the
+        // engine caps `max_concurrent` to 1 since `supports_kv_swap` is false.
+        self.model.num_layers()
+    }
+
+    fn device(&self) -> &Device {
+        &self.model.device
+    }
+
+    fn dtype(&self) -> DType {
+        self.model.dtype
+    }
+
+    fn tokenizer(&self) -> &tokenizers::Tokenizer {
+        &self.model.tokenizer.tokenizer
+    }
+
+    fn eos_token_id(&self) -> Vec<u32> {
+        // Qwen 3 / 3.5 chat models stop at 151645 () and 151643 ().
+        let tok = &self.model.tokenizer.tokenizer;
+        let mut ids = Vec::new();
+        if let Some(id) = tok.token_to_id("") {
+            ids.push(id);
+        }
+        if let Some(id) = tok.token_to_id("") {
+            ids.push(id);
+        }
+        if ids.is_empty() {
+            ids.push(151645);
+            ids.push(151643);
+        }
+        ids
+    }
+
+    fn warmup(&mut self) {
+        self.model.warmup();
+    }
+
+    // supports_kv_swap defaults to false → engine caps max_concurrent to 1.
+    // Batch decode is not yet implemented for hybrid layer types.
+}
+
+// ─────────────────────────────────────────────────────────────
 //  Qwen 3 Backend
 // ─────────────────────────────────────────────────────────────
 

@@ -12,6 +12,7 @@ A high-performance inference framework leveraging Rust's Candle for maximum spee
 
 - [x] Qwen3 (0.6B ~ 30B+)
 - [x] Qwen 2.5 (0.5B ~ 72B)
+- [x] Qwen 3.5 (0.8B; hybrid Gated Delta Net + softmax attention, CPU/CUDA/Metal)
 - [x] Hunyuan Dense
 - [x] Gemma 4 (text and vision; no audio)
 - [x] Qwen3 VL (2B, 4B)
@@ -56,8 +57,9 @@ We include:
 
 ## 🔥 Updates
 
+- **`2026.06.29`**: 🌀 Qwen 3.5 support — hybrid Mamba/Transformer (Gated Delta Net + softmax attention), runs on CPU, NVIDIA CUDA, and Apple Metal. New `crane-core/src/gdn/` module with a fused CUDA recurrence kernel for the linear-attention path.
 - **`2026.05.04`**: Gemma 4 support added for text and vision models (audio is not supported);
-- **`2026.02.23`**: 🎙️ Qwen3-TTS support added — full Talker + Code Predictor transformer in Candle, native speech-tokenizer decoder (ONNX fallback), voice cloning (Base model ICL), OpenAI `/v1/audio/speech` endpoint in crane-oai;
+- **`2026.02.23`**: 🎙️ Qwen3-TTS support added — full Talker + Code Predictor transformer in Candle, native speech-tokenizer decoder (ONNX fallback), voice cloning (Base model ICL), OpenAI `/v1/audio/speech` endpoint in crane-serve;
 - **`2026.02.18`**: ⚡ Qwen3 & Hunyuan Dense inference optimization: pre-allocated KV cache, GQA 4D matmul, fused RoPE with cache pre-growth, GGUF quantization, batched decode, smart sampling fallback for large vocabularies;
 - **`2026.01.30`**: PaddleOCR-VL-1.5 supported now! model: https://huggingface.co/PaddlePaddle/PaddleOCR-VL-1.5/;
 - **`2025.03.21`**: 🔥 Qwen2.5 a more transformers liked Rust interface were supported, you now use Crane just like in your python;
@@ -181,7 +183,7 @@ To use `crane`, here are some notes:
 
 - `crane-core`: All models comes into core, this is a lib;
 - `crane`: All Apps (runnable AI pipelines, such as Qwen2-Chat, Spark-TTS, Qwen2.5-VL etc), you can build your apps inside it, each app is a binary for demonstration purpose;
-- `crane-oai`: OpenAI & SGLang compatible API server with continuous batching, see [crane-oai/README.md](crane-oai/README.md) for full documentation;
+- `crane-serve`: OpenAI & SGLang compatible API server with continuous batching, see [crane-serve/README.md](crane-serve/README.md) for full documentation;
 
 1. Make sure latest Rust were installed;
 2. Build (choose based on your hardware):
@@ -203,15 +205,15 @@ Start a server compatible with OpenAI SDK and SGLang client:
 ```bash
 # Build
 # CPU
-cargo build -p crane-oai --release
+cargo build -p crane-serve --release
 # CUDA
-cargo build -p crane-oai --release --features cuda
+cargo build -p crane-serve --release --features cuda
 
 # Start (auto-detect model type and device)
-./target/release/crane-oai --model-path /path/to/Qwen2.5-7B-Instruct
+./target/release/crane --model-path /path/to/Qwen2.5-7B-Instruct
 
 # Or run directly
-cargo run -p crane-oai --release -- --model-path /path/to/model --port 8000
+cargo run -p crane-serve --release -- --model-path /path/to/model --port 8000
 ```
 
 Then use it with any OpenAI-compatible client:
@@ -244,7 +246,7 @@ Supported endpoints:
 | Mgmt   | `GET /health` | Health check |
 | Mgmt   | `GET /v1/stats` | Engine statistics |
 
-✨ **Text-to-Speech (Qwen3-TTS)**: For TTS models, the server adds a `/v1/audio/speech` endpoint (OpenAI-compatible). Both **CustomVoice** (predefined speakers) and **Base** (voice cloning via reference audio) models are supported. `response_format` currently supports `wav` and `pcm` (other formats return `400`). See [crane-oai/README.md](crane-oai/README.md) for full TTS API documentation.
+✨ **Text-to-Speech (Qwen3-TTS)**: For TTS models, the server adds a `/v1/audio/speech` endpoint (OpenAI-compatible). Both **CustomVoice** (predefined speakers) and **Base** (voice cloning via reference audio) models are supported. `response_format` currently supports `wav` and `pcm` (other formats return `400`). See [crane-serve/README.md](crane-serve/README.md) for full TTS API documentation.
 
 ### TTS Examples
 
@@ -266,7 +268,7 @@ All TTS examples save generated audio files to `data/audio/output`.
 - Base (voice clone): [vc1_base.wav](data/audio/output/vc1_base.wav), [vc2_base.wav](data/audio/output/vc2_base.wav)
 - CustomVoice: [custom_voice_zh.wav](data/audio/output/custom_voice_zh.wav), [custom_voice_en.wav](data/audio/output/custom_voice_en.wav), [custom_voice_ja.wav](data/audio/output/custom_voice_ja.wav)
 
-✨ **Multimodal & Vision support**: For models like PaddleOCR-VL, the endpoints accept OpenAI's structured `messages.[]content.[{type: "image_url", image_url: {url: "..."}}]` payload or SGLang's `image_url` field. See [crane-oai/README.md](crane-oai/README.md) for full API documentation with request/response examples.
+✨ **Multimodal & Vision support**: For models like PaddleOCR-VL, the endpoints accept OpenAI's structured `messages.[]content.[{type: "image_url", image_url: {url: "..."}}]` payload or SGLang's `image_url` field. See [crane-serve/README.md](crane-serve/README.md) for full API documentation with request/response examples.
 
 Now you can run LLM extremly fast (about 6x faster than vanilla transformers on M1)!
 
@@ -275,9 +277,9 @@ Now you can run LLM extremly fast (about 6x faster than vanilla transformers on 
 ```
 Crane/
 ├── crane-core/          # Core library: model implementations, tokenizer, generation
-│   └── src/models/      # Model architectures (Qwen 2.5, Qwen 3, Hunyuan, etc.)
+│   └── src/models/      # Model architectures (Qwen 2.5, Qwen 3, Qwen 3.5, Hunyuan, etc.)
 ├── crane/               # High-level SDK: Chat, Vision, Audio, Multimodal clients
-├── crane-oai/           # OpenAI & SGLang compatible API server
+├── crane-serve/         # OpenAI & SGLang compatible API server
 │   └── src/
 │       ├── engine/      # Continuous batching inference engine
 │       ├── handlers/    # HTTP request handlers (OpenAI, SGLang, common)
