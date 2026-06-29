@@ -32,6 +32,8 @@ use candle_nn::{linear_no_bias, Linear, RmsNorm, VarBuilder};
 use serde::Deserialize;
 use std::io::{Read, Seek};
 
+use crate::models::modules::rotary::RotaryEmbedding;
+
 // Reuse the polymorphic linear layer and GGUF loader from the shared Hunyuan module.
 pub use crate::models::hunyuan_dense::modeling::{Gguf, LinearLayer};
 
@@ -101,55 +103,6 @@ impl Config {
     pub fn head_dim(&self) -> usize {
         self.head_dim
             .unwrap_or(self.hidden_size / self.num_attention_heads)
-    }
-}
-
-// ── Rotary Embedding (with cache) ───────────────────────────────────────
-
-struct RotaryEmbedding {
-    /// Pre-computed cos table: [max_pos, head_dim] — full table, zero-copy narrow per call.
-    cos_table: Tensor,
-    /// Pre-computed sin table: [max_pos, head_dim] — full table, zero-copy narrow per call.
-    sin_table: Tensor,
-}
-
-impl RotaryEmbedding {
-    fn new(config: &Config, device: &Device) -> Result<Self> {
-        let dim = config.head_dim();
-        let base = config.rope_theta;
-        let max_pos = config.max_position_embeddings;
-
-        // inv_freq: [dim/2]
-        let inv: Vec<f32> = (0..dim)
-            .step_by(2)
-            .map(|i| 1.0 / base.powf(i as f64 / dim as f64) as f32)
-            .collect();
-        let inv_freq = Tensor::new(inv.as_slice(), device)?;
-
-        // positions × inv_freq: [max_pos, dim/2]
-        let positions: Vec<f32> = (0..max_pos).map(|i| i as f32).collect();
-        let positions = Tensor::new(positions.as_slice(), device)?;
-        let freqs = positions
-            .unsqueeze(1)?
-            .matmul(&inv_freq.unsqueeze(0)?)?; // [max_pos, dim/2]
-
-        // cos/sin tables: [max_pos, dim/2] — candle_nn::rotary_emb::rope() handles
-        // the half-dim duplication internally, so we store the raw half-dim tables.
-        let cos_table = freqs.cos()?.contiguous()?;
-        let sin_table = freqs.sin()?.contiguous()?;
-
-        Ok(Self {
-            cos_table,
-            sin_table,
-        })
-    }
-
-    /// Return cos/sin slices for positions [0..seq_len].
-    /// Both narrow() calls are zero-copy views — no CUDA kernel launched.
-    fn forward(&self, seq_len: usize) -> Result<(Tensor, Tensor)> {
-        let cos = self.cos_table.narrow(0, 0, seq_len)?;
-        let sin = self.sin_table.narrow(0, 0, seq_len)?;
-        Ok((cos, sin))
     }
 }
 
@@ -718,7 +671,12 @@ impl Qwen3Model {
             )?)
         };
 
-        let rotary_emb = RotaryEmbedding::new(config, vb.device())?;
+        let rotary_emb = RotaryEmbedding::new(
+            config.head_dim(),
+            config.max_position_embeddings,
+            config.rope_theta,
+            vb.device(),
+        )?;
 
         Ok(Self {
             embed_tokens,
@@ -827,7 +785,12 @@ impl Qwen3Model {
             gg.linear("output.weight")?
         };
 
-        let rotary_emb = RotaryEmbedding::new(&config, device)?;
+        let rotary_emb = RotaryEmbedding::new(
+            config.head_dim(),
+            config.max_position_embeddings,
+            config.rope_theta,
+            device,
+        )?;
 
         Ok(Self {
             embed_tokens,
@@ -854,13 +817,9 @@ impl Qwen3Model {
         let hidden_states = self.embed_tokens.forward(input_ids)?.to_dtype(self.dtype)?;
 
         let total_len = start_pos + seq_len;
-        let (full_cos, full_sin) = self.rotary_emb.forward(total_len)?;
-        let cos = full_cos
-            .narrow(0, start_pos, seq_len)?
-            .to_dtype(self.dtype)?;
-        let sin = full_sin
-            .narrow(0, start_pos, seq_len)?
-            .to_dtype(self.dtype)?;
+        let (cos, sin) = self.rotary_emb.forward(start_pos, seq_len)?;
+        let cos = cos.to_dtype(self.dtype)?;
+        let sin = sin.to_dtype(self.dtype)?;
 
         // Causal mask (only during prefill; skipped for single-token decode)
         let attention_mask = if seq_len > 1 {
@@ -1040,7 +999,8 @@ impl Qwen3Model {
 
         let max_pos = positions.iter().copied().max().unwrap_or(0) + 1;
         let device = input_ids.device();
-        let (full_cos, full_sin) = self.rotary_emb.forward(max_pos)?;        let pos_ids: Vec<u32> = positions.iter().map(|&p| p as u32).collect();
+        let (full_cos, full_sin) = self.rotary_emb.forward(0, max_pos)?;
+        let pos_ids: Vec<u32> = positions.iter().map(|&p| p as u32).collect();
         let pos_tensor = Tensor::new(pos_ids.as_slice(), device)?;
         let cos = full_cos
             .index_select(&pos_tensor, 0)?
