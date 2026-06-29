@@ -1,5 +1,6 @@
 use anyhow::Result;
 use candle_core::{DType, Device, IndexOp, Tensor, D};
+use super::super::modules::rotary::RotaryEmbedding;
 use candle_core::{Module, StreamingModule};
 use candle_nn::{
     conv1d, conv1d_no_bias, conv_transpose1d, layer_norm, linear, linear_no_bias, Conv1d,
@@ -240,42 +241,6 @@ impl DecoderConfig {
     }
 }
 
-#[derive(Debug, Clone)]
-struct RotaryEmbedding {
-    cos_table: Tensor,
-    sin_table: Tensor,
-}
-
-impl RotaryEmbedding {
-    fn new(dim: usize, max_pos: usize, theta: f64, device: &Device) -> Result<Self> {
-        let inv: Vec<f32> = (0..dim)
-            .step_by(2)
-            .map(|i| 1.0 / theta.powf(i as f64 / dim as f64) as f32)
-            .collect();
-        let inv_freq = Tensor::new(inv.as_slice(), device)?;
-        let positions: Vec<f32> = (0..max_pos).map(|i| i as f32).collect();
-        let positions = Tensor::new(positions.as_slice(), device)?;
-        let freqs = positions.unsqueeze(1)?.matmul(&inv_freq.unsqueeze(0)?)?;
-        Ok(Self {
-            cos_table: freqs.cos()?,
-            sin_table: freqs.sin()?,
-        })
-    }
-
-    fn forward(&self, seq_len: usize) -> Result<(Tensor, Tensor)> {
-        let cos = self.cos_table.narrow(0, 0, seq_len)?;
-        let sin = self.sin_table.narrow(0, 0, seq_len)?;
-        Ok((cos, sin))
-    }
-}
-
-fn rotate_half(x: &Tensor) -> Result<Tensor> {
-    let half = x.dim(D::Minus1)? / 2;
-    let x1 = x.narrow(D::Minus1, 0, half)?;
-    let x2 = x.narrow(D::Minus1, half, half)?;
-    Ok(Tensor::cat(&[&x2.neg()?, &x1], D::Minus1)?)
-}
-
 fn repeat_kv(x: &Tensor, n_rep: usize) -> Result<Tensor> {
     if n_rep == 1 {
         return Ok(x.clone());
@@ -371,18 +336,7 @@ impl TokenizerAttention {
             .reshape((b, t, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
 
-        let (cos, sin) = self.rotary.forward(t)?;
-        let target_dtype = q.dtype();
-        let cos = Tensor::cat(&[&cos, &cos], D::Minus1)?
-            .to_dtype(target_dtype)?
-            .unsqueeze(0)?
-            .unsqueeze(0)?;
-        let sin = Tensor::cat(&[&sin, &sin], D::Minus1)?
-            .to_dtype(target_dtype)?
-            .unsqueeze(0)?
-            .unsqueeze(0)?;
-        let q = (q.broadcast_mul(&cos)? + rotate_half(&q)?.broadcast_mul(&sin)?)?.contiguous()?;
-        let k = (k.broadcast_mul(&cos)? + rotate_half(&k)?.broadcast_mul(&sin)?)?.contiguous()?;
+        let (q, k) = self.rotary.apply(&q, &k, 0, t)?;
 
         let rep = self.num_heads / self.num_kv_heads;
         let k = repeat_kv(&k, rep)?.contiguous()?;
@@ -1093,13 +1047,7 @@ impl EncoderTransformerLayer {
         let k = normed.apply(&self.k_proj)?.reshape((b, t, h, hd))?.transpose(1, 2)?;
         let v = normed.apply(&self.v_proj)?.reshape((b, t, h, hd))?.transpose(1, 2)?;
 
-        // Apply RoPE using existing rotate_half approach
-        let (cos, sin) = rotary.forward(t)?;
-        // cos/sin: [t, hd/2] → expand to [1, 1, t, hd] by repeating
-        let cos2 = Tensor::cat(&[&cos, &cos], 1)?.reshape((1, 1, t, hd))?;
-        let sin2 = Tensor::cat(&[&sin, &sin], 1)?.reshape((1, 1, t, hd))?;
-        let q = (q.broadcast_mul(&cos2)? + rotate_half(&q)?.broadcast_mul(&sin2)?)?;
-        let k = (k.broadcast_mul(&cos2)? + rotate_half(&k)?.broadcast_mul(&sin2)?)?;
+        let (q, k) = rotary.apply(&q, &k, 0, t)?;
 
         // Sliding window causal attention
         let scale = (hd as f64).sqrt().recip();
