@@ -48,6 +48,8 @@ pub struct VoxtralConfig {
     pub norm_eps: f64,
     /// Tekken vocabulary size (131 072).
     pub vocab_size: usize,
+    /// Maximum sequence length for pre-computed `RoPE` tables (65 536).
+    pub max_seq_len: usize,
     /// Whether the token embedding and output projection share weights.
     pub tied_embeddings: bool,
     /// Multimodal (audio) configuration.
@@ -227,7 +229,11 @@ pub fn build_prompt_segments(text_token_ids: &[u32]) -> Vec<PromptSegment> {
 
 // ── Voice embedding loader ─────────────────────────────────────────────────
 
-/// Internal dimension of all Voxtral embeddings; must equal `VoxtralConfig::dim`.
+/// Internal embedding dimension, fixed by the Voxtral architecture.
+///
+/// Voice embeddings produced by the codec encoder always have this width.
+/// Must equal `VoxtralConfig::dim` (3072). Intentionally not read from the
+/// config so that `load_voice_embedding` has no config dependency.
 const EMBED_DIM: usize = 3072;
 
 /// Load a pre-computed voice embedding from a `PyTorch` `.pt` file.
@@ -316,10 +322,12 @@ mod tests {
     // ── Synthetic helpers ─────────────────────────────────────────────────
 
     fn minimal_params_json() -> &'static str {
+        // Voice IDs are synthetic; they don't match the real checkpoint order.
         r#"{
             "dim": 3072, "n_layers": 26, "head_dim": 128, "hidden_dim": 9216,
             "n_heads": 32, "n_kv_heads": 8, "rope_theta": 1000000.0,
-            "norm_eps": 1e-05, "vocab_size": 131072, "tied_embeddings": true,
+            "norm_eps": 1e-05, "vocab_size": 131072, "max_seq_len": 65536,
+            "tied_embeddings": true,
             "multimodal": {
                 "bos_token_id": 1,
                 "audio_model_args": {
@@ -383,6 +391,7 @@ mod tests {
         assert_eq!(cfg.n_heads, 32);
         assert_eq!(cfg.n_kv_heads, 8);
         assert_eq!(cfg.vocab_size, 131_072);
+        assert_eq!(cfg.max_seq_len, 65_536);
         assert!(cfg.tied_embeddings);
         assert_eq!(cfg.multimodal.audio_model_args.semantic_codebook_size, 8192);
         assert_eq!(cfg.multimodal.audio_model_args.n_acoustic_codebook, 36);

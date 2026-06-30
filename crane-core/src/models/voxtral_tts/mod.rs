@@ -1,7 +1,15 @@
 pub mod model;
+pub mod modeling;
 
 pub use model::{
-    AUDIO_TOKEN, AcousticTransformerArgs, AudioModelArgs, AudioTokenizerArgs, BEGIN_AUDIO, BOS,
-    END_AUDIO_CODE, INST, INST_END, MultimodalConfig, PromptSegment, VoxtralConfig,
-    build_prompt_segments, load_tokenizer, load_voice_embedding,
+    build_prompt_segments, load_tokenizer, load_voice_embedding, PromptSegment, VoxtralConfig,
+    AUDIO_TOKEN, BEGIN_AUDIO, BOS, END_AUDIO_CODE, INST, INST_END,
 };
+pub use modeling::{AudioCodebookEmbedding, VoxtralLlm};
+
+#[allow(unused_imports)] // used by crane-serve later
+pub(crate) use model::{
+    AcousticTransformerArgs, AudioModelArgs, AudioTokenizerArgs, MultimodalConfig,
+};
+#[allow(unused_imports)] // used by crane-serve later
+pub(crate) use modeling::rename_voxtral_transformer_keys;
