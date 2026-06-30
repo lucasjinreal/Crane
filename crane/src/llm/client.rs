@@ -321,9 +321,12 @@ impl LlmClient {
             });
 
             for message in receiver {
-                if let StreamerMessage::Token(token_text) = message {
-                    callback(&token_text);
-                    response_text.push_str(&token_text);
+                match message {
+                    StreamerMessage::Token(token_text) => {
+                        callback(&token_text);
+                        response_text.push_str(&token_text);
+                    }
+                    StreamerMessage::End => break,
                 }
             }
 

@@ -3,6 +3,8 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_PATH="$ROOT_DIR/target/release/crane"
+CHAT_SIMPLE_BIN_PATH="$ROOT_DIR/target/release/chat_simple"
+CHAT_CLI_BIN_PATH="$ROOT_DIR/target/release/chat_cli"
 BUILD_FEATURES=()
 PLATFORM="unknown"
 
@@ -40,13 +42,13 @@ else
   exit 1
 fi
 
-BUILD_CMD=(cargo build --release -p crane)
+BUILD_CMD=(cargo build --release -p crane -p crane-examples --bin chat_simple --bin chat_cli)
 if [[ ${#BUILD_FEATURES[@]} -gt 0 ]]; then
   FEATURES_CSV=$(IFS=,; printf '%s' "${BUILD_FEATURES[*]}")
   BUILD_CMD+=(--features "$FEATURES_CSV")
 fi
 
-say "${BLUE}${BOLD}Building crane...${NC}"
+say "${BLUE}${BOLD}Building crane, chat_simple, and chat_cli...${NC}"
 (
   cd "$ROOT_DIR"
   "${BUILD_CMD[@]}"
@@ -54,6 +56,8 @@ say "${BLUE}${BOLD}Building crane...${NC}"
 
 say "${GREEN}${BOLD}Build complete.${NC}"
 say "${GREEN}Binary:${NC} $BIN_PATH"
+say "${GREEN}Example:${NC} $CHAT_SIMPLE_BIN_PATH"
+say "${GREEN}CLI:${NC} $CHAT_CLI_BIN_PATH"
 say ""
 say "${BLUE}${BOLD}Serve a model:${NC}"
 say "  $BIN_PATH -m /path/to/model -p 8080"

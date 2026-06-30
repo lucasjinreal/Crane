@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use crate::common::CraneResult;
 use crate::chat::{ChatConfig, ChatHistory, ChatMessage, ChatRole};
 use crate::llm::LlmClient;
@@ -7,11 +9,13 @@ pub struct ChatClient {
     config: ChatConfig,
     history: ChatHistory,
     llm_client: LlmClient,
+    load_duration: std::time::Duration,
 }
 
 impl ChatClient {
     /// Create a new chat client with the given configuration
     pub fn new(config: ChatConfig) -> CraneResult<Self> {
+        let started_at = Instant::now();
         let llm_client = LlmClient::new(config.common.clone())?;
         let history = ChatHistory::new(config.max_history_turns);
         
@@ -19,6 +23,7 @@ impl ChatClient {
             config,
             history,
             llm_client,
+            load_duration: started_at.elapsed(),
         })
     }
     
@@ -75,6 +80,14 @@ impl ChatClient {
     /// Clear the conversation history
     pub fn clear_history(&mut self) {
         self.history.clear();
+    }
+
+    pub fn load_duration(&self) -> std::time::Duration {
+        self.load_duration
+    }
+
+    pub fn config(&self) -> &ChatConfig {
+        &self.config
     }
     
     /// Format the conversation for the model
