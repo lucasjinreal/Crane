@@ -46,8 +46,9 @@ pub struct AttentionConfig {
     pub use_rope: bool,
     /// Whether to apply per-head RMS normalization to Q and K after reshaping.
     pub use_qk_norm: bool,
-    /// Epsilon for the QK-norm RMS normalizations. Only consulted when
-    /// `use_qk_norm = true`.
+    /// Epsilon for RMS normalizations. Used by QK-norm (when `use_qk_norm =
+    /// true`) and by [`TransformerBlock`] for the block's input and
+    /// post-attention layer norms.
     pub norm_eps: f64,
 }
 

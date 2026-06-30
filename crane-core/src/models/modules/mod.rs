@@ -3,3 +3,4 @@ pub mod attention;
 pub mod ffn;
 pub mod rotary;
 pub mod siglip2;
+pub mod transformer;
