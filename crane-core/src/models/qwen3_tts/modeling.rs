@@ -1,7 +1,7 @@
 //! Qwen3-TTS transformer modeling.
 //!
 //! Implements the two-level architecture:
-//! 1. **Talker** — main transformer with MRoPE (3D position encoding) that
+//! 1. **Talker** — main transformer with rotary position encoding that
 //!    generates the first-codebook token at each step.
 //! 2. **CodePredictor** — small transformer that autoregressively predicts
 //!    the remaining `num_code_groups - 1` codebook tokens given the talker
@@ -14,10 +14,11 @@
 //!   - `talker.text_projection.*` — MLP that projects text embeddings into talker dim
 //!   - `talker.code_predictor.*`  — code predictor sub-model
 
-use candle_core::{DType, Device, Module, Result, Tensor, D};
+use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::{linear, linear_no_bias, Embedding, Linear, RmsNorm, VarBuilder};
-use super::super::modules::ffn::SwiGluFfn;
-use super::super::modules::rotary::RotaryEmbedding;
+use crate::models::modules::attention::{AttentionConfig, GqaAttention};
+use crate::models::modules::ffn::SwiGluFfn;
+use crate::models::modules::rotary::RotaryEmbedding;
 use serde::Deserialize;
 use std::collections::HashMap;
 
@@ -40,6 +41,7 @@ fn default_max_position_embeddings() -> usize {
 }
 
 /// M-RoPE section configuration.
+/// Retained for forward-compatible deserialization of config.json; not used at runtime.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RopeScaling {
     #[serde(default)]
@@ -219,218 +221,6 @@ fn default_tts_pad() -> u32 {
     151671
 }
 
-// ── RoPE application helpers ────────────────────────────────────────────
-
-fn rotate_half(x: &Tensor) -> Result<Tensor> {
-    let half_dim = x.dim(D::Minus1)? / 2;
-    let x1 = x.narrow(D::Minus1, 0, half_dim)?;
-    let x2 = x.narrow(D::Minus1, half_dim, half_dim)?;
-    Tensor::cat(&[&x2.neg()?, &x1], D::Minus1)
-}
-
-fn apply_rotary_pos_emb(
-    q: &Tensor,
-    k: &Tensor,
-    cos: &Tensor,
-    sin: &Tensor,
-) -> Result<(Tensor, Tensor)> {
-    // cos, sin: [seq_len, head_dim/2] → broadcast to [1, 1, seq_len, head_dim]
-    let target_dtype = q.dtype();
-    let cos_full = Tensor::cat(&[cos, cos], D::Minus1)?
-        .to_dtype(target_dtype)?
-        .unsqueeze(0)?
-        .unsqueeze(0)?;
-    let sin_full = Tensor::cat(&[sin, sin], D::Minus1)?
-        .to_dtype(target_dtype)?
-        .unsqueeze(0)?
-        .unsqueeze(0)?;
-    let q_embed = (q.broadcast_mul(&cos_full)? + rotate_half(q)?.broadcast_mul(&sin_full)?)?;
-    let k_embed = (k.broadcast_mul(&cos_full)? + rotate_half(k)?.broadcast_mul(&sin_full)?)?;
-    Ok((q_embed, k_embed))
-}
-
-/// Apply M-RoPE (multi-modal rotary position embedding) as used by the Talker.
-/// Position IDs is [3, batch, seq_len], cos/sin from 3D rotary embedding.
-fn apply_mrope(
-    q: &Tensor,
-    k: &Tensor,
-    cos: &Tensor,
-    sin: &Tensor,
-    mrope_section: &[usize],
-    _interleaved: bool,
-) -> Result<(Tensor, Tensor)> {
-    // For simplicity, use the non-interleaved path (concatenated sections):
-    // Split head_dim into 3 sections by mrope_section, apply different position
-    // embeddings from the 3 modality dims, then concatenate back.
-    // cos/sin shape: [3, 1, seq_len, head_dim/2]
-    // We duplicate sections * 2 and split along last dim.
-    let sections: Vec<usize> = mrope_section.iter().map(|&s| s * 2).collect();
-
-    let cos_parts: Vec<Tensor> = cos.chunk(3, 0)?;
-    let sin_parts: Vec<Tensor> = sin.chunk(3, 0)?;
-
-    // Build per-head-dim cos/sin by interleaving sections from each modality
-    let mut cos_chunks = Vec::new();
-    let mut sin_chunks = Vec::new();
-    let mut offset = 0;
-    for (i, &sec) in sections.iter().enumerate() {
-        let mod_idx = i % 3;
-        let c = cos_parts[mod_idx].squeeze(0)?.narrow(D::Minus1, offset, sec)?;
-        let s = sin_parts[mod_idx].squeeze(0)?.narrow(D::Minus1, offset, sec)?;
-        cos_chunks.push(c);
-        sin_chunks.push(s);
-        offset += sec;
-    }
-    let target_dtype = q.dtype();
-    let cos_cat = Tensor::cat(&cos_chunks, D::Minus1)?.to_dtype(target_dtype)?;
-    let sin_cat = Tensor::cat(&sin_chunks, D::Minus1)?.to_dtype(target_dtype)?;
-
-    let q_embed = (q.broadcast_mul(&cos_cat)? + rotate_half(q)?.broadcast_mul(&sin_cat)?)?;
-    let k_embed = (k.broadcast_mul(&cos_cat)? + rotate_half(k)?.broadcast_mul(&sin_cat)?)?;
-    Ok((q_embed, k_embed))
-}
-
-// ── Attention ───────────────────────────────────────────────────────────
-
-struct Attention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
-    q_norm: RmsNorm,
-    k_norm: RmsNorm,
-    num_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-    kv_cache: Option<(Tensor, Tensor)>,
-}
-
-impl Attention {
-    fn new(
-        hidden_size: usize,
-        num_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        rms_norm_eps: f64,
-        bias: bool,
-        vb: VarBuilder,
-    ) -> Result<Self> {
-        let make = |in_d, out_d, name: &str| -> Result<Linear> {
-            if bias {
-                linear(in_d, out_d, vb.pp(name))
-            } else {
-                linear_no_bias(in_d, out_d, vb.pp(name))
-            }
-        };
-        Ok(Self {
-            q_proj: make(hidden_size, num_heads * head_dim, "q_proj")?,
-            k_proj: make(hidden_size, num_kv_heads * head_dim, "k_proj")?,
-            v_proj: make(hidden_size, num_kv_heads * head_dim, "v_proj")?,
-            o_proj: make(num_heads * head_dim, hidden_size, "o_proj")?,
-            q_norm: candle_nn::rms_norm(head_dim, rms_norm_eps, vb.pp("q_norm"))?,
-            k_norm: candle_nn::rms_norm(head_dim, rms_norm_eps, vb.pp("k_norm"))?,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            kv_cache: None,
-        })
-    }
-
-    fn forward(
-        &mut self,
-        hidden_states: &Tensor,
-        cos: &Tensor,
-        sin: &Tensor,
-        attention_mask: Option<&Tensor>,
-        use_mrope: bool,
-        mrope_section: &[usize],
-        mrope_interleaved: bool,
-    ) -> Result<Tensor> {
-        let (b_sz, seq_len, _) = hidden_states.dims3()?;
-
-        let q = self.q_proj.forward(hidden_states)?;
-        let k = self.k_proj.forward(hidden_states)?;
-        let v = self.v_proj.forward(hidden_states)?;
-
-        let q = q
-            .reshape((b_sz, seq_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let k = k
-            .reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let v = v
-            .reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-
-        // QK norm
-        let q = self.q_norm.forward(&q)?;
-        let k = self.k_norm.forward(&k)?;
-
-        // RoPE
-        let (q, k) = if use_mrope && !mrope_section.is_empty() {
-            apply_mrope(&q, &k, cos, sin, mrope_section, mrope_interleaved)?
-        } else {
-            apply_rotary_pos_emb(&q, &k, cos, sin)?
-        };
-
-        // KV cache
-        let (k, v) = match self.kv_cache.take() {
-            Some((ck, cv)) => {
-                let k = Tensor::cat(&[&ck, &k], 2)?;
-                let v = Tensor::cat(&[&cv, &v], 2)?;
-                (k, v)
-            }
-            None => (k, v),
-        };
-        self.kv_cache = Some((k.clone(), v.clone()));
-
-        // GQA expand
-        let n_rep = self.num_heads / self.num_kv_heads;
-        let k = if n_rep > 1 {
-            let (b, kv_h, s, d) = k.dims4()?;
-            k.unsqueeze(2)?
-                .expand((b, kv_h, n_rep, s, d))?
-                .reshape((b, kv_h * n_rep, s, d))?
-        } else {
-            k
-        };
-        let v = if n_rep > 1 {
-            let (b, kv_h, s, d) = v.dims4()?;
-            v.unsqueeze(2)?
-                .expand((b, kv_h, n_rep, s, d))?
-                .reshape((b, kv_h * n_rep, s, d))?
-        } else {
-            v
-        };
-
-        // Scaled dot-product attention
-        let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let attn_weights = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?)? * scale)?;
-        let attn_weights = match attention_mask {
-            Some(mask) => attn_weights.broadcast_add(mask)?,
-            None => attn_weights,
-        };
-        // Compute softmax in F32 for numeric stability, matching PyTorch's
-        // `F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)`
-        let input_dtype = attn_weights.dtype();
-        let attn_weights = candle_nn::ops::softmax_last_dim(
-            &attn_weights.to_dtype(DType::F32)?,
-        )?
-        .to_dtype(input_dtype)?;
-        let attn_output = attn_weights.matmul(&v)?;
-
-        let attn_output = attn_output
-            .transpose(1, 2)?
-            .contiguous()?
-            .reshape((b_sz, seq_len, ()))?;
-        self.o_proj.forward(&attn_output)
-    }
-
-    fn clear_kv_cache(&mut self) {
-        self.kv_cache = None;
-    }
-}
-
 // ── Resize MLP (text_projection) ────────────────────────────────────────
 
 struct ResizeMlp {
@@ -460,7 +250,7 @@ impl ResizeMlp {
 // ── Decoder Layer ───────────────────────────────────────────────────────
 
 struct DecoderLayer {
-    self_attn: Attention,
+    self_attn: GqaAttention,
     mlp: SwiGluFfn,
     input_layernorm: RmsNorm,
     post_attention_layernorm: RmsNorm,
@@ -477,16 +267,19 @@ impl DecoderLayer {
         bias: bool,
         vb: VarBuilder,
     ) -> Result<Self> {
+        let attn_cfg = AttentionConfig {
+            dim: hidden_size,
+            n_heads: num_heads,
+            n_kv_heads: num_kv_heads,
+            head_dim,
+            bias,
+            causal: true,
+            use_rope: true,
+            use_qk_norm: true,
+            norm_eps: rms_norm_eps,
+        };
         Ok(Self {
-            self_attn: Attention::new(
-                hidden_size,
-                num_heads,
-                num_kv_heads,
-                head_dim,
-                rms_norm_eps,
-                bias,
-                vb.pp("self_attn"),
-            )?,
+            self_attn: GqaAttention::new(attn_cfg, vb.pp("self_attn"))?,
             mlp: SwiGluFfn::new(hidden_size, intermediate_size, candle_nn::Activation::Silu, vb.pp("mlp"))?,
             input_layernorm: candle_nn::rms_norm(hidden_size, rms_norm_eps, vb.pp("input_layernorm"))?,
             post_attention_layernorm: candle_nn::rms_norm(
@@ -503,21 +296,10 @@ impl DecoderLayer {
         cos: &Tensor,
         sin: &Tensor,
         attention_mask: Option<&Tensor>,
-        use_mrope: bool,
-        mrope_section: &[usize],
-        mrope_interleaved: bool,
     ) -> Result<Tensor> {
         let residual = hidden_states;
         let hidden_states = self.input_layernorm.forward(hidden_states)?;
-        let hidden_states = self.self_attn.forward(
-            &hidden_states,
-            cos,
-            sin,
-            attention_mask,
-            use_mrope,
-            mrope_section,
-            mrope_interleaved,
-        )?;
+        let hidden_states = self.self_attn.forward(&hidden_states, Some((cos, sin)), attention_mask)?;
         let hidden_states = (residual + hidden_states)?;
 
         let residual = &hidden_states;
@@ -693,15 +475,7 @@ impl CodePredictor {
         // Forward through layers
         let mut hidden_states = inputs_embeds;
         for layer in &mut self.layers {
-            hidden_states = layer.forward(
-                &hidden_states,
-                &cos,
-                &sin,
-                causal_mask.as_ref(),
-                false,
-                &[],
-                false,
-            )?;
+            hidden_states = layer.forward(&hidden_states, &cos, &sin, causal_mask.as_ref())?;
         }
         hidden_states = self.norm.forward(&hidden_states)?;
 
@@ -727,7 +501,7 @@ impl CodePredictor {
 
             let mut hs = embed;
             for layer in &mut self.layers {
-                hs = layer.forward(&hs, &cos, &sin, None, false, &[], false)?;
+                hs = layer.forward(&hs, &cos, &sin, None)?;
             }
             hs = self.norm.forward(&hs)?;
             let logits = self.lm_heads[g].forward(&hs)?;
@@ -765,12 +539,8 @@ pub struct TalkerModel {
     codec_head: Linear,
     /// Sub-talker for remaining codebook groups
     pub code_predictor: CodePredictor,
-    /// M-RoPE rotary embedding (3D)
     rotary_emb: RotaryEmbedding,
     config: TalkerConfig,
-    /// M-RoPE section sizes
-    mrope_section: Vec<usize>,
-    mrope_interleaved: bool,
 }
 
 impl TalkerModel {
@@ -821,22 +591,8 @@ impl TalkerModel {
             vb.pp("code_predictor"),
         )?;
 
-        // M-RoPE
-        let (mrope_section, mrope_interleaved) = if let Some(ref rs) = config.rope_scaling {
-            (rs.mrope_section.clone(), rs.interleaved)
-        } else {
-            (vec![], false)
-        };
-
-        // Total head_dim for rotary = sum(mrope_section) or head_dim/2
-        let rotary_dim = if mrope_section.is_empty() {
-            config.head_dim
-        } else {
-            // The full head_dim is used; mrope_section specifies per-section allocation
-            config.head_dim
-        };
         let rotary_emb = RotaryEmbedding::new(
-            rotary_dim,
+            config.head_dim,
             config.max_position_embeddings,
             config.rope_theta,
             model_vb.device(),
@@ -852,8 +608,6 @@ impl TalkerModel {
             code_predictor,
             rotary_emb,
             config: config.clone(),
-            mrope_section,
-            mrope_interleaved,
         })
     }
 
@@ -1016,22 +770,11 @@ impl TalkerModel {
         seq_offset: usize,
     ) -> Result<Tensor> {
         let seq_len = inputs_embeds.dim(1)?;
-        // Compute cos/sin for positions [seq_offset .. seq_offset + seq_len]
         let (cos, sin) = self.rotary_emb.forward(seq_offset, seq_len)?;
 
-        // For TTS all 3 MRoPE position dimensions are identical,
-        // so standard 1D RoPE is equivalent.
         let mut hidden_states = inputs_embeds.clone();
         for layer in &mut self.layers {
-            hidden_states = layer.forward(
-                &hidden_states,
-                &cos,
-                &sin,
-                attention_mask,
-                false,
-                &self.mrope_section,
-                self.mrope_interleaved,
-            )?;
+            hidden_states = layer.forward(&hidden_states, &cos, &sin, attention_mask)?;
         }
         self.norm.forward(&hidden_states)
     }
