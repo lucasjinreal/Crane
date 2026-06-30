@@ -1,18 +1,20 @@
-//! LLM backbone and audio codebook embedding for Voxtral TTS.
+//! LLM backbone, audio codebook embedding, and acoustic transformer for Voxtral TTS.
 //!
-//! Provides two public types:
+//! Provides three public types:
 //! - [`VoxtralLlm`] — 26-layer Mistral-style decoder with GQA and `RoPE`.
 //! - [`AudioCodebookEmbedding`] — summed lookup over 37 parallel codebooks.
+//! - [`AcousticTransformer`] — 3-layer bidirectional transformer with flow matching.
 //!
 //! The Voxtral checkpoint uses Mistral-style weight names that differ from the
 //! `HuggingFace` convention expected by the shared [`TransformerBlock`]. Call
 //! [`rename_voxtral_transformer_keys`] on the raw `HashMap<String, Tensor>`
-//! before constructing a [`VarBuilder`] that is passed to [`VoxtralLlm::new`].
+//! before constructing a [`VarBuilder`] that is passed to [`VoxtralLlm::new`]
+//! and [`AcousticTransformer::new`].
 
 use std::collections::HashMap;
 
-use candle_core::{DType, Device, Module, Result, Tensor};
-use candle_nn::{embedding, Activation, Embedding, VarBuilder};
+use candle_core::{DType, Device, IndexOp, Module, Result, Tensor};
+use candle_nn::{embedding, linear_no_bias, Activation, Embedding, Linear, VarBuilder};
 
 use crate::models::modules::attention::AttentionConfig;
 use crate::models::modules::rotary::RotaryEmbedding;
@@ -354,6 +356,301 @@ impl AudioCodebookEmbedding {
     }
 }
 
+// ── AcousticTransformer ───────────────────────────────────────────────────────
+
+/// Padded semantic head output dimension (8192 + 2 specials, rounded to 128).
+const SEMANTIC_PADDED: usize = 8320;
+/// Classifier-free guidance scale for flow matching.
+const CFG_ALPHA: f32 = 1.2;
+/// Number of Euler integration timesteps (7 intervals between 8 points).
+const FLOW_INTERVALS: u8 = 7;
+/// Base frequency for sinusoidal time embeddings.
+const TIME_EMB_THETA: f32 = 10_000.0;
+
+/// 3-layer bidirectional acoustic transformer with flow-matching inference.
+///
+/// Per audio frame, it receives the LLM hidden state `h ∈ R^{dim}` and produces:
+/// - 1 semantic code via [`AcousticTransformer::predict_semantic_code`]
+/// - 36 acoustic codes via [`AcousticTransformer::flow_match_inference`]
+///
+/// The transformer is **bidirectional** (no `RoPE`, no causal mask). Each
+/// velocity prediction uses a fresh 3-token sequence (noise, timestep, LLM
+/// conditioning), so the KV cache is cleared before every forward pass.
+///
+/// # Weight names
+///
+/// The `VarBuilder` must use `HuggingFace`-style names after
+/// [`rename_voxtral_transformer_keys`]. Expected paths under `vb`:
+/// - `acoustic_transformer.input_projection.weight`
+/// - `acoustic_transformer.time_projection.weight`
+/// - `acoustic_transformer.llm_projection.weight`
+/// - `acoustic_transformer.layers.{i}.self_attn.{q,k,v,o}_proj.weight`
+/// - `acoustic_transformer.layers.{i}.{input,post_attention}_layernorm.weight`
+/// - `acoustic_transformer.layers.{i}.mlp.{gate,up,down}_proj.weight`
+/// - `acoustic_transformer.norm.weight`
+/// - `acoustic_transformer.semantic_codebook_output.weight`
+/// - `acoustic_transformer.acoustic_codebook_output.weight`
+#[derive(Debug)]
+pub struct AcousticTransformer {
+    layers: Vec<TransformerBlock>,
+    input_projection: Linear,
+    time_projection: Linear,
+    llm_projection: Linear,
+    norm: RmsNorm,
+    /// Semantic output head: `[dim] -> [SEMANTIC_PADDED]`, no bias.
+    semantic_head: Linear,
+    /// Acoustic velocity head: `[dim] -> [n_acoustic]`, no bias.
+    acoustic_head: Linear,
+    /// Precomputed `inv_freq[i] = TIME_EMB_THETA^(-i / half_dim)`.
+    time_inv_freq: Vec<f32>,
+    /// Number of acoustic codebooks (36).
+    pub n_acoustic: usize,
+    /// First index past the valid semantic range (8194 = 8192 codes + 2 specials).
+    pub semantic_valid_end: usize,
+    /// Hidden dimension (3072).
+    pub dim: usize,
+}
+
+impl AcousticTransformer {
+    /// Construct the acoustic transformer.
+    ///
+    /// `vb` must contain `HuggingFace`-style weight names as documented above.
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if any weight is missing or has an unexpected shape.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn new(cfg: &VoxtralConfig, vb: VarBuilder) -> Result<Self> {
+        let ac = &cfg.multimodal.audio_model_args.acoustic_transformer_args;
+        let audio = &cfg.multimodal.audio_model_args;
+
+        let attn_cfg = AttentionConfig {
+            dim: ac.dim,
+            n_heads: ac.n_heads,
+            n_kv_heads: ac.n_kv_heads,
+            head_dim: ac.head_dim,
+            qkv_bias: false,
+            o_bias: false,
+            use_rope: false,
+            use_qk_norm: false,
+            norm_eps: cfg.norm_eps,
+        };
+
+        let ac_vb = vb.pp("acoustic_transformer");
+
+        let layers = (0..ac.n_layers)
+            .map(|i| {
+                TransformerBlock::new(
+                    &attn_cfg,
+                    ac.hidden_dim,
+                    Activation::Silu,
+                    ac_vb.pp("layers").pp(i),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let input_projection = linear_no_bias(
+            audio.n_acoustic_codebook,
+            ac.dim,
+            ac_vb.pp("input_projection"),
+        )?;
+        let time_projection = linear_no_bias(ac.dim, ac.dim, ac_vb.pp("time_projection"))?;
+        let llm_projection = linear_no_bias(ac.dim, ac.dim, ac_vb.pp("llm_projection"))?;
+        let norm = RmsNorm::new(ac.dim, cfg.norm_eps, ac_vb.pp("norm"))?;
+        let semantic_head = linear_no_bias(
+            ac.dim,
+            SEMANTIC_PADDED,
+            ac_vb.pp("semantic_codebook_output"),
+        )?;
+        let acoustic_head = linear_no_bias(
+            ac.dim,
+            audio.n_acoustic_codebook,
+            ac_vb.pp("acoustic_codebook_output"),
+        )?;
+
+        // Precompute sinusoidal inverse frequencies (half the embedding dim)
+        let half_dim = ac.dim / 2;
+        let log_theta = TIME_EMB_THETA.ln();
+        #[allow(clippy::cast_precision_loss)]
+        let time_inv_freq: Vec<f32> = (0..half_dim)
+            .map(|i| (-log_theta * i as f32 / half_dim as f32).exp())
+            .collect();
+
+        let semantic_valid_end = audio.semantic_codebook_size + 2;
+
+        Ok(Self {
+            layers,
+            input_projection,
+            time_projection,
+            llm_projection,
+            norm,
+            semantic_head,
+            acoustic_head,
+            time_inv_freq,
+            n_acoustic: audio.n_acoustic_codebook,
+            semantic_valid_end,
+            dim: ac.dim,
+        })
+    }
+
+    /// Predict the semantic code from LLM hidden state `h`.
+    ///
+    /// `llm_hidden` has shape `[dim]`. Returns a code in `[1, semantic_valid_end)`.
+    /// `EMPTY_AUDIO` (index 0) and padding indices `≥ semantic_valid_end` are
+    /// masked to `-1e30` before greedy argmax. Returns `END_AUDIO_CODE` (1) on
+    /// the (impossible) empty-iterator edge case.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the argmax index cannot be represented as `u32`, which cannot
+    /// happen in practice because the vocabulary size is well below `u32::MAX`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if the linear forward or device-to-host copy fails.
+    pub fn predict_semantic_code(&self, llm_hidden: &Tensor) -> Result<u32> {
+        // semantic_head expects 2-D input
+        let logits = self
+            .semantic_head
+            .forward(&llm_hidden.unsqueeze(0)?)?
+            .squeeze(0)?; // [SEMANTIC_PADDED]
+        let mut logits: Vec<f32> = logits.to_dtype(DType::F32)?.to_vec1()?;
+
+        // Mask EMPTY_AUDIO (index 0) — generation must never produce it
+        logits[0] = f32::NEG_INFINITY;
+        // Mask padding beyond the valid semantic range
+        for v in &mut logits[self.semantic_valid_end..] {
+            *v = f32::NEG_INFINITY;
+        }
+
+        let code = logits
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map_or(super::model::END_AUDIO_CODE, |(i, _)| {
+                u32::try_from(i).expect("semantic code index fits u32")
+            });
+
+        Ok(code)
+    }
+
+    /// Compute a sinusoidal time embedding for scalar timestep `t`.
+    ///
+    /// Returns a 1-D tensor of shape `[dim]`:
+    /// `[cos(t·f₀), …, cos(t·f_{H-1}), sin(t·f₀), …, sin(t·f_{H-1})]`
+    /// where `H = dim/2` and `fᵢ = TIME_EMB_THETA^(-i/H)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if tensor construction fails.
+    fn compute_time_embedding(&self, t: f32, device: &Device) -> Result<Tensor> {
+        let half_dim = self.dim / 2;
+        let mut emb = vec![0f32; self.dim];
+        for i in 0..half_dim {
+            let angle = t * self.time_inv_freq[i];
+            emb[i] = angle.cos();
+            emb[half_dim + i] = angle.sin();
+        }
+        Tensor::from_vec(emb, self.dim, device)
+    }
+
+    /// Predict the velocity for one Euler step of flow matching.
+    ///
+    /// Constructs a 3-token sequence (noise projection, time projection, LLM
+    /// projection), runs it through the 3 bidirectional transformer layers (no
+    /// `RoPE`, no mask), and reads the velocity from position 0.
+    ///
+    /// The KV cache is cleared before each call since the transformer is
+    /// stateless across velocity predictions.
+    ///
+    /// `x_t` has shape `[n_acoustic]`. `llm_hidden` has shape `[dim]`.
+    /// Returns velocity of shape `[n_acoustic]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if any layer fails.
+    fn predict_velocity(&mut self, x_t: &Tensor, llm_hidden: &Tensor, t: f32) -> Result<Tensor> {
+        for layer in &mut self.layers {
+            layer.clear_kv_cache();
+        }
+
+        let device = x_t.device();
+        let dtype = llm_hidden.dtype();
+
+        // Build 3 tokens (each [1, dim] for 2-D linear compat, then squeeze to [dim])
+        let tok0 = self
+            .input_projection
+            .forward(&x_t.unsqueeze(0)?)?
+            .squeeze(0)?; // [dim]
+        let time_emb = self.compute_time_embedding(t, device)?.to_dtype(dtype)?;
+        let tok1 = self
+            .time_projection
+            .forward(&time_emb.unsqueeze(0)?)?
+            .squeeze(0)?; // [dim]
+        let tok2 = self
+            .llm_projection
+            .forward(&llm_hidden.unsqueeze(0)?)?
+            .squeeze(0)?; // [dim]
+
+        // Stack to [1, 3, dim] for TransformerBlock
+        let mut h = Tensor::stack(&[&tok0, &tok1, &tok2], 0)?.unsqueeze(0)?;
+
+        for layer in &mut self.layers {
+            h = layer.forward(&h, None, None)?;
+        }
+
+        // Extract position 0, norm, project to velocity [n_acoustic]
+        let pos0 = h.squeeze(0)?.i(0)?; // [dim]
+        let normed = self.norm.forward(&pos0)?;
+        self.acoustic_head
+            .forward(&normed.unsqueeze(0)?)?
+            .squeeze(0) // [n_acoustic]
+    }
+
+    /// Run flow-matching inference: 7 Euler steps with CFG (`alpha=1.2`).
+    ///
+    /// Starting from Gaussian noise `x ~ N(0,1) ∈ R^{n_acoustic}`, integrates
+    /// the ODE conditioned on `llm_hidden` via classifier-free guidance.
+    ///
+    /// `llm_hidden` has shape `[dim]`. Returns a `U32` tensor of shape
+    /// `[n_acoustic]` with FSQ codes in `[2, 22]` (raw code `[0, 20]` plus
+    /// the 2-slot special-token offset used by [`AudioCodebookEmbedding`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if any tensor operation fails.
+    pub fn flow_match_inference(&mut self, llm_hidden: &Tensor) -> Result<Tensor> {
+        let dtype = llm_hidden.dtype();
+        let device = llm_hidden.device();
+
+        // Sample noise x ~ N(0, 1) in f32, then cast to model dtype
+        let mut x = Tensor::randn(0f32, 1f32, self.n_acoustic, device)?.to_dtype(dtype)?;
+
+        // Unconditional (zero) hidden state for CFG unconditioned pass
+        let zeros = Tensor::zeros(self.dim, dtype, device)?;
+
+        // 8 timesteps via linspace(0, 1, 8): t_step = step / FLOW_INTERVALS
+        let dt = 1.0f32 / f32::from(FLOW_INTERVALS);
+
+        for step in 0u8..FLOW_INTERVALS {
+            let t = f32::from(step) * dt;
+            let v_cond = self.predict_velocity(&x, llm_hidden, t)?;
+            let v_uncond = self.predict_velocity(&x, &zeros, t)?;
+            // CFG: v = alpha * v_cond + (1 - alpha) * v_uncond
+            let v = (v_cond.affine(f64::from(CFG_ALPHA), 0.0)?
+                + v_uncond.affine(f64::from(1.0 - CFG_ALPHA), 0.0)?)?;
+            x = (x + v.affine(f64::from(dt), 0.0)?)?;
+        }
+
+        // FSQ quantize: clamp to [-1,1], scale to [0,20], round to integer, add +2 offset
+        // code[i] = round(clamp(x[i], -1, 1) * 10.0 + 10.0) + 2  -> {2, ..., 22}
+        let x_f32 = x.to_dtype(DType::F32)?.clamp(-1f32, 1f32)?;
+        let codes_f32 = x_f32.affine(10.0, 10.0)?.round()?.affine(1.0, 2.0)?;
+
+        codes_f32.to_dtype(DType::U32)
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -662,6 +959,234 @@ mod tests {
         assert_eq!(y1.dims(), y2.dims());
     }
 
+    // ── Acoustic transformer helpers ──────────────────────────────────────────
+
+    /// Build a `VarBuilder` with zero/one dummy weights for `AcousticTransformer`.
+    ///
+    /// Uses `HuggingFace`-style names (post-rename) so that
+    /// `AcousticTransformer::new` can load them without running
+    /// `rename_voxtral_transformer_keys`.
+    fn acoustic_vb(cfg: &VoxtralConfig) -> VarBuilder<'static> {
+        let device = &Device::Cpu;
+        let ac = &cfg.multimodal.audio_model_args.acoustic_transformer_args;
+        let audio = &cfg.multimodal.audio_model_args;
+        let dim = ac.dim;
+        let q_out = ac.n_heads * ac.head_dim;
+        let kv_out = ac.n_kv_heads * ac.head_dim;
+
+        let mut t: HashMap<String, Tensor> = HashMap::new();
+        let zeros2 = |s: (usize, usize)| Tensor::zeros(s, DType::F32, device).expect("zeros");
+        let ones1 = |n: usize| Tensor::ones(n, DType::F32, device).expect("ones");
+
+        let p = "acoustic_transformer.";
+
+        // Projection linears (no bias)
+        t.insert(
+            format!("{p}input_projection.weight"),
+            zeros2((dim, audio.n_acoustic_codebook)),
+        );
+        t.insert(format!("{p}time_projection.weight"), zeros2((dim, dim)));
+        t.insert(format!("{p}llm_projection.weight"), zeros2((dim, dim)));
+
+        // Semantic head (no bias), acoustic head (no bias)
+        t.insert(
+            format!("{p}semantic_codebook_output.weight"),
+            zeros2((SEMANTIC_PADDED, dim)),
+        );
+        t.insert(
+            format!("{p}acoustic_codebook_output.weight"),
+            zeros2((audio.n_acoustic_codebook, dim)),
+        );
+
+        // Final norm
+        t.insert(format!("{p}norm.weight"), ones1(dim));
+
+        // Transformer layers (post-rename HF-style names)
+        for i in 0..ac.n_layers {
+            let lp = format!("{p}layers.{i}.");
+            t.insert(format!("{lp}self_attn.q_proj.weight"), zeros2((q_out, dim)));
+            t.insert(
+                format!("{lp}self_attn.k_proj.weight"),
+                zeros2((kv_out, dim)),
+            );
+            t.insert(
+                format!("{lp}self_attn.v_proj.weight"),
+                zeros2((kv_out, dim)),
+            );
+            t.insert(format!("{lp}self_attn.o_proj.weight"), zeros2((dim, q_out)));
+            t.insert(format!("{lp}input_layernorm.weight"), ones1(dim));
+            t.insert(format!("{lp}post_attention_layernorm.weight"), ones1(dim));
+            t.insert(
+                format!("{lp}mlp.gate_proj.weight"),
+                zeros2((ac.hidden_dim, dim)),
+            );
+            t.insert(
+                format!("{lp}mlp.up_proj.weight"),
+                zeros2((ac.hidden_dim, dim)),
+            );
+            t.insert(
+                format!("{lp}mlp.down_proj.weight"),
+                zeros2((dim, ac.hidden_dim)),
+            );
+        }
+
+        VarBuilder::from_tensors(t, DType::F32, device)
+    }
+
+    // ── Acoustic transformer tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_acoustic_transformer_new() {
+        let cfg = tiny_config();
+        let vb = acoustic_vb(&cfg);
+        AcousticTransformer::new(&cfg, vb).expect("AcousticTransformer::new");
+    }
+
+    #[test]
+    fn test_time_embedding_shape() {
+        let cfg = tiny_config();
+        let at = AcousticTransformer::new(&cfg, acoustic_vb(&cfg)).expect("new");
+        let emb = at
+            .compute_time_embedding(0.5, &Device::Cpu)
+            .expect("time_emb");
+        assert_eq!(emb.dims(), &[at.dim]);
+    }
+
+    #[test]
+    fn test_time_embedding_cos_sin_split() {
+        // At t=0, cos(0) = 1.0 and sin(0) = 0.0 for all frequencies.
+        let cfg = tiny_config();
+        let at = AcousticTransformer::new(&cfg, acoustic_vb(&cfg)).expect("new");
+        let emb: Vec<f32> = at
+            .compute_time_embedding(0.0, &Device::Cpu)
+            .expect("emb")
+            .to_vec1()
+            .expect("to_vec1");
+        let half = at.dim / 2;
+        for &v in &emb[..half] {
+            assert!((v - 1.0).abs() < 1e-5, "cos(0) should be 1, got {v}");
+        }
+        for &v in &emb[half..] {
+            assert!(v.abs() < 1e-5, "sin(0) should be 0, got {v}");
+        }
+    }
+
+    #[test]
+    fn test_semantic_code_valid_range() {
+        let cfg = tiny_config();
+        let at = AcousticTransformer::new(&cfg, acoustic_vb(&cfg)).expect("new");
+        let h = Tensor::zeros(at.dim, DType::F32, &Device::Cpu).expect("h");
+        let code = at.predict_semantic_code(&h).expect("predict_semantic_code");
+        // Must not be EMPTY_AUDIO (0) and must be within valid range
+        assert!(code >= 1, "code must not be EMPTY_AUDIO");
+        assert!(
+            (code as usize) < at.semantic_valid_end,
+            "code {code} must be below semantic_valid_end {}",
+            at.semantic_valid_end,
+        );
+    }
+
+    #[test]
+    fn test_semantic_code_non_end_audio() {
+        // Build a VarBuilder where row 42 of the semantic head weight is all
+        // ones. With h = ones(dim), logit[42] = dim while all others are 0,
+        // so argmax picks code 42.
+        let cfg = tiny_config();
+        let device = &Device::Cpu;
+        let ac = &cfg.multimodal.audio_model_args.acoustic_transformer_args;
+        let audio = &cfg.multimodal.audio_model_args;
+        let dim = ac.dim;
+        let q_out = ac.n_heads * ac.head_dim;
+        let kv_out = ac.n_kv_heads * ac.head_dim;
+
+        let mut t: HashMap<String, Tensor> = HashMap::new();
+        let zeros2 = |s: (usize, usize)| Tensor::zeros(s, DType::F32, device).expect("zeros");
+        let ones1 = |n: usize| Tensor::ones(n, DType::F32, device).expect("ones");
+
+        let p = "acoustic_transformer.";
+        t.insert(
+            format!("{p}input_projection.weight"),
+            zeros2((dim, audio.n_acoustic_codebook)),
+        );
+        t.insert(format!("{p}time_projection.weight"), zeros2((dim, dim)));
+        t.insert(format!("{p}llm_projection.weight"), zeros2((dim, dim)));
+        // Row 42 = ones, all other rows = zeros -> logit[42] = dim
+        let mut w = vec![0f32; SEMANTIC_PADDED * dim];
+        for j in 0..dim {
+            w[42 * dim + j] = 1.0;
+        }
+        t.insert(
+            format!("{p}semantic_codebook_output.weight"),
+            Tensor::from_vec(w, (SEMANTIC_PADDED, dim), device).expect("weight"),
+        );
+        t.insert(
+            format!("{p}acoustic_codebook_output.weight"),
+            zeros2((audio.n_acoustic_codebook, dim)),
+        );
+        t.insert(format!("{p}norm.weight"), ones1(dim));
+        for i in 0..ac.n_layers {
+            let lp = format!("{p}layers.{i}.");
+            t.insert(format!("{lp}self_attn.q_proj.weight"), zeros2((q_out, dim)));
+            t.insert(
+                format!("{lp}self_attn.k_proj.weight"),
+                zeros2((kv_out, dim)),
+            );
+            t.insert(
+                format!("{lp}self_attn.v_proj.weight"),
+                zeros2((kv_out, dim)),
+            );
+            t.insert(format!("{lp}self_attn.o_proj.weight"), zeros2((dim, q_out)));
+            t.insert(format!("{lp}input_layernorm.weight"), ones1(dim));
+            t.insert(format!("{lp}post_attention_layernorm.weight"), ones1(dim));
+            t.insert(
+                format!("{lp}mlp.gate_proj.weight"),
+                zeros2((ac.hidden_dim, dim)),
+            );
+            t.insert(
+                format!("{lp}mlp.up_proj.weight"),
+                zeros2((ac.hidden_dim, dim)),
+            );
+            t.insert(
+                format!("{lp}mlp.down_proj.weight"),
+                zeros2((dim, ac.hidden_dim)),
+            );
+        }
+        let vb = VarBuilder::from_tensors(t, DType::F32, device);
+
+        let at = AcousticTransformer::new(&cfg, vb).expect("new");
+        let h = Tensor::ones(at.dim, DType::F32, device).expect("h");
+        let code = at.predict_semantic_code(&h).expect("predict_semantic_code");
+        assert_eq!(code, 42, "expected argmax at index 42");
+    }
+
+    #[test]
+    fn test_predict_velocity_shape() {
+        let cfg = tiny_config();
+        let mut at = AcousticTransformer::new(&cfg, acoustic_vb(&cfg)).expect("new");
+        let x_t = Tensor::zeros(at.n_acoustic, DType::F32, &Device::Cpu).expect("x_t");
+        let h = Tensor::zeros(at.dim, DType::F32, &Device::Cpu).expect("h");
+        let v = at
+            .predict_velocity(&x_t, &h, 0.5)
+            .expect("predict_velocity");
+        assert_eq!(v.dims(), &[at.n_acoustic]);
+    }
+
+    #[test]
+    fn test_flow_match_output_shape_and_range() {
+        let cfg = tiny_config();
+        let mut at = AcousticTransformer::new(&cfg, acoustic_vb(&cfg)).expect("new");
+        let h = Tensor::zeros(at.dim, DType::F32, &Device::Cpu).expect("h");
+        let codes = at.flow_match_inference(&h).expect("flow_match_inference");
+
+        assert_eq!(codes.dims(), &[at.n_acoustic]);
+        assert_eq!(codes.dtype(), DType::U32);
+
+        let codes: Vec<u32> = codes.to_vec1().expect("to_vec1");
+        for &c in &codes {
+            assert!(c >= 2 && c <= 22, "FSQ code {c} out of range [2, 22]");
+        }
+    }
+
     // ── Integration tests (require local checkpoint) ──────────────────────────
 
     fn checkpoint_path() -> Option<std::path::PathBuf> {
@@ -685,6 +1210,22 @@ mod tests {
         let renamed = rename_voxtral_transformer_keys(raw);
         let vb = VarBuilder::from_tensors(renamed, DType::BF16, &Device::Cpu);
         VoxtralLlm::new(&cfg, vb, &Device::Cpu).expect("VoxtralLlm::new");
+    }
+
+    #[test]
+    #[ignore = "requires local checkpoint at checkpoints/Voxtral-4B-TTS-2603"]
+    fn test_acoustic_transformer_load_real() {
+        use super::super::model::VoxtralConfig;
+        let Some(cp) = checkpoint_path() else {
+            return;
+        };
+        let cfg = VoxtralConfig::from_model_dir(&cp).expect("config");
+        let raw =
+            candle_core::safetensors::load(&cp.join("consolidated.safetensors"), &Device::Cpu)
+                .expect("load safetensors");
+        let renamed = rename_voxtral_transformer_keys(raw);
+        let vb = VarBuilder::from_tensors(renamed, DType::BF16, &Device::Cpu);
+        AcousticTransformer::new(&cfg, vb).expect("AcousticTransformer::new");
     }
 
     #[test]
