@@ -8,7 +8,7 @@ use crate::models::with_tracing::{linear_no_bias, Linear};
 /// Computes `activation(x @ gate) * (x @ up) @ down` with a single fused
 /// matmul for the gate+up path. Uses `fused_silu_mul` on CUDA when the
 /// activation is `Silu`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SwiGluFfn {
     gate_up_proj: Linear,
     down_proj: Linear,
