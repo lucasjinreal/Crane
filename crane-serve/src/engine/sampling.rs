@@ -134,7 +134,7 @@ pub fn sample(
     {
         if greedy && seq.repetition_penalty == 1.0 && logits.device().is_cuda() {
             let flat = logits.squeeze(0)?.squeeze(0)?;
-            let token = crane_core::fused_ops::gpu_argmax(&flat)?;
+            let token = crane_core::ops::gpu_argmax(&flat)?;
             if trace {
                 let t_done = Instant::now();
                 tracing::debug!(
@@ -202,7 +202,7 @@ pub fn sample(
         top_k = top_k.min(64).min(vocab);
 
         if top_k > 0 && top_k < vocab {
-            let topk_idx = crane_core::fused_ops::topk_indices(&logits, top_k).map_err(anyhow::Error::from)?;
+            let topk_idx = crane_core::ops::topk_indices(&logits, top_k).map_err(anyhow::Error::from)?;
             let topk_logits = logits.gather(&topk_idx, candle_core::D::Minus1)?;
             let t_after_topk = Instant::now();
 

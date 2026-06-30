@@ -651,7 +651,7 @@ impl Mlp {
                 #[cfg(feature = "cuda")]
                 {
                     if gu.device().is_cuda() {
-                        let activated = crate::fused_ops::fused_silu_mul(
+                        let activated = crate::ops::fused_silu_mul(
                             &gu.contiguous()?,
                             *intermediate_size,
                         )?;

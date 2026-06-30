@@ -323,7 +323,7 @@ impl ModelForCausalLM for Model {
 
             // Greedy + no repetition penalty: GPU argmax avoids D→H logits copy.
             let next_token = if config.temperature.is_none() && config.repetition_penalty == 1. {
-                crate::fused_ops::gpu_argmax(&logits)?
+                crate::ops::gpu_argmax(&logits)?
             } else {
                 let logits = logits.to_dtype(DType::F32)?;
                 let logits = if config.repetition_penalty == 1. {

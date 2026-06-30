@@ -937,7 +937,7 @@ impl InferenceEngine {
                 })
                 .collect();
 
-            let input_ids = match crane_core::fused_ops::copy_from_slice_u32(
+            let input_ids = match crane_core::ops::copy_from_slice_u32(
                 &tokens,
                 self.model.device(),
             )
