@@ -2,64 +2,32 @@ use std::sync::{Arc, Mutex};
 
 use candle::{DType, Device, IndexOp, Result, Tensor};
 use candle_nn::{
-    embedding, kv_cache::KvCache, linear, linear_b, rms_norm, Activation, Embedding, Linear,
-    Module, RmsNorm, VarBuilder,
+    embedding, kv_cache::KvCache, linear, linear_b, rms_norm, rotary_emb::rope, Activation,
+    Embedding, Linear, Module, RmsNorm, VarBuilder,
 };
 
 use super::config::TextConfig;
+use crate::models::modules::rotary::RotaryEmbedding;
 
-#[derive(Debug, Clone)]
-pub struct RotaryEmbedding {
-    cos: Tensor,
-    sin: Tensor,
-}
-
-impl RotaryEmbedding {
-    pub fn new(
-        base: f32,
-        head_dim: usize,
-        max_position_embeddings: usize,
-        device: &Device,
-        dtype: DType,
-    ) -> Result<Self> {
-        let inv_freq: Vec<_> = (0..head_dim)
-            .step_by(2)
-            .map(|i| 1f32 / base.powf(i as f32 / head_dim as f32))
-            .collect();
-        let inv_freq_len = inv_freq.len();
-        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), device)?;
-        let t = Tensor::arange(0u32, max_position_embeddings as u32, device)?
-            .to_dtype(DType::F32)?
-            .reshape((max_position_embeddings, 1))?;
-        let freqs = t.matmul(&inv_freq)?;
-        let sin = freqs.sin()?.to_dtype(dtype)?;
-        let cos = freqs.cos()?.to_dtype(dtype)?;
-
-        Ok(Self { cos, sin })
+fn apply_rotary_emb_batched(
+    rotary_emb: &RotaryEmbedding,
+    q: &Tensor,
+    k: &Tensor,
+    seqlen_offsets: &[usize],
+) -> Result<(Tensor, Tensor)> {
+    let (_b_sz, _qh, seq_len, _n_embd) = q.dims4()?;
+    let mut q_embeds = Vec::new();
+    let mut k_embeds = Vec::new();
+    for (i, offset) in seqlen_offsets.iter().enumerate() {
+        let (cos, sin) = rotary_emb.forward(*offset, seq_len)?;
+        let cos = cos.to_dtype(q.dtype())?;
+        let sin = sin.to_dtype(q.dtype())?;
+        let q_embed = rope(&q.i(i)?.unsqueeze(0)?.contiguous()?, &cos, &sin)?;
+        let k_embed = rope(&k.i(i)?.unsqueeze(0)?.contiguous()?, &cos, &sin)?;
+        q_embeds.push(q_embed);
+        k_embeds.push(k_embed);
     }
-
-    pub fn forward(
-        &self,
-        q: &Tensor,
-        k: &Tensor,
-        seqlen_offsets: &[usize],
-    ) -> Result<(Tensor, Tensor)> {
-        let (_b_sz, _qh, seq_len, _n_embd) = q.dims4()?;
-
-        let rope = candle_nn::rotary_emb::rope;
-
-        let mut q_embeds = Vec::new();
-        let mut k_embeds = Vec::new();
-        for (i, offset) in seqlen_offsets.iter().enumerate() {
-            let cos = self.cos.narrow(0, *offset, seq_len)?;
-            let sin = self.sin.narrow(0, *offset, seq_len)?;
-            let q_embed = rope(&q.i(i)?.unsqueeze(0)?.contiguous()?, &cos, &sin)?;
-            let k_embed = rope(&k.i(i)?.unsqueeze(0)?.contiguous()?, &cos, &sin)?;
-            q_embeds.push(q_embed);
-            k_embeds.push(k_embed);
-        }
-        Ok((Tensor::cat(&q_embeds, 0)?, Tensor::cat(&k_embeds, 0)?))
-    }
+    Ok((Tensor::cat(&q_embeds, 0)?, Tensor::cat(&k_embeds, 0)?))
 }
 
 struct Mlp {
@@ -170,7 +138,7 @@ impl Attention {
         q = q.apply(&self.q_norm)?;
         k = k.apply(&self.k_norm)?;
 
-        (q, k) = self.rotary_emb.forward(&q, &k, seqlen_offsets)?;
+        (q, k) = apply_rotary_emb_batched(&self.rotary_emb, &q, &k, seqlen_offsets)?;
 
         let q = q.contiguous()?;
         let k = k.contiguous()?;
@@ -265,11 +233,10 @@ impl Qwen3VLTextModel {
         let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
 
         let rotary_emb = Arc::new(RotaryEmbedding::new(
-            cfg.rope_theta as f32,
             cfg.head_dim,
             cfg.max_position_embeddings,
+            cfg.rope_theta,
             vb.device(),
-            vb_m.dtype(),
         )?);
         let vb_l = vb_m.pp("layers");
         let mut layers = Vec::new();

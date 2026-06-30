@@ -16,6 +16,7 @@
 
 use candle_core::{DType, Device, Module, Result, Tensor, D};
 use candle_nn::{linear, linear_no_bias, Embedding, Linear, RmsNorm, VarBuilder};
+use super::super::modules::rotary::RotaryEmbedding;
 use serde::Deserialize;
 use std::collections::HashMap;
 
@@ -215,38 +216,6 @@ fn default_tts_eos() -> u32 {
 }
 fn default_tts_pad() -> u32 {
     151671
-}
-
-// ── Rotary Embedding (standard, 1D) ────────────────────────────────────
-
-struct RotaryEmbedding {
-    cos_table: Tensor,
-    sin_table: Tensor,
-}
-
-impl RotaryEmbedding {
-    fn new(dim: usize, max_pos: usize, theta: f64, device: &Device) -> Result<Self> {
-        let inv: Vec<f32> = (0..dim)
-            .step_by(2)
-            .map(|i| 1.0 / theta.powf(i as f64 / dim as f64) as f32)
-            .collect();
-        let inv_freq = Tensor::new(inv.as_slice(), device)?;
-        let positions: Vec<f32> = (0..max_pos).map(|i| i as f32).collect();
-        let positions = Tensor::new(positions.as_slice(), device)?;
-        let freqs = positions.unsqueeze(1)?.matmul(&inv_freq.unsqueeze(0)?)?;
-        let cos_table = freqs.cos()?.contiguous()?;
-        let sin_table = freqs.sin()?.contiguous()?;
-        Ok(Self {
-            cos_table,
-            sin_table,
-        })
-    }
-
-    fn forward(&self, seq_len: usize) -> Result<(Tensor, Tensor)> {
-        let cos = self.cos_table.narrow(0, 0, seq_len)?;
-        let sin = self.sin_table.narrow(0, 0, seq_len)?;
-        Ok((cos, sin))
-    }
 }
 
 // ── RoPE application helpers ────────────────────────────────────────────
@@ -726,7 +695,7 @@ impl CodePredictor {
         };
 
         let seq_len = inputs_embeds.dim(1)?;
-        let (cos, sin) = self.rotary_emb.forward(seq_len)?;
+        let (cos, sin) = self.rotary_emb.forward(0, seq_len)?;
 
         // Build causal mask for the 2-token prefill
         let causal_mask = if seq_len > 1 {
@@ -777,9 +746,7 @@ impl CodePredictor {
                 None => embed,
             };
             let total = seq_len + g;
-            let (cos, sin) = self.rotary_emb.forward(total)?;
-            let cos = cos.narrow(0, total - 1, 1)?;
-            let sin = sin.narrow(0, total - 1, 1)?;
+            let (cos, sin) = self.rotary_emb.forward(total - 1, 1)?;
 
             let mut hs = embed;
             for layer in &mut self.layers {
@@ -1073,10 +1040,7 @@ impl TalkerModel {
     ) -> Result<Tensor> {
         let seq_len = inputs_embeds.dim(1)?;
         // Compute cos/sin for positions [seq_offset .. seq_offset + seq_len]
-        let total_pos = seq_offset + seq_len;
-        let (cos_full, sin_full) = self.rotary_emb.forward(total_pos)?;
-        let cos = cos_full.narrow(0, seq_offset, seq_len)?;
-        let sin = sin_full.narrow(0, seq_offset, seq_len)?;
+        let (cos, sin) = self.rotary_emb.forward(seq_offset, seq_len)?;
 
         // For TTS all 3 MRoPE position dimensions are identical,
         // so standard 1D RoPE is equivalent.

@@ -2,6 +2,7 @@ use candle_core::quantized::{gguf_file, QTensor};
 use candle_core::{DType, Device, Module, Result, Tensor, D};
 use candle_nn::rotary_emb::rope;
 use candle_nn::{linear_no_bias, Linear, RmsNorm, VarBuilder};
+use crate::models::modules::rotary::RotaryEmbedding;
 use serde::Deserialize;
 use std::io::{Read, Seek};
 use std::sync::Arc;
@@ -182,71 +183,6 @@ impl EventTrackingGuard {
 
 // RoPE is applied via candle's fused `rope()` kernel (1 CUDA launch per tensor)
 // instead of manual rotate_half + broadcast_mul (~5 launches per tensor).
-//
-// Pre-computes the full [max_position_embeddings, dim/2] cos/sin table once
-// at construction time. `forward()` returns zero-copy `narrow` views.
-
-struct RotaryEmbedding {
-    /// Pre-computed cos table: [max_pos, dim/2]
-    cos_table: Tensor,
-    /// Pre-computed sin table: [max_pos, dim/2]
-    sin_table: Tensor,
-}
-
-impl RotaryEmbedding {
-    fn new(config: &Config, device: &Device) -> Result<Self> {
-        let dim = config.head_dim();
-        let rope_theta = config.rope_theta();
-        let max_pos = config.max_position_embeddings;
-
-        let inv_freq = if let Some(ref scaling) = config.rope_scaling {
-            if let Some(alpha) = scaling.alpha {
-                if alpha > 0.0 {
-                    let base = rope_theta * alpha.powf(dim as f64 / (dim as f64 - 2.0));
-                    let inv: Vec<f32> = (0..dim)
-                        .step_by(2)
-                        .map(|i| 1.0 / base.powf(i as f64 / dim as f64) as f32)
-                        .collect();
-                    Tensor::new(inv.as_slice(), device)?
-                } else {
-                    Self::default_inv_freq(dim, rope_theta, device)?
-                }
-            } else {
-                Self::default_inv_freq(dim, rope_theta, device)?
-            }
-        } else {
-            Self::default_inv_freq(dim, rope_theta, device)?
-        };
-
-        // Pre-compute full cos/sin tables: [max_pos, dim/2]
-        let positions: Vec<f32> = (0..max_pos).map(|i| i as f32).collect();
-        let positions = Tensor::new(positions.as_slice(), device)?;
-        let freqs = positions
-            .unsqueeze(1)?
-            .matmul(&inv_freq.unsqueeze(0)?)?; // [max_pos, dim/2]
-        let cos_table = freqs.cos()?.contiguous()?;
-        let sin_table = freqs.sin()?.contiguous()?;
-
-        Ok(Self { cos_table, sin_table })
-    }
-
-    fn default_inv_freq(dim: usize, base: f64, device: &Device) -> Result<Tensor> {
-        let inv: Vec<f32> = (0..dim)
-            .step_by(2)
-            .map(|i| 1.0 / base.powf(i as f64 / dim as f64) as f32)
-            .collect();
-        Tensor::new(inv.as_slice(), device)
-    }
-
-    /// Return cos/sin slices for positions [0..seq_len].
-    /// Both narrow() calls are zero-copy views — no CUDA kernel launched.
-    fn forward(&self, seq_len: usize) -> Result<(Tensor, Tensor)> {
-        let cos = self.cos_table.narrow(0, 0, seq_len)?;
-        let sin = self.sin_table.narrow(0, 0, seq_len)?;
-        Ok((cos, sin))
-    }
-}
-
 struct Attention {
     q_proj: LinearLayer,
     k_proj: LinearLayer,
@@ -852,7 +788,24 @@ impl HunYuanDenseV1 {
             )?)
         };
 
-        let rotary_emb = RotaryEmbedding::new(config, vb.device())?;
+        let dim = config.head_dim();
+        let theta = if let Some(ref scaling) = config.rope_scaling {
+            if let Some(alpha) = scaling.alpha {
+                if alpha > 0.0 {
+                    #[allow(clippy::cast_precision_loss)]
+                    let ratio = dim as f64 / (dim as f64 - 2.0);
+                    config.rope_theta() * alpha.powf(ratio)
+                } else {
+                    config.rope_theta()
+                }
+            } else {
+                config.rope_theta()
+            }
+        } else {
+            config.rope_theta()
+        };
+        let rotary_emb =
+            RotaryEmbedding::new(dim, config.max_position_embeddings, theta, vb.device())?;
 
         Ok(Self {
             embed_tokens,
@@ -973,7 +926,12 @@ impl HunYuanDenseV1 {
             gg.linear("output.weight")?
         };
 
-        let rotary_emb = RotaryEmbedding::new(&config, device)?;
+        let rotary_emb = RotaryEmbedding::new(
+            config.head_dim(),
+            config.max_position_embeddings,
+            config.rope_theta(),
+            device,
+        )?;
 
         Ok(Self {
             embed_tokens,
@@ -996,16 +954,9 @@ impl HunYuanDenseV1 {
         // weights in BF16 which is unsupported for CPU matmul.
         let hidden_states = self.embed_tokens.forward(input_ids)?.to_dtype(self.dtype)?;
 
-        let total_len = start_pos + seq_len;
-        let (full_cos, full_sin) = self.rotary_emb.forward(total_len)?;
-        // Slice for current positions; cast to model dtype (RoPE computes in F32)
-        // cos/sin: [seq_len, dim/2] — rope() handles broadcasting.
-        let cos = full_cos
-            .narrow(0, start_pos, seq_len)?
-            .to_dtype(self.dtype)?;
-        let sin = full_sin
-            .narrow(0, start_pos, seq_len)?
-            .to_dtype(self.dtype)?;
+        let (cos, sin) = self.rotary_emb.forward(start_pos, seq_len)?;
+        let cos = cos.to_dtype(self.dtype)?;
+        let sin = sin.to_dtype(self.dtype)?;
 
         // Build causal mask
         let attention_mask = if seq_len > 1 {
@@ -1232,7 +1183,7 @@ impl HunYuanDenseV1 {
 
         let max_pos = positions.iter().copied().max().unwrap_or(0) + 1;
         let device = input_ids.device();
-        let (full_cos, full_sin) = self.rotary_emb.forward(max_pos)?;
+        let (full_cos, full_sin) = self.rotary_emb.forward(0, max_pos)?;
 
         let pos_ids: Vec<u32> = positions.iter().map(|&p| p as u32).collect();
         let pos_tensor = Tensor::new(pos_ids.as_slice(), device)?;
