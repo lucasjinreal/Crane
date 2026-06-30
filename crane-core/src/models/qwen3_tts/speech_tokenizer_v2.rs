@@ -3,9 +3,11 @@ use candle_core::{DType, Device, IndexOp, Tensor, D};
 use super::super::modules::rotary::RotaryEmbedding;
 use candle_core::{Module, StreamingModule};
 use candle_nn::{
-    conv1d, conv1d_no_bias, conv_transpose1d, layer_norm, linear, linear_no_bias, Conv1d,
-    Conv1dConfig, ConvTranspose1d, ConvTranspose1dConfig, LayerNorm, Linear, RmsNorm, VarBuilder,
+    conv1d, conv1d_no_bias, conv_transpose1d, layer_norm, linear, linear_no_bias, Activation,
+    Conv1d, Conv1dConfig, ConvTranspose1d, ConvTranspose1dConfig, LayerNorm, Linear, RmsNorm,
+    VarBuilder,
 };
+use super::super::modules::ffn::SwiGluFfn;
 use candle_transformers::models::mimi;
 use serde::Deserialize;
 use std::cell::RefCell;
@@ -399,32 +401,9 @@ impl LayerScale {
 }
 
 #[derive(Debug, Clone)]
-struct TokenizerMlp {
-    gate_proj: Linear,
-    up_proj: Linear,
-    down_proj: Linear,
-}
-
-impl TokenizerMlp {
-    fn new(cfg: &DecoderConfig, vb: VarBuilder) -> Result<Self> {
-        Ok(Self {
-            gate_proj: linear_no_bias(cfg.hidden_size, cfg.intermediate_size, vb.pp("gate_proj"))?,
-            up_proj: linear_no_bias(cfg.hidden_size, cfg.intermediate_size, vb.pp("up_proj"))?,
-            down_proj: linear_no_bias(cfg.intermediate_size, cfg.hidden_size, vb.pp("down_proj"))?,
-        })
-    }
-
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let g = x.apply(&self.gate_proj)?.silu()?;
-        let u = x.apply(&self.up_proj)?;
-        Ok(g.broadcast_mul(&u)?.apply(&self.down_proj)?)
-    }
-}
-
-#[derive(Debug, Clone)]
 struct TokenizerTransformerLayer {
     self_attn: TokenizerAttention,
-    mlp: TokenizerMlp,
+    mlp: SwiGluFfn,
     input_layernorm: RmsNorm,
     post_attention_layernorm: RmsNorm,
     self_attn_layer_scale: LayerScale,
@@ -435,7 +414,7 @@ impl TokenizerTransformerLayer {
     fn new(cfg: &DecoderConfig, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
             self_attn: TokenizerAttention::new(cfg, vb.pp("self_attn"))?,
-            mlp: TokenizerMlp::new(cfg, vb.pp("mlp"))?,
+            mlp: SwiGluFfn::new(cfg.hidden_size, cfg.intermediate_size, Activation::Silu, vb.pp("mlp"))?,
             input_layernorm: candle_nn::rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?,
             post_attention_layernorm: candle_nn::rms_norm(
                 cfg.hidden_size,
@@ -463,7 +442,7 @@ impl TokenizerTransformerLayer {
 
         let residual = hidden.clone();
         let hidden = hidden.apply(&self.post_attention_layernorm)?;
-        let hidden = self.mlp.forward(&hidden)?;
+        let hidden = hidden.apply(&self.mlp)?;
         Ok((residual + self.mlp_layer_scale.forward(&hidden)?)?)
     }
 }

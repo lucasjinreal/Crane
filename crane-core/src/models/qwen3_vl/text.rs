@@ -2,12 +2,12 @@ use std::sync::{Arc, Mutex};
 
 use candle::{DType, Device, IndexOp, Result, Tensor};
 use candle_nn::{
-    embedding, kv_cache::KvCache, linear, linear_b, rms_norm, rotary_emb::rope, Activation,
-    Embedding, Linear, Module, RmsNorm, VarBuilder,
+    embedding, kv_cache::KvCache, linear, linear_b, rms_norm, rotary_emb::rope, Embedding,
+    Linear, Module, RmsNorm, VarBuilder,
 };
 
 use super::config::TextConfig;
-use crate::models::modules::rotary::RotaryEmbedding;
+use crate::models::modules::{ffn::SwiGluFfn, rotary::RotaryEmbedding};
 
 fn apply_rotary_emb_batched(
     rotary_emb: &RotaryEmbedding,
@@ -30,34 +30,6 @@ fn apply_rotary_emb_batched(
     Ok((Tensor::cat(&q_embeds, 0)?, Tensor::cat(&k_embeds, 0)?))
 }
 
-struct Mlp {
-    gate_proj: Linear,
-    up_proj: Linear,
-    down_proj: Linear,
-    act_fn: Activation,
-}
-
-impl Mlp {
-    fn new(cfg: &TextConfig, vb: VarBuilder) -> Result<Self> {
-        let hidden_sz = cfg.hidden_size;
-        let intermediate_sz = cfg.intermediate_size;
-        let gate_proj = linear_b(hidden_sz, intermediate_sz, false, vb.pp("gate_proj"))?;
-        let up_proj = linear_b(hidden_sz, intermediate_sz, false, vb.pp("up_proj"))?;
-        let down_proj = linear_b(intermediate_sz, hidden_sz, false, vb.pp("down_proj"))?;
-        Ok(Self {
-            gate_proj,
-            up_proj,
-            down_proj,
-            act_fn: cfg.hidden_act,
-        })
-    }
-
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let lhs = self.gate_proj.forward(xs)?.apply(&self.act_fn)?;
-        let rhs = self.up_proj.forward(xs)?;
-        self.down_proj.forward(&(lhs * rhs)?)
-    }
-}
 
 struct Attention {
     q_proj: Linear,
@@ -172,7 +144,7 @@ impl Attention {
 
 pub struct DecoderLayer {
     self_attn: Attention,
-    mlp: Mlp,
+    mlp: SwiGluFfn,
     input_layernorm: RmsNorm,
     post_attention_layernorm: RmsNorm,
 }
@@ -180,7 +152,7 @@ pub struct DecoderLayer {
 impl DecoderLayer {
     fn new(rotary_emb: Arc<RotaryEmbedding>, cfg: &TextConfig, vb: VarBuilder) -> Result<Self> {
         let self_attn = Attention::new(rotary_emb, cfg, vb.pp("self_attn"))?;
-        let mlp = Mlp::new(cfg, vb.pp("mlp"))?;
+        let mlp = SwiGluFfn::new(cfg.hidden_size, cfg.intermediate_size, cfg.hidden_act, vb.pp("mlp"))?;
         let input_layernorm =
             rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
         let post_attention_layernorm = rms_norm(

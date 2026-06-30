@@ -15,6 +15,7 @@
 //! - 🤗 [Qwen2 Model](https://huggingface.co/Qwen/Qwen2-7B)
 //!
 
+use crate::models::modules::ffn::SwiGluFfn;
 use crate::models::modules::rotary::RotaryEmbedding;
 use crate::models::with_tracing::{linear, linear_no_bias, Linear, RmsNorm};
 use candle_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
@@ -38,39 +39,6 @@ pub struct Config {
     pub hidden_act: Activation,
 }
 
-
-#[derive(Debug, Clone)]
-#[allow(clippy::upper_case_acronyms)]
-struct MLP {
-    gate_proj: Linear,
-    up_proj: Linear,
-    down_proj: Linear,
-    act_fn: Activation,
-}
-
-impl MLP {
-    fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
-        let hidden_sz = cfg.hidden_size;
-        let intermediate_sz = cfg.intermediate_size;
-        let gate_proj = linear_no_bias(hidden_sz, intermediate_sz, vb.pp("gate_proj"))?;
-        let up_proj = linear_no_bias(hidden_sz, intermediate_sz, vb.pp("up_proj"))?;
-        let down_proj = linear_no_bias(intermediate_sz, hidden_sz, vb.pp("down_proj"))?;
-        Ok(Self {
-            gate_proj,
-            up_proj,
-            down_proj,
-            act_fn: cfg.hidden_act,
-        })
-    }
-}
-
-impl Module for MLP {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let lhs = xs.apply(&self.gate_proj)?.apply(&self.act_fn)?;
-        let rhs = xs.apply(&self.up_proj)?;
-        (lhs * rhs)?.apply(&self.down_proj)
-    }
-}
 
 #[derive(Debug, Clone)]
 struct Attention {
@@ -177,7 +145,7 @@ impl Attention {
 #[derive(Debug, Clone)]
 struct DecoderLayer {
     self_attn: Attention,
-    mlp: MLP,
+    mlp: SwiGluFfn,
     input_layernorm: RmsNorm,
     post_attention_layernorm: RmsNorm,
 }
@@ -185,7 +153,7 @@ struct DecoderLayer {
 impl DecoderLayer {
     fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
         let self_attn = Attention::new(cfg, vb.pp("self_attn"))?;
-        let mlp = MLP::new(cfg, vb.pp("mlp"))?;
+        let mlp = SwiGluFfn::new(cfg.hidden_size, cfg.intermediate_size, cfg.hidden_act, vb.pp("mlp"))?;
         let input_layernorm =
             RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
         let post_attention_layernorm = RmsNorm::new(

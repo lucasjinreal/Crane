@@ -16,6 +16,7 @@
 
 use candle_core::{DType, Device, Module, Result, Tensor, D};
 use candle_nn::{linear, linear_no_bias, Embedding, Linear, RmsNorm, VarBuilder};
+use super::super::modules::ffn::SwiGluFfn;
 use super::super::modules::rotary::RotaryEmbedding;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -430,30 +431,6 @@ impl Attention {
     }
 }
 
-// ── MLP ─────────────────────────────────────────────────────────────────
-
-struct Mlp {
-    gate_proj: Linear,
-    up_proj: Linear,
-    down_proj: Linear,
-}
-
-impl Mlp {
-    fn new(hidden_size: usize, intermediate_size: usize, vb: VarBuilder) -> Result<Self> {
-        Ok(Self {
-            gate_proj: linear_no_bias(hidden_size, intermediate_size, vb.pp("gate_proj"))?,
-            up_proj: linear_no_bias(hidden_size, intermediate_size, vb.pp("up_proj"))?,
-            down_proj: linear_no_bias(intermediate_size, hidden_size, vb.pp("down_proj"))?,
-        })
-    }
-
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let gate = candle_nn::Activation::Silu.forward(&self.gate_proj.forward(x)?)?;
-        let up = self.up_proj.forward(x)?;
-        self.down_proj.forward(&(gate * up)?)
-    }
-}
-
 // ── Resize MLP (text_projection) ────────────────────────────────────────
 
 struct ResizeMlp {
@@ -484,7 +461,7 @@ impl ResizeMlp {
 
 struct DecoderLayer {
     self_attn: Attention,
-    mlp: Mlp,
+    mlp: SwiGluFfn,
     input_layernorm: RmsNorm,
     post_attention_layernorm: RmsNorm,
 }
@@ -510,7 +487,7 @@ impl DecoderLayer {
                 bias,
                 vb.pp("self_attn"),
             )?,
-            mlp: Mlp::new(hidden_size, intermediate_size, vb.pp("mlp"))?,
+            mlp: SwiGluFfn::new(hidden_size, intermediate_size, candle_nn::Activation::Silu, vb.pp("mlp"))?,
             input_layernorm: candle_nn::rms_norm(hidden_size, rms_norm_eps, vb.pp("input_layernorm"))?,
             post_attention_layernorm: candle_nn::rms_norm(
                 hidden_size,

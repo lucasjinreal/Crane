@@ -22,12 +22,13 @@
 use candle_core::quantized::gguf_file;
 use candle_core::{DType, Device, Module, Result, Tensor, D};
 use candle_nn::rotary_emb::rope;
-use candle_nn::{linear_no_bias, Embedding, Linear, RmsNorm, VarBuilder};
+use candle_nn::{linear_no_bias, Activation, Embedding, Linear, RmsNorm, VarBuilder};
 use serde::Deserialize;
 use std::io::{Read, Seek};
 
 // Reuse the polymorphic linear layer and GGUF loader from the shared Hunyuan module.
 pub use crate::models::hunyuan_dense::modeling::{Gguf, LinearLayer};
+use crate::models::modules::ffn::SwiGluFfn;
 
 // Note: Gemma 4 norms use standard `x * weight` (no `+1` shift unlike Gemma 3).
 // Weights are stored in final form. Use candle_nn::rms_norm / gg.rms_norm directly.
@@ -555,35 +556,23 @@ impl Attention {
 
 // ── MLP ─────────────────────────────────────────────────────────────────
 
-struct Mlp {
-    gate_proj: LinearLayer,
-    up_proj: LinearLayer,
-    down_proj: LinearLayer,
+enum Mlp {
+    Standard(SwiGluFfn),
+    Gguf {
+        gate_proj: LinearLayer,
+        up_proj: LinearLayer,
+        down_proj: LinearLayer,
+    },
 }
 
 impl Mlp {
     fn new(config: &Gemma4TextConfig, intermediate_size: usize, vb: VarBuilder) -> Result<Self> {
-        let gate_proj = LinearLayer::Standard(linear_no_bias(
+        Ok(Self::Standard(SwiGluFfn::new(
             config.hidden_size,
             intermediate_size,
-            vb.pp("gate_proj"),
-        )?);
-        let up_proj = LinearLayer::Standard(linear_no_bias(
-            config.hidden_size,
-            intermediate_size,
-            vb.pp("up_proj"),
-        )?);
-        let down_proj = LinearLayer::Standard(linear_no_bias(
-            intermediate_size,
-            config.hidden_size,
-            vb.pp("down_proj"),
-        )?);
-
-        Ok(Self {
-            gate_proj,
-            up_proj,
-            down_proj,
-        })
+            Activation::GeluPytorchTanh,
+            vb,
+        )?))
     }
 
     fn new_from_gguf<R: Read + Seek>(gg: &mut Gguf<R>, layer_idx: usize) -> Result<Self> {
@@ -591,7 +580,7 @@ impl Mlp {
         let gate_proj = gg.linear(&format!("{prefix}.ffn_gate.weight"))?;
         let up_proj = gg.linear(&format!("{prefix}.ffn_up.weight"))?;
         let down_proj = gg.linear(&format!("{prefix}.ffn_down.weight"))?;
-        Ok(Self {
+        Ok(Self::Gguf {
             gate_proj,
             up_proj,
             down_proj,
@@ -599,10 +588,19 @@ impl Mlp {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let gate = self.gate_proj.forward(x)?;
-        let gate = candle_nn::Activation::GeluPytorchTanh.forward(&gate)?;
-        let up = self.up_proj.forward(x)?;
-        self.down_proj.forward(&(gate * up)?)
+        match self {
+            Self::Standard(ffn) => ffn.forward(x),
+            Self::Gguf {
+                gate_proj,
+                up_proj,
+                down_proj,
+            } => {
+                let gate = gate_proj.forward(x)?;
+                let gate = Activation::GeluPytorchTanh.forward(&gate)?;
+                let up = up_proj.forward(x)?;
+                down_proj.forward(&(gate * up)?)
+            }
+        }
     }
 }
 
