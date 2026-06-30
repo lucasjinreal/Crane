@@ -5,10 +5,10 @@
 //! # Weight names
 //!
 //! The [`VarBuilder`] passed to [`GqaAttention::new`] is expected to hold:
-//! - `q_proj.weight` (and `q_proj.bias` when `cfg.bias = true`)
-//! - `k_proj.weight` (and `k_proj.bias` when `cfg.bias = true`)
-//! - `v_proj.weight` (and `v_proj.bias` when `cfg.bias = true`)
-//! - `o_proj.weight` (and `o_proj.bias` when `cfg.bias = true`)
+//! - `q_proj.weight` (and `q_proj.bias` when `cfg.qkv_bias = true`)
+//! - `k_proj.weight` (and `k_proj.bias` when `cfg.qkv_bias = true`)
+//! - `v_proj.weight` (and `v_proj.bias` when `cfg.qkv_bias = true`)
+//! - `o_proj.weight` (and `o_proj.bias` when `cfg.o_bias = true`)
 //! - `q_norm.weight` and `k_norm.weight` (only when `cfg.use_qk_norm = true`)
 //!
 //! These names match the safetensors checkpoint layout for Qwen3-TTS and Qwen2.5.
@@ -22,8 +22,8 @@ use crate::models::with_tracing::{linear_b, Linear, RmsNorm};
 /// Configuration for [`GqaAttention`].
 ///
 /// All dimension and feature-flag information needed to construct the layer.
-/// `causal` is kept as metadata — causality is enforced by the caller via
-/// `attention_mask`, not by the attention layer itself.
+/// Causality is enforced by the caller via `attention_mask`, not by the
+/// attention layer itself.
 #[allow(clippy::module_name_repetitions)]
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy)]
@@ -36,14 +36,10 @@ pub struct AttentionConfig {
     pub n_kv_heads: usize,
     /// Dimension of each attention head (`dim / n_heads` for most models).
     pub head_dim: usize,
-    /// Whether all four projections (`q`, `k`, `v`, `o`) include a bias term.
-    pub bias: bool,
-    /// Metadata: whether this attention is causal.
-    ///
-    /// Causality is enforced by the caller providing an appropriate additive
-    /// `attention_mask`; this flag is not consulted inside
-    /// [`GqaAttention::forward`].
-    pub causal: bool,
+    /// Whether Q, K, V projections include a bias term.
+    pub qkv_bias: bool,
+    /// Whether the output projection includes a bias term.
+    pub o_bias: bool,
     /// Whether to apply rotary position embeddings in [`GqaAttention::forward`].
     ///
     /// When `true`, the `cos_sin` argument to `forward` must be `Some`.
@@ -61,7 +57,7 @@ pub struct AttentionConfig {
 /// and the expected weight-name layout.
 ///
 /// Call [`GqaAttention::clear_kv_cache`] between independent sequences.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct GqaAttention {
     q_proj: Linear,
     k_proj: Linear,
@@ -73,6 +69,27 @@ pub struct GqaAttention {
     /// Precomputed `cfg.n_heads / cfg.n_kv_heads`.
     n_kv_groups: usize,
     kv_cache: Option<(Tensor, Tensor)>,
+}
+
+impl Clone for GqaAttention {
+    /// Clone the layer with the KV cache reset to empty.
+    ///
+    /// Projection weights and norms are cloned as-is, but the accumulated KV
+    /// cache is **not** carried over — the clone starts with a fresh cache.
+    /// This prevents an accidental deep-copy of potentially large cached tensors.
+    fn clone(&self) -> Self {
+        Self {
+            q_proj: self.q_proj.clone(),
+            k_proj: self.k_proj.clone(),
+            v_proj: self.v_proj.clone(),
+            o_proj: self.o_proj.clone(),
+            q_norm: self.q_norm.clone(),
+            k_norm: self.k_norm.clone(),
+            cfg: self.cfg,
+            n_kv_groups: self.n_kv_groups,
+            kv_cache: None,
+        }
+    }
 }
 
 impl GqaAttention {
@@ -100,25 +117,25 @@ impl GqaAttention {
         let q_proj = linear_b(
             cfg.dim,
             cfg.n_heads * cfg.head_dim,
-            cfg.bias,
+            cfg.qkv_bias,
             vb.pp("q_proj"),
         )?;
         let k_proj = linear_b(
             cfg.dim,
             cfg.n_kv_heads * cfg.head_dim,
-            cfg.bias,
+            cfg.qkv_bias,
             vb.pp("k_proj"),
         )?;
         let v_proj = linear_b(
             cfg.dim,
             cfg.n_kv_heads * cfg.head_dim,
-            cfg.bias,
+            cfg.qkv_bias,
             vb.pp("v_proj"),
         )?;
         let o_proj = linear_b(
             cfg.n_heads * cfg.head_dim,
             cfg.dim,
-            cfg.bias,
+            cfg.o_bias,
             vb.pp("o_proj"),
         )?;
         let (q_norm, k_norm) = if cfg.use_qk_norm {
@@ -171,22 +188,22 @@ impl GqaAttention {
         cos_sin: Option<(&Tensor, &Tensor)>,
         attention_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
-        let (b_sz, seq_len, _) = hidden_states.dims3()?;
+        let (b_sz, q_seq_len, _) = hidden_states.dims3()?;
 
         // 1. Project Q, K, V
         let q = self.q_proj.forward(hidden_states)?;
         let k = self.k_proj.forward(hidden_states)?;
         let v = self.v_proj.forward(hidden_states)?;
 
-        // 2. Reshape to [batch, heads, seq_len, head_dim]
+        // 2. Reshape to [batch, heads, q_seq_len, head_dim]
         let q = q
-            .reshape((b_sz, seq_len, self.cfg.n_heads, self.cfg.head_dim))?
+            .reshape((b_sz, q_seq_len, self.cfg.n_heads, self.cfg.head_dim))?
             .transpose(1, 2)?;
         let k = k
-            .reshape((b_sz, seq_len, self.cfg.n_kv_heads, self.cfg.head_dim))?
+            .reshape((b_sz, q_seq_len, self.cfg.n_kv_heads, self.cfg.head_dim))?
             .transpose(1, 2)?;
         let v = v
-            .reshape((b_sz, seq_len, self.cfg.n_kv_heads, self.cfg.head_dim))?
+            .reshape((b_sz, q_seq_len, self.cfg.n_kv_heads, self.cfg.head_dim))?
             .transpose(1, 2)?;
 
         // 3. Optional per-head QK-norm (RMS norm applied to the head_dim dimension)
@@ -244,7 +261,7 @@ impl GqaAttention {
             attn_output
                 .transpose(1, 2)?
                 .contiguous()?
-                .reshape((b_sz, seq_len, ()))?;
+                .reshape((b_sz, q_seq_len, ()))?;
         self.o_proj.forward(&attn_output)
     }
 
@@ -272,8 +289,8 @@ mod tests {
             n_heads: 4,
             n_kv_heads: 4,
             head_dim: 4,
-            bias: false,
-            causal: true,
+            qkv_bias: false,
+            o_bias: false,
             use_rope: false,
             use_qk_norm: false,
             norm_eps: 1e-6,
@@ -283,8 +300,8 @@ mod tests {
     /// Build a `VarBuilder` with zero-valued projection weights (and ones for
     /// QK-norm weights) that matches the given `cfg`.
     ///
-    /// Includes bias tensors only when `cfg.bias = true`, and norm weights only
-    /// when `cfg.use_qk_norm = true`.
+    /// Includes QKV bias tensors when `cfg.qkv_bias = true`, output bias when
+    /// `cfg.o_bias = true`, and norm weights only when `cfg.use_qk_norm = true`.
     fn make_vb(cfg: &AttentionConfig) -> VarBuilder<'static> {
         let device = &Device::Cpu;
         let mut t: HashMap<String, Tensor> = HashMap::new();
@@ -301,10 +318,12 @@ mod tests {
         t.insert("v_proj.weight".into(), zeros((kv_out, cfg.dim)));
         t.insert("o_proj.weight".into(), zeros((cfg.dim, q_out)));
 
-        if cfg.bias {
+        if cfg.qkv_bias {
             t.insert("q_proj.bias".into(), zeros1(q_out));
             t.insert("k_proj.bias".into(), zeros1(kv_out));
             t.insert("v_proj.bias".into(), zeros1(kv_out));
+        }
+        if cfg.o_bias {
             t.insert("o_proj.bias".into(), zeros1(cfg.dim));
         }
 
@@ -324,8 +343,9 @@ mod tests {
     /// Build a `VarBuilder` with small non-zero weights for tests that need
     /// non-trivial outputs. All weights follow `(i + 1) * scale`.
     ///
-    /// Includes bias tensors only when `cfg.bias = true`, and norm weights only
-    /// when `cfg.use_qk_norm = true` (mirrors `make_vb`'s conditional logic).
+    /// Includes QKV bias tensors when `cfg.qkv_bias = true`, output bias when
+    /// `cfg.o_bias = true`, and norm weights only when `cfg.use_qk_norm = true`
+    /// (mirrors `make_vb`'s conditional logic).
     fn nonzero_vb(cfg: &AttentionConfig, scale: f32) -> VarBuilder<'static> {
         let device = &Device::Cpu;
         let mut t: HashMap<String, Tensor> = HashMap::new();
@@ -346,10 +366,12 @@ mod tests {
         t.insert("v_proj.weight".into(), fill(kv_out, cfg.dim));
         t.insert("o_proj.weight".into(), fill(cfg.dim, q_out));
 
-        if cfg.bias {
+        if cfg.qkv_bias {
             t.insert("q_proj.bias".into(), fill1(q_out));
             t.insert("k_proj.bias".into(), fill1(kv_out));
             t.insert("v_proj.bias".into(), fill1(kv_out));
+        }
+        if cfg.o_bias {
             t.insert("o_proj.bias".into(), fill1(cfg.dim));
         }
 
@@ -926,7 +948,8 @@ mod tests {
     #[test]
     fn test_bias_true_output_shape() {
         let cfg = AttentionConfig {
-            bias: true,
+            qkv_bias: true,
+            o_bias: true,
             ..base_cfg()
         };
         let vb = make_vb(&cfg); // includes zero bias tensors
@@ -939,7 +962,8 @@ mod tests {
     #[test]
     fn test_bias_false_output_shape() {
         let cfg = AttentionConfig {
-            bias: false,
+            qkv_bias: false,
+            o_bias: false,
             ..base_cfg()
         };
         let vb = make_vb(&cfg); // no bias tensors present
@@ -953,7 +977,8 @@ mod tests {
     fn test_nonzero_bias_changes_output() {
         // A non-zero bias shifts Q/K/V projections and must change the output.
         let cfg = AttentionConfig {
-            bias: true,
+            qkv_bias: true,
+            o_bias: true,
             ..base_cfg()
         };
         let device = &Device::Cpu;
@@ -992,6 +1017,22 @@ mod tests {
             max_abs_diff(&y0, &y1) > 1e-4,
             "non-zero bias must change the output"
         );
+    }
+
+    #[test]
+    fn test_asymmetric_bias_qkv_only() {
+        // qkv_bias=true, o_bias=false is the Qwen2.5 layout: Q/K/V projections have
+        // bias tensors in the checkpoint but the output projection does not.
+        let cfg = AttentionConfig {
+            qkv_bias: true,
+            o_bias: false,
+            ..base_cfg()
+        };
+        let vb = make_vb(&cfg); // inserts QKV bias tensors, omits o_proj.bias
+        let mut attn = GqaAttention::new(cfg, vb).expect("asymmetric bias construction");
+        let x = Tensor::zeros((1, 3, 16), DType::F32, &Device::Cpu).expect("zeros");
+        let y = attn.forward(&x, None, None).expect("forward");
+        assert_eq!(y.dims(), &[1, 3, 16]);
     }
 
     // -------------------------------------------------------------------------

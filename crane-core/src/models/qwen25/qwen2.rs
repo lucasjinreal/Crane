@@ -15,11 +15,12 @@
 //! - 🤗 [Qwen2 Model](https://huggingface.co/Qwen/Qwen2-7B)
 //!
 
+use crate::models::modules::attention::{AttentionConfig, GqaAttention};
 use crate::models::modules::ffn::SwiGluFfn;
 use crate::models::modules::rotary::RotaryEmbedding;
-use crate::models::with_tracing::{linear, linear_no_bias, Linear, RmsNorm};
+use crate::models::with_tracing::{linear_no_bias, Linear, RmsNorm};
 use candle_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
-use candle_nn::{rotary_emb::rope, Activation, VarBuilder};
+use candle_nn::{Activation, VarBuilder};
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct Config {
@@ -41,110 +42,8 @@ pub struct Config {
 
 
 #[derive(Debug, Clone)]
-struct Attention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
-    num_heads: usize,
-    num_kv_heads: usize,
-    num_kv_groups: usize,
-    head_dim: usize,
-    hidden_size: usize,
-    kv_cache: Option<(Tensor, Tensor)>,
-}
-
-impl Attention {
-    fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
-        let hidden_sz = cfg.hidden_size;
-        let num_heads = cfg.num_attention_heads;
-        let num_kv_heads = cfg.num_key_value_heads;
-        let num_kv_groups = num_heads / num_kv_heads;
-        let head_dim = hidden_sz / num_heads;
-        let q_proj = linear(hidden_sz, num_heads * head_dim, vb.pp("q_proj"))?;
-        let k_proj = linear(hidden_sz, num_kv_heads * head_dim, vb.pp("k_proj"))?;
-        let v_proj = linear(hidden_sz, num_kv_heads * head_dim, vb.pp("v_proj"))?;
-        let o_proj = linear_no_bias(num_heads * head_dim, hidden_sz, vb.pp("o_proj"))?;
-        Ok(Self {
-            q_proj,
-            k_proj,
-            v_proj,
-            o_proj,
-            num_heads,
-            num_kv_heads,
-            num_kv_groups,
-            head_dim,
-            hidden_size: hidden_sz,
-            kv_cache: None,
-        })
-    }
-
-    fn forward(
-        &mut self,
-        xs: &Tensor,
-        attention_mask: Option<&Tensor>,
-        cos: &Tensor,
-        sin: &Tensor,
-    ) -> Result<Tensor> {
-        let (b_sz, q_len, _) = xs.dims3()?;
-
-        let query_states = self.q_proj.forward(xs)?;
-        let key_states = self.k_proj.forward(xs)?;
-        let value_states = self.v_proj.forward(xs)?;
-
-        let query_states = query_states
-            .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let key_states = key_states
-            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let value_states = value_states
-            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-
-        let query_states = rope(&query_states.contiguous()?, cos, sin)?;
-        let key_states = rope(&key_states.contiguous()?, cos, sin)?;
-
-        let (key_states, value_states) = match &self.kv_cache {
-            None => (key_states, value_states),
-            Some((prev_k, prev_v)) => {
-                let key_states = Tensor::cat(&[prev_k, &key_states], 2)?;
-                let value_states = Tensor::cat(&[prev_v, &value_states], 2)?;
-                (key_states, value_states)
-            }
-        };
-        self.kv_cache = Some((key_states.clone(), value_states.clone()));
-
-        let key_states =
-            crate::models::utils::repeat_kv(key_states, self.num_kv_groups)?.contiguous()?;
-        let value_states =
-            crate::models::utils::repeat_kv(value_states, self.num_kv_groups)?.contiguous()?;
-
-        let attn_output = {
-            let scale = 1f64 / f64::sqrt(self.head_dim as f64);
-            let attn_weights = (query_states.matmul(&key_states.transpose(2, 3)?)? * scale)?;
-
-            let attn_weights = match attention_mask {
-                None => attn_weights,
-                Some(mask) => attn_weights.broadcast_add(mask)?,
-            };
-            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-            attn_weights.matmul(&value_states)?
-        };
-        attn_output
-            .transpose(1, 2)?
-            .reshape((b_sz, q_len, self.hidden_size))?
-            .apply(&self.o_proj)
-    }
-
-    fn clear_kv_cache(&mut self) {
-        self.kv_cache = None
-    }
-}
-
-#[derive(Debug, Clone)]
 struct DecoderLayer {
-    self_attn: Attention,
+    self_attn: GqaAttention,
     mlp: SwiGluFfn,
     input_layernorm: RmsNorm,
     post_attention_layernorm: RmsNorm,
@@ -152,7 +51,19 @@ struct DecoderLayer {
 
 impl DecoderLayer {
     fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
-        let self_attn = Attention::new(cfg, vb.pp("self_attn"))?;
+        let head_dim = cfg.hidden_size / cfg.num_attention_heads;
+        let attn_cfg = AttentionConfig {
+            dim: cfg.hidden_size,
+            n_heads: cfg.num_attention_heads,
+            n_kv_heads: cfg.num_key_value_heads,
+            head_dim,
+            qkv_bias: true,
+            o_bias: false,
+            use_rope: true,
+            use_qk_norm: false,
+            norm_eps: cfg.rms_norm_eps,
+        };
+        let self_attn = GqaAttention::new(attn_cfg, vb.pp("self_attn"))?;
         let mlp = SwiGluFfn::new(cfg.hidden_size, cfg.intermediate_size, cfg.hidden_act, vb.pp("mlp"))?;
         let input_layernorm =
             RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
@@ -178,7 +89,7 @@ impl DecoderLayer {
     ) -> Result<Tensor> {
         let residual = xs;
         let xs = self.input_layernorm.forward(xs)?;
-        let xs = self.self_attn.forward(&xs, attention_mask, cos, sin)?;
+        let xs = self.self_attn.forward(&xs, Some((cos, sin)), attention_mask)?;
         let xs = (xs + residual)?;
         let residual = &xs;
         let xs = xs.apply(&self.post_attention_layernorm)?.apply(&self.mlp)?;
