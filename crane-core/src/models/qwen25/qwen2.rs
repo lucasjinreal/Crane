@@ -15,9 +15,9 @@
 //! - 🤗 [Qwen2 Model](https://huggingface.co/Qwen/Qwen2-7B)
 //!
 
-use crate::models::modules::attention::{AttentionConfig, GqaAttention};
-use crate::models::modules::ffn::SwiGluFfn;
+use crate::models::modules::attention::AttentionConfig;
 use crate::models::modules::rotary::RotaryEmbedding;
+use crate::models::modules::transformer::TransformerBlock;
 use crate::models::with_tracing::{linear_no_bias, Linear, RmsNorm};
 use candle_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
 use candle_nn::{Activation, VarBuilder};
@@ -40,71 +40,10 @@ pub struct Config {
     pub hidden_act: Activation,
 }
 
-
-#[derive(Debug, Clone)]
-struct DecoderLayer {
-    self_attn: GqaAttention,
-    mlp: SwiGluFfn,
-    input_layernorm: RmsNorm,
-    post_attention_layernorm: RmsNorm,
-}
-
-impl DecoderLayer {
-    fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
-        let head_dim = cfg.hidden_size / cfg.num_attention_heads;
-        let attn_cfg = AttentionConfig {
-            dim: cfg.hidden_size,
-            n_heads: cfg.num_attention_heads,
-            n_kv_heads: cfg.num_key_value_heads,
-            head_dim,
-            qkv_bias: true,
-            o_bias: false,
-            use_rope: true,
-            use_qk_norm: false,
-            norm_eps: cfg.rms_norm_eps,
-        };
-        let self_attn = GqaAttention::new(attn_cfg, vb.pp("self_attn"))?;
-        let mlp = SwiGluFfn::new(cfg.hidden_size, cfg.intermediate_size, cfg.hidden_act, vb.pp("mlp"))?;
-        let input_layernorm =
-            RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
-        let post_attention_layernorm = RmsNorm::new(
-            cfg.hidden_size,
-            cfg.rms_norm_eps,
-            vb.pp("post_attention_layernorm"),
-        )?;
-        Ok(Self {
-            self_attn,
-            mlp,
-            input_layernorm,
-            post_attention_layernorm,
-        })
-    }
-
-    fn forward(
-        &mut self,
-        xs: &Tensor,
-        attention_mask: Option<&Tensor>,
-        cos: &Tensor,
-        sin: &Tensor,
-    ) -> Result<Tensor> {
-        let residual = xs;
-        let xs = self.input_layernorm.forward(xs)?;
-        let xs = self.self_attn.forward(&xs, Some((cos, sin)), attention_mask)?;
-        let xs = (xs + residual)?;
-        let residual = &xs;
-        let xs = xs.apply(&self.post_attention_layernorm)?.apply(&self.mlp)?;
-        residual + xs
-    }
-
-    fn clear_kv_cache(&mut self) {
-        self.self_attn.clear_kv_cache()
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct Model {
     embed_tokens: candle_nn::Embedding,
-    layers: Vec<DecoderLayer>,
+    layers: Vec<TransformerBlock>,
     norm: RmsNorm,
     rotary_emb: RotaryEmbedding,
     sliding_window: usize,
@@ -124,11 +63,27 @@ impl Model {
             cfg.rope_theta,
             vb_m.device(),
         )?;
+        let attn_cfg = AttentionConfig {
+            dim: cfg.hidden_size,
+            n_heads: cfg.num_attention_heads,
+            n_kv_heads: cfg.num_key_value_heads,
+            head_dim,
+            qkv_bias: true,
+            o_bias: false,
+            use_rope: true,
+            use_qk_norm: false,
+            norm_eps: cfg.rms_norm_eps,
+        };
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_l = vb_m.pp("layers");
         for layer_idx in 0..cfg.num_hidden_layers {
-            let layer = DecoderLayer::new(cfg, vb_l.pp(layer_idx))?;
-            layers.push(layer)
+            let layer = TransformerBlock::new(
+                &attn_cfg,
+                cfg.intermediate_size,
+                cfg.hidden_act,
+                vb_l.pp(layer_idx),
+            )?;
+            layers.push(layer);
         }
         let norm = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
         Ok(Self {
@@ -207,7 +162,7 @@ impl Model {
         let cos = cos.to_dtype(self.dtype)?;
         let sin = sin.to_dtype(self.dtype)?;
         for layer in self.layers.iter_mut() {
-            xs = layer.forward(&xs, attention_mask.as_ref(), &cos, &sin)?
+            xs = layer.forward(&xs, Some((&cos, &sin)), attention_mask.as_ref())?;
         }
         xs.apply(&self.norm)
     }
