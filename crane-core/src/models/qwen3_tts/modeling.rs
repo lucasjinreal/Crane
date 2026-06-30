@@ -16,9 +16,9 @@
 
 use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::{linear, linear_no_bias, Embedding, Linear, RmsNorm, VarBuilder};
-use crate::models::modules::attention::{AttentionConfig, GqaAttention};
-use crate::models::modules::ffn::SwiGluFfn;
+use crate::models::modules::attention::AttentionConfig;
 use crate::models::modules::rotary::RotaryEmbedding;
+use crate::models::modules::transformer::TransformerBlock;
 use serde::Deserialize;
 use std::collections::HashMap;
 
@@ -247,72 +247,6 @@ impl ResizeMlp {
     }
 }
 
-// ── Decoder Layer ───────────────────────────────────────────────────────
-
-struct DecoderLayer {
-    self_attn: GqaAttention,
-    mlp: SwiGluFfn,
-    input_layernorm: RmsNorm,
-    post_attention_layernorm: RmsNorm,
-}
-
-impl DecoderLayer {
-    fn new(
-        hidden_size: usize,
-        intermediate_size: usize,
-        num_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        rms_norm_eps: f64,
-        bias: bool,
-        vb: VarBuilder,
-    ) -> Result<Self> {
-        let attn_cfg = AttentionConfig {
-            dim: hidden_size,
-            n_heads: num_heads,
-            n_kv_heads: num_kv_heads,
-            head_dim,
-            qkv_bias: bias,
-            o_bias: bias,
-            use_rope: true,
-            use_qk_norm: true,
-            norm_eps: rms_norm_eps,
-        };
-        Ok(Self {
-            self_attn: GqaAttention::new(attn_cfg, vb.pp("self_attn"))?,
-            mlp: SwiGluFfn::new(hidden_size, intermediate_size, candle_nn::Activation::Silu, vb.pp("mlp"))?,
-            input_layernorm: candle_nn::rms_norm(hidden_size, rms_norm_eps, vb.pp("input_layernorm"))?,
-            post_attention_layernorm: candle_nn::rms_norm(
-                hidden_size,
-                rms_norm_eps,
-                vb.pp("post_attention_layernorm"),
-            )?,
-        })
-    }
-
-    fn forward(
-        &mut self,
-        hidden_states: &Tensor,
-        cos: &Tensor,
-        sin: &Tensor,
-        attention_mask: Option<&Tensor>,
-    ) -> Result<Tensor> {
-        let residual = hidden_states;
-        let hidden_states = self.input_layernorm.forward(hidden_states)?;
-        let hidden_states = self.self_attn.forward(&hidden_states, Some((cos, sin)), attention_mask)?;
-        let hidden_states = (residual + hidden_states)?;
-
-        let residual = &hidden_states;
-        let hidden_states = self.post_attention_layernorm.forward(&hidden_states)?;
-        let hidden_states = self.mlp.forward(&hidden_states)?;
-        residual + hidden_states
-    }
-
-    fn clear_kv_cache(&mut self) {
-        self.self_attn.clear_kv_cache();
-    }
-}
-
 // ═══════════════════════════════════════════════════════════════════════
 //  Code Predictor (sub-talker)
 // ═══════════════════════════════════════════════════════════════════════
@@ -322,7 +256,7 @@ impl DecoderLayer {
 pub struct CodePredictor {
     /// Embeddings per code group: codec_embedding[i] for group i+1
     codec_embeddings: Vec<Embedding>,
-    layers: Vec<DecoderLayer>,
+    layers: Vec<TransformerBlock>,
     norm: RmsNorm,
     /// Linear heads per code group: lm_head[i] for group i+1
     lm_heads: Vec<Linear>,
@@ -354,14 +288,21 @@ impl CodePredictor {
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for i in 0..config.num_hidden_layers {
-            layers.push(DecoderLayer::new(
-                config.hidden_size,
+            let attn_cfg = AttentionConfig {
+                dim: config.hidden_size,
+                n_heads: config.num_attention_heads,
+                n_kv_heads: config.num_key_value_heads,
+                head_dim: config.head_dim,
+                qkv_bias: config.attention_bias,
+                o_bias: config.attention_bias,
+                use_rope: true,
+                use_qk_norm: true,
+                norm_eps: config.rms_norm_eps,
+            };
+            layers.push(TransformerBlock::new(
+                &attn_cfg,
                 config.intermediate_size,
-                config.num_attention_heads,
-                config.num_key_value_heads,
-                config.head_dim,
-                config.rms_norm_eps,
-                config.attention_bias,
+                candle_nn::Activation::Silu,
                 model_vb.pp("layers").pp(i),
             )?);
         }
@@ -475,7 +416,7 @@ impl CodePredictor {
         // Forward through layers
         let mut hidden_states = inputs_embeds;
         for layer in &mut self.layers {
-            hidden_states = layer.forward(&hidden_states, &cos, &sin, causal_mask.as_ref())?;
+            hidden_states = layer.forward(&hidden_states, Some((&cos, &sin)), causal_mask.as_ref())?;
         }
         hidden_states = self.norm.forward(&hidden_states)?;
 
@@ -501,7 +442,7 @@ impl CodePredictor {
 
             let mut hs = embed;
             for layer in &mut self.layers {
-                hs = layer.forward(&hs, &cos, &sin, None)?;
+                hs = layer.forward(&hs, Some((&cos, &sin)), None)?;
             }
             hs = self.norm.forward(&hs)?;
             let logits = self.lm_heads[g].forward(&hs)?;
@@ -533,7 +474,7 @@ pub struct TalkerModel {
     text_embedding: Embedding,
     /// Text → talker hidden projection
     text_projection: ResizeMlp,
-    layers: Vec<DecoderLayer>,
+    layers: Vec<TransformerBlock>,
     norm: RmsNorm,
     /// Head that predicts first-codebook tokens
     codec_head: Linear,
@@ -566,14 +507,21 @@ impl TalkerModel {
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for i in 0..config.num_hidden_layers {
-            layers.push(DecoderLayer::new(
-                config.hidden_size,
+            let attn_cfg = AttentionConfig {
+                dim: config.hidden_size,
+                n_heads: config.num_attention_heads,
+                n_kv_heads: config.num_key_value_heads,
+                head_dim: config.head_dim,
+                qkv_bias: config.attention_bias,
+                o_bias: config.attention_bias,
+                use_rope: true,
+                use_qk_norm: true,
+                norm_eps: config.rms_norm_eps,
+            };
+            layers.push(TransformerBlock::new(
+                &attn_cfg,
                 config.intermediate_size,
-                config.num_attention_heads,
-                config.num_key_value_heads,
-                config.head_dim,
-                config.rms_norm_eps,
-                config.attention_bias,
+                candle_nn::Activation::Silu,
                 model_vb.pp("layers").pp(i),
             )?);
         }
@@ -774,7 +722,7 @@ impl TalkerModel {
 
         let mut hidden_states = inputs_embeds.clone();
         for layer in &mut self.layers {
-            hidden_states = layer.forward(&hidden_states, &cos, &sin, attention_mask)?;
+            hidden_states = layer.forward(&hidden_states, Some((&cos, &sin)), attention_mask)?;
         }
         self.norm.forward(&hidden_states)
     }
