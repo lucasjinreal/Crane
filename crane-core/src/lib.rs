@@ -8,7 +8,7 @@
 //!
 //! | Module | Purpose |
 //! |---|---|
-//! | [`ops`] | Custom CUDA kernels and other core ops |
+//! | [`ops`] | Custom CUDA kernels and other core ops (fused ops, Gated Delta Net) |
 //! | [`models`] | Transformer model implementations (Qwen3, HunyuanDense, Qwen2.5, multimodal) |
 //! | [`generation`] | Token generation utilities (sampling, stopping criteria, logit processors) |
 //! | [`autotokenizer`] | HuggingFace-compatible tokenizer loader |
@@ -19,7 +19,7 @@
 //! ## Feature flags
 //!
 //! | Flag | Effect |
-//! |---|---|
+//! |---|
 //! | `cuda` | Enable CUDA device and custom PTX kernels (requires CUDA toolkit) |
 //! | `accelerate` | Link against Apple Accelerate for CPU BLAS |
 //! | `mkl` | Link against Intel MKL for CPU BLAS |

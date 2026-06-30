@@ -7,22 +7,34 @@ use crane::llm::{GenerationConfig, LlmModelType};
 use crane::prelude::*;
 
 fn main() -> CraneResult<()> {
-    // Create a simple chat configuration
+    // Create a simple chat configuration.
+    //
+    // Qwen 3.5 (hybrid Gated Delta Net + attention) runs on CPU/CUDA/Metal.
+    // Picks the best available target: CUDA (F16) when built `--features cuda`,
+    // Metal (F16) on macOS, otherwise CPU (F32).
+    #[cfg(feature = "cuda")]
+    let (device, dtype) = (DeviceConfig::Cuda(0), DataType::F16);
+    #[cfg(all(not(feature = "cuda"), target_os = "macos"))]
+    let (device, dtype) = (DeviceConfig::Metal, DataType::F16);
+    #[cfg(all(not(feature = "cuda"), not(target_os = "macos")))]
+    let (device, dtype) = (DeviceConfig::Cpu, DataType::F32);
+
     let config = ChatConfig {
         common: CommonConfig {
-            model_path: "checkpoints/Qwen3-0.6B-Instruct".to_string(), // Update this path to your model
-            model_type: LlmModelType::Qwen3,
-            device: DeviceConfig::Metal, // Use DeviceConfig::Cuda(0) for GPU
-            dtype: DataType::F16,
+            // Update this path to your local Qwen 3.5 checkpoint.
+            model_path: "checkpoints/Qwen3.5-0.8B".to_string(),
+            model_type: LlmModelType::Qwen35,
+            device,
+            dtype,
             max_memory: None,
         },
         generation: GenerationConfig {
-            max_new_tokens: 100, // Keep responses short for demo
+            max_new_tokens: 128,
             temperature: Some(0.7),
             ..Default::default()
         },
         max_history_turns: 4,
-        enable_streaming: true, // Enable streaming for real-time responses
+        enable_streaming: true,
     };
 
     // Create a new chat client

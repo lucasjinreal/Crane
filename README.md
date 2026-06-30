@@ -12,6 +12,7 @@ A high-performance inference framework leveraging Rust's Candle for maximum spee
 
 - [x] Qwen3 (0.6B ~ 30B+)
 - [x] Qwen 2.5 (0.5B ~ 72B)
+- [x] Qwen 3.5 (0.8B; hybrid Gated Delta Net + softmax attention, CPU/CUDA/Metal) + Ornith-1.0-9B (agentic, tool calling)
 - [x] Hunyuan Dense
 - [x] Gemma 4 (text and vision; no audio)
 - [x] Qwen3 VL (2B, 4B)
@@ -56,8 +57,10 @@ We include:
 
 ## 🔥 Updates
 
+- **`2026.06.30`**: 🚀 Qwen 3.5 / Ornith follow-up — K=128 register-resident CUDA recurrence kernel (~5× prefill, ~7.8× recurrence-only on RTX 3090), per-token int8 / int4 K/V cache backends (~2× / ~4× smaller via `CRANE_KV_QUANT`), and Ornith tool-calling support (HF-byte-identical chat template via `AutoTokenizer::apply_chat_template_with_tools`, end-to-end `ornith_tools` example).
+- **`2026.06.29`**: 🌀 Qwen 3.5 support — hybrid Mamba/Transformer (Gated Delta Net + softmax attention), runs on CPU, NVIDIA CUDA, and Apple Metal. New `crane-core/src/ops/gdn/` module with a fused CUDA recurrence kernel for the linear-attention path.
 - **`2026.05.04`**: Gemma 4 support added for text and vision models (audio is not supported);
-- **`2026.02.23`**: 🎙️ Qwen3-TTS support added — full Talker + Code Predictor transformer in Candle, native speech-tokenizer decoder (ONNX fallback), voice cloning (Base model ICL), OpenAI `/v1/audio/speech` endpoint in crane-oai;
+- **`2026.02.23`**: 🎙️ Qwen3-TTS support added — full Talker + Code Predictor transformer in Candle, native speech-tokenizer decoder (ONNX fallback), voice cloning (Base model ICL), OpenAI `/v1/audio/speech` endpoint in crane-serve;
 - **`2026.02.18`**: ⚡ Qwen3 & Hunyuan Dense inference optimization: pre-allocated KV cache, GQA 4D matmul, fused RoPE with cache pre-growth, GGUF quantization, batched decode, smart sampling fallback for large vocabularies;
 - **`2026.01.30`**: PaddleOCR-VL-1.5 supported now! model: https://huggingface.co/PaddlePaddle/PaddleOCR-VL-1.5/;
 - **`2025.03.21`**: 🔥 Qwen2.5 a more transformers liked Rust interface were supported, you now use Crane just like in your python;
@@ -181,7 +184,7 @@ To use `crane`, here are some notes:
 
 - `crane-core`: All models comes into core, this is a lib;
 - `crane`: All Apps (runnable AI pipelines, such as Qwen2-Chat, Spark-TTS, Qwen2.5-VL etc), you can build your apps inside it, each app is a binary for demonstration purpose;
-- `crane-oai`: OpenAI & SGLang compatible API server with continuous batching, see [crane-oai/README.md](crane-oai/README.md) for full documentation;
+- `crane-serve`: OpenAI & SGLang compatible API server with continuous batching, see [crane-serve/README.md](crane-serve/README.md) for full documentation;
 
 1. Make sure latest Rust were installed;
 2. Build (choose based on your hardware):
@@ -203,15 +206,15 @@ Start a server compatible with OpenAI SDK and SGLang client:
 ```bash
 # Build
 # CPU
-cargo build -p crane-oai --release
+cargo build -p crane-serve --release
 # CUDA
-cargo build -p crane-oai --release --features cuda
+cargo build -p crane-serve --release --features cuda
 
 # Start (auto-detect model type and device)
-./target/release/crane-oai --model-path /path/to/Qwen2.5-7B-Instruct
+./target/release/crane --model-path /path/to/Qwen2.5-7B-Instruct
 
 # Or run directly
-cargo run -p crane-oai --release -- --model-path /path/to/model --port 8000
+cargo run -p crane-serve --release -- --model-path /path/to/model --port 8000
 ```
 
 Then use it with any OpenAI-compatible client:
@@ -244,7 +247,7 @@ Supported endpoints:
 | Mgmt   | `GET /health` | Health check |
 | Mgmt   | `GET /v1/stats` | Engine statistics |
 
-✨ **Text-to-Speech (Qwen3-TTS)**: For TTS models, the server adds a `/v1/audio/speech` endpoint (OpenAI-compatible). Both **CustomVoice** (predefined speakers) and **Base** (voice cloning via reference audio) models are supported. `response_format` currently supports `wav` and `pcm` (other formats return `400`). See [crane-oai/README.md](crane-oai/README.md) for full TTS API documentation.
+✨ **Text-to-Speech (Qwen3-TTS)**: For TTS models, the server adds a `/v1/audio/speech` endpoint (OpenAI-compatible). Both **CustomVoice** (predefined speakers) and **Base** (voice cloning via reference audio) models are supported. `response_format` currently supports `wav` and `pcm` (other formats return `400`). See [crane-serve/README.md](crane-serve/README.md) for full TTS API documentation.
 
 ### TTS Examples
 
@@ -266,7 +269,65 @@ All TTS examples save generated audio files to `data/audio/output`.
 - Base (voice clone): [vc1_base.wav](data/audio/output/vc1_base.wav), [vc2_base.wav](data/audio/output/vc2_base.wav)
 - CustomVoice: [custom_voice_zh.wav](data/audio/output/custom_voice_zh.wav), [custom_voice_en.wav](data/audio/output/custom_voice_en.wav), [custom_voice_ja.wav](data/audio/output/custom_voice_ja.wav)
 
-✨ **Multimodal & Vision support**: For models like PaddleOCR-VL, the endpoints accept OpenAI's structured `messages.[]content.[{type: "image_url", image_url: {url: "..."}}]` payload or SGLang's `image_url` field. See [crane-oai/README.md](crane-oai/README.md) for full API documentation with request/response examples.
+### Qwen 3.5 / Ornith (hybrid Gated Delta Net + softmax attention)
+
+Qwen 3.5 is a hybrid architecture: most layers are Gated Delta Net linear
+attention (recurrent, constant-size state per layer), every 4th layer is
+softmax attention (cumulative K/V cache). On RTX 3090 with `Qwen3.5-0.8B`,
+prefill argmax matches HuggingFace Transformers bit-exactly in f32/f16/bf16
+(`token 283 " ="` on a 512-token prefill); decoding is coherent on CPU,
+CUDA, and Metal.
+
+**Run:**
+
+```bash
+cargo run --bin chat_simple --release   # auto-targets Qwen 3.5
+# Point chat_simple.rs at your local Qwen3.5-0.8B or Ornith-1.0-9B path
+```
+
+**Tool calling (Ornith-1.0-9B):** Ornith is an agentic variant of the
+Qwen3.5 architecture with a `# Tools` system block and a `<tool_call>…/tool`
+turn protocol. `AutoTokenizer::apply_chat_template_with_tools` renders this
+with byte-identical output to HuggingFace's tokenizer (Python-style
+`tojson`, `raise_exception`, `serde_json` with `preserve_order`).
+See `example/src/ornith_tools.rs` for an end-to-end agentic loop
+(reason → tool_call → run tool → tool turn → answer):
+
+```bash
+cargo run -p crane-examples --bin ornith_tools --release --features cuda \
+  -- --model-path /path/to/Ornith-1.0-9B
+# or:  MODEL_PATH=/path/to/Ornith-1.0-9B cargo run --bin ornith_tools ...
+```
+
+**K/V cache compression (CUDA):** the full-attention K/V cache dominates
+memory at long context (the GDN layers carry a constant recurrent state).
+Pick the representation per-model-load via `CRANE_KV_QUANT`:
+
+| `CRANE_KV_QUANT` | Storage              | vs fp16 | Notes                                    |
+|------------------|----------------------|--------:|------------------------------------------|
+| unset (default)  | fp16 / bf16          |    1.0× | lossless                                 |
+| `int8`           | per-token symmetric  |  ~0.56× | ~2× smaller, dequantized on read         |
+| `int4`           | nibble-packed        |  ~0.31× | ~4× smaller; requires even `head_dim`    |
+
+Measured at 4 K tokens, full-attention K+V across all layers of the
+Qwen3.5-0.8B architecture (24 layers, full-attention every 4th). At
+Ornith-9B's full 262K-token window, int4 is what lets a single agent
+hold the whole window locally on a 24 GB GPU.
+
+**Other toggles:**
+
+- `CRANE_GDN_PORTABLE=1` — force the op-by-op GDN recurrence path on CUDA
+  instead of the fused kernel (cross-check numerics).
+- `CRANE_FULL_RECOMPUTE=1` — force the O(n²) reset-and-reprocess decode
+  path (debugging cross-check for the incremental path).
+- `cargo run -p crane-core --release --features cuda --bin gdn_bench` —
+  micro-benchmark for the fused GDN recurrence in isolation.
+
+**Limitation:** the Qwen 3.5 backend caps `max_concurrent=1` — KV swap
+and batched decode aren't implemented yet (hybrid layer types complicate
+a generic GPU-batched implementation).
+
+✨ **Multimodal & Vision support**: For models like PaddleOCR-VL, the endpoints accept OpenAI's structured `messages.[]content.[{type: "image_url", image_url: {url: "..."}}]` payload or SGLang's `image_url` field. See [crane-serve/README.md](crane-serve/README.md) for full API documentation with request/response examples.
 
 Now you can run LLM extremly fast (about 6x faster than vanilla transformers on M1)!
 
@@ -275,16 +336,17 @@ Now you can run LLM extremly fast (about 6x faster than vanilla transformers on 
 ```
 Crane/
 ├── crane-core/          # Core library: model implementations, tokenizer, generation
-│   └── src/models/      # Model architectures (Qwen 2.5, Qwen 3, Hunyuan, etc.)
+│   ├── src/models/      # Model architectures (Qwen 2.5, Qwen 3, Qwen 3.5, Hunyuan, etc.)
+│   └── src/ops/gdn/     # Gated Delta Net (Qwen 3.5 linear-attention path) + fused CUDA kernel
 ├── crane/               # High-level SDK: Chat, Vision, Audio, Multimodal clients
-├── crane-oai/           # OpenAI & SGLang compatible API server
+├── crane-serve/         # OpenAI & SGLang compatible API server
 │   └── src/
 │       ├── engine/      # Continuous batching inference engine
 │       ├── handlers/    # HTTP request handlers (OpenAI, SGLang, common)
 │       ├── openai_api.rs # OpenAI request/response types
 │       ├── sglang_api.rs # SGLang API types
 │       └── main.rs      # CLI entry point & router
-├── example/             # Example binaries (chat, ASR, vision, OCR, TTS)
+├── example/             # Example binaries (chat, ASR, vision, OCR, TTS, ornith_tools)
 ├── vendor/              # Vendored references (llama.cpp, sglang, vllm)
 └── scripts/             # Utility scripts
 ```
@@ -308,9 +370,10 @@ One can reference to `crane-core/src/models/namo2.rs` for new arch add, which us
 
 ## ⚡ Inference Optimizations
 
-Crane implements production-grade inference optimizations for both **Qwen3** and **Hunyuan Dense**.
+Crane implements production-grade inference optimizations for **Qwen3**,
+**Hunyuan Dense**, and **Qwen 3.5 / Ornith**.
 
-Environment variables for tuning:
+Sampling-related environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -318,6 +381,17 @@ Environment variables for tuning:
 | `CRANE_TOPP_FALLBACK_TOPK` | `64` | Top-k size when top_p is active and GPU path is used |
 | `CRANE_TOPK_SAMPLE_ON_CPU` | `0` | Force CPU sampling after GPU topk |
 | `CRANE_SAMPLE_TRACE` | `0` | Enable detailed sampling timing logs |
+
+Qwen 3.5 / Ornith environment variables (see the
+[Qwen 3.5 / Ornith section](#qwen-35--ornith-hybrid-gated-delta-net--softmax-attention)
+above for context):
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CRANE_GDN_PORTABLE` | unset | Force the portable op-by-op GDN recurrence path on CUDA (skip the fused kernel) |
+| `CRANE_KV_QUANT` | unset | K/V cache representation: `int8` (≈2× smaller) or `int4` (≈4× smaller); unset = fp |
+| `CRANE_FULL_RECOMPUTE` | unset | Force the O(n²) reset-and-reprocess decode path (debugging cross-check) |
+| `CRANE_GDN_VTILE` | unset | V-column tile size for the fused CUDA GDN kernel (advanced tuning) |
 
 ## ⚡️ Speed
 
