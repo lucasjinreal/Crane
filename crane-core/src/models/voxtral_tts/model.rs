@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use candle_core::{DType, Device, Tensor};
+use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::VarBuilder;
 use hound::{SampleFormat, WavSpec, WavWriter};
 use serde::Deserialize;
@@ -21,8 +21,6 @@ use crate::generation::SpeechOptions;
 
 /// BOS token (id=1, `<s>`).
 pub const BOS: u32 = 1;
-/// Audio token placeholder fed as LLM input at each decoding step (id=24).
-pub const AUDIO_TOKEN: u32 = 24;
 /// Marks the start of an audio section (id=25).
 pub const BEGIN_AUDIO: u32 = 25;
 /// `[INST]` instruction start marker (id=35).
@@ -492,32 +490,28 @@ impl Model {
 
         let prompt_embeds = self.build_prompt_embeds(&segments, &voice_embed)?;
 
-        let _prefill = self
+        // Prefill: the last hidden state (from [BEGIN_AUDIO]) seeds the first
+        // audio frame prediction — exactly as the reference implementation does.
+        let prefill_h = self
             .llm
             .forward(&prompt_embeds, 0)
             .map_err(|e| anyhow::anyhow!("LLM prefill failed: {e}"))?;
         let prompt_len = prompt_embeds.dim(1)?;
+        let mut h_for_frame = prefill_h.i((.., prompt_len - 1, ..))?.unsqueeze(1)?; // [1, 1, dim]
+        drop(prefill_h);
 
-        // Feed the initial AUDIO_TOKEN embedding
-        let audio_token_id = Tensor::new(&[AUDIO_TOKEN], &self.device)?;
-        let mut next_input = self
-            .llm
-            .embed_tokens(&audio_token_id)
-            .map_err(|e| anyhow::anyhow!("audio token embed failed: {e}"))?
-            .to_dtype(self.dtype)?
-            .unsqueeze(0)?; // [1, 1, dim]
+        anyhow::ensure!(
+            prompt_len + opts.max_new_tokens <= self.config.max_seq_len,
+            "prompt ({prompt_len}) + max_new_tokens ({}) exceeds max_seq_len ({})",
+            opts.max_new_tokens,
+            self.config.max_seq_len,
+        );
 
         let n_codebooks = 1 + self.config.multimodal.audio_model_args.n_acoustic_codebook;
         let mut all_codes: Vec<Vec<u32>> = Vec::new();
 
         for frame_idx in 0..opts.max_new_tokens {
-            let start_pos = prompt_len + frame_idx;
-            let h = self
-                .llm
-                .forward(&next_input, start_pos)
-                .map_err(|e| anyhow::anyhow!("LLM decode step failed: {e}"))?;
-
-            let h_squeezed = h.squeeze(0)?.squeeze(0)?; // [dim]
+            let h_squeezed = h_for_frame.squeeze(0)?.squeeze(0)?; // [dim]
 
             let semantic_code = self
                 .acoustic
@@ -540,20 +534,28 @@ impl Model {
             let codes_tensor =
                 Tensor::new(frame_codes.as_slice(), &self.device)?.to_dtype(DType::U32)?;
             all_codes.push(frame_codes);
-            let summed_embed = self
-                .codebook_embed
-                .forward(&codes_tensor)
-                .map_err(|e| anyhow::anyhow!("codebook embed failed: {e}"))?
-                .to_dtype(self.dtype)?
-                .unsqueeze(0)?
-                .unsqueeze(0)?; // [1, 1, dim]
-            next_input = summed_embed;
+
+            if frame_idx + 1 < opts.max_new_tokens {
+                let summed_embed = self
+                    .codebook_embed
+                    .forward(&codes_tensor)
+                    .map_err(|e| anyhow::anyhow!("codebook embed failed: {e}"))?
+                    .to_dtype(self.dtype)?
+                    .unsqueeze(0)?
+                    .unsqueeze(0)?; // [1, 1, dim]
+                let start_pos = prompt_len + frame_idx;
+                h_for_frame = self
+                    .llm
+                    .forward(&summed_embed, start_pos)
+                    .map_err(|e| anyhow::anyhow!("LLM decode step failed: {e}"))?;
+            }
         }
 
         anyhow::ensure!(!all_codes.is_empty(), "no speech frames generated");
 
         let n_frames = all_codes.len();
-        #[allow(clippy::cast_precision_loss)] // codes are small integers (semantic <= 8191, acoustic <= 20)
+        #[allow(clippy::cast_precision_loss)]
+        // codes are small integers (semantic <= 8191, acoustic <= 20)
         let flat: Vec<f32> = all_codes
             .iter()
             .flat_map(|f| f.iter().copied().map(|c| c as f32))
