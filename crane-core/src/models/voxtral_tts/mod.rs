@@ -1,6 +1,8 @@
+pub mod codec;
 pub mod model;
 pub mod modeling;
 
+pub use codec::CodecDecoder;
 pub use model::{
     build_prompt_segments, load_tokenizer, load_voice_embedding, PromptSegment, VoxtralConfig,
     AUDIO_TOKEN, BEGIN_AUDIO, BOS, END_AUDIO_CODE, INST, INST_END,
