@@ -66,5 +66,5 @@ path = "src/hunyuan_simple.rs"
 [features]
 default = []
 onnx = ["crane/onnx"]
-cuda = ["crane-core/cuda"]
+cuda = ["crane/cuda", "crane-core/cuda"]
 

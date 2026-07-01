@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use crate::llm::LlmModelType;
+use serde::{Deserialize, Serialize};
 
 /// Common configuration for Crane SDK
 #[derive(Debug, Clone, Serialize, Deserialize)]

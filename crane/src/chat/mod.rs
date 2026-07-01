@@ -4,4 +4,4 @@ mod client;
 mod types;
 
 pub use client::ChatClient;
-pub use types::{ChatConfig, ChatMessage, ChatRole, ChatHistory};
+pub use types::{ChatConfig, ChatHistory, ChatMessage, ChatRole};

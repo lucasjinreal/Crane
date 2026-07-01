@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use crane::common::config::{CommonConfig, DataType, DeviceConfig};
 use crane::llm::{GenerationConfig, LlmModelType};
 use crane::prelude::*;
+use crane::utils::gpu_memory_info;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 
@@ -23,10 +24,11 @@ fn arg(flag: &str) -> Option<String> {
         .and_then(|i| args.get(i + 1).cloned())
 }
 
-fn model_path() -> String {
-    arg("--model-path")
+fn model_path() -> Result<String> {
+    arg("-m")
+        .or_else(|| arg("--model-path"))
         .or_else(|| std::env::var("MODEL_PATH").ok())
-        .unwrap_or_else(|| "checkpoints/Qwen3.5-0.8B".to_string())
+        .context("missing model path; pass -m <path>, --model-path <path>, or set MODEL_PATH")
 }
 
 fn model_type() -> LlmModelType {
@@ -45,7 +47,7 @@ fn max_new_tokens() -> usize {
     arg("--max-new-tokens")
         .or_else(|| std::env::var("MAX_NEW_TOKENS").ok())
         .and_then(|s| s.parse().ok())
-        .unwrap_or(256)
+        .unwrap_or(4096)
 }
 
 fn pick_device_dtype() -> (DeviceConfig, DataType) {
@@ -71,8 +73,8 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn gpu_mem_usage() -> Option<(u64, u64)> {
-    None
+fn gpu_mem_usage(device: &DeviceConfig) -> Option<(u64, u64)> {
+    gpu_memory_info(device).map(|info| (info.used_bytes, info.total_bytes))
 }
 
 fn grey(text: impl AsRef<str>) -> String {
@@ -96,18 +98,22 @@ fn yellow(text: impl AsRef<str>) -> String {
 }
 
 fn print_help() {
-    println!("{} {}", grey("Commands:"), "/help /history /clear /stats /exit");
+    println!(
+        "{} {}",
+        grey("Commands:"),
+        "/help /history /clear /stats /exit"
+    );
 }
 
 fn main() -> Result<()> {
-    let model_path = model_path();
+    let model_path = model_path()?;
     let model_type = model_type();
     let (device, dtype) = pick_device_dtype();
     let config = ChatConfig {
         common: CommonConfig {
             model_path: model_path.clone(),
             model_type,
-            device,
+            device: device.clone(),
             dtype,
             max_memory: None,
         },
@@ -122,11 +128,11 @@ fn main() -> Result<()> {
     };
 
     println!("{} {}", grey("Loading model from"), model_path);
-    let gpu_before = gpu_mem_usage();
+    let gpu_before = gpu_mem_usage(&device);
     let load_started_at = Instant::now();
     let mut chat_client = ChatClient::new(config).context("create chat client")?;
     let load_elapsed = load_started_at.elapsed().max(chat_client.load_duration());
-    let gpu_after = gpu_mem_usage();
+    let gpu_after = gpu_mem_usage(&chat_client.config().common.device);
 
     println!("{} {:.2}s", grey("Loaded in"), load_elapsed.as_secs_f64());
     println!(
@@ -185,7 +191,13 @@ fn main() -> Result<()> {
             }
             "/stats" => {
                 let turns = chat_client.get_history().len() / 2;
-                println!("{} {} | {} {}", grey("Turns:"), turns, grey("messages:"), chat_client.get_history().len());
+                println!(
+                    "{} {} | {} {}",
+                    grey("Turns:"),
+                    turns,
+                    grey("messages:"),
+                    chat_client.get_history().len()
+                );
                 continue;
             }
             _ => {}

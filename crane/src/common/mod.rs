@@ -3,4 +3,4 @@
 pub mod config;
 pub mod error;
 
-pub use error::{CraneResult, CraneError};
+pub use error::{CraneError, CraneResult};

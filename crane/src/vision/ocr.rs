@@ -1,6 +1,6 @@
 use crate::common::{
-    CraneError, CraneResult,
     config::{CommonConfig, DataType, DeviceConfig},
+    CraneError, CraneResult,
 };
 use crane_core::models::paddleocr_vl::{OcrTask, PaddleOcrVL};
 use ribo::utils::log::info;
