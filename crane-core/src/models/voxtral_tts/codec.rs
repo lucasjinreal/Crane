@@ -477,8 +477,7 @@ impl CodecDecoder {
         )?;
 
         let n_stages = cfg.decoder_transformer_lengths.len();
-        if cfg.decoder_convs_kernels.len() < n_stages
-            || cfg.decoder_convs_strides.len() < n_stages
+        if cfg.decoder_convs_kernels.len() < n_stages || cfg.decoder_convs_strides.len() < n_stages
         {
             candle_core::bail!(
                 "decoder_convs_kernels/strides must have at least {n_stages} entries, \

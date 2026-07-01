@@ -28,6 +28,7 @@ pub enum ModelType {
     Qwen3,
     Qwen3_5,
     Qwen3TTS,
+    VoxtralTTS,
     PaddleOcrVl,
 }
 
@@ -41,6 +42,7 @@ impl ModelType {
             "qwen3" => Self::Qwen3,
             "qwen3_5" | "qwen3.5" | "qwen35" | "qwen3_5_dense" => Self::Qwen3_5,
             "qwen3_tts" | "qwen3tts" | "qwen3-tts" | "tts" => Self::Qwen3TTS,
+            "voxtral_tts" | "voxtral-tts" | "voxtral" | "voxtral_4b" => Self::VoxtralTTS,
             "paddleocr_vl" | "paddleocrv" | "paddleocr" | "paddle_ocr_vl" | "paddleocrvl" => Self::PaddleOcrVl,
             _ => Self::Auto,
         }
@@ -56,6 +58,7 @@ impl ModelType {
             Self::Qwen3 => "qwen3",
             Self::Qwen3_5 => "qwen3_5",
             Self::Qwen3TTS => "qwen3_tts",
+            Self::VoxtralTTS => "voxtral_tts",
             Self::PaddleOcrVl => "paddleocr_vl",
         }
     }
@@ -67,7 +70,7 @@ impl ModelType {
 
     /// Whether this model type is a TTS model.
     pub fn is_tts(&self) -> bool {
-        matches!(self, Self::Qwen3TTS)
+        matches!(self, Self::Qwen3TTS | Self::VoxtralTTS)
     }
 }
 
@@ -99,6 +102,12 @@ struct HfConfig {
     model_type: Option<String>,
     architectures: Option<Vec<String>>,
     vision_config: Option<serde_json::Value>,
+}
+
+/// Minimal subset of Mistral `params.json` for architecture detection.
+#[derive(Deserialize, Default)]
+struct MistralConfig {
+    model_type: Option<String>,
 }
 
 /// Auto-detect the model type from `config.json` in the model directory.
@@ -166,9 +175,29 @@ pub fn detect_model_type(model_path: &str) -> ModelType {
         }
     }
 
-    // 3. Heuristic: check the model path name
+    // 3. Check params.json (Mistral-style config, e.g. Voxtral)
+    let params_path = if path.is_file() {
+        path.parent().map(|p| p.join("params.json"))
+    } else {
+        Some(path.join("params.json"))
+    };
+    if let Some(params_path) = params_path {
+        if let Ok(data) = std::fs::read(&params_path) {
+            if let Ok(config) = serde_json::from_slice::<MistralConfig>(&data) {
+                if let Some(ref mt) = config.model_type {
+                    if mt == "voxtral_tts" {
+                        return ModelType::VoxtralTTS;
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Heuristic: check the model path name
     let path_lower = model_path.to_lowercase();
-    if path_lower.contains("paddleocr") {
+    if path_lower.contains("voxtral") {
+        ModelType::VoxtralTTS
+    } else if path_lower.contains("paddleocr") {
         ModelType::PaddleOcrVl
     } else if path_lower.contains("gemma4") || path_lower.contains("gemma-4") {
         ModelType::Gemma4
@@ -241,6 +270,9 @@ pub fn create_backend(
         ModelType::Qwen3TTS => {
             anyhow::bail!("Qwen3-TTS is a TTS model — use create_tts_model() instead of create_backend()")
         }
+        ModelType::VoxtralTTS => {
+            anyhow::bail!("Voxtral-TTS is a TTS model — use create_voxtral_tts_model() instead of create_backend()")
+        }
         ModelType::Auto => unreachable!(),
     }
 }
@@ -290,6 +322,16 @@ pub fn create_tts_model(
     crane_core::models::qwen3_tts::Model::new(model_path, device, dtype)
 }
 
+/// Create a Voxtral TTS model for TTS inference.
+pub fn create_voxtral_tts_model(
+    model_path: &str,
+    device: &Device,
+    dtype: &DType,
+) -> Result<crane_core::models::voxtral_tts::Model> {
+    tracing::info!("Creating Voxtral-TTS model from: {}", model_path);
+    crane_core::models::voxtral_tts::Model::new(model_path, device, dtype)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,10 +357,26 @@ mod tests {
     }
 
     #[test]
+    fn model_type_from_str_voxtral_variants() {
+        assert_eq!(ModelType::from_str("voxtral_tts"), ModelType::VoxtralTTS);
+        assert_eq!(ModelType::from_str("voxtral-tts"), ModelType::VoxtralTTS);
+        assert_eq!(ModelType::from_str("voxtral"), ModelType::VoxtralTTS);
+        assert_eq!(ModelType::from_str("voxtral_4b"), ModelType::VoxtralTTS);
+        assert_eq!(ModelType::from_str("VOXTRAL"), ModelType::VoxtralTTS);
+    }
+
+    #[test]
     fn model_type_from_str_auto_fallback() {
         assert_eq!(ModelType::from_str("auto"), ModelType::Auto);
         assert_eq!(ModelType::from_str("unknown"), ModelType::Auto);
         assert_eq!(ModelType::from_str(""), ModelType::Auto);
+    }
+
+    #[test]
+    fn model_type_is_tts() {
+        assert!(ModelType::Qwen3TTS.is_tts());
+        assert!(ModelType::VoxtralTTS.is_tts());
+        assert!(!ModelType::Qwen3.is_tts());
     }
 
     #[test]
@@ -415,6 +473,21 @@ mod tests {
     fn detect_path_heuristic_qwen2() {
         let result = detect_model_type("/models/Qwen2.5-7B-Instruct");
         assert_eq!(result, ModelType::Qwen25);
+    }
+
+    #[test]
+    fn detect_from_params_json_voxtral() {
+        let dir = tempfile::tempdir().unwrap();
+        let params = dir.path().join("params.json");
+        std::fs::write(&params, r#"{"model_type": "voxtral_tts"}"#).unwrap();
+        let result = detect_model_type(dir.path().to_str().unwrap());
+        assert_eq!(result, ModelType::VoxtralTTS);
+    }
+
+    #[test]
+    fn detect_path_heuristic_voxtral() {
+        let result = detect_model_type("/models/Voxtral-4B-TTS-2603");
+        assert_eq!(result, ModelType::VoxtralTTS);
     }
 
     #[test]

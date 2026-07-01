@@ -1,8 +1,8 @@
-//! TTS (Text-to-Speech) handlers for Qwen3-TTS.
+//! TTS (Text-to-Speech) handlers.
 //!
-//! These handlers bypass the continuous-batching engine and use Qwen3-TTS directly
-//! on a dedicated thread. The model generates speech from text input and returns
-//! audio bytes (WAV or raw PCM) to the client.
+//! These handlers bypass the continuous-batching engine and use TTS models
+//! (Qwen3-TTS, Voxtral TTS) directly on a dedicated thread. The model generates
+//! speech from text input and returns audio bytes (WAV or raw PCM) to the client.
 
 use std::sync::Arc;
 
@@ -59,7 +59,7 @@ pub async fn speech(
         None => {
             let (status, json) = make_error(
                 StatusCode::SERVICE_UNAVAILABLE,
-                "TTS model not loaded. Start the server with a Qwen3-TTS model to enable /v1/audio/speech.",
+                "TTS model not loaded. Start the server with a TTS model to enable /v1/audio/speech.",
             );
             return (status, json).into_response();
         }

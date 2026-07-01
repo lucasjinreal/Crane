@@ -1,12 +1,20 @@
-//! Voxtral TTS model configuration, tokenizer integration, and voice embedding loader.
+//! Voxtral TTS model configuration, tokenizer integration, voice embedding loader,
+//! and end-to-end speech generation.
 
 use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use candle_core::{DType, Device, Tensor};
+use candle_nn::VarBuilder;
+use hound::{SampleFormat, WavSpec, WavWriter};
 use serde::Deserialize;
 use tekken::Tekkenizer;
+
+use super::codec::CodecDecoder;
+use super::modeling::{
+    rename_voxtral_transformer_keys, AcousticTransformer, AudioCodebookEmbedding, VoxtralLlm,
+};
 
 // ── Token IDs ──────────────────────────────────────────────────────────────
 
@@ -313,6 +321,320 @@ pub fn load_tokenizer(model_dir: &Path) -> Result<Tekkenizer> {
     })
 }
 
+// ── End-to-end Model ──────────────────────────────────────────────────────
+
+/// End-to-end Voxtral TTS model.
+///
+/// Owns the LLM backbone, acoustic transformer, audio codebook embeddings,
+/// codec decoder, Tekken tokenizer, and pre-loaded voice embeddings. Call
+/// [`Model::generate_speech`] to go from text + voice name to a waveform tensor.
+pub struct Model {
+    llm: VoxtralLlm,
+    acoustic: AcousticTransformer,
+    codebook_embed: AudioCodebookEmbedding,
+    codec: CodecDecoder,
+    tokenizer: Tekkenizer,
+    voices: HashMap<String, Tensor>,
+    config: VoxtralConfig,
+    device: Device,
+    dtype: DType,
+}
+
+impl Model {
+    /// Load the complete Voxtral TTS model from a checkpoint directory.
+    ///
+    /// Expects:
+    /// - `params.json` — model configuration
+    /// - `tekken.json` — Tekken tokenizer
+    /// - `consolidated.safetensors` — all weights (LLM + acoustic TX + codec)
+    /// - `voice_embedding/*.pt` — pre-computed voice embeddings
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any required file is missing, weights are
+    /// incompatible, or tensor construction fails.
+    pub fn new(model_path: &str, device: &Device, dtype: &DType) -> Result<Self> {
+        let model_dir = Path::new(model_path);
+
+        let config = VoxtralConfig::from_model_dir(model_dir)?;
+        let tokenizer = load_tokenizer(model_dir)?;
+
+        let safetensors_path = model_dir.join("consolidated.safetensors");
+        anyhow::ensure!(
+            safetensors_path.exists(),
+            "consolidated.safetensors not found in {}",
+            model_dir.display()
+        );
+        let raw = candle_core::safetensors::load(&safetensors_path, device)
+            .with_context(|| format!("failed to load {}", safetensors_path.display()))?;
+        let renamed = rename_voxtral_transformer_keys(raw);
+        let vb = VarBuilder::from_tensors(renamed, *dtype, device);
+
+        let llm = VoxtralLlm::new(&config, vb.clone(), device)
+            .map_err(|e| anyhow::anyhow!("failed to construct VoxtralLlm: {e}"))?;
+        let acoustic = AcousticTransformer::new(&config, vb.clone())
+            .map_err(|e| anyhow::anyhow!("failed to construct AcousticTransformer: {e}"))?;
+        let codebook_embed = AudioCodebookEmbedding::new(&config, vb.clone())
+            .map_err(|e| anyhow::anyhow!("failed to construct AudioCodebookEmbedding: {e}"))?;
+        let codec = CodecDecoder::new(
+            &config.multimodal.audio_tokenizer_args,
+            vb.pp("audio_tokenizer"),
+        )
+        .map_err(|e| anyhow::anyhow!("failed to construct CodecDecoder: {e}"))?;
+
+        let voice_dir = model_dir.join("voice_embedding");
+        let mut voices = HashMap::new();
+        for name in config.multimodal.audio_tokenizer_args.voice.keys() {
+            let pt_path = voice_dir.join(format!("{name}.pt"));
+            if pt_path.exists() {
+                let emb = load_voice_embedding(&pt_path, device)?;
+                voices.insert(name.clone(), emb);
+            }
+        }
+        anyhow::ensure!(
+            !voices.is_empty(),
+            "no voice embeddings found in {}",
+            voice_dir.display()
+        );
+
+        Ok(Self {
+            llm,
+            acoustic,
+            codebook_embed,
+            codec,
+            tokenizer,
+            voices,
+            config,
+            device: device.clone(),
+            dtype: *dtype,
+        })
+    }
+
+    /// Build prompt embeddings from segments and a voice embedding.
+    ///
+    /// Each `Token` segment is looked up in the LLM token embedding table;
+    /// `VoiceEmbeddings` is replaced by `voice_embed`. Returns a tensor of
+    /// shape `[1, seq_len, dim]`.
+    fn build_prompt_embeds(
+        &self,
+        segments: &[PromptSegment],
+        voice_embed: &Tensor,
+    ) -> Result<Tensor> {
+        let mut parts: Vec<Tensor> = Vec::with_capacity(segments.len());
+        for seg in segments {
+            match seg {
+                PromptSegment::Token(id) => {
+                    let id_tensor = Tensor::new(&[*id], &self.device)?;
+                    let emb = self
+                        .llm
+                        .embed_tokens(&id_tensor)
+                        .map_err(|e| anyhow::anyhow!("embed_tokens failed: {e}"))?
+                        .to_dtype(self.dtype)?;
+                    parts.push(emb);
+                }
+                PromptSegment::VoiceEmbeddings => {
+                    parts.push(voice_embed.clone());
+                }
+            }
+        }
+        Ok(Tensor::cat(&parts, 0)?.unsqueeze(0)?) // [1, seq, dim]
+    }
+
+    /// Generate speech from text using a named voice.
+    ///
+    /// `language`, `temperature`, `top_p`, and `repetition_penalty` are accepted
+    /// for API compatibility with the server's TTS interface but are not used —
+    /// Voxtral TTS always uses greedy decoding and language is implicit in the
+    /// text.
+    ///
+    /// Returns `(waveform, sample_rate)` where `waveform` has shape `[1, n_samples]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the voice is unknown, tokenization fails, or any
+    /// tensor operation fails during generation or decoding.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the model was constructed with no voice embeddings, which
+    /// cannot happen because [`Model::new`] ensures at least one voice exists.
+    #[allow(unused_variables, clippy::too_many_arguments)]
+    pub fn generate_speech(
+        &mut self,
+        text: &str,
+        language: &str,
+        voice: Option<&str>,
+        max_new_tokens: usize,
+        temperature: f64,
+        top_p: Option<f64>,
+        repetition_penalty: f32,
+    ) -> Result<(Tensor, u32)> {
+        self.llm.clear_kv_cache();
+
+        let voice_name = match voice {
+            Some(v) => v.to_string(),
+            None => self
+                .voices
+                .keys()
+                .next()
+                .expect("at least one voice")
+                .clone(),
+        };
+        let voice_embed = self
+            .voices
+            .get(&voice_name)
+            .ok_or_else(|| anyhow::anyhow!("unknown voice '{voice_name}'"))?
+            .to_dtype(self.dtype)?;
+
+        let token_ids = self
+            .tokenizer
+            .encode(text, false, false)
+            .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))?;
+        let segments = build_prompt_segments(&token_ids);
+
+        let prompt_embeds = self.build_prompt_embeds(&segments, &voice_embed)?;
+
+        let _prefill = self
+            .llm
+            .forward(&prompt_embeds, 0)
+            .map_err(|e| anyhow::anyhow!("LLM prefill failed: {e}"))?;
+        let prompt_len = prompt_embeds.dim(1)?;
+
+        // Feed the initial AUDIO_TOKEN embedding
+        let audio_token_id = Tensor::new(&[AUDIO_TOKEN], &self.device)?;
+        let mut next_input = self
+            .llm
+            .embed_tokens(&audio_token_id)
+            .map_err(|e| anyhow::anyhow!("audio token embed failed: {e}"))?
+            .to_dtype(self.dtype)?
+            .unsqueeze(0)?; // [1, 1, dim]
+
+        let n_codebooks = 1 + self.config.multimodal.audio_model_args.n_acoustic_codebook;
+        let mut all_codes: Vec<Vec<u32>> = Vec::new();
+
+        for frame_idx in 0..max_new_tokens {
+            let start_pos = prompt_len + frame_idx;
+            let h = self
+                .llm
+                .forward(&next_input, start_pos)
+                .map_err(|e| anyhow::anyhow!("LLM decode step failed: {e}"))?;
+
+            let h_squeezed = h.squeeze(0)?.squeeze(0)?; // [dim]
+
+            let semantic_code = self
+                .acoustic
+                .predict_semantic_code(&h_squeezed)
+                .map_err(|e| anyhow::anyhow!("predict_semantic_code failed: {e}"))?;
+
+            if semantic_code == END_AUDIO_CODE {
+                break;
+            }
+
+            let acoustic_codes = self
+                .acoustic
+                .flow_match_inference(&h_squeezed)
+                .map_err(|e| anyhow::anyhow!("flow_match_inference failed: {e}"))?;
+            let acoustic_vec: Vec<u32> = acoustic_codes.to_vec1()?;
+
+            let mut frame_codes = Vec::with_capacity(n_codebooks);
+            frame_codes.push(semantic_code);
+            frame_codes.extend_from_slice(&acoustic_vec);
+            let codes_tensor =
+                Tensor::new(frame_codes.as_slice(), &self.device)?.to_dtype(DType::U32)?;
+            all_codes.push(frame_codes);
+            let summed_embed = self
+                .codebook_embed
+                .forward(&codes_tensor)
+                .map_err(|e| anyhow::anyhow!("codebook embed failed: {e}"))?
+                .to_dtype(self.dtype)?
+                .unsqueeze(0)?
+                .unsqueeze(0)?; // [1, 1, dim]
+            next_input = summed_embed;
+        }
+
+        anyhow::ensure!(!all_codes.is_empty(), "no speech frames generated");
+
+        let n_frames = all_codes.len();
+        #[allow(clippy::cast_precision_loss)] // codes are small integers (semantic <= 8191, acoustic <= 20)
+        let flat: Vec<f32> = all_codes
+            .iter()
+            .flat_map(|f| f.iter().copied().map(|c| c as f32))
+            .collect();
+        let codes_for_codec =
+            Tensor::new(flat.as_slice(), &self.device)?.reshape((1, n_frames, n_codebooks))?;
+
+        let waveform = self
+            .codec
+            .decode(&codes_for_codec)
+            .map_err(|e| anyhow::anyhow!("codec decode failed: {e}"))?;
+
+        Ok((waveform, self.sample_rate()))
+    }
+
+    /// Generate speech and write to a WAV file.
+    ///
+    /// Returns the output file path on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if generation or WAV writing fails.
+    pub fn generate_speech_to_file(
+        &mut self,
+        text: &str,
+        voice: Option<&str>,
+        max_new_tokens: usize,
+        output_path: &str,
+    ) -> Result<String> {
+        let (audio, sr) =
+            self.generate_speech(text, "auto", voice, max_new_tokens, 0.0, None, 0.0)?;
+        Self::save_wav(&audio, output_path, sr)
+    }
+
+    /// Write a waveform tensor to a 16-bit PCM WAV file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the tensor cannot be converted or the file cannot be
+    /// written.
+    pub fn save_wav(audio: &Tensor, path: &str, sample_rate: u32) -> Result<String> {
+        let audio_f32 = audio.to_dtype(DType::F32)?.flatten_all()?;
+        let samples: Vec<f32> = audio_f32.to_vec1()?;
+
+        let spec = WavSpec {
+            channels: 1,
+            sample_rate,
+            bits_per_sample: 16,
+            sample_format: SampleFormat::Int,
+        };
+        let mut writer = WavWriter::create(path, spec)?;
+        for &s in &samples {
+            #[allow(clippy::cast_possible_truncation)] // value is clamped to i16 range
+            let s16 = (s * 32767.0).clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16;
+            writer.write_sample(s16)?;
+        }
+        writer.finalize()?;
+        Ok(path.to_string())
+    }
+
+    /// List the names of available voices.
+    #[must_use]
+    pub fn available_voices(&self) -> Vec<&str> {
+        self.voices.keys().map(String::as_str).collect()
+    }
+
+    /// Output sample rate in Hz (always 24 000 for Voxtral).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the configured sample rate exceeds `u32::MAX`, which cannot
+    /// happen with any real audio config.
+    #[must_use]
+    pub fn sample_rate(&self) -> u32 {
+        u32::try_from(self.config.multimodal.audio_tokenizer_args.sampling_rate)
+            .expect("sample rate fits u32")
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -509,5 +831,21 @@ mod tests {
                 .expect("voice embedding should load");
         assert_eq!(emb.dims()[1], EMBED_DIM);
         assert_eq!(emb.dtype(), DType::BF16);
+    }
+
+    #[test]
+    fn test_model_new_missing_dir() {
+        let result = Model::new("/nonexistent/voxtral/path", &Device::Cpu, &DType::F32);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[ignore = "requires checkpoint dir (set VOXTRAL_CHECKPOINT_DIR or place at checkpoints/Voxtral-4B-TTS-2603)"]
+    fn test_model_load_real() {
+        let dir = checkpoint_path().expect("checkpoint not found");
+        let model = Model::new(dir.to_str().unwrap(), &Device::Cpu, &DType::BF16)
+            .expect("model should load");
+        assert!(!model.available_voices().is_empty());
+        assert_eq!(model.sample_rate(), 24000);
     }
 }

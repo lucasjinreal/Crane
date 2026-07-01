@@ -117,6 +117,87 @@ pub async fn cli_main() -> Result<()> {
     run(Args::parse()).await
 }
 
+fn encode_tts_audio(
+    audio: &candle_core::Tensor,
+    sr: u32,
+    format: &openai_api::AudioResponseFormat,
+) -> Result<handlers::tts::TtsResult, String> {
+    let audio_f32 = audio
+        .to_dtype(candle_core::DType::F32)
+        .map_err(|e| e.to_string())?
+        .flatten_all()
+        .map_err(|e| e.to_string())?;
+    let samples = audio_f32.to_vec1::<f32>().map_err(|e| e.to_string())?;
+    tracing::info!("TTS writing {} samples", samples.len());
+    match format {
+        openai_api::AudioResponseFormat::Wav => {
+            let mut wav_buf = std::io::Cursor::new(Vec::new());
+            {
+                let spec = hound::WavSpec {
+                    channels: 1,
+                    sample_rate: sr,
+                    bits_per_sample: 16,
+                    sample_format: hound::SampleFormat::Int,
+                };
+                let mut writer =
+                    hound::WavWriter::new(&mut wav_buf, spec).map_err(|e| e.to_string())?;
+                for &s in &samples {
+                    #[allow(clippy::cast_possible_truncation)] // value is clamped to i16 range
+                    let s16 = (s * 32767.0).clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16;
+                    writer.write_sample(s16).map_err(|e| e.to_string())?;
+                }
+                writer.finalize().map_err(|e| e.to_string())?;
+            }
+            Ok(handlers::tts::TtsResult {
+                audio_bytes: wav_buf.into_inner(),
+                content_type: "audio/wav",
+                file_name: "speech.wav".to_string(),
+                sample_rate: sr,
+            })
+        }
+        openai_api::AudioResponseFormat::Pcm => {
+            let mut pcm = Vec::with_capacity(samples.len() * 2);
+            for &s in &samples {
+                #[allow(clippy::cast_possible_truncation)] // value is clamped to i16 range
+                let s16 = (s * 32767.0).clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16;
+                pcm.extend_from_slice(&s16.to_le_bytes());
+            }
+            Ok(handlers::tts::TtsResult {
+                audio_bytes: pcm,
+                content_type: "audio/pcm",
+                file_name: "speech.pcm".to_string(),
+                sample_rate: sr,
+            })
+        }
+        other => Err(format!(
+            "Unsupported response_format '{other:?}'. Supported: wav, pcm"
+        )),
+    }
+}
+
+fn run_tts_loop<F>(
+    mut tts_rx: tokio::sync::mpsc::UnboundedReceiver<TtsGenerateRequest>,
+    model_name: &str,
+    mut generate: F,
+) where
+    F: FnMut(&TtsGenerateRequest) -> Result<(candle_core::Tensor, u32), String>,
+{
+    info!("{model_name} engine thread started");
+    while let Some(req) = tts_rx.blocking_recv() {
+        let result = generate(&req)
+            .and_then(|(audio, sr)| encode_tts_audio(&audio, sr, &req.response_format));
+        if let Err(ref e) = result {
+            tracing::error!(
+                "TTS generation failed: {e} (language={}, voice={:?}, input_len={})",
+                req.language,
+                req.voice,
+                req.input.chars().count()
+            );
+        }
+        let _ = req.tx.send(result);
+    }
+}
+
 pub async fn run(args: Args) -> Result<()> {
     info!("Loading model from: {}", args.model_path);
 
@@ -190,7 +271,7 @@ pub async fn run(args: Args) -> Result<()> {
         Option<tokio::sync::mpsc::UnboundedSender<Gemma4VlmRequest>>,
         Option<tokio::sync::mpsc::UnboundedSender<TtsGenerateRequest>>,
     ) = if is_tts {
-        info!("Loading TTS model (Qwen3-TTS) from: {}", args.model_path);
+        info!("Loading TTS model ({:?}) from: {}", resolved_type, args.model_path);
         let model_path_clone = args.model_path.clone();
         let use_cpu = args.cpu || {
             #[cfg(feature = "cuda")]
@@ -204,63 +285,98 @@ pub async fn run(args: Args) -> Result<()> {
         };
         let tts_device = if use_cpu { crane_core::models::Device::Cpu } else { device.clone() };
         let tts_dtype = dtype;
-        let (tts_tx, mut tts_rx) = tokio::sync::mpsc::unbounded_channel::<TtsGenerateRequest>();
-        std::thread::Builder::new().name("tts-engine".into()).spawn(move || {
-            let mut tts = match engine::model_factory::create_tts_model(&model_path_clone, &tts_device, &tts_dtype) {
-                Ok(m) => m,
-                Err(e) => {
-                    tracing::error!("Failed to load TTS model: {e}");
-                    return;
-                }
-            };
-            info!("TTS engine thread started");
-            while let Some(req) = tts_rx.blocking_recv() {
-                let result = (|| -> Result<handlers::tts::TtsResult, String> {
-                    let (audio, sr) = if let Some(ref ref_audio_path) = req.reference_audio {
-                        let ref_text = req.reference_text.as_deref().unwrap_or("");
-                        tracing::info!("TTS voice-clone mode: ref_audio={}, ref_text_len={}", ref_audio_path, ref_text.len());
-                        tts.generate_voice_clone(&req.input, &req.language, ref_audio_path, ref_text, req.max_tokens, req.temperature, req.top_p, req.repetition_penalty).map_err(|e| e.to_string())?
-                    } else {
-                        tts.generate_speech(&req.input, &req.language, req.voice.as_deref(), req.max_tokens, req.temperature, req.top_p, req.repetition_penalty).map_err(|e| e.to_string())?
+        let (tts_tx, tts_rx) = tokio::sync::mpsc::unbounded_channel::<TtsGenerateRequest>();
+        if resolved_type == engine::model_factory::ModelType::VoxtralTTS {
+            std::thread::Builder::new()
+                .name("tts-engine".into())
+                .spawn(move || {
+                    let mut tts = match engine::model_factory::create_voxtral_tts_model(
+                        &model_path_clone,
+                        &tts_device,
+                        &tts_dtype,
+                    ) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            tracing::error!("Failed to load Voxtral TTS model: {e}");
+                            return;
+                        }
                     };
-                    tracing::info!("TTS audio tensor shape: {:?}, sr={sr}", audio.dims());
-                    let audio_f32 = audio.to_dtype(candle_core::DType::F32).map_err(|e| e.to_string())?.flatten_all().map_err(|e| e.to_string())?;
-                    let samples = audio_f32.to_vec1::<f32>().map_err(|e| e.to_string())?;
-                    tracing::info!("TTS writing {} samples", samples.len());
-                    match req.response_format {
-                        openai_api::AudioResponseFormat::Wav => {
-                            let mut wav_buf = std::io::Cursor::new(Vec::new());
-                            {
-                                let spec = hound::WavSpec { channels: 1, sample_rate: sr, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
-                                let mut writer = hound::WavWriter::new(&mut wav_buf, spec).map_err(|e| e.to_string())?;
-                                for &s in &samples {
-                                    let s16 = (s * 32767.0).clamp(-32768.0, 32767.0) as i16;
-                                    writer.write_sample(s16).map_err(|e| e.to_string())?;
-                                }
-                                writer.finalize().map_err(|e| e.to_string())?;
-                            }
-                            Ok(handlers::tts::TtsResult { audio_bytes: wav_buf.into_inner(), content_type: "audio/wav", file_name: "speech.wav".to_string(), sample_rate: sr })
+                    run_tts_loop(tts_rx, "Voxtral TTS", |req| {
+                        if req.reference_audio.is_some() {
+                            return Err(
+                                "Voxtral TTS does not support voice cloning".to_string()
+                            );
                         }
-                        openai_api::AudioResponseFormat::Pcm => {
-                            let mut pcm = Vec::with_capacity(samples.len() * 2);
-                            for &s in &samples {
-                                let s16 = (s * 32767.0).clamp(-32768.0, 32767.0) as i16;
-                                pcm.extend_from_slice(&s16.to_le_bytes());
-                            }
-                            Ok(handlers::tts::TtsResult { audio_bytes: pcm, content_type: "audio/pcm", file_name: "speech.pcm".to_string(), sample_rate: sr })
+                        tts.generate_speech(
+                            &req.input,
+                            &req.language,
+                            req.voice.as_deref(),
+                            req.max_tokens,
+                            req.temperature,
+                            req.top_p,
+                            req.repetition_penalty,
+                        )
+                        .map_err(|e| e.to_string())
+                    });
+                })
+                .expect("Failed to spawn TTS thread");
+        } else {
+            std::thread::Builder::new()
+                .name("tts-engine".into())
+                .spawn(move || {
+                    let mut tts = match engine::model_factory::create_tts_model(
+                        &model_path_clone,
+                        &tts_device,
+                        &tts_dtype,
+                    ) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            tracing::error!("Failed to load TTS model: {e}");
+                            return;
                         }
-                        other => Err(format!("Unsupported response_format '{other:?}'. Supported: wav, pcm")),
-                    }
-                })();
-                if let Err(ref e) = result {
-                    tracing::error!("TTS generation failed: {e} (language={}, voice={:?}, input_len={})", req.language, req.voice, req.input.chars().count());
-                }
-                let _ = req.tx.send(result);
-            }
-        }).expect("Failed to spawn TTS thread");
+                    };
+                    run_tts_loop(tts_rx, "Qwen3 TTS", |req| {
+                        if let Some(ref ref_audio_path) = req.reference_audio {
+                            let ref_text = req.reference_text.as_deref().unwrap_or("");
+                            tracing::info!(
+                                "TTS voice-clone mode: ref_audio={}, ref_text_len={}",
+                                ref_audio_path,
+                                ref_text.len()
+                            );
+                            tts.generate_voice_clone(
+                                &req.input,
+                                &req.language,
+                                ref_audio_path,
+                                ref_text,
+                                req.max_tokens,
+                                req.temperature,
+                                req.top_p,
+                                req.repetition_penalty,
+                            )
+                            .map_err(|e| e.to_string())
+                        } else {
+                            tts.generate_speech(
+                                &req.input,
+                                &req.language,
+                                req.voice.as_deref(),
+                                req.max_tokens,
+                                req.temperature,
+                                req.top_p,
+                                req.repetition_penalty,
+                            )
+                            .map_err(|e| e.to_string())
+                        }
+                    });
+                })
+                .expect("Failed to spawn TTS thread");
+        }
         info!("TTS model routing established (type: {:?})", resolved_type);
-        let tokenizer = crane_core::utils::tokenizer_utils::load_tokenizer_from_model_dir(&args.model_path).map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
-        let eos_id = tokenizer.token_to_id("<|im_end|>").or_else(|| tokenizer.token_to_id("<|endoftext|>")) .unwrap_or(151645);
+        let tokenizer = crane_core::utils::tokenizer_utils::load_tokenizer_from_model_dir(&args.model_path)
+            .unwrap_or_else(|e| {
+                tracing::warn!("Failed to load HF tokenizer: {e}; creating stub for TTS-only mode");
+                tokenizers::Tokenizer::new(tokenizers::models::bpe::BPE::default())
+            });
+        let eos_id = tokenizer.token_to_id("<|im_end|>").or_else(|| tokenizer.token_to_id("<|endoftext|>")).unwrap_or(2);
         let chat_template = engine::model_factory::create_chat_template(model_type, &args.model_path);
         (None, tokenizer, vec![eos_id], chat_template, None, None, Some(tts_tx))
     } else if is_vlm {
