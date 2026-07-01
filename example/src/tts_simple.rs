@@ -89,10 +89,14 @@ fn run_voice_clone(model: &mut crane_core::models::qwen3_tts::Model, output_dir:
 
         let start = std::time::Instant::now();
         let output_path = format!("{output_dir}/{filename}");
+        let opts = crane_core::generation::SpeechOptions {
+            max_new_tokens: 2048,
+            temperature: 0.9,
+            top_p: Some(1.0),
+            repetition_penalty: 1.05,
+        };
         let saved_path = model.generate_voice_clone_to_file(
-            text, lang, ref_audio, ref_text,
-            2048, 0.9, Some(1.0), 1.05,
-            &output_path,
+            text, lang, ref_audio, ref_text, &opts, &output_path,
         )?;
         let elapsed = start.elapsed();
         println!("  Saved {saved_path} in {elapsed:.1?}");
@@ -121,9 +125,14 @@ fn run_custom_voice(model: &mut crane_core::models::qwen3_tts::Model, output_dir
 
         let start = std::time::Instant::now();
         let output_path = format!("{output_dir}/{filename}");
+        let opts = crane_core::generation::SpeechOptions {
+            max_new_tokens: 2048,
+            temperature: 0.9,
+            top_p: Some(1.0),
+            repetition_penalty: 1.05,
+        };
         let saved_path = model.generate_speech_to_file(
-            text, lang, speaker.as_deref(), 2048, 0.9, Some(1.0), 1.05,
-            &output_path,
+            text, lang, speaker.as_deref(), &opts, &output_path,
         )?;
         let elapsed = start.elapsed();
         println!("  Saved {saved_path} in {elapsed:.1?}");

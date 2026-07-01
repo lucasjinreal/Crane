@@ -11,6 +11,7 @@ use tokenizers::Tokenizer;
 
 use super::modeling::{Qwen3TTSConfig, Qwen3TTSModel};
 use super::speech_tokenizer_v2::NativeSpeechTokenizerDecoder;
+use crate::generation::SpeechOptions;
 use crate::utils::utils;
 
 // ── Speech Tokenizer decoders (codes → waveform) ───────────────────────
@@ -247,23 +248,12 @@ impl Model {
         text: &str,
         language: &str,
         speaker: Option<&str>,
-        max_new_tokens: usize,
-        temperature: f64,
-        top_p: Option<f64>,
-        repetition_penalty: f32,
+        opts: &SpeechOptions,
     ) -> Result<(Tensor, u32)> {
         self.validate_tts_generation_mode()?;
         let input_ids = self.prepare_tts_input(text)?;
 
-        let codes = self.inner.generate_speech_codes(
-            &input_ids,
-            language,
-            speaker,
-            max_new_tokens,
-            temperature,
-            top_p,
-            repetition_penalty,
-        )?;
+        let codes = self.inner.generate_speech_codes(&input_ids, language, speaker, opts)?;
 
         if codes.is_empty() {
             anyhow::bail!("No speech codes generated");
@@ -307,21 +297,10 @@ impl Model {
         text: &str,
         language: &str,
         speaker: Option<&str>,
-        max_new_tokens: usize,
-        temperature: f64,
-        top_p: Option<f64>,
-        repetition_penalty: f32,
+        opts: &SpeechOptions,
         output_path: &str,
     ) -> Result<String> {
-        let (audio, sr) = self.generate_speech(
-            text,
-            language,
-            speaker,
-            max_new_tokens,
-            temperature,
-            top_p,
-            repetition_penalty,
-        )?;
+        let (audio, sr) = self.generate_speech(text, language, speaker, opts)?;
         Self::save_wav(&audio, output_path, sr)
     }
 
@@ -332,23 +311,11 @@ impl Model {
         text: &str,
         language: &str,
         speaker: Option<&str>,
-        max_new_tokens: usize,
-        temperature: f64,
-        top_p: Option<f64>,
-        repetition_penalty: f32,
+        opts: &SpeechOptions,
     ) -> Result<Vec<Vec<u32>>> {
         self.validate_tts_generation_mode()?;
         let input_ids = self.prepare_tts_input(text)?;
-        let codes = self.inner.generate_speech_codes(
-            &input_ids,
-            language,
-            speaker,
-            max_new_tokens,
-            temperature,
-            top_p,
-            repetition_penalty,
-        )?;
-        Ok(codes)
+        Ok(self.inner.generate_speech_codes(&input_ids, language, speaker, opts)?)
     }
 
     /// Convert pre-generated codes to raw audio bytes (PCM 16-bit LE).
@@ -639,10 +606,7 @@ impl Model {
         language: &str,
         ref_audio_path: &str,
         ref_text: &str,
-        max_new_tokens: usize,
-        temperature: f64,
-        top_p: Option<f64>,
-        repetition_penalty: f32,
+        opts: &SpeechOptions,
     ) -> Result<(Tensor, u32)> {
         // 1. Validate model type
         match self.config.tts_model_type.as_deref().unwrap_or("base") {
@@ -734,10 +698,7 @@ impl Model {
             &ref_codes,
             &spk_embed,
             language,
-            max_new_tokens,
-            temperature,
-            top_p,
-            repetition_penalty,
+            opts,
         )?;
 
         if new_codes.is_empty() {
@@ -814,16 +775,10 @@ impl Model {
         language: &str,
         ref_audio_path: &str,
         ref_text: &str,
-        max_new_tokens: usize,
-        temperature: f64,
-        top_p: Option<f64>,
-        repetition_penalty: f32,
+        opts: &SpeechOptions,
         output_path: &str,
     ) -> Result<String> {
-        let (audio, sr) = self.generate_voice_clone(
-            text, language, ref_audio_path, ref_text,
-            max_new_tokens, temperature, top_p, repetition_penalty,
-        )?;
+        let (audio, sr) = self.generate_voice_clone(text, language, ref_audio_path, ref_text, opts)?;
         Self::save_wav(&audio, output_path, sr)
     }
 

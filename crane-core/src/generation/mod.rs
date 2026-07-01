@@ -1,6 +1,30 @@
 pub mod based;
 pub mod streamer;
 
+/// Generation options for TTS (text-to-speech) models.
+#[derive(Clone, Debug)]
+pub struct SpeechOptions {
+    /// Maximum number of codec frames to generate before stopping.
+    pub max_new_tokens: usize,
+    /// Sampling temperature; higher values increase randomness.
+    pub temperature: f64,
+    /// Nucleus sampling threshold; `None` disables top-p filtering.
+    pub top_p: Option<f64>,
+    /// Repetition penalty applied to previously generated tokens; `1.0` means no penalty.
+    pub repetition_penalty: f32,
+}
+
+impl Default for SpeechOptions {
+    fn default() -> Self {
+        Self {
+            max_new_tokens: 8192,
+            temperature: 0.9,
+            top_p: None,
+            repetition_penalty: 1.05,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct GenerationConfig {
     pub max_new_tokens: usize,

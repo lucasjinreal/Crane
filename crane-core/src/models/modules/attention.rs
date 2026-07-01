@@ -19,13 +19,25 @@ use candle_nn::VarBuilder;
 use crate::models::utils::repeat_kv;
 use crate::models::with_tracing::{linear_b, Linear, RmsNorm};
 
+/// Which rotary position embedding convention to apply in [`GqaAttention::forward`].
+#[derive(Debug, Clone, Copy)]
+pub enum RopeMode {
+    /// No rotary embeddings — `cos_sin` is ignored.
+    None,
+    /// Half-split rotation (`d` paired with `d + half_dim`). Used by
+    /// HuggingFace-converted checkpoints (Qwen2.5, Qwen3-TTS).
+    HalfSplit,
+    /// Interleaved rotation (`2d` paired with `2d + 1`). Required by
+    /// Mistral-native checkpoints such as Voxtral TTS.
+    Interleaved,
+}
+
 /// Configuration for [`GqaAttention`].
 ///
 /// All dimension and feature-flag information needed to construct the layer.
 /// Causality is enforced by the caller via `attention_mask`, not by the
 /// attention layer itself.
 #[allow(clippy::module_name_repetitions)]
-#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy)]
 pub struct AttentionConfig {
     /// Hidden dimension — input and output size of the attention layer.
@@ -40,10 +52,10 @@ pub struct AttentionConfig {
     pub qkv_bias: bool,
     /// Whether the output projection includes a bias term.
     pub o_bias: bool,
-    /// Whether to apply rotary position embeddings in [`GqaAttention::forward`].
-    ///
-    /// When `true`, the `cos_sin` argument to `forward` must be `Some`.
-    pub use_rope: bool,
+    /// Which rotary position embedding convention to apply. When set to any
+    /// variant other than [`RopeMode::None`], `cos_sin` must be `Some` in
+    /// [`GqaAttention::forward`].
+    pub rope_mode: RopeMode,
     /// Whether to apply per-head RMS normalization to Q and K after reshaping.
     pub use_qk_norm: bool,
     /// Epsilon for RMS normalizations. Used by QK-norm (when `use_qk_norm =
@@ -168,7 +180,8 @@ impl GqaAttention {
     /// * `cos_sin` — Pre-computed `RoPE` tables `(cos, sin)`, each of shape
     ///   `[seq_len, head_dim / 2]`. May be in any floating-point dtype; they are
     ///   cast to the query dtype internally so BF16/F16 models work without an
-    ///   explicit conversion by the caller. **Must be `Some` when `use_rope = true`.**
+    ///   explicit conversion by the caller. **Must be `Some` when `rope_mode !=
+    ///   RopeMode::None`.**
     /// * `attention_mask` — Optional additive mask broadcastable to
     ///   `[batch, n_heads, q_seq_len, kv_seq_len]`. Set blocked positions to
     ///   `f32::NEG_INFINITY` (or a sufficiently large negative value) to prevent
@@ -180,8 +193,8 @@ impl GqaAttention {
     ///
     /// # Errors
     ///
-    /// Returns a candle error if `cos_sin` is `None` but `use_rope = true` was set
-    /// at construction time, or if any tensor operation fails.
+    /// Returns a candle error if `cos_sin` is `None` but `rope_mode` is not
+    /// `RopeMode::None`, or if any tensor operation fails.
     #[allow(clippy::cast_precision_loss)]
     pub fn forward(
         &mut self,
@@ -218,18 +231,30 @@ impl GqaAttention {
         };
 
         // 4. Optional RoPE — cast cos/sin to Q dtype for BF16/F16 models
-        let (q, k) = if self.cfg.use_rope {
-            let Some((cos, sin)) = cos_sin else {
-                candle_core::bail!("`cos_sin` must be `Some` when `use_rope = true`")
-            };
-            let cos = cos.to_dtype(q.dtype())?;
-            let sin = sin.to_dtype(q.dtype())?;
-            (
-                candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?,
-                candle_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?,
-            )
-        } else {
-            (q, k)
+        let (q, k) = match self.cfg.rope_mode {
+            RopeMode::None => (q, k),
+            mode => {
+                let Some((cos, sin)) = cos_sin else {
+                    candle_core::bail!(
+                        "`cos_sin` must be `Some` when `rope_mode` is not `RopeMode::None`"
+                    )
+                };
+                let cos = cos.to_dtype(q.dtype())?;
+                let sin = sin.to_dtype(q.dtype())?;
+                let rope_fn: fn(
+                    &Tensor,
+                    &Tensor,
+                    &Tensor,
+                ) -> candle_core::Result<Tensor> = match mode {
+                    RopeMode::HalfSplit => candle_nn::rotary_emb::rope,
+                    RopeMode::Interleaved => candle_nn::rotary_emb::rope_i,
+                    RopeMode::None => unreachable!(),
+                };
+                (
+                    rope_fn(&q.contiguous()?, &cos, &sin)?,
+                    rope_fn(&k.contiguous()?, &cos, &sin)?,
+                )
+            }
         };
 
         // 5. KV cache: concat new K/V with cached K/V along the sequence dim
@@ -292,7 +317,7 @@ mod tests {
             head_dim: 4,
             qkv_bias: false,
             o_bias: false,
-            use_rope: false,
+            rope_mode: RopeMode::None,
             use_qk_norm: false,
             norm_eps: 1e-6,
         }
@@ -601,7 +626,7 @@ mod tests {
     #[test]
     fn test_rope_enabled_output_shape() {
         let cfg = AttentionConfig {
-            use_rope: true,
+            rope_mode: RopeMode::HalfSplit,
             ..base_cfg()
         };
         let mut attn = zeros_attn(cfg);
@@ -614,9 +639,24 @@ mod tests {
     }
 
     #[test]
+    fn test_interleaved_rope_output_shape() {
+        let cfg = AttentionConfig {
+            rope_mode: RopeMode::Interleaved,
+            ..base_cfg()
+        };
+        let mut attn = zeros_attn(cfg);
+        let x = Tensor::zeros((1, 3, 16), DType::F32, &Device::Cpu).expect("zeros");
+        let (cos, sin) = identity_cos_sin(3, cfg.head_dim / 2);
+        let y = attn
+            .forward(&x, Some((&cos, &sin)), None)
+            .expect("forward with interleaved rope");
+        assert_eq!(y.dims(), &[1, 3, 16]);
+    }
+
+    #[test]
     fn test_rope_disabled_accepts_none_cos_sin() {
         let cfg = AttentionConfig {
-            use_rope: false,
+            rope_mode: RopeMode::None,
             ..base_cfg()
         };
         let mut attn = zeros_attn(cfg);
@@ -627,10 +667,9 @@ mod tests {
 
     #[test]
     fn test_rope_disabled_ignores_cos_sin() {
-        // When use_rope=false, the cos_sin argument is silently ignored regardless
-        // of whether it is Some or None. Callers may always pass cos_sin without
-        // branching on whether the layer uses RoPE.
-        let cfg = base_cfg(); // use_rope: false
+        // When rope_mode=None, cos_sin is silently ignored regardless of whether
+        // it is Some or None. Callers may always pass cos_sin without branching.
+        let cfg = base_cfg(); // rope_mode: RopeMode::None
         let vb1 = nonzero_vb(&cfg, 0.02);
         let vb2 = nonzero_vb(&cfg, 0.02);
 
@@ -647,21 +686,21 @@ mod tests {
 
         assert!(
             max_abs_diff(&y_none, &y_some) < 1e-6,
-            "cos_sin must be silently ignored when use_rope=false"
+            "cos_sin must be silently ignored when rope_mode=None"
         );
     }
 
     #[test]
     fn test_rope_enabled_none_cos_sin_errors() {
         let cfg = AttentionConfig {
-            use_rope: true,
+            rope_mode: RopeMode::HalfSplit,
             ..base_cfg()
         };
         let mut attn = zeros_attn(cfg);
         let x = Tensor::zeros((1, 3, 16), DType::F32, &Device::Cpu).expect("zeros");
         assert!(
             attn.forward(&x, None, None).is_err(),
-            "use_rope=true with cos_sin=None must return an error"
+            "rope_mode != None with cos_sin=None must return an error"
         );
     }
 
@@ -670,7 +709,7 @@ mod tests {
         // cos=1, sin=0 is a no-op rotation, so RoPE at position 0 must not
         // change the output compared to the same model without RoPE.
         let cfg_rope = AttentionConfig {
-            use_rope: true,
+            rope_mode: RopeMode::HalfSplit,
             ..base_cfg()
         };
         let cfg_no_rope = base_cfg();
@@ -709,7 +748,7 @@ mod tests {
         // 2. Q/K must be non-zero (position-varying input ensures different per-token Q/K).
         let device = &Device::Cpu;
         let cfg_rope = AttentionConfig {
-            use_rope: true,
+            rope_mode: RopeMode::HalfSplit,
             ..base_cfg()
         };
         let cfg_no_rope = base_cfg();
