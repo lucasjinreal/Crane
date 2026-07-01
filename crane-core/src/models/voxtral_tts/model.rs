@@ -244,6 +244,7 @@ pub fn build_prompt_segments(text_token_ids: &[u32]) -> Vec<PromptSegment> {
 /// Must equal `VoxtralConfig::dim` (3072). Intentionally not read from the
 /// config so that `load_voice_embedding` has no config dependency.
 const EMBED_DIM: usize = 3072;
+const SILENCE_THRESHOLD: f32 = 1e-8;
 
 /// Load a pre-computed voice embedding from a `PyTorch` `.pt` file.
 ///
@@ -441,6 +442,21 @@ impl Model {
         Ok(Tensor::cat(&parts, 0)?.unsqueeze(0)?) // [1, seq, dim]
     }
 
+    /// Scale `audio` so its peak absolute sample equals `target_peak`.
+    ///
+    /// The raw codec output is typically very quiet (< 0.15 peak).  This
+    /// normalization brings the output to a consistent volume independent of
+    /// the specific codes generated.  Silent audio (peak < [`SILENCE_THRESHOLD`])
+    /// is returned unchanged to avoid division by zero.
+    fn normalize_peak(audio: &Tensor, target_peak: f32) -> candle_core::Result<Tensor> {
+        let audio_f32 = audio.to_dtype(DType::F32)?;
+        let max_abs: f32 = audio_f32.abs()?.max_all()?.to_scalar()?;
+        if max_abs < SILENCE_THRESHOLD {
+            return Ok(audio_f32);
+        }
+        audio_f32.affine(f64::from(target_peak) / f64::from(max_abs), 0.0)
+    }
+
     /// Generate speech from text using a named voice.
     ///
     /// `language`, `temperature`, `top_p`, and `repetition_penalty` are accepted
@@ -565,6 +581,9 @@ impl Model {
             .codec
             .decode(&codes_for_codec)
             .map_err(|e| anyhow::anyhow!("codec decode failed: {e}"))?;
+
+        let waveform = Self::normalize_peak(&waveform, 0.95)
+            .map_err(|e| anyhow::anyhow!("peak normalization failed: {e}"))?;
 
         Ok((waveform, self.sample_rate()))
     }
@@ -834,6 +853,25 @@ mod tests {
                 .expect("voice embedding should load");
         assert_eq!(emb.dims()[1], EMBED_DIM);
         assert_eq!(emb.dtype(), DType::BF16);
+    }
+
+    #[test]
+    fn test_normalize_peak_scales_to_target() {
+        let data: Vec<f32> = vec![0.5, -0.3, 0.1];
+        let t = Tensor::new(data.as_slice(), &Device::Cpu).unwrap();
+        let out = Model::normalize_peak(&t, 0.95).unwrap();
+        let out_data = out.to_vec1::<f32>().unwrap();
+        let peak: f32 = out_data.iter().map(|x| x.abs()).fold(0.0_f32, f32::max);
+        assert!((peak - 0.95).abs() < 1e-6, "peak={peak}");
+    }
+
+    #[test]
+    fn test_normalize_peak_silent_unchanged() {
+        let data: Vec<f32> = vec![0.0, 0.0, 0.0];
+        let t = Tensor::new(data.as_slice(), &Device::Cpu).unwrap();
+        let out = Model::normalize_peak(&t, 0.95).unwrap();
+        let out_data = out.to_vec1::<f32>().unwrap();
+        assert!(out_data.iter().all(|&x| x == 0.0));
     }
 
     #[test]
