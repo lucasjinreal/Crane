@@ -49,20 +49,26 @@ use super::model::VoxtralConfig;
 pub fn rename_voxtral_transformer_keys(
     tensors: HashMap<String, Tensor>,
 ) -> HashMap<String, Tensor> {
+    const RENAMES: &[(&str, &str)] = &[
+        (".attention.wq.", ".self_attn.q_proj."),
+        (".attention.wk.", ".self_attn.k_proj."),
+        (".attention.wv.", ".self_attn.v_proj."),
+        (".attention.wo.", ".self_attn.o_proj."),
+        (".attention_norm.", ".input_layernorm."),
+        (".feed_forward.w1.", ".mlp.gate_proj."),
+        (".feed_forward.w2.", ".mlp.down_proj."),
+        (".feed_forward.w3.", ".mlp.up_proj."),
+        (".ffn_norm.", ".post_attention_layernorm."),
+    ];
     tensors
         .into_iter()
         .map(|(k, v)| {
             let new_k = if k.starts_with("layers.") || k.starts_with("acoustic_transformer.layers.")
             {
-                k.replace(".attention.wq.", ".self_attn.q_proj.")
-                    .replace(".attention.wk.", ".self_attn.k_proj.")
-                    .replace(".attention.wv.", ".self_attn.v_proj.")
-                    .replace(".attention.wo.", ".self_attn.o_proj.")
-                    .replace(".attention_norm.", ".input_layernorm.")
-                    .replace(".feed_forward.w1.", ".mlp.gate_proj.")
-                    .replace(".feed_forward.w2.", ".mlp.down_proj.")
-                    .replace(".feed_forward.w3.", ".mlp.up_proj.")
-                    .replace(".ffn_norm.", ".post_attention_layernorm.")
+                RENAMES
+                    .iter()
+                    .find_map(|(old, new)| k.contains(old).then(|| k.replace(old, new)))
+                    .unwrap_or(k)
             } else {
                 k
             };
@@ -348,7 +354,13 @@ impl AudioCodebookEmbedding {
         let global: Vec<u32> = local
             .iter()
             .zip(self.offsets.iter())
-            .map(|(c, o)| c + o)
+            .map(|(c, o)| {
+                debug_assert!(
+                    c.checked_add(*o).is_some(),
+                    "codebook code {c} + offset {o} overflows u32"
+                );
+                c + o
+            })
             .collect();
         let indices = Tensor::from_vec(global, self.n_codebooks, device)?;
 
@@ -554,22 +566,24 @@ impl AcousticTransformer {
         Tensor::from_vec(emb, self.dim, device)
     }
 
-    /// Predict the velocity for one Euler step of flow matching.
+    /// Predict conditioned and unconditional velocities for one Euler step.
     ///
-    /// Constructs a 3-token sequence (noise projection, time projection, LLM
-    /// projection), runs it through the 3 bidirectional transformer layers (no
-    /// `RoPE`, no mask), and reads the velocity from position 0.
+    /// Constructs a batched `[2, 3, dim]` input where row 0 uses the real LLM
+    /// hidden state (conditioned) and row 1 uses a zero vector (unconditional).
+    /// `tok0` (noise) and `tok1` (time) are shared and computed once. The single
+    /// forward pass replaces two sequential passes, halving transformer invocations.
     ///
-    /// The KV cache is cleared before each call since the transformer is
-    /// stateless across velocity predictions.
-    ///
-    /// `x_t` has shape `[n_acoustic]`. `llm_hidden` has shape `[dim]`.
-    /// Returns velocity of shape `[n_acoustic]`.
+    /// Returns `(v_cond, v_uncond)`, each of shape `[n_acoustic]`.
     ///
     /// # Errors
     ///
     /// Returns a candle error if any layer fails.
-    fn predict_velocity(&mut self, x_t: &Tensor, llm_hidden: &Tensor, t: f32) -> Result<Tensor> {
+    fn predict_velocity_cfg(
+        &mut self,
+        x_t: &Tensor,
+        llm_hidden: &Tensor,
+        t: f32,
+    ) -> Result<(Tensor, Tensor)> {
         for layer in &mut self.layers {
             layer.clear_kv_cache();
         }
@@ -577,7 +591,7 @@ impl AcousticTransformer {
         let device = x_t.device();
         let dtype = llm_hidden.dtype();
 
-        // Build 3 tokens (each [1, dim] for 2-D linear compat, then squeeze to [dim])
+        // Shared tokens (identical for both CFG passes)
         let tok0 = self
             .input_projection
             .forward(&x_t.unsqueeze(0)?)?
@@ -587,24 +601,36 @@ impl AcousticTransformer {
             .time_projection
             .forward(&time_emb.unsqueeze(0)?)?
             .squeeze(0)?; // [dim]
-        let tok2 = self
+
+        // Conditioning tokens: real hidden state vs. zeros
+        let tok2_cond = self
             .llm_projection
             .forward(&llm_hidden.unsqueeze(0)?)?
             .squeeze(0)?; // [dim]
+        let zeros = Tensor::zeros(self.dim, dtype, device)?;
+        let tok2_uncond = self
+            .llm_projection
+            .forward(&zeros.unsqueeze(0)?)?
+            .squeeze(0)?; // [dim]
 
-        // Stack to [1, 3, dim] for TransformerBlock
-        let mut h = Tensor::stack(&[&tok0, &tok1, &tok2], 0)?.unsqueeze(0)?;
+        // Batch both passes: [2, 3, dim]
+        // tok0 and tok1 appear in both rows by design — CFG requires the noise
+        // and time tokens to be identical across the conditioned/unconditioned passes.
+        let h_cond = Tensor::stack(&[&tok0, &tok1, &tok2_cond], 0)?;
+        let h_uncond = Tensor::stack(&[&tok0, &tok1, &tok2_uncond], 0)?;
+        let mut h = Tensor::stack(&[&h_cond, &h_uncond], 0)?;
 
         for layer in &mut self.layers {
             h = layer.forward(&h, None, None)?;
         }
 
-        // Extract position 0, norm, project to velocity [n_acoustic]
-        let pos0 = h.squeeze(0)?.i(0)?; // [dim]
+        // Extract position 0 from both batch items, norm, project to velocity
+        let pos0 = h.i((.., 0, ..))?; // [2, dim]
         let normed = self.norm.forward(&pos0)?;
-        self.acoustic_head
-            .forward(&normed.unsqueeze(0)?)?
-            .squeeze(0) // [n_acoustic]
+        let out = self.acoustic_head.forward(&normed)?; // [2, n_acoustic]
+        let v_cond = out.i(0)?; // [n_acoustic]
+        let v_uncond = out.i(1)?; // [n_acoustic]
+        Ok((v_cond, v_uncond))
     }
 
     /// Run flow-matching inference: 7 Euler steps with CFG (`alpha=1.2`).
@@ -626,16 +652,12 @@ impl AcousticTransformer {
         // Sample noise x ~ N(0, 1) in f32, then cast to model dtype
         let mut x = Tensor::randn(0f32, 1f32, self.n_acoustic, device)?.to_dtype(dtype)?;
 
-        // Unconditional (zero) hidden state for CFG unconditioned pass
-        let zeros = Tensor::zeros(self.dim, dtype, device)?;
-
         // 8 timesteps via linspace(0, 1, 8): t_step = step / FLOW_INTERVALS
         let dt = 1.0f32 / f32::from(FLOW_INTERVALS);
 
         for step in 0u8..FLOW_INTERVALS {
             let t = f32::from(step) * dt;
-            let v_cond = self.predict_velocity(&x, llm_hidden, t)?;
-            let v_uncond = self.predict_velocity(&x, &zeros, t)?;
+            let (v_cond, v_uncond) = self.predict_velocity_cfg(&x, llm_hidden, t)?;
             // CFG: v = alpha * v_cond + (1 - alpha) * v_uncond
             let v = (v_cond.affine(f64::from(CFG_ALPHA), 0.0)?
                 + v_uncond.affine(f64::from(1.0 - CFG_ALPHA), 0.0)?)?;
@@ -1160,15 +1182,16 @@ mod tests {
     }
 
     #[test]
-    fn test_predict_velocity_shape() {
+    fn test_predict_velocity_cfg_shape() {
         let cfg = tiny_config();
         let mut at = AcousticTransformer::new(&cfg, acoustic_vb(&cfg)).expect("new");
         let x_t = Tensor::zeros(at.n_acoustic, DType::F32, &Device::Cpu).expect("x_t");
         let h = Tensor::zeros(at.dim, DType::F32, &Device::Cpu).expect("h");
-        let v = at
-            .predict_velocity(&x_t, &h, 0.5)
-            .expect("predict_velocity");
-        assert_eq!(v.dims(), &[at.n_acoustic]);
+        let (v_cond, v_uncond) = at
+            .predict_velocity_cfg(&x_t, &h, 0.5)
+            .expect("predict_velocity_cfg");
+        assert_eq!(v_cond.dims(), &[at.n_acoustic]);
+        assert_eq!(v_uncond.dims(), &[at.n_acoustic]);
     }
 
     #[test]
