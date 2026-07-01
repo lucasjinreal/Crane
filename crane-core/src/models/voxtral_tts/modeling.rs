@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use candle_core::{DType, Device, IndexOp, Module, Result, Tensor};
 use candle_nn::{embedding, linear_no_bias, Activation, Embedding, Linear, VarBuilder};
 
-use crate::models::modules::attention::AttentionConfig;
+use crate::models::modules::attention::{AttentionConfig, RopeMode};
 use crate::models::modules::rotary::RotaryEmbedding;
 use crate::models::modules::transformer::TransformerBlock;
 use crate::models::with_tracing::RmsNorm;
@@ -156,7 +156,7 @@ impl VoxtralLlm {
             head_dim: cfg.head_dim,
             qkv_bias: false,
             o_bias: false,
-            use_rope: true,
+            rope_mode: RopeMode::Interleaved,
             use_qk_norm: false,
             norm_eps: cfg.norm_eps,
         };
@@ -443,7 +443,7 @@ impl AcousticTransformer {
             head_dim: ac.head_dim,
             qkv_bias: false,
             o_bias: false,
-            use_rope: false,
+            rope_mode: RopeMode::None,
             use_qk_norm: false,
             norm_eps: cfg.norm_eps,
         };

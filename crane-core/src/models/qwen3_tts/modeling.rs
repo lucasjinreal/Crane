@@ -17,7 +17,7 @@
 use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::{linear, linear_no_bias, Embedding, Linear, RmsNorm, VarBuilder};
 use crate::generation::SpeechOptions;
-use crate::models::modules::attention::AttentionConfig;
+use crate::models::modules::attention::{AttentionConfig, RopeMode};
 use crate::models::modules::rotary::RotaryEmbedding;
 use crate::models::modules::transformer::TransformerBlock;
 use serde::Deserialize;
@@ -296,7 +296,7 @@ impl CodePredictor {
                 head_dim: config.head_dim,
                 qkv_bias: config.attention_bias,
                 o_bias: config.attention_bias,
-                use_rope: true,
+                rope_mode: RopeMode::HalfSplit,
                 use_qk_norm: true,
                 norm_eps: config.rms_norm_eps,
             };
@@ -515,7 +515,7 @@ impl TalkerModel {
                 head_dim: config.head_dim,
                 qkv_bias: config.attention_bias,
                 o_bias: config.attention_bias,
-                use_rope: true,
+                rope_mode: RopeMode::HalfSplit,
                 use_qk_norm: true,
                 norm_eps: config.rms_norm_eps,
             };
