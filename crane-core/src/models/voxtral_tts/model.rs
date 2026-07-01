@@ -466,14 +466,18 @@ mod tests {
     // ── Integration tests (require local checkpoint, skipped in CI) ───────
 
     fn checkpoint_path() -> Option<std::path::PathBuf> {
-        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()?
-            .join("checkpoints/Voxtral-4B-TTS-2603");
+        let p = if let Ok(dir) = std::env::var("VOXTRAL_CHECKPOINT_DIR") {
+            std::path::PathBuf::from(dir)
+        } else {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()?
+                .join("checkpoints/Voxtral-4B-TTS-2603")
+        };
         p.is_dir().then_some(p)
     }
 
     #[test]
-    #[ignore = "requires local checkpoint at checkpoints/Voxtral-4B-TTS-2603"]
+    #[ignore = "requires checkpoint dir (set VOXTRAL_CHECKPOINT_DIR or place at checkpoints/Voxtral-4B-TTS-2603)"]
     fn test_config_parse_real() {
         let dir = checkpoint_path().expect("checkpoint not found");
         let cfg = VoxtralConfig::from_model_dir(&dir).expect("config should parse");
@@ -482,7 +486,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires local checkpoint at checkpoints/Voxtral-4B-TTS-2603"]
+    #[ignore = "requires checkpoint dir (set VOXTRAL_CHECKPOINT_DIR or place at checkpoints/Voxtral-4B-TTS-2603)"]
     fn test_tekken_encode_real() {
         let dir = checkpoint_path().expect("checkpoint not found");
         let tok = load_tokenizer(&dir).expect("tokenizer should load");
@@ -497,7 +501,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires local checkpoint at checkpoints/Voxtral-4B-TTS-2603"]
+    #[ignore = "requires checkpoint dir (set VOXTRAL_CHECKPOINT_DIR or place at checkpoints/Voxtral-4B-TTS-2603)"]
     fn test_voice_embedding_load_real() {
         let dir = checkpoint_path().expect("checkpoint not found");
         let emb =

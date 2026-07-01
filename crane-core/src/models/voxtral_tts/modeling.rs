@@ -1190,14 +1190,18 @@ mod tests {
     // ── Integration tests (require local checkpoint) ──────────────────────────
 
     fn checkpoint_path() -> Option<std::path::PathBuf> {
-        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()?
-            .join("checkpoints/Voxtral-4B-TTS-2603");
+        let p = if let Ok(dir) = std::env::var("VOXTRAL_CHECKPOINT_DIR") {
+            std::path::PathBuf::from(dir)
+        } else {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()?
+                .join("checkpoints/Voxtral-4B-TTS-2603")
+        };
         p.is_dir().then_some(p)
     }
 
     #[test]
-    #[ignore = "requires local checkpoint at checkpoints/Voxtral-4B-TTS-2603"]
+    #[ignore = "requires checkpoint dir (set VOXTRAL_CHECKPOINT_DIR or place at checkpoints/Voxtral-4B-TTS-2603)"]
     fn test_llm_load_real() {
         use super::super::model::VoxtralConfig;
         let Some(cp) = checkpoint_path() else {
@@ -1213,7 +1217,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires local checkpoint at checkpoints/Voxtral-4B-TTS-2603"]
+    #[ignore = "requires checkpoint dir (set VOXTRAL_CHECKPOINT_DIR or place at checkpoints/Voxtral-4B-TTS-2603)"]
     fn test_acoustic_transformer_load_real() {
         use super::super::model::VoxtralConfig;
         let Some(cp) = checkpoint_path() else {
@@ -1229,7 +1233,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires local checkpoint at checkpoints/Voxtral-4B-TTS-2603"]
+    #[ignore = "requires checkpoint dir (set VOXTRAL_CHECKPOINT_DIR or place at checkpoints/Voxtral-4B-TTS-2603)"]
     fn test_codebook_load_real() {
         use super::super::model::VoxtralConfig;
         let Some(cp) = checkpoint_path() else {
