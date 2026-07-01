@@ -307,14 +307,17 @@ pub async fn run(args: Args) -> Result<()> {
                                 "Voxtral TTS does not support voice cloning".to_string()
                             );
                         }
+                        let opts = crane_core::generation::SpeechOptions {
+                            max_new_tokens: req.max_tokens,
+                            temperature: req.temperature,
+                            top_p: req.top_p,
+                            repetition_penalty: req.repetition_penalty,
+                        };
                         tts.generate_speech(
                             &req.input,
                             &req.language,
                             req.voice.as_deref(),
-                            req.max_tokens,
-                            req.temperature,
-                            req.top_p,
-                            req.repetition_penalty,
+                            &opts,
                         )
                         .map_err(|e| e.to_string())
                     });
@@ -336,6 +339,12 @@ pub async fn run(args: Args) -> Result<()> {
                         }
                     };
                     run_tts_loop(tts_rx, "Qwen3 TTS", |req| {
+                        let opts = crane_core::generation::SpeechOptions {
+                            max_new_tokens: req.max_tokens,
+                            temperature: req.temperature,
+                            top_p: req.top_p,
+                            repetition_penalty: req.repetition_penalty,
+                        };
                         if let Some(ref ref_audio_path) = req.reference_audio {
                             let ref_text = req.reference_text.as_deref().unwrap_or("");
                             tracing::info!(
@@ -348,10 +357,7 @@ pub async fn run(args: Args) -> Result<()> {
                                 &req.language,
                                 ref_audio_path,
                                 ref_text,
-                                req.max_tokens,
-                                req.temperature,
-                                req.top_p,
-                                req.repetition_penalty,
+                                &opts,
                             )
                             .map_err(|e| e.to_string())
                         } else {
@@ -359,10 +365,7 @@ pub async fn run(args: Args) -> Result<()> {
                                 &req.input,
                                 &req.language,
                                 req.voice.as_deref(),
-                                req.max_tokens,
-                                req.temperature,
-                                req.top_p,
-                                req.repetition_penalty,
+                                &opts,
                             )
                             .map_err(|e| e.to_string())
                         }

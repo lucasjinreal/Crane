@@ -79,16 +79,14 @@ fn main() -> anyhow::Result<()> {
 
         let start = std::time::Instant::now();
         let output_path = format!("{output_dir}/{filename}");
+        let opts = crane_core::generation::SpeechOptions {
+            max_new_tokens: 2048,
+            temperature: 0.9,
+            top_p: Some(1.0),
+            repetition_penalty: 1.05,
+        };
         let saved_path = model.generate_voice_clone_to_file(
-            text,
-            lang,
-            ref_audio,
-            ref_text,
-            2048,      // max codec tokens
-            0.9,       // temperature
-            Some(1.0), // top_p (matching official Python default)
-            1.05,      // repetition_penalty (matching official Python default)
-            &output_path,
+            text, lang, ref_audio, ref_text, &opts, &output_path,
         )?;
         let elapsed = start.elapsed();
         println!("  Saved {saved_path} in {elapsed:.1?}");

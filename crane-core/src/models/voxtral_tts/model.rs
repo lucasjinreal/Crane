@@ -15,6 +15,7 @@ use super::codec::CodecDecoder;
 use super::modeling::{
     rename_voxtral_transformer_keys, AcousticTransformer, AudioCodebookEmbedding, VoxtralLlm,
 };
+use crate::generation::SpeechOptions;
 
 // ── Token IDs ──────────────────────────────────────────────────────────────
 
@@ -458,16 +459,13 @@ impl Model {
     ///
     /// Panics if the model was constructed with no voice embeddings, which
     /// cannot happen because [`Model::new`] ensures at least one voice exists.
-    #[allow(unused_variables, clippy::too_many_arguments)]
+    #[allow(unused_variables)]
     pub fn generate_speech(
         &mut self,
         text: &str,
         language: &str,
         voice: Option<&str>,
-        max_new_tokens: usize,
-        temperature: f64,
-        top_p: Option<f64>,
-        repetition_penalty: f32,
+        opts: &SpeechOptions,
     ) -> Result<(Tensor, u32)> {
         self.llm.clear_kv_cache();
 
@@ -512,7 +510,7 @@ impl Model {
         let n_codebooks = 1 + self.config.multimodal.audio_model_args.n_acoustic_codebook;
         let mut all_codes: Vec<Vec<u32>> = Vec::new();
 
-        for frame_idx in 0..max_new_tokens {
+        for frame_idx in 0..opts.max_new_tokens {
             let start_pos = prompt_len + frame_idx;
             let h = self
                 .llm
@@ -585,8 +583,13 @@ impl Model {
         max_new_tokens: usize,
         output_path: &str,
     ) -> Result<String> {
-        let (audio, sr) =
-            self.generate_speech(text, "auto", voice, max_new_tokens, 0.0, None, 0.0)?;
+        let opts = SpeechOptions {
+            max_new_tokens,
+            temperature: 0.0,
+            top_p: None,
+            repetition_penalty: 0.0,
+        };
+        let (audio, sr) = self.generate_speech(text, "auto", voice, &opts)?;
         Self::save_wav(&audio, output_path, sr)
     }
 
