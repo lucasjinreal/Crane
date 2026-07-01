@@ -521,7 +521,6 @@ impl AcousticTransformer {
     ///
     /// Returns a candle error if the linear forward or device-to-host copy fails.
     pub fn predict_semantic_code(&self, llm_hidden: &Tensor) -> Result<u32> {
-        // semantic_head expects 2-D input
         let logits = self
             .semantic_head
             .forward(&llm_hidden.unsqueeze(0)?)?
@@ -605,10 +604,7 @@ impl AcousticTransformer {
         for step in 0u8..FLOW_INTERVALS {
             let t = f32::from(step) * dt;
             let emb = self.compute_time_embedding(t, device)?.to_dtype(dtype)?;
-            let tok = self
-                .time_projection
-                .forward(&emb.unsqueeze(0)?)?
-                .squeeze(0)?;
+            let tok = self.time_projection.forward(&emb.unsqueeze(0)?)?.squeeze(0)?;
             time_tokens.push(tok);
         }
 
