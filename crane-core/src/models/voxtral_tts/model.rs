@@ -525,9 +525,10 @@ impl Model {
 
         let n_codebooks = 1 + self.config.multimodal.audio_model_args.n_acoustic_codebook;
         let mut all_codes: Vec<Vec<u32>> = Vec::new();
+        let mut frame_codes = Vec::with_capacity(n_codebooks);
 
         for frame_idx in 0..opts.max_new_tokens {
-            let h_squeezed = h_for_frame.squeeze(0)?.squeeze(0)?; // [dim]
+            let h_squeezed = h_for_frame.reshape(self.config.dim)?; // [1,1,dim] -> [dim]
 
             let semantic_code = self
                 .acoustic
@@ -544,14 +545,12 @@ impl Model {
                 .map_err(|e| anyhow::anyhow!("flow_match_inference failed: {e}"))?;
             let acoustic_vec: Vec<u32> = acoustic_codes.to_vec1()?;
 
-            let mut frame_codes = Vec::with_capacity(n_codebooks);
+            frame_codes.clear();
             frame_codes.push(semantic_code);
             frame_codes.extend_from_slice(&acoustic_vec);
-            let codes_tensor =
-                Tensor::new(frame_codes.as_slice(), &self.device)?.to_dtype(DType::U32)?;
-            all_codes.push(frame_codes);
 
             if frame_idx + 1 < opts.max_new_tokens {
+                let codes_tensor = Tensor::new(frame_codes.as_slice(), &self.device)?;
                 let summed_embed = self
                     .codebook_embed
                     .forward(&codes_tensor)
@@ -565,6 +564,7 @@ impl Model {
                     .forward(&summed_embed, start_pos)
                     .map_err(|e| anyhow::anyhow!("LLM decode step failed: {e}"))?;
             }
+            all_codes.push(frame_codes.clone());
         }
 
         anyhow::ensure!(!all_codes.is_empty(), "no speech frames generated");
