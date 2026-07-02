@@ -16,7 +16,8 @@
 
 use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::{linear, linear_no_bias, Embedding, Linear, RmsNorm, VarBuilder};
-use crate::models::modules::attention::AttentionConfig;
+use crate::generation::SpeechOptions;
+use crate::models::modules::attention::{AttentionConfig, RopeMode};
 use crate::models::modules::rotary::RotaryEmbedding;
 use crate::models::modules::transformer::TransformerBlock;
 use serde::Deserialize;
@@ -295,7 +296,7 @@ impl CodePredictor {
                 head_dim: config.head_dim,
                 qkv_bias: config.attention_bias,
                 o_bias: config.attention_bias,
-                use_rope: true,
+                rope_mode: RopeMode::HalfSplit,
                 use_qk_norm: true,
                 norm_eps: config.rms_norm_eps,
             };
@@ -514,7 +515,7 @@ impl TalkerModel {
                 head_dim: config.head_dim,
                 qkv_bias: config.attention_bias,
                 o_bias: config.attention_bias,
-                use_rope: true,
+                rope_mode: RopeMode::HalfSplit,
                 use_qk_norm: true,
                 norm_eps: config.rms_norm_eps,
             };
@@ -1298,10 +1299,7 @@ impl Qwen3TTSModel {
         text_token_ids: &[u32],
         language: &str,
         speaker: Option<&str>,
-        max_new_tokens: usize,
-        temperature: f64,
-        top_p: Option<f64>,
-        repetition_penalty: f32,
+        opts: &SpeechOptions,
     ) -> Result<Vec<Vec<u32>>> {
         self.clear_kv_cache();
 
@@ -1333,8 +1331,8 @@ impl Qwen3TTSModel {
                 42,
                 candle_transformers::generation::Sampling::TopKThenTopP {
                     k: 50,
-                    p: top_p.unwrap_or(1.0),
-                    temperature,
+                    p: opts.top_p.unwrap_or(1.0),
+                    temperature: opts.temperature,
                 },
             );
 
@@ -1360,18 +1358,18 @@ impl Qwen3TTSModel {
 
         let trailing_len = trailing_text_hidden.dim(1)?;
 
-        for step in 0..max_new_tokens {
+        for step in 0..opts.max_new_tokens {
             // Predict first codebook token
             let logits = self.talker.predict_first_code(&past_hidden)?
                 .squeeze(0)?.squeeze(0)?
                 .to_dtype(DType::F32)?;
 
             // Apply repetition penalty
-            let logits = if repetition_penalty != 1.0 && !all_codes.is_empty() {
+            let logits = if opts.repetition_penalty != 1.0 && !all_codes.is_empty() {
                 let recent: Vec<u32> = all_codes.iter().map(|c: &Vec<u32>| c[0]).collect();
                 candle_transformers::utils::apply_repeat_penalty(
                     &logits,
-                    repetition_penalty,
+                    opts.repetition_penalty,
                     &recent,
                 )?
             } else {
@@ -1398,8 +1396,8 @@ impl Qwen3TTSModel {
                 first_code,
                 &self.talker.codec_embedding,
                 &self.device,
-                temperature,
-                top_p,
+                opts.temperature,
+                opts.top_p,
             )?;
 
             let mut frame_codes = vec![first_code];
@@ -1437,11 +1435,11 @@ impl Qwen3TTSModel {
                 "[CRANE_TTS_DEBUG] generate_speech_codes: generated {} frames, max_new_tokens={}, \
                  trailing_text_len={}, top_p={}, temperature={}, repetition_penalty={}",
                 all_codes.len(),
-                max_new_tokens,
+                opts.max_new_tokens,
                 trailing_len,
-                top_p.unwrap_or(1.0),
-                temperature,
-                repetition_penalty,
+                opts.top_p.unwrap_or(1.0),
+                opts.temperature,
+                opts.repetition_penalty,
             );
             if let Some(first_frame) = all_codes.first() {
                 eprintln!(
@@ -1481,10 +1479,7 @@ impl Qwen3TTSModel {
         ref_codes: &Tensor,
         spk_embed: &Tensor,
         language: &str,
-        max_new_tokens: usize,
-        temperature: f64,
-        top_p: Option<f64>,
-        repetition_penalty: f32,
+        opts: &SpeechOptions,
     ) -> Result<(Vec<Vec<u32>>, usize)> {
         self.clear_kv_cache();
 
@@ -1496,8 +1491,8 @@ impl Qwen3TTSModel {
         const ICL_MIN_REP_PENALTY: f32 = 1.05;
         const ICL_MIN_FRAMES: usize = 75;
         const ICL_FRAMES_PER_TOKEN: usize = 6;
-        let repetition_penalty = repetition_penalty.max(ICL_MIN_REP_PENALTY);
-        let max_new_tokens = max_new_tokens
+        let repetition_penalty = opts.repetition_penalty.max(ICL_MIN_REP_PENALTY);
+        let max_new_tokens = opts.max_new_tokens
             .min(ICL_MIN_FRAMES.max(text_token_ids.len() * ICL_FRAMES_PER_TOKEN));
 
         // ── Phase 1: Build prefill (9 positions) ───────────────────────
@@ -1573,8 +1568,8 @@ impl Qwen3TTSModel {
                 42,
                 candle_transformers::generation::Sampling::TopKThenTopP {
                     k: 50,
-                    p: top_p.unwrap_or(1.0),
-                    temperature,
+                    p: opts.top_p.unwrap_or(1.0),
+                    temperature: opts.temperature,
                 },
             );
 
@@ -1669,8 +1664,8 @@ impl Qwen3TTSModel {
                 first_code,
                 &self.talker.codec_embedding,
                 &self.device,
-                temperature,
-                top_p,
+                opts.temperature,
+                opts.top_p,
             )?;
 
             let mut frame_codes = vec![first_code];

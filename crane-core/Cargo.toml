@@ -27,6 +27,10 @@ serde = "1.0.219"
 serde_json = { version = "1.0.140", features = ["preserve_order"] }
 tokenizers = "0.23.1"
 ribo = "0.1.3"
+base64 = "0.22"
+fancy-regex = "0.13"
+tekken-rs = "0.1.1"
+zip = "2"
 
 
 intel-mkl-src = { version = "0.8.1", optional = true }
@@ -65,5 +69,8 @@ mkl = [
 ]
 accelerate = ["candle-core/accelerate"]
 onnx = ["dep:candle-onnx"]
+[dev-dependencies]
+tempfile = "3"
+
 [build-dependencies]
 bindgen_cuda = { version = "0.1.6", optional = true }

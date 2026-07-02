@@ -109,7 +109,7 @@ impl TransformerBlock {
     ///
     /// * `hidden_states` — Input tensor of shape `[batch, seq_len, dim]`.
     /// * `cos_sin` — Pre-computed `RoPE` tables `(cos, sin)`. **Must be `Some` when
-    ///   `cfg.use_rope = true`.**
+    ///   `cfg.rope_mode != RopeMode::None`.**
     /// * `attention_mask` — Optional additive causal attention mask broadcastable to
     ///   `[batch, n_heads, q_seq_len, kv_seq_len]`.
     ///
@@ -119,8 +119,8 @@ impl TransformerBlock {
     ///
     /// # Errors
     ///
-    /// Returns a candle error if `cos_sin` is `None` but `cfg.use_rope = true`, or
-    /// if any tensor operation fails.
+    /// Returns a candle error if `cos_sin` is `None` but `cfg.rope_mode != RopeMode::None`,
+    /// or if any tensor operation fails.
     pub fn forward(
         &mut self,
         hidden_states: &Tensor,
@@ -157,6 +157,8 @@ mod tests {
     use candle_core::{DType, Device, Tensor};
     use candle_nn::VarBuilder;
 
+    use crate::models::modules::attention::RopeMode;
+
     // dim=16, 4 heads, head_dim=4, intermediate_size=32, no bias/rope/qk_norm.
     fn base_cfg() -> AttentionConfig {
         AttentionConfig {
@@ -166,7 +168,7 @@ mod tests {
             head_dim: 4,
             qkv_bias: false,
             o_bias: false,
-            use_rope: false,
+            rope_mode: RopeMode::None,
             use_qk_norm: false,
             norm_eps: 1e-6,
         }
@@ -323,7 +325,7 @@ mod tests {
 
     #[test]
     fn test_rope_disabled_accepts_none_cos_sin() {
-        let cfg = base_cfg(); // use_rope: false
+        let cfg = base_cfg(); // rope_mode: RopeMode::None
         let mut block = zeros_block(cfg, base_intermediate());
         let x = Tensor::zeros((1, 3, 16), DType::F32, &Device::Cpu).expect("zeros");
         let y = block.forward(&x, None, None).expect("forward without rope");
@@ -333,21 +335,21 @@ mod tests {
     #[test]
     fn test_rope_enabled_none_cos_sin_errors() {
         let cfg = AttentionConfig {
-            use_rope: true,
+            rope_mode: RopeMode::HalfSplit,
             ..base_cfg()
         };
         let mut block = zeros_block(cfg, base_intermediate());
         let x = Tensor::zeros((1, 3, 16), DType::F32, &Device::Cpu).expect("zeros");
         assert!(
             block.forward(&x, None, None).is_err(),
-            "use_rope=true with cos_sin=None must return an error"
+            "rope_mode != None with cos_sin=None must return an error"
         );
     }
 
     #[test]
     fn test_rope_enabled_output_shape() {
         let cfg = AttentionConfig {
-            use_rope: true,
+            rope_mode: RopeMode::HalfSplit,
             ..base_cfg()
         };
         let mut block = zeros_block(cfg, base_intermediate());

@@ -15,7 +15,7 @@
 //! - 🤗 [Qwen2 Model](https://huggingface.co/Qwen/Qwen2-7B)
 //!
 
-use crate::models::modules::attention::AttentionConfig;
+use crate::models::modules::attention::{AttentionConfig, RopeMode};
 use crate::models::modules::rotary::RotaryEmbedding;
 use crate::models::modules::transformer::TransformerBlock;
 use crate::models::with_tracing::{linear_no_bias, Linear, RmsNorm};
@@ -70,7 +70,7 @@ impl Model {
             head_dim,
             qkv_bias: true,
             o_bias: false,
-            use_rope: true,
+            rope_mode: RopeMode::HalfSplit,
             use_qk_norm: false,
             norm_eps: cfg.rms_norm_eps,
         };
