@@ -2,4 +2,6 @@ pub mod model;
 pub mod modeling;
 pub mod speech_tokenizer_v2;
 
-pub use model::*;
+pub use model::Model;
+#[cfg(feature = "onnx")]
+pub use model::SpeechTokenizerDecoder;
