@@ -692,7 +692,7 @@ impl Model {
         let ref_token_ids = ref_encoding.get_ids().to_vec();
 
         // 6. Generate codec codes (voice-clone mode)
-        let (new_codes, ref_code_len) = self.inner.generate_voice_clone_codes(
+        let (new_codes, _ref_code_len) = self.inner.generate_voice_clone_codes(
             &input_ids,
             &ref_token_ids,
             &ref_codes,
@@ -764,7 +764,6 @@ impl Model {
         }
         let audio = audio_full.narrow(2, cut, total_samples - cut)?;
 
-        let _ = ref_code_len;
         Ok((audio, speech_decoder.sample_rate()))
     }
 

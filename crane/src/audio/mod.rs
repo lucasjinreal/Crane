@@ -4,6 +4,7 @@
 mod asr;
 pub mod tts;
 mod tts_client;
+mod tts_qwen3;
 
 #[cfg(feature = "onnx")]
 pub use asr::AsrClient;
