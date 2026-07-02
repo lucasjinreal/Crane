@@ -512,7 +512,7 @@ impl Model {
         let mut frame_codes = Vec::with_capacity(n_codebooks);
 
         for frame_idx in 0..opts.max_new_tokens {
-            let h_squeezed = h_for_frame.reshape(self.config.dim)?; // [1,1,dim] -> [dim]
+            let h_squeezed = h_for_frame.reshape((self.config.dim,))?; // [1,1,dim] -> [dim]
 
             let semantic_code = self
                 .acoustic
@@ -581,17 +581,12 @@ impl Model {
     pub fn generate_speech_to_file(
         &mut self,
         text: &str,
+        language: &str,
         voice: Option<&str>,
-        max_new_tokens: usize,
+        opts: &SpeechOptions,
         output_path: &str,
     ) -> Result<String> {
-        let opts = SpeechOptions {
-            max_new_tokens,
-            temperature: 0.0,
-            top_p: None,
-            repetition_penalty: 0.0,
-        };
-        let (audio, sr) = self.generate_speech(text, "auto", voice, &opts)?;
+        let (audio, sr) = self.generate_speech(text, language, voice, opts)?;
         Self::save_wav(&audio, output_path, sr)
     }
 
