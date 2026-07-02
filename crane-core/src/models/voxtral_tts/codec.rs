@@ -451,6 +451,12 @@ pub struct CodecDecoder {
     semantic_dim: usize,
     acoustic_dim: usize,
     fsq_levels: usize,
+    /// Number of PCM samples produced per input frame.
+    ///
+    /// Equals `total_upsample × pretransform_patch_size`. For the standard
+    /// Voxtral codec (strides `[1,2,2,2]`, patch_size=240): `8 × 240 = 1920`
+    /// (80 ms at 24 kHz).
+    samples_per_frame: usize,
 }
 
 impl CodecDecoder {
@@ -537,6 +543,9 @@ impl CodecDecoder {
             vb.pp("output_proj"),
         )?;
 
+        let total_upsample: usize = cfg.decoder_convs_strides[1..n_stages].iter().product();
+        let samples_per_frame = total_upsample * cfg.pretransform_patch_size;
+
         Ok(Self {
             semantic_codebook,
             input_conv,
@@ -546,6 +555,7 @@ impl CodecDecoder {
             semantic_dim: cfg.semantic_dim,
             acoustic_dim: cfg.acoustic_dim,
             fsq_levels: cfg.acoustic_codebook_size,
+            samples_per_frame,
         })
     }
 
@@ -640,6 +650,80 @@ impl CodecDecoder {
         x.transpose(1, 2)?
             .contiguous()?
             .reshape((b, t_final * patch_size))
+    }
+
+    /// Number of PCM samples produced per input frame.
+    ///
+    /// For the standard Voxtral codec (strides `[1,2,2,2]`, patch_size=240)
+    /// this is `1920` (80 ms at 24 kHz).
+    #[must_use]
+    pub fn samples_per_frame(&self) -> usize {
+        self.samples_per_frame
+    }
+
+    /// Decode a chunk of frames, trimming the left-context prefix from the output.
+    ///
+    /// `chunk_codes` has shape `[B, context_frames + new_frames, 37]`.
+    /// Returns `[B, new_frames × samples_per_frame]` — only the audio for the
+    /// new frames, with the context portion trimmed.
+    ///
+    /// The context frames are decoded (for numerical correctness — causal
+    /// convolutions need left history) but their output samples are discarded.
+    /// With `context_frames ≥ 15` the output is numerically equivalent to
+    /// what a full-sequence decode would produce for the same frames.
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if `decode` fails or the tensor narrow fails.
+    pub fn decode_chunk(&self, chunk_codes: &Tensor, context_frames: usize) -> Result<Tensor> {
+        let wav = self.decode(chunk_codes)?;
+        if context_frames == 0 {
+            return Ok(wav);
+        }
+        let trim = context_frames * self.samples_per_frame;
+        let total = wav.dim(1)?;
+        if trim > total {
+            candle_core::bail!(
+                "context_frames ({context_frames}) × samples_per_frame ({}) = {trim} \
+                 exceeds decoded length ({total})",
+                self.samples_per_frame
+            );
+        }
+        wav.narrow(1, trim, total - trim)
+    }
+
+    /// Decode the full code sequence in overlapping chunks.
+    ///
+    /// Produces the same output as [`decode`](Self::decode) but decodes
+    /// `chunk_size` frames at a time, each with up to `left_context` frames
+    /// of overlap from the previous chunk. The overlap output is trimmed
+    /// before concatenation, matching the full-sequence decode result for
+    /// `left_context ≥ 15` (the codec's effective receptive field).
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if any chunk decode or concatenation fails.
+    pub fn chunked_decode(
+        &self,
+        codes: &Tensor,
+        chunk_size: usize,
+        left_context: usize,
+    ) -> Result<Tensor> {
+        if chunk_size == 0 {
+            return self.decode(codes);
+        }
+        let n_frames = codes.dim(1)?;
+        let mut parts: Vec<Tensor> = Vec::new();
+        let mut pos = 0usize;
+        while pos < n_frames {
+            let end = (pos + chunk_size).min(n_frames);
+            let ctx = pos.min(left_context);
+            let chunk = codes.narrow(1, pos - ctx, end - (pos - ctx))?;
+            let audio = self.decode_chunk(&chunk, ctx)?;
+            parts.push(audio);
+            pos = end;
+        }
+        Tensor::cat(&parts, 1)
     }
 }
 
@@ -825,6 +909,7 @@ mod tests {
             semantic_dim,
             acoustic_dim,
             fsq_levels: 21,
+            samples_per_frame: 1920,
         };
 
         let mut code_data = vec![0f32; n_frames * 37];
@@ -865,6 +950,291 @@ mod tests {
             conv: CandleConv1d::new(weight, Some(bias), config),
             left_pad: kernel - stride,
         })
+    }
+
+    fn dummy_causal_conv_transpose1d(
+        in_ch: usize,
+        out_ch: usize,
+        kernel: usize,
+        stride: usize,
+        dev: &Device,
+    ) -> Result<CausalConvTranspose1d> {
+        let weight = Tensor::randn(0f32, 0.01, (in_ch, out_ch, kernel), dev)?;
+        let bias = Tensor::zeros(out_ch, DType::F32, dev)?;
+        let config = ConvTranspose1dConfig {
+            stride,
+            ..Default::default()
+        };
+        Ok(CausalConvTranspose1d {
+            conv: CandleConvTranspose1d::new(weight, Some(bias), config),
+            right_trim: kernel - stride,
+        })
+    }
+
+    fn dummy_rms_norm(dim: usize, dev: &Device) -> Result<RmsNorm> {
+        use std::collections::HashMap;
+        let mut t: HashMap<String, Tensor> = HashMap::new();
+        t.insert("weight".to_string(), Tensor::ones(dim, DType::F32, dev)?);
+        RmsNorm::new(dim, 1e-6, VarBuilder::from_tensors(t, DType::F32, dev))
+    }
+
+    fn dummy_layer_scale(dim: usize, dev: &Device) -> Result<LayerScale> {
+        Ok(LayerScale {
+            scale: Tensor::ones(dim, DType::F32, dev)?,
+        })
+    }
+
+    fn dummy_codec_attention(
+        dim: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        dev: &Device,
+    ) -> Result<CodecAttention> {
+        let kv_dim = n_kv_heads * head_dim;
+        let q_dim = n_heads * head_dim;
+        Ok(CodecAttention {
+            wq: Linear::new(Tensor::randn(0f32, 0.01, (q_dim, dim), dev)?, None),
+            wk: Linear::new(Tensor::randn(0f32, 0.01, (kv_dim, dim), dev)?, None),
+            wv: Linear::new(Tensor::randn(0f32, 0.01, (kv_dim, dim), dev)?, None),
+            wo: Linear::new(Tensor::randn(0f32, 0.01, (dim, q_dim), dev)?, None),
+            q_norm: dummy_rms_norm(q_dim, dev)?,
+            k_norm: dummy_rms_norm(kv_dim, dev)?,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+        })
+    }
+
+    fn dummy_codec_ffn(dim: usize, hidden_dim: usize, dev: &Device) -> Result<CodecFfn> {
+        Ok(CodecFfn {
+            w1: Linear::new(Tensor::randn(0f32, 0.01, (hidden_dim, dim), dev)?, None),
+            w2: Linear::new(Tensor::randn(0f32, 0.01, (dim, hidden_dim), dev)?, None),
+            w3: Linear::new(Tensor::randn(0f32, 0.01, (hidden_dim, dim), dev)?, None),
+        })
+    }
+
+    fn dummy_codec_transformer_layer(
+        dim: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        hidden_dim: usize,
+        dev: &Device,
+    ) -> Result<CodecTransformerLayer> {
+        Ok(CodecTransformerLayer {
+            attention: dummy_codec_attention(dim, n_heads, n_kv_heads, head_dim, dev)?,
+            ffn: dummy_codec_ffn(dim, hidden_dim, dev)?,
+            attention_norm: dummy_rms_norm(dim, dev)?,
+            ffn_norm: dummy_rms_norm(dim, dev)?,
+            attn_scale: dummy_layer_scale(dim, dev)?,
+            ffn_scale: dummy_layer_scale(dim, dev)?,
+        })
+    }
+
+    /// Build a reduced-dimension dummy codec decoder for CPU unit tests.
+    ///
+    /// Config: semantic_dim=4, acoustic_dim=4, embed_dim=8, dim=8,
+    /// n_heads=2, n_kv_heads=2, head_dim=4, hidden_dim=16, patch_size=4,
+    /// 2 stages ([1 layer + upsample], [1 layer]), total_upsample=2,
+    /// samples_per_frame=8.
+    fn dummy_codec_decoder(dev: &Device) -> Result<CodecDecoder> {
+        let semantic_dim = 4usize;
+        let acoustic_dim = 4usize;
+        let dim = 8usize;
+        let n_heads = 2usize;
+        let n_kv_heads = 2usize;
+        let head_dim = 4usize;
+        let hidden_dim = 16usize;
+        let patch_size = 4usize;
+        let codebook_size = 8usize;
+        let fsq_levels = 5usize;
+        let embed_dim = semantic_dim + acoustic_dim;
+        let total_upsample = 2usize;
+
+        let semantic_codebook =
+            Tensor::randn(0f32, 0.01, (codebook_size, semantic_dim), dev)?;
+        let alibi_slopes = compute_alibi_slopes(n_heads);
+        let input_conv = dummy_causal_conv1d(embed_dim, dim, 3, 1, dev)?;
+        let output_conv = dummy_causal_conv1d(dim, patch_size, 7, 1, dev)?;
+
+        let layer0 = dummy_codec_transformer_layer(dim, n_heads, n_kv_heads, head_dim, hidden_dim, dev)?;
+        let stage0 = CodecStage {
+            layers: vec![layer0],
+            upsample: Some(dummy_causal_conv_transpose1d(dim, dim, 4, 2, dev)?),
+            window_size: 4,
+        };
+
+        let layer1 = dummy_codec_transformer_layer(dim, n_heads, n_kv_heads, head_dim, hidden_dim, dev)?;
+        let stage1 = CodecStage {
+            layers: vec![layer1],
+            upsample: None,
+            window_size: 8,
+        };
+
+        Ok(CodecDecoder {
+            semantic_codebook,
+            input_conv,
+            stages: vec![stage0, stage1],
+            output_conv,
+            alibi_slopes,
+            semantic_dim,
+            acoustic_dim,
+            fsq_levels,
+            samples_per_frame: total_upsample * patch_size,
+        })
+    }
+
+    /// Build a codes tensor with `n_frames` frames and `n_cols` codebooks.
+    ///
+    /// Uses code value 5 for semantic (column 0) and 4 for acoustic columns.
+    fn dummy_codes(n_frames: usize, n_cols: usize, dev: &Device) -> Result<Tensor> {
+        let data: Vec<f32> = (0..n_frames * n_cols)
+            .map(|i| if i % n_cols == 0 { 5.0f32 } else { 4.0f32 })
+            .collect();
+        Tensor::new(data.as_slice(), dev)?.reshape((1, n_frames, n_cols))
+    }
+
+    #[test]
+    fn test_samples_per_frame() -> Result<()> {
+        let dev = &Device::Cpu;
+        let decoder = dummy_codec_decoder(dev)?;
+        assert_eq!(decoder.samples_per_frame(), 8);
+        Ok(())
+    }
+
+    #[test]
+    fn test_decode_chunk_shape() -> Result<()> {
+        let dev = &Device::Cpu;
+        let decoder = dummy_codec_decoder(dev)?;
+        let n_cols = 1 + decoder.acoustic_dim;
+        let spf = decoder.samples_per_frame();
+
+        // No context: 5 new frames → [1, 5*spf]
+        let codes = dummy_codes(5, n_cols, dev)?;
+        let wav = decoder.decode_chunk(&codes, 0)?;
+        assert_eq!(wav.dims(), &[1, 5 * spf]);
+
+        // 2 context + 3 new frames (5 total) → [1, 3*spf]
+        let codes = dummy_codes(5, n_cols, dev)?;
+        let wav = decoder.decode_chunk(&codes, 2)?;
+        assert_eq!(wav.dims(), &[1, 3 * spf]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_chunked_decode_matches_decode() -> Result<()> {
+        let dev = &Device::Cpu;
+        let decoder = dummy_codec_decoder(dev)?;
+        let n_cols = 1 + decoder.acoustic_dim;
+        let n_frames = 20;
+
+        let codes = dummy_codes(n_frames, n_cols, dev)?;
+
+        let full = decoder.decode(&codes)?;
+        // left_context=10 exceeds the dummy decoder's ~7-frame receptive field
+        let chunked = decoder.chunked_decode(&codes, 5, 10)?;
+
+        let full_v: Vec<f32> = full.flatten_all()?.to_vec1()?;
+        let chunked_v: Vec<f32> = chunked.flatten_all()?.to_vec1()?;
+
+        assert_eq!(full_v.len(), chunked_v.len(), "output length mismatch");
+        let max_diff = full_v
+            .iter()
+            .zip(chunked_v.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            max_diff < 1e-4,
+            "max abs diff between decode and chunked_decode: {max_diff:.2e}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_chunked_decode_shape() -> Result<()> {
+        let dev = &Device::Cpu;
+        let decoder = dummy_codec_decoder(dev)?;
+        let n_cols = 1 + decoder.acoustic_dim;
+        let n_frames = 20;
+        let codes = dummy_codes(n_frames, n_cols, dev)?;
+
+        let expected_dims = decoder.decode(&codes)?.dims().to_vec();
+        for &chunk_size in &[1usize, 3, 7, 20, 100] {
+            let chunked = decoder.chunked_decode(&codes, chunk_size, 5)?;
+            assert_eq!(
+                chunked.dims(),
+                expected_dims.as_slice(),
+                "shape mismatch for chunk_size={chunk_size}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires checkpoint dir (set VOXTRAL_CHECKPOINT_DIR or place at checkpoints/Voxtral-4B-TTS-2603)"]
+    fn test_chunked_decode_matches_decode_real() {
+        use candle_core::safetensors;
+        use std::path::PathBuf;
+
+        let checkpoint_dir = match std::env::var("VOXTRAL_CHECKPOINT_DIR") {
+            Ok(d) => PathBuf::from(d),
+            Err(_) => {
+                eprintln!("VOXTRAL_CHECKPOINT_DIR not set, skipping");
+                return;
+            }
+        };
+
+        let weights_path = checkpoint_dir.join("consolidated.safetensors");
+        let dev = &Device::Cpu;
+
+        let tensors = safetensors::load(&weights_path, dev).expect("load weights");
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, dev);
+
+        let params_path = checkpoint_dir.join("params.json");
+        let params: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&params_path).expect("read params"))
+                .expect("parse params");
+        let at_args: super::super::model::AudioTokenizerArgs =
+            serde_json::from_value(params["audio_tokenizer_args"].clone())
+                .expect("parse audio_tokenizer_args");
+
+        let decoder =
+            CodecDecoder::new(&at_args, vb.pp("audio_tokenizer")).expect("construct codec");
+
+        let n_frames = 50usize;
+        let n_cols = 37usize;
+        let mut code_data = vec![0f32; n_frames * n_cols];
+        for t in 0..n_frames {
+            code_data[t * n_cols] = 100.0;
+            for i in 1..n_cols {
+                code_data[t * n_cols + i] = 12.0;
+            }
+        }
+        let codes = Tensor::new(code_data.as_slice(), dev)
+            .unwrap()
+            .reshape((1, n_frames, n_cols))
+            .unwrap();
+
+        let full = decoder.decode(&codes).expect("full decode");
+        let chunked = decoder
+            .chunked_decode(&codes, 25, 25)
+            .expect("chunked decode");
+
+        let full_v: Vec<f32> = full.flatten_all().unwrap().to_vec1().unwrap();
+        let chunked_v: Vec<f32> = chunked.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(full_v.len(), chunked_v.len());
+        let max_diff = full_v
+            .iter()
+            .zip(chunked_v.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            max_diff < 1e-4,
+            "real codec: max abs diff {max_diff:.2e} between decode and chunked_decode"
+        );
+        eprintln!("chunked decode matches full decode: max_diff={max_diff:.2e}");
     }
 
     #[test]

@@ -5,7 +5,7 @@ use candle_core::Tensor;
 use crane_core::generation::SpeechOptions;
 use crane_core::models::voxtral_tts::Model;
 
-use super::tts::{AudioInfo, Tts, VoiceInfo};
+use super::tts::{AudioInfo, Tts, TtsStream, VoiceInfo};
 
 impl Tts for Model {
     fn audio_info(&self) -> AudioInfo {
@@ -38,5 +38,21 @@ impl Tts for Model {
     ) -> Result<Tensor> {
         let (tensor, _sample_rate) = Model::generate_speech(self, text, language, voice, opts)?;
         Ok(tensor)
+    }
+
+    /// Returns a streaming iterator that yields f32 PCM chunks as they are
+    /// generated. The first chunk arrives after ~0.4 s; subsequent chunks
+    /// arrive every ~2 s.
+    fn generate_speech_stream(
+        &mut self,
+        text: &str,
+        language: &str,
+        voice: Option<&str>,
+        opts: &SpeechOptions,
+    ) -> Result<TtsStream<'_>> {
+        // Capture audio_info before the mutable borrow from generate_speech_streaming.
+        let audio_info = self.audio_info();
+        let stream = self.generate_speech_streaming(text, language, voice, opts)?;
+        Ok(TtsStream::new(audio_info, stream))
     }
 }
