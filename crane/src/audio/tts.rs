@@ -1,6 +1,6 @@
 //! Shared TTS abstraction: trait, stream, and PCM utilities.
 //!
-//! Consumers (crane-engine, crane-serve, ...) hold a
+//! Consumers (crane::engine, crane-serve, ...) hold a
 //! `Box<dyn Tts>` and never import model-specific types.
 
 use std::io::Cursor;
@@ -87,7 +87,7 @@ impl<'a> TtsStream<'a> {
 
 /// Unified TTS interface.
 ///
-/// Implemented by every TTS model in Crane. Consumers (crane-engine,
+/// Implemented by every TTS model in Crane. Consumers (crane::engine,
 /// crane-serve, crane-wyoming) use `Box<dyn Tts>` and never import
 /// model-specific types.
 pub trait Tts {

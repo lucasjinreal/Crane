@@ -58,7 +58,7 @@ pub struct Sequence {
 
     // ── response channel ──
     /// Sends `EngineResponse` chunks back to the API handler.
-    pub response_tx: mpsc::UnboundedSender<super::EngineResponse>,
+    pub response_tx: mpsc::UnboundedSender<crate::engine::EngineResponse>,
 }
 
 impl Sequence {

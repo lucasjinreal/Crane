@@ -14,7 +14,7 @@ use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 use tracing::debug;
 
-use super::sequence::Sequence;
+use crate::engine::sequence::Sequence;
 
 /// Persistent buffers for GPU-side top-k/top-p sampling.
 ///

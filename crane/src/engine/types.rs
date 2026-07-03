@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
-use super::stats::EngineStats;
+use crate::engine::stats::EngineStats;
 
 /// A request from an API handler to the engine.
 pub struct EngineRequest {

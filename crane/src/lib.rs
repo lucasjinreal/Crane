@@ -6,6 +6,7 @@
 pub mod audio;
 pub mod chat;
 pub mod common;
+pub mod engine;
 pub mod llm;
 pub mod multimodal;
 pub mod utils;

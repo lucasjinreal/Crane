@@ -8,10 +8,9 @@ use candle_core::{DType, Device};
 use serde::Deserialize;
 use std::path::Path;
 
-use super::backend::{
+use crate::engine::backend::{
     Gemma4Backend, HunyuanBackend, ModelBackend, Qwen25Backend, Qwen3Backend, Qwen3_5Backend,
 };
-use crate::chat_template::{AutoChatTemplate, ChatTemplateProcessor, HunyuanChatTemplate};
 
 // ─────────────────────────────────────────────────────────────
 //  Enums
@@ -229,7 +228,7 @@ pub fn detect_model_type(model_path: &str) -> ModelType {
 // ─────────────────────────────────────────────────────────────
 
 /// Resolve `ModelType::Auto` to a concrete type.
-fn resolve(model_type: ModelType, model_path: &str) -> ModelType {
+pub fn resolve(model_type: ModelType, model_path: &str) -> ModelType {
     if model_type == ModelType::Auto {
         detect_model_type(model_path)
     } else {
@@ -286,31 +285,6 @@ pub fn create_backend(
             anyhow::bail!("Voxtral-TTS is a TTS model — use create_voxtral_tts_model() instead of create_backend()")
         }
         ModelType::Auto => unreachable!(),
-    }
-}
-
-/// Create a chat template processor for the given model.
-pub fn create_chat_template(
-    model_type: ModelType,
-    model_path: &str,
-) -> Box<dyn ChatTemplateProcessor> {
-    let model_type = resolve(model_type, model_path);
-
-    match model_type {
-        ModelType::HunyuanDense => {
-            // Prefer jinja template from tokenizer_config.json if available.
-            match AutoChatTemplate::new(model_path) {
-                Ok(t) => Box::new(t),
-                Err(_) => Box::new(HunyuanChatTemplate),
-            }
-        }
-        _ => match AutoChatTemplate::new(model_path) {
-            Ok(t) => Box::new(t),
-            Err(e) => {
-                tracing::warn!("Failed to load chat template: {e}; using Hunyuan fallback");
-                Box::new(HunyuanChatTemplate)
-            }
-        },
     }
 }
 

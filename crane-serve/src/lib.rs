@@ -1,5 +1,5 @@
 pub mod chat_template;
-pub mod engine;
+pub use crane::engine;
 pub mod handlers;
 pub mod openai_api;
 pub mod sglang_api;
@@ -17,9 +17,9 @@ use axum::{
 use clap::Parser;
 use tracing::info;
 
-use chat_template::ChatTemplateProcessor;
-use engine::model_factory::{ModelFormat, ModelType};
-use engine::{EngineHandle, InferenceEngine, MemoryConfig};
+use chat_template::{AutoChatTemplate, ChatTemplateProcessor, HunyuanChatTemplate};
+use crane::engine::model_factory::{ModelFormat, ModelType};
+use crane::engine::{EngineHandle, InferenceEngine, MemoryConfig};
 use handlers::tts::TtsGenerateRequest;
 use handlers::vlm::{Gemma4VlmRequest, VlmRequest};
 use openai_api::ErrorResponse;
@@ -101,6 +101,31 @@ pub fn make_error(status: StatusCode, msg: &str) -> (StatusCode, Json<ErrorRespo
             },
         }),
     )
+}
+
+/// Create a chat template processor for the given model.
+///
+/// Lives in crane-serve (not crane::engine) because it depends on the
+/// chat_template module, which uses `openai_api::ChatMessage`.
+fn create_chat_template(model_type: ModelType, model_path: &str) -> Box<dyn ChatTemplateProcessor> {
+    let model_type = engine::model_factory::resolve(model_type, model_path);
+
+    match model_type {
+        ModelType::HunyuanDense => {
+            // Prefer jinja template from tokenizer_config.json if available.
+            match AutoChatTemplate::new(model_path) {
+                Ok(t) => Box::new(t),
+                Err(_) => Box::new(HunyuanChatTemplate),
+            }
+        }
+        _ => match AutoChatTemplate::new(model_path) {
+            Ok(t) => Box::new(t),
+            Err(e) => {
+                tracing::warn!("Failed to load chat template: {e}; using Hunyuan fallback");
+                Box::new(HunyuanChatTemplate)
+            }
+        },
+    }
 }
 
 pub fn init_logging() {
@@ -380,7 +405,7 @@ pub async fn run(args: Args) -> Result<()> {
                 tokenizers::Tokenizer::new(tokenizers::models::bpe::BPE::default())
             });
         let eos_id = tokenizer.token_to_id("<|im_end|>").or_else(|| tokenizer.token_to_id("<|endoftext|>")).unwrap_or(2);
-        let chat_template = engine::model_factory::create_chat_template(model_type, &args.model_path);
+        let chat_template = create_chat_template(model_type, &args.model_path);
         (None, tokenizer, vec![eos_id], chat_template, None, None, Some(tts_tx))
     } else if is_vlm {
         let use_cpu = args.cpu || {
@@ -399,7 +424,7 @@ pub async fn run(args: Args) -> Result<()> {
         let use_bf16 = false;
         let tok_path = std::path::Path::new(&args.model_path).join("tokenizer.json");
         let tokenizer = tokenizers::Tokenizer::from_file(&tok_path).map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
-        let chat_template = engine::model_factory::create_chat_template(model_type, &args.model_path);
+        let chat_template = create_chat_template(model_type, &args.model_path);
         let mut vlm_tx_opt_inner: Option<tokio::sync::mpsc::UnboundedSender<VlmRequest>> = None;
         let mut gemma4_vlm_tx_opt_inner: Option<tokio::sync::mpsc::UnboundedSender<Gemma4VlmRequest>> = None;
         if resolved_type == engine::model_factory::ModelType::Gemma4VL {
@@ -498,7 +523,7 @@ pub async fn run(args: Args) -> Result<()> {
         info!("Model warmed up");
         let tokenizer = backend.tokenizer().clone();
         let eos_token_id = backend.eos_token_id();
-        let chat_template = engine::model_factory::create_chat_template(model_type, &args.model_path);
+        let chat_template = create_chat_template(model_type, &args.model_path);
         let mut memory_config = MemoryConfig::parse(args.max_seq_len, args.gpu_memory_limit.as_deref(), &device);
         memory_config.record_baseline(&device);
         let baseline_gpu = memory_config.baseline_gpu_bytes;
