@@ -20,6 +20,22 @@ pub struct EngineRequest {
     pub response_tx: mpsc::UnboundedSender<EngineResponse>,
 }
 
+/// Sampling parameters for a generation request.
+pub struct GenerationParams {
+    /// Maximum number of tokens to generate.
+    pub max_tokens: usize,
+    /// Sampling temperature; `None` disables temperature scaling.
+    pub temperature: Option<f64>,
+    /// Nucleus sampling probability mass; `None` disables top-p filtering.
+    pub top_p: Option<f64>,
+    /// Number of highest-probability tokens to keep; `None` disables top-k filtering.
+    pub top_k: Option<usize>,
+    /// Penalty applied to previously generated tokens (1.0 = no penalty).
+    pub repetition_penalty: f32,
+    /// Token IDs that terminate generation when produced.
+    pub eos_token_id: Vec<u32>,
+}
+
 /// A response chunk from the engine to an API handler.
 #[derive(Debug, Clone)]
 pub enum EngineResponse {
@@ -45,28 +61,27 @@ pub struct EngineHandle {
 
 impl EngineHandle {
     /// Submit a new generation request. Returns a receiver for response chunks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the engine thread has shut down.
     pub fn submit(
         &self,
         id: String,
         tokens: Vec<u32>,
-        max_tokens: usize,
-        temperature: Option<f64>,
-        top_p: Option<f64>,
-        top_k: Option<usize>,
-        repetition_penalty: f32,
-        eos_token_id: Vec<u32>,
+        params: GenerationParams,
     ) -> anyhow::Result<mpsc::UnboundedReceiver<EngineResponse>> {
         let (response_tx, response_rx) = mpsc::unbounded_channel();
         self.request_tx
             .send(EngineRequest {
                 id,
                 tokens,
-                max_tokens,
-                temperature,
-                top_p,
-                top_k,
-                repetition_penalty,
-                eos_token_id,
+                max_tokens: params.max_tokens,
+                temperature: params.temperature,
+                top_p: params.top_p,
+                top_k: params.top_k,
+                repetition_penalty: params.repetition_penalty,
+                eos_token_id: params.eos_token_id,
                 response_tx,
             })
             .map_err(|_| anyhow::anyhow!("Engine thread has shut down"))?;
@@ -74,6 +89,7 @@ impl EngineHandle {
     }
 
     /// Number of active sequences (waiting + running).
+    #[must_use]
     pub fn active_count(&self) -> u64 {
         self.stats.active_sequences.load(Ordering::Relaxed)
             + self.stats.waiting_sequences.load(Ordering::Relaxed)
@@ -102,12 +118,14 @@ mod tests {
         let rx = handle.submit(
             "test-1".into(),
             vec![1, 2, 3],
-            10,
-            Some(0.8),
-            Some(0.95),
-            Some(40),
-            1.0,
-            vec![0],
+            GenerationParams {
+                max_tokens: 10,
+                temperature: Some(0.8),
+                top_p: Some(0.95),
+                top_k: Some(40),
+                repetition_penalty: 1.0,
+                eos_token_id: vec![0],
+            },
         );
         assert!(rx.is_ok());
     }
@@ -123,18 +141,17 @@ mod tests {
         let result = handle.submit(
             "test-2".into(),
             vec![1],
-            10,
-            None,
-            None,
-            None,
-            1.0,
-            vec![0],
+            GenerationParams {
+                max_tokens: 10,
+                temperature: None,
+                top_p: None,
+                top_k: None,
+                repetition_penalty: 1.0,
+                eos_token_id: vec![0],
+            },
         );
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("shut down"));
+        assert!(result.unwrap_err().to_string().contains("shut down"));
     }
 
     #[test]
@@ -198,16 +215,20 @@ mod tests {
             stats: Arc::new(EngineStats::new()),
         };
 
-        let _resp_rx = handle.submit(
-            "req-42".into(),
-            vec![10, 20, 30],
-            100,
-            Some(0.7),
-            Some(0.9),
-            None,
-            1.1,
-            vec![2],
-        ).unwrap();
+        let _resp_rx = handle
+            .submit(
+                "req-42".into(),
+                vec![10, 20, 30],
+                GenerationParams {
+                    max_tokens: 100,
+                    temperature: Some(0.7),
+                    top_p: Some(0.9),
+                    top_k: None,
+                    repetition_penalty: 1.1,
+                    eos_token_id: vec![2],
+                },
+            )
+            .unwrap();
 
         let req = rx.recv().await.unwrap();
         assert_eq!(req.id, "req-42");
