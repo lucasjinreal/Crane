@@ -37,7 +37,7 @@ pub mod types;
 
 // Re-export commonly used items for convenience.
 pub use stats::{EngineStats, StatsSnapshot};
-pub use types::{EngineHandle, EngineRequest, EngineResponse};
+pub use types::{EngineHandle, EngineRequest, EngineResponse, GenerationParams};
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;

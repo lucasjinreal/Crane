@@ -19,7 +19,7 @@ use axum::{
     },
 };
 
-use crate::engine::EngineResponse;
+use crate::engine::{EngineResponse, GenerationParams};
 use crate::openai_api::*;
 use crate::{make_error, now_epoch, AppState};
 
@@ -71,12 +71,14 @@ pub async fn chat_completions(
         .submit(
             request_id.clone(),
             input_ids,
-            req.max_tokens,
-            req.temperature.or(Some(0.8)),
-            req.top_p.or(Some(0.95)),
-            req.top_k.or(Some(40)),
-            req.repetition_penalty.unwrap_or(1.05),
-            state.eos_token_id.clone(),
+            GenerationParams {
+                max_tokens: req.max_tokens,
+                temperature: req.temperature.or(Some(0.8)),
+                top_p: req.top_p.or(Some(0.95)),
+                top_k: req.top_k.or(Some(40)),
+                repetition_penalty: req.repetition_penalty.unwrap_or(1.05),
+                eos_token_id: state.eos_token_id.clone(),
+            },
         )
         .map_err(|e| make_error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()))?;
 
@@ -146,12 +148,14 @@ pub async fn completions(
         .submit(
             request_id.clone(),
             input_ids,
-            req.max_tokens,
-            req.temperature.or(Some(0.8)),
-            req.top_p.or(Some(0.95)),
-            req.top_k.or(Some(40)),
-            req.repetition_penalty.unwrap_or(1.05),
-            state.eos_token_id.clone(),
+            GenerationParams {
+                max_tokens: req.max_tokens,
+                temperature: req.temperature.or(Some(0.8)),
+                top_p: req.top_p.or(Some(0.95)),
+                top_k: req.top_k.or(Some(40)),
+                repetition_penalty: req.repetition_penalty.unwrap_or(1.05),
+                eos_token_id: state.eos_token_id.clone(),
+            },
         )
         .map_err(|e| make_error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()))?;
 
