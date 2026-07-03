@@ -20,6 +20,8 @@ use tokio::sync::{mpsc, oneshot};
 use crane_core::generation::SpeechOptions;
 
 use crate::audio::tts::{AudioInfo, Tts, VoiceInfo};
+#[cfg(feature = "tts-cache")]
+use crate::engine::cache::{CacheKey, TtsCache};
 use crate::engine::model_factory::{self, ModelType};
 use crate::engine::types::EngineHandle;
 
@@ -57,6 +59,11 @@ pub struct TtsHandle {
     supports_voice_cloning: bool,
     model_type_name: &'static str,
     pending_count: Arc<AtomicU64>,
+    /// Identity used in TTS cache keys. Defaults to the registration name,
+    /// but [`ModelRuntime::load_tts`] overrides it to the full model path so
+    /// two directories that merely share a final path component (different
+    /// checkpoint, dtype, or quantization) don't collide in the cache.
+    cache_model_id: String,
 }
 
 impl TtsHandle {
@@ -113,6 +120,8 @@ pub struct ModelRuntime {
     engine: Option<EngineHandle>,
     tts: HashMap<String, TtsHandle>,
     default_tts: Option<String>,
+    #[cfg(feature = "tts-cache")]
+    tts_cache: Option<Arc<TtsCache>>,
     model_name: String,
     model_type: ModelType,
     dtype_name: String,
@@ -132,11 +141,24 @@ impl ModelRuntime {
             engine: None,
             tts: HashMap::new(),
             default_tts: None,
+            #[cfg(feature = "tts-cache")]
+            tts_cache: None,
             model_name,
             model_type,
             dtype_name,
             device_name,
         }
+    }
+
+    /// Enable disk caching for TTS responses.
+    ///
+    /// Once set, [`generate_speech`](Self::generate_speech) checks the
+    /// cache before dispatching to a model's thread and returns a cached
+    /// waveform on a hit. Disabled by default. Requests with
+    /// `reference_audio` set (voice cloning) always bypass the cache.
+    #[cfg(feature = "tts-cache")]
+    pub fn set_tts_cache(&mut self, cache: TtsCache) {
+        self.tts_cache = Some(Arc::new(cache));
     }
 
     /// Register an already-constructed TTS model under `name`.
@@ -174,7 +196,7 @@ impl ModelRuntime {
         }
 
         self.tts.insert(
-            name,
+            name.clone(),
             TtsHandle {
                 tx,
                 audio_info,
@@ -182,6 +204,7 @@ impl ModelRuntime {
                 supports_voice_cloning,
                 model_type_name,
                 pending_count,
+                cache_model_id: name,
             },
         );
         Ok(())
@@ -208,6 +231,12 @@ impl ModelRuntime {
         );
 
         self.register_tts(name.clone(), resolved_type.display_name(), tts)?;
+        // Cache keys should discriminate by the full on-disk path, not just
+        // its final component -- two directories with the same file name
+        // (different checkpoint, dtype, or quantization) must not collide.
+        if let Some(handle) = self.tts.get_mut(&name) {
+            handle.cache_model_id = model_path.to_string();
+        }
         Ok(name)
     }
 
@@ -224,6 +253,83 @@ impl ModelRuntime {
     #[must_use]
     pub fn default_tts_handle(&self) -> Option<&TtsHandle> {
         self.default_tts.as_ref().and_then(|name| self.tts.get(name))
+    }
+
+    /// Dispatch a TTS request, consulting the cache first if one is configured.
+    ///
+    /// This is the preferred entry point for TTS generation over calling
+    /// [`TtsHandle::send`] directly:
+    ///
+    /// 1. If no cache is configured, delegates straight to `TtsHandle::send`.
+    /// 2. If `req.reference_audio` is set (voice cloning), delegates
+    ///    straight to `TtsHandle::send` -- voice-cloned audio is never
+    ///    cached (see [`crate::engine::cache::TtsCache`]).
+    /// 3. On a cache hit, sends the cached tensor back immediately without
+    ///    running inference.
+    /// 4. On a cache miss, tees the model's response through the cache: the
+    ///    result is forwarded to the caller and written to disk on a
+    ///    spawned task so the write never blocks generation.
+    ///
+    /// Concurrent requests for the same not-yet-cached text each miss and
+    /// run inference independently -- there is no in-flight de-duplication.
+    /// Atomic writes (see [`crate::engine::cache::TtsCache::put`]) keep this safe,
+    /// just not maximally efficient under that access pattern.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `model_name` is not registered or the model's
+    /// thread has stopped.
+    #[cfg(feature = "tts-cache")]
+    pub fn generate_speech(&self, model_name: &str, req: TtsGenerateRequest) -> Result<()> {
+        let handle = self
+            .tts_handle(model_name)
+            .ok_or_else(|| anyhow::anyhow!("unknown TTS model: {model_name}"))?;
+
+        let Some(cache) = &self.tts_cache else {
+            return handle.send(req);
+        };
+        if req.reference_audio.is_some() {
+            return handle.send(req);
+        }
+
+        let digest = CacheKey::from_request(&handle.cache_model_id, &req).digest();
+        if let Some(audio) = cache.get(&digest) {
+            tracing::debug!(model = %model_name, "TTS cache hit");
+            let _ = req.response_tx.send(Ok(audio));
+            return Ok(());
+        }
+
+        let (tx, rx) = oneshot::channel();
+        let original_tx = req.response_tx;
+        let cache = Arc::clone(cache);
+        tokio::spawn(async move {
+            if let Ok(result) = rx.await {
+                if let Ok(ref audio) = result
+                    && let Err(e) = cache.put(&digest, audio)
+                {
+                    tracing::warn!("Failed to write TTS cache entry: {e}");
+                }
+                let _ = original_tx.send(result);
+            }
+        });
+        handle.send(TtsGenerateRequest { response_tx: tx, ..req })
+    }
+
+    /// Dispatch a TTS request directly to the model's thread.
+    ///
+    /// Built without the `tts-cache` feature, so there is no cache to
+    /// consult -- this always delegates straight to [`TtsHandle::send`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `model_name` is not registered or the model's
+    /// thread has stopped.
+    #[cfg(not(feature = "tts-cache"))]
+    pub fn generate_speech(&self, model_name: &str, req: TtsGenerateRequest) -> Result<()> {
+        let handle = self
+            .tts_handle(model_name)
+            .ok_or_else(|| anyhow::anyhow!("unknown TTS model: {model_name}"))?;
+        handle.send(req)
     }
 
     /// Returns the LLM engine handle, if a continuous-batching model is loaded.
@@ -336,6 +442,8 @@ fn run_tts_thread(
 mod tests {
     use super::*;
     use candle_core::Device;
+    #[cfg(feature = "tts-cache")]
+    use std::fs;
 
     struct MockTts {
         audio_info: AudioInfo,
@@ -562,6 +670,7 @@ mod tests {
             supports_voice_cloning: false,
             model_type_name: "qwen3_tts",
             pending_count: Arc::new(AtomicU64::new(0)),
+            cache_model_id: "test-model".into(),
         };
 
         let (resp_tx, _resp_rx) = oneshot::channel();
@@ -699,5 +808,140 @@ mod tests {
         assert!(result2.is_ok());
         let samples: Vec<f32> = result2.unwrap().to_vec1().unwrap();
         assert_eq!(samples, vec![0.1f32; 2]);
+    }
+
+    #[test]
+    fn test_generate_speech_no_cache() {
+        let mut rt = new_runtime();
+        rt.register_tts("m1".into(), "qwen3_tts", Box::new(MockTts::new()))
+            .unwrap();
+
+        let (tx, rx) = oneshot::channel();
+        rt.generate_speech(
+            "m1",
+            TtsGenerateRequest {
+                text: "hello".into(),
+                language: "en".into(),
+                voice: None,
+                opts: SpeechOptions::default(),
+                reference_audio: None,
+                reference_text: None,
+                response_tx: tx,
+            },
+        )
+        .unwrap();
+
+        let tensor = rx.blocking_recv().unwrap().unwrap();
+        let samples: Vec<f32> = tensor.to_vec1().unwrap();
+        assert_eq!(samples, vec![0.5f32; 5]);
+    }
+
+    #[test]
+    fn test_generate_speech_unknown_model() {
+        let rt = new_runtime();
+        let (tx, _rx) = oneshot::channel();
+        let result = rt.generate_speech(
+            "nonexistent",
+            TtsGenerateRequest {
+                text: "hello".into(),
+                language: "en".into(),
+                voice: None,
+                opts: SpeechOptions::default(),
+                reference_audio: None,
+                reference_text: None,
+                response_tx: tx,
+            },
+        );
+        assert!(result.is_err());
+    }
+
+    #[cfg(feature = "tts-cache")]
+    #[tokio::test]
+    async fn test_generate_speech_cache_hit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rt = new_runtime();
+        rt.set_tts_cache(TtsCache::new(dir.path().to_path_buf(), 10_000_000).unwrap());
+        rt.register_tts("m1".into(), "qwen3_tts", Box::new(MockTts::new()))
+            .unwrap();
+
+        // First request: cache miss, generates and caches.
+        let (tx1, rx1) = oneshot::channel();
+        rt.generate_speech(
+            "m1",
+            TtsGenerateRequest {
+                text: "hello".into(),
+                language: "en".into(),
+                voice: None,
+                opts: SpeechOptions::default(),
+                reference_audio: None,
+                reference_text: None,
+                response_tx: tx1,
+            },
+        )
+        .unwrap();
+        let first = rx1.await.unwrap().unwrap();
+        assert_eq!(first.to_vec1::<f32>().unwrap(), vec![0.5f32; 5]);
+
+        // The tee task writes the cache entry before forwarding the
+        // response, so by the time `rx1.await` resolves above the entry
+        // is already on disk -- no extra synchronization needed here.
+
+        // Second identical request: cache hit, same result without
+        // depending on the (still-registered) model thread.
+        let (tx2, rx2) = oneshot::channel();
+        rt.generate_speech(
+            "m1",
+            TtsGenerateRequest {
+                text: "hello".into(),
+                language: "en".into(),
+                voice: None,
+                opts: SpeechOptions::default(),
+                reference_audio: None,
+                reference_text: None,
+                response_tx: tx2,
+            },
+        )
+        .unwrap();
+        let second = rx2.await.unwrap().unwrap();
+        assert_eq!(second.to_vec1::<f32>().unwrap(), vec![0.5f32; 5]);
+    }
+
+    #[cfg(feature = "tts-cache")]
+    #[tokio::test]
+    async fn test_generate_speech_reference_audio_bypasses_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rt = new_runtime();
+        rt.set_tts_cache(TtsCache::new(dir.path().to_path_buf(), 10_000_000).unwrap());
+        rt.register_tts(
+            "m1".into(),
+            "qwen3_tts",
+            Box::new(MockTts::new().with_cloning()),
+        )
+        .unwrap();
+
+        let (tx, rx) = oneshot::channel();
+        rt.generate_speech(
+            "m1",
+            TtsGenerateRequest {
+                text: "hello".into(),
+                language: "en".into(),
+                voice: None,
+                opts: SpeechOptions::default(),
+                reference_audio: Some(PathBuf::from("/ref.wav")),
+                reference_text: Some("hi".into()),
+                response_tx: tx,
+            },
+        )
+        .unwrap();
+
+        let result = rx.await.unwrap().unwrap();
+        assert_eq!(result.to_vec1::<f32>().unwrap(), vec![-0.5f32; 5]);
+
+        // Nothing should have been written to the cache directory.
+        let has_entries = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .any(|e| e.path().is_dir());
+        assert!(!has_entries);
     }
 }

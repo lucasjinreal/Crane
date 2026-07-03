@@ -27,8 +27,11 @@
 //! | `backend`       | `ModelBackend` trait + concrete implementations   |
 //! | `model_factory` | Auto-detection and factory creation               |
 //! | `runtime`       | `ModelRuntime` — protocol-independent model lifecycle |
+//! | `cache`         | `TtsCache` — optional disk cache for TTS responses (behind the `tts-cache` feature) |
 
 pub mod backend;
+#[cfg(feature = "tts-cache")]
+pub mod cache;
 pub mod model_factory;
 pub mod runtime;
 pub mod sampling;
@@ -38,6 +41,8 @@ pub mod stats;
 pub mod types;
 
 // Re-export commonly used items for convenience.
+#[cfg(feature = "tts-cache")]
+pub use cache::TtsCache;
 pub use runtime::{ModelRuntime, TtsGenerateRequest, TtsHandle};
 pub use stats::{EngineStats, StatsSnapshot};
 pub use types::{EngineHandle, EngineRequest, EngineResponse, GenerationParams};
