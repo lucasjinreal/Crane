@@ -33,6 +33,10 @@ pub enum ModelType {
 }
 
 impl ModelType {
+    // Infallible convenience constructor, not the fallible std::str::FromStr
+    // trait (unknown strings fall back to `Auto` instead of erroring).
+    #[allow(clippy::should_implement_trait)]
+    #[must_use]
     pub fn from_str(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "gemma4" | "gemma-4" | "gemma4_e2b" => Self::Gemma4,
@@ -48,6 +52,7 @@ impl ModelType {
         }
     }
 
+    #[must_use]
     pub fn display_name(&self) -> &'static str {
         match self {
             Self::Auto => "auto",
@@ -64,11 +69,13 @@ impl ModelType {
     }
 
     /// Whether this model type is a vision-language model.
+    #[must_use]
     pub fn is_vlm(&self) -> bool {
         matches!(self, Self::PaddleOcrVl | Self::Gemma4VL)
     }
 
     /// Whether this model type is a TTS model.
+    #[must_use]
     pub fn is_tts(&self) -> bool {
         matches!(self, Self::Qwen3TTS | Self::VoxtralTTS)
     }
@@ -83,6 +90,10 @@ pub enum ModelFormat {
 }
 
 impl ModelFormat {
+    // Infallible convenience constructor, not the fallible std::str::FromStr
+    // trait (unknown strings fall back to `Auto` instead of erroring).
+    #[allow(clippy::should_implement_trait)]
+    #[must_use]
     pub fn from_str(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "safetensors" => Self::Safetensors,
@@ -96,7 +107,7 @@ impl ModelFormat {
 //  Detection
 // ─────────────────────────────────────────────────────────────
 
-/// Minimal subset of HuggingFace `config.json` for architecture detection.
+/// Minimal subset of `HuggingFace` `config.json` for architecture detection.
 #[derive(Deserialize, Default)]
 struct HfConfig {
     model_type: Option<String>,
@@ -121,55 +132,54 @@ pub fn detect_model_type(model_path: &str) -> ModelType {
         Some(path.join("config.json"))
     };
 
-    if let Some(config_path) = config_path {
-        if let Ok(data) = std::fs::read(&config_path) {
-            if let Ok(config) = serde_json::from_slice::<HfConfig>(&data) {
-                // 1. Check `model_type` field
-                if let Some(ref mt) = config.model_type {
-                    match mt.to_lowercase().as_str() {
-                        "gemma4" => {
-                            return if config.vision_config.is_some() {
-                                ModelType::Gemma4VL
-                            } else {
-                                ModelType::Gemma4
-                            };
-                        }
-                        "qwen2" | "qwen2.5" => return ModelType::Qwen25,
-                        "qwen3" => return ModelType::Qwen3,
-                        "qwen3_5" | "qwen3.5" => return ModelType::Qwen3_5,
-                        "qwen3_tts" | "qwen3tts" => return ModelType::Qwen3TTS,
-                        m if m.contains("hunyuan") => return ModelType::HunyuanDense,
-                        m if m.contains("paddleocr") => return ModelType::PaddleOcrVl,
-                        _ => {}
-                    }
+    if let Some(config_path) = config_path
+        && let Ok(data) = std::fs::read(&config_path)
+        && let Ok(config) = serde_json::from_slice::<HfConfig>(&data)
+    {
+        // 1. Check `model_type` field
+        if let Some(ref mt) = config.model_type {
+            match mt.to_lowercase().as_str() {
+                "gemma4" => {
+                    return if config.vision_config.is_some() {
+                        ModelType::Gemma4VL
+                    } else {
+                        ModelType::Gemma4
+                    };
                 }
+                "qwen2" | "qwen2.5" => return ModelType::Qwen25,
+                "qwen3" => return ModelType::Qwen3,
+                "qwen3_5" | "qwen3.5" => return ModelType::Qwen3_5,
+                "qwen3_tts" | "qwen3tts" => return ModelType::Qwen3TTS,
+                m if m.contains("hunyuan") => return ModelType::HunyuanDense,
+                m if m.contains("paddleocr") => return ModelType::PaddleOcrVl,
+                _ => {}
+            }
+        }
 
-                // 2. Check `architectures` field
-                if let Some(ref archs) = config.architectures {
-                    for arch in archs {
-                        let a = arch.to_lowercase();
-                        if a.contains("paddleocr") {
-                            return ModelType::PaddleOcrVl;
-                        }
-                        if a.contains("hunyuan") {
-                            return ModelType::HunyuanDense;
-                        }
-                        if a.contains("gemma4") {
-                            return ModelType::Gemma4;
-                        }
-                        if a.contains("qwen3ttsforconditional") || a.contains("qwen3_tts") {
-                            return ModelType::Qwen3TTS;
-                        }
-                        if a.contains("qwen3_5") || a.contains("qwen3.5") {
-                            return ModelType::Qwen3_5;
-                        }
-                        if a.contains("qwen3") {
-                            return ModelType::Qwen3;
-                        }
-                        if a.contains("qwen2") {
-                            return ModelType::Qwen25;
-                        }
-                    }
+        // 2. Check `architectures` field
+        if let Some(ref archs) = config.architectures {
+            for arch in archs {
+                let a = arch.to_lowercase();
+                if a.contains("paddleocr") {
+                    return ModelType::PaddleOcrVl;
+                }
+                if a.contains("hunyuan") {
+                    return ModelType::HunyuanDense;
+                }
+                if a.contains("gemma4") {
+                    return ModelType::Gemma4;
+                }
+                if a.contains("qwen3ttsforconditional") || a.contains("qwen3_tts") {
+                    return ModelType::Qwen3TTS;
+                }
+                if a.contains("qwen3_5") || a.contains("qwen3.5") {
+                    return ModelType::Qwen3_5;
+                }
+                if a.contains("qwen3") {
+                    return ModelType::Qwen3;
+                }
+                if a.contains("qwen2") {
+                    return ModelType::Qwen25;
                 }
             }
         }
@@ -181,16 +191,13 @@ pub fn detect_model_type(model_path: &str) -> ModelType {
     } else {
         Some(path.join("params.json"))
     };
-    if let Some(params_path) = params_path {
-        if let Ok(data) = std::fs::read(&params_path) {
-            if let Ok(config) = serde_json::from_slice::<MistralConfig>(&data) {
-                if let Some(ref mt) = config.model_type {
-                    if mt == "voxtral_tts" {
-                        return ModelType::VoxtralTTS;
-                    }
-                }
-            }
-        }
+    if let Some(params_path) = params_path
+        && let Ok(data) = std::fs::read(&params_path)
+        && let Ok(config) = serde_json::from_slice::<MistralConfig>(&data)
+        && let Some(ref mt) = config.model_type
+        && mt == "voxtral_tts"
+    {
+        return ModelType::VoxtralTTS;
     }
 
     // 4. Heuristic: check the model path name
@@ -231,6 +238,11 @@ fn resolve(model_type: ModelType, model_path: &str) -> ModelType {
 }
 
 /// Create a model backend.
+///
+/// # Errors
+///
+/// Returns an error if `model_type` resolves to a VLM/TTS type (use
+/// `create_vlm_model()`/`create_tts_model()` instead) or the model fails to load.
 pub fn create_backend(
     model_type: ModelType,
     model_path: &str,
@@ -303,6 +315,10 @@ pub fn create_chat_template(
 }
 
 /// Create a PaddleOCR-VL model for VLM inference.
+///
+/// # Errors
+///
+/// Returns an error if the model fails to load from `model_path`.
 pub fn create_vlm_model(
     model_path: &str,
     use_cpu: bool,
@@ -313,6 +329,10 @@ pub fn create_vlm_model(
 }
 
 /// Create a Qwen3-TTS model for TTS inference.
+///
+/// # Errors
+///
+/// Returns an error if the model fails to load from `model_path`.
 pub fn create_tts_model(
     model_path: &str,
     device: &Device,
@@ -323,6 +343,10 @@ pub fn create_tts_model(
 }
 
 /// Create a Voxtral TTS model for TTS inference.
+///
+/// # Errors
+///
+/// Returns an error if the model fails to load from `model_path`.
 pub fn create_voxtral_tts_model(
     model_path: &str,
     device: &Device,
