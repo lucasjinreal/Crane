@@ -18,6 +18,7 @@ nvml-wrapper = { version = "0.10", optional = true }
 
 crane-core = { path = "../crane-core" }
 crane-serve = { path = "../crane-serve" }
+hound = "3"
 ribo = "0.1.3"
 tokenizers = { workspace = true }
 
@@ -35,6 +36,9 @@ onnx = ["crane-core/onnx"]
 cuda = ["crane-core/cuda", "crane-serve/cuda", "dep:nvml-wrapper"]
 cudnn = ["crane-core/cudnn", "crane-serve/cudnn"]
 mkl = ["crane-core/mkl", "crane-serve/mkl"]
+
+[dev-dependencies]
+tempfile = "3"
 
 [lib]
 name = "crane"
