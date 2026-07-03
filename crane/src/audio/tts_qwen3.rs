@@ -7,7 +7,7 @@ use candle_core::Tensor;
 use crane_core::generation::SpeechOptions;
 use crane_core::models::qwen3_tts::Model;
 
-use super::tts::{AudioInfo, Tts, VoiceInfo};
+use super::tts::{AudioInfo, Tts, TtsStream, VoiceInfo};
 
 impl Tts for Model {
     fn audio_info(&self) -> AudioInfo {
@@ -65,5 +65,17 @@ impl Tts for Model {
         let (tensor, _sample_rate) =
             Model::generate_voice_clone(self, text, language, ref_audio_str, ref_text, opts)?;
         Ok(tensor)
+    }
+
+    fn generate_speech_stream(
+        &mut self,
+        text: &str,
+        language: &str,
+        voice: Option<&str>,
+        opts: &SpeechOptions,
+    ) -> Result<TtsStream<'_>> {
+        let audio_info = self.audio_info();
+        let stream = self.generate_speech_streaming(text, language, voice, opts)?;
+        Ok(TtsStream::new(audio_info, stream))
     }
 }

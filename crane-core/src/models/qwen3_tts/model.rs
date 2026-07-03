@@ -9,7 +9,7 @@ use candle_nn::VarBuilder;
 use hound::{SampleFormat, WavSpec, WavWriter};
 use tokenizers::Tokenizer;
 
-use super::modeling::{Qwen3TTSConfig, Qwen3TTSModel};
+use super::modeling::{Qwen3TTSConfig, Qwen3TTSModel, StreamingState};
 use super::speech_tokenizer_v2::NativeSpeechTokenizerDecoder;
 use crate::generation::SpeechOptions;
 use crate::utils::utils;
@@ -44,6 +44,23 @@ impl SpeechDecoderBackend {
             Self::Native(m) => m.sample_rate(),
             #[cfg(feature = "onnx")]
             Self::Onnx(m) => m.sample_rate,
+        }
+    }
+
+    fn decode_chunk(&self, codes: &Tensor, context_frames: usize) -> Result<Tensor> {
+        match self {
+            Self::Native(m) => m.decode_chunk(codes, context_frames),
+            #[cfg(feature = "onnx")]
+            Self::Onnx(m) => {
+                let wav = m.decode(codes)?;
+                if context_frames == 0 {
+                    return Ok(wav);
+                }
+                // total_upsample=1920 for Qwen3-TTS speech tokenizer
+                let trim = context_frames * 1920usize;
+                let tw = wav.dim(candle_core::D::Minus1)?;
+                wav.narrow(candle_core::D::Minus1, trim, tw.saturating_sub(trim))
+            }
         }
     }
 }
@@ -289,6 +306,34 @@ impl Model {
 
         let audio = speech_decoder.decode(&codes_tensor)?;
         Ok((audio, speech_decoder.sample_rate()))
+    }
+
+    /// Generate speech as an incremental stream of f32 PCM chunks.
+    ///
+    /// Returns a [`SpeechStream`] that yields audio chunks as codec frames are
+    /// generated. The first chunk arrives after [`STREAM_FIRST_CHUNK_SIZE`] frames
+    /// (~0.4 s); subsequent chunks every [`STREAM_CHUNK_SIZE`] frames (~2 s).
+    pub fn generate_speech_streaming(
+        &mut self,
+        text: &str,
+        language: &str,
+        speaker: Option<&str>,
+        opts: &SpeechOptions,
+    ) -> Result<SpeechStream<'_>> {
+        self.validate_tts_generation_mode()?;
+        let input_ids = self.prepare_tts_input(text)?;
+        let state = self.inner.prepare_streaming(&input_ids, language, speaker, opts)?;
+        Ok(SpeechStream {
+            model: self,
+            state,
+            max_new_tokens: opts.max_new_tokens,
+            chunk_size: STREAM_CHUNK_SIZE,
+            first_chunk_size: STREAM_FIRST_CHUNK_SIZE,
+            left_context: STREAM_LEFT_CONTEXT,
+            all_codes: Vec::new(),
+            emitted_up_to: 0,
+            done: false,
+        })
     }
 
     /// Generate speech and write directly to a WAV file.
@@ -799,3 +844,132 @@ impl Model {
         Ok(filename.to_string())
     }
 }
+
+// ── Streaming speech generation ────────────────────────────────────────────
+
+/// Number of codec frames in each chunk after the first.
+/// 25 frames × 1920 samples/frame = 48 000 samples ≈ 2 s at 24 kHz.
+const STREAM_CHUNK_SIZE: usize = 25;
+/// Number of codec frames in the first emitted chunk.
+/// 5 frames × 1920 samples/frame = 9 600 samples ≈ 0.4 s — fast first audio.
+const STREAM_FIRST_CHUNK_SIZE: usize = 5;
+/// Number of overlap frames prepended to each codec decode call.
+/// Must exceed the codec's causal receptive field (~25 frames) for exact output.
+const STREAM_LEFT_CONTEXT: usize = 25;
+
+/// Incremental speech generator that yields PCM audio chunks on demand.
+///
+/// Returned by [`Model::generate_speech_streaming`]. Implements
+/// `Iterator<Item = anyhow::Result<Tensor>>`, where each `Tensor` is a flat
+/// `[n_samples]` f32 PCM slice at 24 kHz.
+///
+/// The first chunk arrives after [`STREAM_FIRST_CHUNK_SIZE`] codec frames
+/// (~0.4 s). Subsequent chunks are emitted every [`STREAM_CHUNK_SIZE`] frames
+/// (~2 s). [`STREAM_LEFT_CONTEXT`] frames of overlap between consecutive codec
+/// calls ensure the waveform is numerically equivalent to non-streaming output.
+pub struct SpeechStream<'a> {
+    model: &'a mut Model,
+    state: StreamingState,
+    max_new_tokens: usize,
+    chunk_size: usize,
+    first_chunk_size: usize,
+    left_context: usize,
+    all_codes: Vec<Vec<u32>>,
+    emitted_up_to: usize,
+    done: bool,
+}
+
+impl SpeechStream<'_> {
+    fn generate_one_frame(&mut self) -> Result<bool> {
+        if self.state.step >= self.max_new_tokens {
+            return Ok(true);
+        }
+        match self.model.inner.generate_one_frame(&mut self.state, &self.all_codes)? {
+            None => Ok(true),
+            Some(frame) => {
+                self.all_codes.push(frame);
+                Ok(false)
+            }
+        }
+    }
+
+    fn try_next(&mut self) -> Result<Option<Tensor>> {
+        let target = if self.emitted_up_to == 0 {
+            self.first_chunk_size
+        } else {
+            self.chunk_size
+        };
+
+        loop {
+            let new_frames = self.all_codes.len() - self.emitted_up_to;
+            if new_frames >= target {
+                break;
+            }
+            let done = self.generate_one_frame()?;
+            if done {
+                self.done = true;
+                break;
+            }
+        }
+
+        let new_frames = self.all_codes.len() - self.emitted_up_to;
+        if new_frames == 0 {
+            return Ok(None);
+        }
+
+        let ctx = self.emitted_up_to.min(self.left_context);
+        let chunk_start = self.emitted_up_to - ctx;
+        let chunk_end = self.all_codes.len();
+        let n_chunk_frames = chunk_end - chunk_start;
+        let num_groups = self.all_codes[0].len();
+
+        // Normalize and flatten codes into [1, num_groups, n_chunk_frames] i64 tensor.
+        let codebook_size = self.model.config.talker_config.code_predictor_config.vocab_size as u32;
+        let flat: Vec<i64> = self.all_codes[chunk_start..chunk_end]
+            .iter()
+            .flat_map(|frame| {
+                frame.iter().map(move |&c| {
+                    let normalized = if codebook_size == 0 { c } else { c.min(codebook_size - 1) };
+                    normalized as i64
+                })
+            })
+            .collect();
+        let codes_tensor = Tensor::new(flat.as_slice(), &self.model.device)?
+            .reshape((n_chunk_frames, num_groups))?
+            .transpose(0, 1)?
+            .unsqueeze(0)?;
+
+        let speech_decoder = self.model.speech_decoder.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("speech decoder not loaded"))?;
+        let audio = speech_decoder.decode_chunk(&codes_tensor, ctx)?.flatten_all()?;
+
+        self.emitted_up_to = chunk_end;
+
+        let keep_from = self.emitted_up_to.saturating_sub(self.left_context);
+        if keep_from > 0 {
+            self.all_codes.drain(..keep_from);
+            self.emitted_up_to -= keep_from;
+        }
+
+        Ok(Some(audio))
+    }
+}
+
+impl Iterator for SpeechStream<'_> {
+    type Item = Result<Tensor>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done && self.emitted_up_to >= self.all_codes.len() {
+            return None;
+        }
+        match self.try_next() {
+            Ok(Some(chunk)) => Some(Ok(chunk)),
+            Ok(None) => None,
+            Err(e) => {
+                self.done = true;
+                Some(Err(e))
+            }
+        }
+    }
+}
+
