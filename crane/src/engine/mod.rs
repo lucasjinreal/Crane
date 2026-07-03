@@ -26,9 +26,11 @@
 //! | `sequence`      | Per-request lifecycle state                       |
 //! | `backend`       | `ModelBackend` trait + concrete implementations   |
 //! | `model_factory` | Auto-detection and factory creation               |
+//! | `runtime`       | `ModelRuntime` — protocol-independent model lifecycle |
 
 pub mod backend;
 pub mod model_factory;
+pub mod runtime;
 pub mod sampling;
 pub mod scheduler;
 pub mod sequence;
@@ -36,6 +38,7 @@ pub mod stats;
 pub mod types;
 
 // Re-export commonly used items for convenience.
+pub use runtime::{ModelRuntime, TtsGenerateRequest, TtsHandle};
 pub use stats::{EngineStats, StatsSnapshot};
 pub use types::{EngineHandle, EngineRequest, EngineResponse, GenerationParams};
 

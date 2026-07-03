@@ -1,0 +1,703 @@
+//! Protocol-independent model runtime.
+//!
+//! [`ModelRuntime`] owns the full model lifecycle (LLM engine, TTS models)
+//! independently of any transport (HTTP, Wyoming). Consumers load models via
+//! [`ModelRuntime::load_tts`], then send generation requests through the
+//! returned [`TtsHandle`]. Each TTS model runs on its own dedicated OS thread
+//! and is addressed through channels, so [`ModelRuntime`] can be shared via
+//! `Arc` across async tasks without locking.
+
+use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+use anyhow::Result;
+use candle_core::{DType, Device, Tensor};
+use tokio::sync::{mpsc, oneshot};
+
+use crane_core::generation::SpeechOptions;
+
+use crate::audio::tts::{AudioInfo, Tts, VoiceInfo};
+use crate::engine::model_factory::{self, ModelType};
+use crate::engine::types::EngineHandle;
+
+/// A request to generate speech, sent to a TTS model's dedicated thread.
+///
+/// This type is transport-agnostic: it carries no HTTP- or Wyoming-specific
+/// fields. The response is a raw f32 PCM [`Tensor`]; encoding to WAV, PCM
+/// bytes, or any other wire format is the caller's responsibility.
+pub struct TtsGenerateRequest {
+    /// Text to synthesize.
+    pub text: String,
+    /// Target language (e.g. "english", "auto").
+    pub language: String,
+    /// Voice name from [`TtsHandle::voices`], or `None` for the model default.
+    pub voice: Option<String>,
+    /// Generation parameters (temperature, max tokens, etc.).
+    pub opts: SpeechOptions,
+    /// Reference audio path for voice cloning. `None` for a predefined voice.
+    pub reference_audio: Option<PathBuf>,
+    /// Transcript of the reference audio (required by some models).
+    pub reference_text: Option<String>,
+    /// Channel to send back the generated audio tensor.
+    pub response_tx: oneshot::Sender<Result<Tensor>>,
+}
+
+/// Handle to a TTS model running on its dedicated thread.
+///
+/// Cloneable metadata (audio format, voices) is queried once at load time,
+/// before the model is moved to its thread, so it can be read without
+/// blocking on the generation queue.
+pub struct TtsHandle {
+    tx: mpsc::UnboundedSender<TtsGenerateRequest>,
+    audio_info: AudioInfo,
+    voices: Vec<VoiceInfo>,
+    supports_voice_cloning: bool,
+    model_type_name: &'static str,
+    pending_count: Arc<AtomicU64>,
+}
+
+impl TtsHandle {
+    /// Returns the audio format this model produces.
+    #[must_use]
+    pub fn audio_info(&self) -> AudioInfo {
+        self.audio_info
+    }
+
+    /// Returns the voices available for service discovery.
+    #[must_use]
+    pub fn voices(&self) -> &[VoiceInfo] {
+        &self.voices
+    }
+
+    /// Returns true if this model supports voice cloning from reference audio.
+    #[must_use]
+    pub fn supports_voice_cloning(&self) -> bool {
+        self.supports_voice_cloning
+    }
+
+    /// Returns the model type name (e.g. "`qwen3_tts`", "`voxtral_tts`").
+    #[must_use]
+    pub fn model_type_name(&self) -> &'static str {
+        self.model_type_name
+    }
+
+    /// Returns the number of requests currently queued or being processed.
+    #[must_use]
+    pub fn pending_count(&self) -> u64 {
+        self.pending_count.load(Ordering::Relaxed)
+    }
+
+    /// Send a generation request to the model's thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the model's thread has stopped.
+    pub fn send(&self, req: TtsGenerateRequest) -> Result<()> {
+        self.pending_count.fetch_add(1, Ordering::Relaxed);
+        self.tx.send(req).map_err(|_| {
+            self.pending_count.fetch_sub(1, Ordering::Relaxed);
+            anyhow::anyhow!("TTS thread has stopped")
+        })
+    }
+}
+
+/// Protocol-independent model runtime.
+///
+/// Owns the LLM continuous-batching engine handle (if any) and all loaded
+/// TTS models, keyed by name. crane-serve and crane-wyoming build one
+/// `ModelRuntime` at startup and share it via `Arc`.
+pub struct ModelRuntime {
+    engine: Option<EngineHandle>,
+    tts: HashMap<String, TtsHandle>,
+    default_tts: Option<String>,
+    model_name: String,
+    model_type: ModelType,
+    dtype_name: String,
+    device_name: String,
+}
+
+impl ModelRuntime {
+    /// Create an empty runtime with the given metadata.
+    #[must_use]
+    pub fn new(
+        model_name: String,
+        model_type: ModelType,
+        dtype_name: String,
+        device_name: String,
+    ) -> Self {
+        Self {
+            engine: None,
+            tts: HashMap::new(),
+            default_tts: None,
+            model_name,
+            model_type,
+            dtype_name,
+            device_name,
+        }
+    }
+
+    /// Register an already-constructed TTS model under `name`.
+    ///
+    /// Queries audio format, voices, and voice-cloning support from the
+    /// model before moving it to a dedicated thread. This ordering lets
+    /// tests inject a mock [`Tts`] implementation without touching disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the model's dedicated thread fails to spawn.
+    pub fn register_tts(
+        &mut self,
+        name: String,
+        model_type_name: &'static str,
+        tts: Box<dyn Tts + Send>,
+    ) -> Result<()> {
+        let audio_info = tts.audio_info();
+        let voices = tts.voices();
+        let supports_voice_cloning = tts.supports_voice_cloning();
+        let pending_count = Arc::new(AtomicU64::new(0));
+
+        let (tx, rx) = mpsc::unbounded_channel::<TtsGenerateRequest>();
+
+        let thread_name = format!("tts-{name}");
+        let log_name = name.clone();
+        let thread_pending_count = Arc::clone(&pending_count);
+        std::thread::Builder::new()
+            .name(thread_name)
+            .spawn(move || run_tts_thread(rx, tts, &log_name, &thread_pending_count))
+            .map_err(|e| anyhow::anyhow!("Failed to spawn TTS thread: {e}"))?;
+
+        if self.default_tts.is_none() {
+            self.default_tts = Some(name.clone());
+        }
+
+        self.tts.insert(
+            name,
+            TtsHandle {
+                tx,
+                audio_info,
+                voices,
+                supports_voice_cloning,
+                model_type_name,
+                pending_count,
+            },
+        );
+        Ok(())
+    }
+
+    /// Load a TTS model from disk and register it.
+    ///
+    /// Detects the model type from `model_path`, constructs the model, and
+    /// registers it under a name derived from the path's final component.
+    /// Returns the registration name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the model fails to load.
+    pub fn load_tts(&mut self, model_path: &str, device: &Device, dtype: &DType) -> Result<String> {
+        let resolved_type = model_factory::resolve(self.model_type, model_path);
+        let tts = model_factory::create_tts(resolved_type, model_path, device, dtype)?;
+        let name = extract_model_name(model_path);
+
+        tracing::info!(
+            name = %name,
+            model_type = %resolved_type.display_name(),
+            "TTS model loaded, spawning thread",
+        );
+
+        self.register_tts(name.clone(), resolved_type.display_name(), tts)?;
+        Ok(name)
+    }
+
+    /// Returns the TTS handle registered under `name`, if any.
+    #[must_use]
+    pub fn tts_handle(&self, name: &str) -> Option<&TtsHandle> {
+        self.tts.get(name)
+    }
+
+    /// Returns an arbitrary loaded TTS handle.
+    ///
+    /// Useful when only one TTS model is loaded (the common case for a
+    /// Wyoming server started with a single `--model` flag).
+    #[must_use]
+    pub fn default_tts_handle(&self) -> Option<&TtsHandle> {
+        self.default_tts.as_ref().and_then(|name| self.tts.get(name))
+    }
+
+    /// Returns the LLM engine handle, if a continuous-batching model is loaded.
+    #[must_use]
+    pub fn engine(&self) -> Option<&EngineHandle> {
+        self.engine.as_ref()
+    }
+
+    /// Set the LLM engine handle.
+    pub fn set_engine(&mut self, engine: EngineHandle) {
+        self.engine = Some(engine);
+    }
+
+    /// Returns the model's display name.
+    #[must_use]
+    pub fn model_name(&self) -> &str {
+        &self.model_name
+    }
+
+    /// Returns the detected/configured model type.
+    #[must_use]
+    pub fn model_type(&self) -> ModelType {
+        self.model_type
+    }
+
+    /// Returns the dtype display name (e.g. "F32", "BF16").
+    #[must_use]
+    pub fn dtype_name(&self) -> &str {
+        &self.dtype_name
+    }
+
+    /// Returns the device display name (e.g. "Cpu", "Cuda(0)").
+    #[must_use]
+    pub fn device_name(&self) -> &str {
+        &self.device_name
+    }
+}
+
+/// Derive a registration name from a model path's final path component.
+fn extract_model_name(model_path: &str) -> String {
+    Path::new(model_path)
+        .file_name()
+        .map_or_else(|| "tts".to_string(), |n| n.to_string_lossy().into_owned())
+}
+
+/// Run the blocking generation loop for one TTS model on its dedicated thread.
+fn run_tts_thread(
+    mut rx: mpsc::UnboundedReceiver<TtsGenerateRequest>,
+    mut tts: Box<dyn Tts + Send>,
+    model_name: &str,
+    pending_count: &AtomicU64,
+) {
+    tracing::info!(model = %model_name, "TTS thread started");
+    while let Some(req) = rx.blocking_recv() {
+        let text_len = req.text.chars().count();
+
+        if req.response_tx.is_closed() {
+            tracing::warn!(model = %model_name, text_len, "Caller disconnected, skipping");
+            pending_count.fetch_sub(1, Ordering::Relaxed);
+            continue;
+        }
+
+        let t0 = std::time::Instant::now();
+
+        let panic_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            if let Some(ref ref_audio) = req.reference_audio {
+                let ref_text = req.reference_text.as_deref().unwrap_or("");
+                tts.generate_voice_clone(&req.text, &req.language, ref_audio, ref_text, &req.opts)
+            } else {
+                tts.generate_speech(&req.text, &req.language, req.voice.as_deref(), &req.opts)
+            }
+        }));
+
+        let result = match panic_result {
+            Ok(result) => result,
+            Err(panic_payload) => {
+                let msg = panic_payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| panic_payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".to_string());
+                tracing::error!(model = %model_name, text_len, panic = %msg, "TTS generation panicked");
+                Err(anyhow::anyhow!("TTS generation panicked: {msg}"))
+            }
+        };
+
+        let elapsed_ms = t0.elapsed().as_millis();
+        match &result {
+            Ok(tensor) => {
+                tracing::info!(
+                    model = %model_name,
+                    text_len,
+                    samples = tensor.elem_count(),
+                    elapsed_ms,
+                    "TTS generation complete",
+                );
+            }
+            Err(e) => {
+                tracing::error!(model = %model_name, text_len, elapsed_ms, error = %e, "TTS generation failed");
+            }
+        }
+
+        let _ = req.response_tx.send(result);
+        pending_count.fetch_sub(1, Ordering::Relaxed);
+    }
+    tracing::info!(model = %model_name, "TTS thread stopped (channel closed)");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::Device;
+
+    struct MockTts {
+        audio_info: AudioInfo,
+        voices: Vec<VoiceInfo>,
+        supports_cloning: bool,
+    }
+
+    impl MockTts {
+        fn new() -> Self {
+            Self {
+                audio_info: AudioInfo {
+                    sample_rate: 24000,
+                    channels: 1,
+                    bits_per_sample: 16,
+                },
+                voices: vec![
+                    VoiceInfo {
+                        name: "alice".into(),
+                        languages: vec!["en".into()],
+                    },
+                    VoiceInfo {
+                        name: "bob".into(),
+                        languages: vec!["en".into(), "fr".into()],
+                    },
+                ],
+                supports_cloning: false,
+            }
+        }
+
+        fn with_cloning(mut self) -> Self {
+            self.supports_cloning = true;
+            self
+        }
+
+        fn with_sample_rate(mut self, sample_rate: u32) -> Self {
+            self.audio_info.sample_rate = sample_rate;
+            self
+        }
+    }
+
+    impl Tts for MockTts {
+        fn audio_info(&self) -> AudioInfo {
+            self.audio_info
+        }
+
+        fn voices(&self) -> Vec<VoiceInfo> {
+            self.voices.clone()
+        }
+
+        fn supports_voice_cloning(&self) -> bool {
+            self.supports_cloning
+        }
+
+        fn generate_speech(
+            &mut self,
+            text: &str,
+            _language: &str,
+            _voice: Option<&str>,
+            _opts: &SpeechOptions,
+        ) -> Result<Tensor> {
+            let n = text.chars().count().max(1);
+            Tensor::new(vec![0.5f32; n], &Device::Cpu).map_err(Into::into)
+        }
+
+        fn generate_voice_clone(
+            &mut self,
+            text: &str,
+            _language: &str,
+            _ref_audio: &Path,
+            _ref_text: &str,
+            _opts: &SpeechOptions,
+        ) -> Result<Tensor> {
+            let n = text.chars().count().max(1);
+            Tensor::new(vec![-0.5f32; n], &Device::Cpu).map_err(Into::into)
+        }
+    }
+
+    fn new_runtime() -> ModelRuntime {
+        ModelRuntime::new(
+            "test-model".into(),
+            ModelType::Qwen3TTS,
+            "F32".into(),
+            "Cpu".into(),
+        )
+    }
+
+    #[test]
+    fn test_register_tts_stores_handle() {
+        let mut rt = new_runtime();
+        rt.register_tts("m1".into(), "qwen3_tts", Box::new(MockTts::new()))
+            .unwrap();
+
+        let handle = rt.tts_handle("m1").expect("handle should be registered");
+        assert_eq!(handle.audio_info().sample_rate, 24000);
+        assert_eq!(handle.voices().len(), 2);
+        assert!(!handle.supports_voice_cloning());
+        assert_eq!(handle.model_type_name(), "qwen3_tts");
+    }
+
+    #[test]
+    fn test_generate_speech_roundtrip() {
+        let mut rt = new_runtime();
+        rt.register_tts("m1".into(), "qwen3_tts", Box::new(MockTts::new()))
+            .unwrap();
+        let handle = rt.tts_handle("m1").unwrap();
+
+        let (tx, rx) = oneshot::channel();
+        handle
+            .send(TtsGenerateRequest {
+                text: "hello".into(),
+                language: "en".into(),
+                voice: None,
+                opts: SpeechOptions::default(),
+                reference_audio: None,
+                reference_text: None,
+                response_tx: tx,
+            })
+            .unwrap();
+
+        let tensor = rx.blocking_recv().unwrap().unwrap();
+        let samples: Vec<f32> = tensor.to_vec1().unwrap();
+        assert_eq!(samples, vec![0.5f32; 5]);
+    }
+
+    #[test]
+    fn test_generate_voice_clone_roundtrip() {
+        let mut rt = new_runtime();
+        rt.register_tts(
+            "m1".into(),
+            "qwen3_tts",
+            Box::new(MockTts::new().with_cloning()),
+        )
+        .unwrap();
+        let handle = rt.tts_handle("m1").unwrap();
+
+        let (tx, rx) = oneshot::channel();
+        handle
+            .send(TtsGenerateRequest {
+                text: "hi".into(),
+                language: "en".into(),
+                voice: None,
+                opts: SpeechOptions::default(),
+                reference_audio: Some(PathBuf::from("/ref.wav")),
+                reference_text: Some("hi there".into()),
+                response_tx: tx,
+            })
+            .unwrap();
+
+        let tensor = rx.blocking_recv().unwrap().unwrap();
+        let samples: Vec<f32> = tensor.to_vec1().unwrap();
+        assert_eq!(samples, vec![-0.5f32; 2]);
+    }
+
+    #[test]
+    fn test_multiple_tts_models() {
+        let mut rt = new_runtime();
+        rt.register_tts(
+            "a".into(),
+            "qwen3_tts",
+            Box::new(MockTts::new().with_sample_rate(24000)),
+        )
+        .unwrap();
+        rt.register_tts(
+            "b".into(),
+            "voxtral_tts",
+            Box::new(MockTts::new().with_sample_rate(16000)),
+        )
+        .unwrap();
+
+        assert_eq!(rt.tts_handle("a").unwrap().audio_info().sample_rate, 24000);
+        assert_eq!(rt.tts_handle("b").unwrap().audio_info().sample_rate, 16000);
+    }
+
+    #[test]
+    fn test_default_tts_handle() {
+        let mut rt = new_runtime();
+        assert!(rt.default_tts_handle().is_none());
+
+        rt.register_tts("a".into(), "qwen3_tts", Box::new(MockTts::new()))
+            .unwrap();
+        assert!(rt.default_tts_handle().is_some());
+    }
+
+    #[test]
+    fn test_tts_handle_not_found() {
+        let rt = new_runtime();
+        assert!(rt.tts_handle("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_model_runtime_new_metadata() {
+        let rt = new_runtime();
+        assert_eq!(rt.model_name(), "test-model");
+        assert_eq!(rt.model_type(), ModelType::Qwen3TTS);
+        assert_eq!(rt.dtype_name(), "F32");
+        assert_eq!(rt.device_name(), "Cpu");
+        assert!(rt.engine().is_none());
+        assert!(rt.default_tts_handle().is_none());
+    }
+
+    #[test]
+    fn test_extract_model_name() {
+        assert_eq!(
+            extract_model_name("/models/Qwen3-TTS-12Hz-0.6B"),
+            "Qwen3-TTS-12Hz-0.6B"
+        );
+        assert_eq!(extract_model_name("/models/voxtral/"), "voxtral");
+        assert_eq!(extract_model_name(""), "tts");
+    }
+
+    #[test]
+    fn test_send_after_thread_stopped() {
+        let (tx, rx) = mpsc::unbounded_channel::<TtsGenerateRequest>();
+        drop(rx);
+
+        let handle = TtsHandle {
+            tx,
+            audio_info: AudioInfo {
+                sample_rate: 24000,
+                channels: 1,
+                bits_per_sample: 16,
+            },
+            voices: vec![],
+            supports_voice_cloning: false,
+            model_type_name: "qwen3_tts",
+            pending_count: Arc::new(AtomicU64::new(0)),
+        };
+
+        let (resp_tx, _resp_rx) = oneshot::channel();
+        let result = handle.send(TtsGenerateRequest {
+            text: "hello".into(),
+            language: "en".into(),
+            voice: None,
+            opts: SpeechOptions::default(),
+            reference_audio: None,
+            reference_text: None,
+            response_tx: resp_tx,
+        });
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("stopped"));
+        assert_eq!(handle.pending_count(), 0);
+    }
+
+    #[test]
+    fn test_set_engine_roundtrip() {
+        use crate::engine::stats::EngineStats;
+        use crate::engine::types::EngineHandle;
+
+        let mut rt = new_runtime();
+        assert!(rt.engine().is_none());
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let engine = EngineHandle {
+            request_tx: tx,
+            stats: Arc::new(EngineStats::new()),
+        };
+        rt.set_engine(engine);
+
+        assert!(rt.engine().is_some());
+    }
+
+    #[test]
+    fn test_register_duplicate_name() {
+        let mut rt = new_runtime();
+        rt.register_tts(
+            "dup".into(),
+            "qwen3_tts",
+            Box::new(MockTts::new().with_sample_rate(24000)),
+        )
+        .unwrap();
+        rt.register_tts(
+            "dup".into(),
+            "voxtral_tts",
+            Box::new(MockTts::new().with_sample_rate(16000)),
+        )
+        .unwrap();
+
+        let handle = rt.tts_handle("dup").unwrap();
+        assert_eq!(handle.audio_info().sample_rate, 16000);
+        assert_eq!(handle.model_type_name(), "voxtral_tts");
+    }
+
+    struct PanickingTts {
+        call_count: u32,
+    }
+
+    impl PanickingTts {
+        fn new() -> Self {
+            Self { call_count: 0 }
+        }
+    }
+
+    impl Tts for PanickingTts {
+        fn audio_info(&self) -> AudioInfo {
+            AudioInfo {
+                sample_rate: 24000,
+                channels: 1,
+                bits_per_sample: 16,
+            }
+        }
+
+        fn voices(&self) -> Vec<VoiceInfo> {
+            vec![]
+        }
+
+        fn generate_speech(
+            &mut self,
+            text: &str,
+            _language: &str,
+            _voice: Option<&str>,
+            _opts: &SpeechOptions,
+        ) -> Result<Tensor> {
+            self.call_count += 1;
+            if self.call_count == 1 {
+                panic!("simulated model panic");
+            }
+            let n = text.chars().count().max(1);
+            Tensor::new(vec![0.1f32; n], &Device::Cpu).map_err(Into::into)
+        }
+    }
+
+    #[test]
+    fn test_panic_in_generate_is_caught() {
+        let mut rt = new_runtime();
+        rt.register_tts("panic_model".into(), "qwen3_tts", Box::new(PanickingTts::new()))
+            .unwrap();
+        let handle = rt.tts_handle("panic_model").unwrap();
+
+        let (tx1, rx1) = oneshot::channel();
+        handle
+            .send(TtsGenerateRequest {
+                text: "boom".into(),
+                language: "en".into(),
+                voice: None,
+                opts: SpeechOptions::default(),
+                reference_audio: None,
+                reference_text: None,
+                response_tx: tx1,
+            })
+            .unwrap();
+
+        let result1 = rx1.blocking_recv().unwrap();
+        assert!(result1.is_err());
+        assert!(result1.unwrap_err().to_string().contains("panicked"));
+
+        let (tx2, rx2) = oneshot::channel();
+        handle
+            .send(TtsGenerateRequest {
+                text: "ok".into(),
+                language: "en".into(),
+                voice: None,
+                opts: SpeechOptions::default(),
+                reference_audio: None,
+                reference_text: None,
+                response_tx: tx2,
+            })
+            .unwrap();
+
+        let result2 = rx2.blocking_recv().unwrap();
+        assert!(result2.is_ok());
+        let samples: Vec<f32> = result2.unwrap().to_vec1().unwrap();
+        assert_eq!(samples, vec![0.1f32; 2]);
+    }
+}

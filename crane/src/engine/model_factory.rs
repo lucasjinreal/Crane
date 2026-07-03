@@ -330,6 +330,35 @@ pub fn create_voxtral_tts_model(
     crane_core::models::voxtral_tts::Model::new(model_path, device, dtype)
 }
 
+/// Create a TTS model as a trait object.
+///
+/// Dispatches on [`ModelType`] and returns a `Box<dyn Tts + Send>`, allowing
+/// callers (e.g. [`crate::engine::runtime::ModelRuntime`]) to work with any
+/// TTS model through the [`crate::audio::tts::Tts`] trait without depending
+/// on concrete model types.
+///
+/// # Errors
+///
+/// Returns an error if `model_type` does not resolve to a TTS type, or if
+/// the model fails to load from `model_path`.
+pub fn create_tts(
+    model_type: ModelType,
+    model_path: &str,
+    device: &Device,
+    dtype: &DType,
+) -> Result<Box<dyn crate::audio::tts::Tts + Send>> {
+    let model_type = resolve(model_type, model_path);
+    tracing::info!("Creating TTS model: {:?}", model_type);
+
+    match model_type {
+        ModelType::Qwen3TTS => Ok(Box::new(create_tts_model(model_path, device, dtype)?)),
+        ModelType::VoxtralTTS => Ok(Box::new(create_voxtral_tts_model(model_path, device, dtype)?)),
+        other => anyhow::bail!(
+            "{other:?} is not a TTS model — use create_backend() or create_vlm_model() instead"
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,5 +537,17 @@ mod tests {
     fn resolve_explicit_type_is_passthrough() {
         let result = resolve(ModelType::HunyuanDense, "/models/whatever");
         assert_eq!(result, ModelType::HunyuanDense);
+    }
+
+    // ── create_tts ──
+
+    #[test]
+    fn create_tts_rejects_non_tts_type() {
+        let result = create_tts(ModelType::Qwen3, "/models/whatever", &Device::Cpu, &DType::F32);
+        let err = match result {
+            Ok(_) => panic!("expected create_tts to reject a non-TTS model type"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("not a TTS model"));
     }
 }
