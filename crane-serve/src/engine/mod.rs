@@ -79,6 +79,7 @@ impl MemoryConfig {
     /// `gpu_memory_limit` accepts:
     ///   - Absolute sizes: "5G", "8G", "5120M", "5368709120" (bytes)
     ///   - Utilization fraction: "0.7" (70% of total GPU memory)
+    #[must_use]
     pub fn parse(max_seq_len: usize, gpu_memory_limit: Option<&str>, device: &Device) -> Self {
         let gpu_memory_limit_bytes = match gpu_memory_limit {
             Some(s) => Self::parse_memory_limit(s, device),
@@ -99,15 +100,25 @@ impl MemoryConfig {
 
         // Try absolute sizes: "5G", "8G", "5120M", "1024K"
         let upper = s.to_uppercase();
-        if upper.ends_with('G') {
-            if let Ok(n) = upper[..upper.len() - 1].trim().parse::<f64>() {
-                return (n * (1u64 << 30) as f64) as u64;
-            }
+        if upper.ends_with('G')
+            && let Ok(n) = upper[..upper.len() - 1].trim().parse::<f64>()
+        {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                clippy::cast_precision_loss
+            )]
+            return (n * (1u64 << 30) as f64) as u64;
         }
-        if upper.ends_with('M') {
-            if let Ok(n) = upper[..upper.len() - 1].trim().parse::<f64>() {
-                return (n * (1u64 << 20) as f64) as u64;
-            }
+        if upper.ends_with('M')
+            && let Ok(n) = upper[..upper.len() - 1].trim().parse::<f64>()
+        {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                clippy::cast_precision_loss
+            )]
+            return (n * (1u64 << 20) as f64) as u64;
         }
 
         // Try as a fraction (0.0 - 1.0)
@@ -115,16 +126,22 @@ impl MemoryConfig {
             if (0.0..=1.0).contains(&frac) {
                 let total = Self::query_total_gpu_memory(device);
                 if total > 0 {
+                    #[allow(
+                        clippy::cast_possible_truncation,
+                        clippy::cast_sign_loss,
+                        clippy::cast_precision_loss
+                    )]
                     return (frac * total as f64) as u64;
                 }
             }
             // If > 1.0, treat as bytes
             if frac > 1.0 {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                 return frac as u64;
             }
         }
 
-        tracing::warn!("Could not parse gpu_memory_limit '{}', ignoring", s);
+        tracing::warn!("Could not parse gpu_memory_limit '{s}', ignoring");
         0
     }
 
@@ -150,7 +167,7 @@ impl MemoryConfig {
     }
 }
 
-/// Query current GPU memory usage. Returns (used_bytes, total_bytes).
+/// Query current GPU memory usage. Returns (`used_bytes`, `total_bytes`).
 /// Returns (0, 0) if not on CUDA.
 fn query_gpu_memory_usage(_device: &Device) -> (u64, u64) {
     #[cfg(feature = "cuda")]
@@ -169,12 +186,14 @@ fn query_gpu_memory_usage(_device: &Device) -> (u64, u64) {
 /// Format a byte count as a human-readable string (used in engine log messages).
 fn format_bytes_engine(bytes: u64) -> String {
     if bytes >= 1 << 30 {
-        format!("{:.1}G", bytes as f64 / (1u64 << 30) as f64)
-    } else if bytes >= 1 << 20 {
-        format!("{:.0}M", bytes as f64 / (1u64 << 20) as f64)
-    } else {
-        format!("{}B", bytes)
+        #[allow(clippy::cast_precision_loss)]
+        return format!("{:.1}G", bytes as f64 / (1u64 << 30) as f64);
     }
+    if bytes >= 1 << 20 {
+        #[allow(clippy::cast_precision_loss)]
+        return format!("{:.0}M", bytes as f64 / (1u64 << 20) as f64);
+    }
+    format!("{bytes}B")
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -246,10 +265,7 @@ impl InferenceEngine {
             1.min(max_concurrent)
         };
         if effective_max != max_concurrent {
-            info!(
-                "Model does not support KV swap — limiting max_concurrent to {}",
-                effective_max
-            );
+            info!("Model does not support KV swap — limiting max_concurrent to {effective_max}");
         }
 
         let stats = Arc::new(EngineStats::new());
@@ -267,7 +283,9 @@ impl InferenceEngine {
             step_counter: 0,
             sampling_buffers: SamplingBuffers::new(),
             memory_config,
-            last_mem_warn: Instant::now() - std::time::Duration::from_secs(60),
+            last_mem_warn: Instant::now()
+                .checked_sub(std::time::Duration::from_mins(1))
+                .unwrap_or_else(Instant::now),
             tracked_kv_bytes: 0,
             eviction_cooldown: 0,
         };
@@ -360,18 +378,17 @@ impl InferenceEngine {
                     }
                     self.step_counter += 1;
 
-                    if self.step_counter % 50 == 0 {
+                    if self.step_counter.is_multiple_of(50) {
                         self.log_stats();
                     }
                 }
                 None => {
-                    match self.request_rx.blocking_recv() {
-                        Some(req) => self.accept_request(req),
-                        None => {
-                            info!("Engine channel closed, shutting down");
-                            self.log_stats();
-                            return;
-                        }
+                    if let Some(req) = self.request_rx.blocking_recv() {
+                        self.accept_request(req);
+                    } else {
+                        info!("Engine channel closed, shutting down");
+                        self.log_stats();
+                        return;
                     }
                 }
             }
@@ -388,6 +405,7 @@ impl InferenceEngine {
         } else {
             String::new()
         };
+        #[allow(clippy::cast_precision_loss)]
         let gpu_info = if gpu_total > 0 {
             format!(
                 " | gpu_mem: {:.1}G/{:.1}G ({:.0}%) | kv_cache: {}{}",
@@ -548,17 +566,13 @@ impl InferenceEngine {
                 .max_by_key(|(_, len)| *len)
                 .map(|(id, _)| id);
 
-            let victim_id = match victim_id {
-                Some(id) => id,
-                None => break,
-            };
+            let Some(victim_id) = victim_id else { break };
 
             // Compute bytes being freed.
             let freed = self
                 .sequences
                 .get(&victim_id)
-                .map(|seq| sequence::kv_cache_bytes(&seq.kv_caches))
-                .unwrap_or(0);
+                .map_or(0, |seq| sequence::kv_cache_bytes(&seq.kv_caches));
 
             info!(
                 id = %victim_id,
@@ -606,7 +620,7 @@ impl InferenceEngine {
         self.eviction_cooldown = 5;
     }
 
-    /// Effective max_tokens for a request, taking server-level max_seq_len into account.
+    /// Effective `max_tokens` for a request, taking server-level `max_seq_len` into account.
     fn effective_max_tokens(&self, prompt_len: usize, requested_max_tokens: usize) -> usize {
         if self.memory_config.max_seq_len == 0 {
             return requested_max_tokens;
@@ -731,7 +745,7 @@ impl InferenceEngine {
             // performs every scheduling round.
             self.step_decode_batch(output.batch);
         } else {
-            self.step_decode_sequential(output.batch);
+            self.step_decode_sequential(&output.batch);
         }
     }
 
@@ -772,11 +786,13 @@ impl InferenceEngine {
 
         self.swap_out(&seq_id);
 
+        #[allow(clippy::cast_possible_truncation)]
         let prefill_us = t0.elapsed().as_micros() as u64;
         self.stats
             .total_prefill_time_us
             .fetch_add(prefill_us, Ordering::Relaxed);
 
+        #[allow(clippy::cast_precision_loss)]
         let prefill_tok_s = if prefill_us > 0 {
             (prompt_len as f64) / (prefill_us as f64 / 1_000_000.0)
         } else {
@@ -810,21 +826,15 @@ impl InferenceEngine {
     //  Batched decode
     // ─────────────────────────────────────────────────────────
 
-    /// Decode step for all running sequences — TRUE BATCHED forward.
-    ///
-    /// Uses **lazy eviction**: when a sequence completes or is cancelled
-    /// mid-loop, it stays in the batch tensor (wasting trivial compute)
-    /// rather than triggering an expensive extract→re-setup cycle.
-    fn step_decode_batch(&mut self, batch: Vec<String>) {
-        let t0 = Instant::now();
-
-        // Filter cancelled sequences.
+    /// Remove cancelled/disconnected sequences from a decode batch, cleaning
+    /// each one up. Returns the filtered batch.
+    fn filter_cancelled_batch(&mut self, batch: Vec<String>) -> Vec<String> {
         let cancelled: Vec<String> = batch
             .iter()
             .filter(|id| {
                 self.sequences
                     .get(id.as_str())
-                    .map_or(true, |s| s.response_tx.is_closed())
+                    .is_none_or(|s| s.response_tx.is_closed())
             })
             .cloned()
             .collect();
@@ -833,17 +843,15 @@ impl InferenceEngine {
             self.stats.cancelled_requests.fetch_add(1, Ordering::Relaxed);
             self.cleanup_sequence(id);
         }
-        let batch: Vec<String> = batch
+        batch
             .into_iter()
             .filter(|id| !cancelled.contains(id))
-            .collect();
-        if batch.is_empty() {
-            return;
-        }
+            .collect()
+    }
 
-        let batch_size = batch.len();
-
-        // Flush model's internal KV cache state.
+    /// Flush the model's active single-sequence KV cache before batch decode
+    /// takes over, saving it back to the owning sequence.
+    fn flush_active_kv_for_batch(&mut self) {
         if let Some(ref prev_id) = self.active_seq_id.take() {
             if self.sequences.contains_key(prev_id) {
                 let caches = self.model.get_kv_caches();
@@ -854,6 +862,65 @@ impl InferenceEngine {
             self.model.clear_kv_cache();
         }
         self.recount_kv_bytes();
+    }
+
+    /// Extract per-sequence KV caches from the model's batched buffer back
+    /// into `self.sequences` after a batch decode step.
+    fn save_extracted_batch_kv(
+        &mut self,
+        batch: &[String],
+        alive: &[bool],
+        kv_lens: &[usize],
+        original_max_kv: usize,
+        rounds_done: usize,
+    ) {
+        if rounds_done == 0 {
+            return;
+        }
+        match self
+            .model
+            .extract_batch_kv(kv_lens, original_max_kv, rounds_done)
+        {
+            Ok(extracted) => {
+                for (i, seq_id) in batch.iter().enumerate() {
+                    if alive[i]
+                        && let Some(seq) = self.sequences.get_mut(seq_id)
+                        && i < extracted.len()
+                    {
+                        seq.kv_caches.clone_from(&extracted[i]);
+                    }
+                }
+                // KV caches changed for multiple sequences — recount.
+                self.recount_kv_bytes();
+            }
+            Err(e) => {
+                error!("Final KV extraction failed: {e}");
+                self.model.clear_kv_cache();
+                self.recount_kv_bytes();
+            }
+        }
+    }
+
+    /// Decode step for all running sequences — TRUE BATCHED forward.
+    ///
+    /// Uses **lazy eviction**: when a sequence completes or is cancelled
+    /// mid-loop, it stays in the batch tensor (wasting trivial compute)
+    /// rather than triggering an expensive extract→re-setup cycle.
+    // The setup, multi-round decode loop, and finalization below are one
+    // cohesive decode step; splitting them further would scatter shared
+    // local state (batch, kv_lens, alive, positions) across functions.
+    #[allow(clippy::too_many_lines)]
+    fn step_decode_batch(&mut self, batch: Vec<String>) {
+        let t0 = Instant::now();
+
+        let batch = self.filter_cancelled_batch(batch);
+        if batch.is_empty() {
+            return;
+        }
+
+        let batch_size = batch.len();
+
+        self.flush_active_kv_for_batch();
 
         // Collect KV caches and setup batched decode.
         let kv_caches: Vec<Vec<Option<(Tensor, Tensor)>>> = batch
@@ -1014,13 +1081,13 @@ impl InferenceEngine {
 
                 self.send_token(seq_id, next_token);
 
-                if self.sequences.get(seq_id).map_or(true, |s| s.should_stop()) {
+                if self.sequences.get(seq_id).is_none_or(Sequence::should_stop) {
                     alive[i] = false;
                     pending_finish.push(seq_id.clone());
                 } else if self
                     .sequences
                     .get(seq_id)
-                    .map_or(true, |s| s.response_tx.is_closed())
+                    .is_none_or(|s| s.response_tx.is_closed())
                 {
                     warn!(id = %seq_id, "Client disconnected mid-batch-decode");
                     alive[i] = false;
@@ -1028,37 +1095,12 @@ impl InferenceEngine {
                 }
             }
 
-            for p in positions.iter_mut() {
+            for p in &mut positions {
                 *p += 1;
             }
         }
 
-        // Extract per-sequence KV caches.
-        if rounds_done > 0 {
-            match self
-                .model
-                .extract_batch_kv(&kv_lens, original_max_kv, rounds_done)
-            {
-                Ok(extracted) => {
-                    for (i, seq_id) in batch.iter().enumerate() {
-                        if alive[i] {
-                            if let Some(seq) = self.sequences.get_mut(seq_id) {
-                                if i < extracted.len() {
-                                    seq.kv_caches = extracted[i].clone();
-                                }
-                            }
-                        }
-                    }
-                    // KV caches changed for multiple sequences — recount.
-                    self.recount_kv_bytes();
-                }
-                Err(e) => {
-                    error!("Final KV extraction failed: {e}");
-                    self.model.clear_kv_cache();
-                    self.recount_kv_bytes();
-                }
-            }
-        }
+        self.save_extracted_batch_kv(&batch, &alive, &kv_lens, original_max_kv, rounds_done);
 
         for id in &pending_finish {
             self.finish_sequence(id);
@@ -1068,23 +1110,27 @@ impl InferenceEngine {
             self.cleanup_sequence(id);
         }
 
+        #[allow(clippy::cast_possible_truncation)]
         let decode_us = t0.elapsed().as_micros() as u64;
         self.stats
             .total_decode_time_us
             .fetch_add(decode_us, Ordering::Relaxed);
 
         if total_tokens_this_step > 0 {
+            #[allow(clippy::cast_precision_loss)]
             let tok_s = if decode_us > 0 {
                 (total_tokens_this_step as f64) / (decode_us as f64 / 1_000_000.0)
             } else {
                 0.0
             };
+            #[allow(clippy::cast_possible_truncation)]
+            let setup_ms = t_setup.as_millis() as u64;
             debug!(
                 batch_size,
                 tokens = total_tokens_this_step,
                 rounds = rounds_done,
                 finished = pending_finish.len(),
-                setup_ms = t_setup.as_millis() as u64,
+                setup_ms,
                 decode_ms = decode_us / 1000,
                 tok_s = format!("{:.1}", tok_s),
                 "Batched decode step complete",
@@ -1100,15 +1146,15 @@ impl InferenceEngine {
     // ─────────────────────────────────────────────────────────
 
     /// Sequential decode for backends without batch decode support.
-    fn step_decode_sequential(&mut self, batch: Vec<String>) {
+    fn step_decode_sequential(&mut self, batch: &[String]) {
         let t0 = Instant::now();
         let mut total_tokens: u64 = 0;
 
-        for seq_id in &batch {
+        for seq_id in batch {
             if self
                 .sequences
                 .get(seq_id)
-                .map_or(true, |s| s.response_tx.is_closed())
+                .is_none_or(|s| s.response_tx.is_closed())
             {
                 self.stats
                     .cancelled_requests
@@ -1121,10 +1167,7 @@ impl InferenceEngine {
 
             for _round in 0..self.decode_tokens_per_seq {
                 let (input_ids, start_pos) = {
-                    let seq = match self.sequences.get(seq_id) {
-                        Some(s) => s,
-                        None => break,
-                    };
+                    let Some(seq) = self.sequences.get(seq_id) else { break };
                     (seq.next_input_ids().to_vec(), seq.start_pos())
                 };
 
@@ -1161,7 +1204,7 @@ impl InferenceEngine {
                 if self
                     .sequences
                     .get(seq_id)
-                    .map_or(true, |s| s.should_stop())
+                    .is_none_or(Sequence::should_stop)
                 {
                     self.finish_sequence(seq_id);
                     break;
@@ -1170,7 +1213,7 @@ impl InferenceEngine {
                 if self
                     .sequences
                     .get(seq_id)
-                    .map_or(true, |s| s.response_tx.is_closed())
+                    .is_none_or(|s| s.response_tx.is_closed())
                 {
                     warn!(id = %seq_id, "Client disconnected mid-decode");
                     self.stats
@@ -1184,12 +1227,14 @@ impl InferenceEngine {
             self.swap_out(seq_id);
         }
 
+        #[allow(clippy::cast_possible_truncation)]
         let decode_us = t0.elapsed().as_micros() as u64;
         self.stats
             .total_decode_time_us
             .fetch_add(decode_us, Ordering::Relaxed);
 
         if total_tokens > 0 {
+            #[allow(clippy::cast_precision_loss)]
             let tok_s = if decode_us > 0 {
                 (total_tokens as f64) / (decode_us as f64 / 1_000_000.0)
             } else {
@@ -1217,10 +1262,8 @@ impl InferenceEngine {
         }
 
         if !self.model.supports_kv_swap() {
-            if self.active_seq_id.as_deref() != Some(seq_id) {
-                self.model.clear_kv_cache();
-                self.active_seq_id = Some(seq_id.to_string());
-            }
+            self.model.clear_kv_cache();
+            self.active_seq_id = Some(seq_id.to_string());
             return;
         }
 
@@ -1236,8 +1279,7 @@ impl InferenceEngine {
         let caches = self
             .sequences
             .get(seq_id)
-            .map(|s| s.kv_caches.clone())
-            .unwrap_or_else(|| vec![None; self.num_layers]);
+            .map_or_else(|| vec![None; self.num_layers], |s| s.kv_caches.clone());
         self.model.set_kv_caches(caches);
         self.active_seq_id = Some(seq_id.to_string());
 
@@ -1262,10 +1304,10 @@ impl InferenceEngine {
         // Drop stale seq cache references (from the last swap_in) to free
         // GPU memory.  swap_in will extract fresh caches from the model
         // when switching to a different sequence.
-        if let Some(seq) = self.sequences.get_mut(seq_id) {
-            if seq.kv_caches.iter().any(|c| c.is_some()) {
-                seq.kv_caches = vec![None; seq.kv_caches.len()];
-            }
+        if let Some(seq) = self.sequences.get_mut(seq_id)
+            && seq.kv_caches.iter().any(Option::is_some)
+        {
+            seq.kv_caches = vec![None; seq.kv_caches.len()];
         }
         self.recount_kv_bytes();
     }
@@ -1288,14 +1330,13 @@ impl InferenceEngine {
             return;
         };
 
-        if let Some(seq) = self.sequences.get(seq_id) {
-            if seq
+        if let Some(seq) = self.sequences.get(seq_id)
+            && seq
                 .response_tx
                 .send(EngineResponse::Token { text, token_id })
                 .is_err()
-            {
-                debug!(id = %seq_id, "Response channel closed (client disconnected)");
-            }
+        {
+            debug!(id = %seq_id, "Response channel closed (client disconnected)");
         }
     }
 
@@ -1315,13 +1356,13 @@ impl InferenceEngine {
             .and_then(|s| s.decode_rest().ok().flatten())
             .unwrap_or_default();
 
-        if !remaining.is_empty() {
-            if let Some(seq) = self.sequences.get(seq_id) {
-                let _ = seq.response_tx.send(EngineResponse::Token {
-                    text: remaining,
-                    token_id: 0,
-                });
-            }
+        if !remaining.is_empty()
+            && let Some(seq) = self.sequences.get(seq_id)
+        {
+            let _ = seq.response_tx.send(EngineResponse::Token {
+                text: remaining,
+                token_id: 0,
+            });
         }
 
         if let Some(seq) = self.sequences.get(seq_id) {
