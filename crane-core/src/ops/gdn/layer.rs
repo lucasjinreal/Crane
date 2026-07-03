@@ -1,14 +1,16 @@
 //! Top-level `GatedDeltaNet` layer: orchestrates input projection, causal
 //! Conv1D, gated delta rule recurrence, gated RMSNorm, and output projection.
 
+use candle_core::quantized::GgmlDType;
 use candle_core::{Module, Result, Tensor};
-use candle_nn::{linear_no_bias, Linear, VarBuilder};
+use candle_nn::VarBuilder;
 
 use super::backend::{apply_recurrence, causal_conv1d, compute_beta_g, l2_norm};
 use super::cache::GdnLayerCache;
 use super::config::{GdnConfig, GdnDims};
 use super::norm::RmsNormGated;
 use super::projection::{GdnInputProjection, GdnInputProjectionKind};
+use crate::ops::linear::{linear_layer, LinearLayer};
 
 /// One linear-attention layer as used by Qwen 3.5 (and similar hybrid models).
 ///
@@ -20,7 +22,7 @@ pub struct GatedDeltaNet {
     pub dt_bias: Tensor,
     pub a_log: Tensor,
     pub norm: RmsNormGated,
-    pub out_proj: Linear,
+    pub out_proj: LinearLayer,
 }
 
 impl GatedDeltaNet {
@@ -28,15 +30,18 @@ impl GatedDeltaNet {
 ///
 /// `cfg` supplies the dimensions; `projection_kind` selects the QKV/Z/B/A
 /// weight layout (Qwen 3.5 uses [`GdnInputProjectionKind::Split`]).
+/// `quant` requests in-situ quantization of the large projections
+/// (conv1d / dt_bias / A_log / norm always stay in full precision).
 pub fn load(
         vb: VarBuilder,
         cfg: &dyn GdnConfig,
         projection_kind: GdnInputProjectionKind,
+        quant: Option<GgmlDType>,
 ) -> Result<Self> {
         let dims = GdnDims::new(cfg);
         let vb_la = vb.pp("linear_attn");
 
-        let input_proj = GdnInputProjection::load(vb_la.clone(), &dims, projection_kind)?;
+        let input_proj = GdnInputProjection::load(vb_la.clone(), &dims, projection_kind, quant)?;
         let conv1d_weight = vb_la.get(
             (dims.conv_dim, 1, dims.conv_kernel_size),
             "conv1d.weight",
@@ -45,7 +50,7 @@ pub fn load(
         let a_log = vb_la.get(dims.num_v_heads, "A_log")?;
 
         let norm = RmsNormGated::new(dims.head_v_dim, cfg.rms_norm_eps(), vb_la.pp("norm"))?;
-        let out_proj = linear_no_bias(dims.value_dim, dims.hidden_size, vb_la.pp("out_proj"))?;
+        let out_proj = linear_layer(dims.value_dim, dims.hidden_size, vb_la.pp("out_proj"), quant)?;
 
         Ok(Self {
             input_proj,

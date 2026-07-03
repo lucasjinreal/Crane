@@ -61,6 +61,18 @@ impl<R: Read + Seek> Gguf<R> {
         self.ct.tensor(&mut self.reader, name, &self.device)
     }
 
+    /// Load a tensor, dequantize, and cast to the target compute dtype.
+    /// For small full-precision tensors (norm weights, biases, conv kernels).
+    pub fn dequant_tensor(&mut self, name: &str) -> Result<Tensor> {
+        let ws = self.ct.tensor(&mut self.reader, name, &self.device)?;
+        ws.dequantize(&self.device)?.to_dtype(self.dtype)
+    }
+
+    /// Whether the file contains a tensor with this exact name.
+    pub fn contains_tensor(&self, name: &str) -> bool {
+        self.ct.tensor_infos.contains_key(name)
+    }
+
     /// Access GGUF metadata.
     pub fn metadata(&self) -> &std::collections::HashMap<String, gguf_file::Value> {
         &self.ct.metadata
@@ -68,43 +80,9 @@ impl<R: Read + Seek> Gguf<R> {
 }
 
 // ── Polymorphic linear layer ──
-
-/// A linear layer that can be either a standard (f16/f32) Linear or a
-/// quantized QMatMul. Both implement Module::forward identically from the
-/// caller's perspective. This allows the same model code to serve both
-/// safetensors and GGUF weights with zero duplication.
-pub enum LinearLayer {
-    Standard(Linear),
-    Quantized(candle_core::quantized::QMatMul),
-}
-
-impl Module for LinearLayer {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        match self {
-            Self::Standard(l) => l.forward(xs),
-            Self::Quantized(q) => {
-                // candle's QMatMul internally dequantizes weights to F32
-                // and requires F32 input. When the activation pipeline
-                // runs in BF16/F16 we must:
-                //   1. Cast input to F32 for the quantized matmul
-                //   2. Cast output back to the original dtype for
-                //      downstream binary ops (residual adds, etc.)
-                let input_dtype = xs.dtype();
-                let xs_f32 = if input_dtype != DType::F32 {
-                    xs.to_dtype(DType::F32)?
-                } else {
-                    xs.clone()
-                };
-                let out = q.forward(&xs_f32)?;
-                if input_dtype != DType::F32 {
-                    out.to_dtype(input_dtype)
-                } else {
-                    Ok(out)
-                }
-            }
-        }
-    }
-}
+// Moved to `crate::ops::linear` so shared ops (e.g. GDN) can use it too;
+// re-exported here for existing users (hunyuan, qwen3).
+pub use crate::ops::linear::LinearLayer;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RopeScaling {

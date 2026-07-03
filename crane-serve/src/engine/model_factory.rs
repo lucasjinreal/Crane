@@ -200,7 +200,13 @@ pub fn detect_model_type(model_path: &str) -> ModelType {
         return ModelType::VoxtralTTS;
     }
 
-    // 4. Heuristic: check the model path name
+    // 4. GGUF files: the architecture is recorded in the header — far more
+    // reliable than the path name.
+    if let Some(mt) = detect_from_gguf_header(path) {
+        return mt;
+    }
+
+    // 5. Heuristic: check the model path name
     let path_lower = model_path.to_lowercase();
     if path_lower.contains("voxtral") {
         ModelType::VoxtralTTS
@@ -212,6 +218,8 @@ pub fn detect_model_type(model_path: &str) -> ModelType {
         ModelType::HunyuanDense
     } else if path_lower.contains("qwen3-tts") || path_lower.contains("qwen3_tts") || path_lower.contains("qwen3tts") {
         ModelType::Qwen3TTS
+    } else if path_lower.contains("qwen3.5") || path_lower.contains("qwen3_5") || path_lower.contains("qwen35") {
+        ModelType::Qwen3_5
     } else if path_lower.contains("qwen3") {
         ModelType::Qwen3
     } else if path_lower.contains("qwen2") || path_lower.contains("qwen25") {
@@ -221,6 +229,36 @@ pub fn detect_model_type(model_path: &str) -> ModelType {
             "Could not auto-detect model type from '{model_path}', defaulting to Qwen25"
         );
         ModelType::Qwen25
+    }
+}
+
+/// Read `general.architecture` from a `.gguf` file's header.
+fn detect_from_gguf_header(path: &Path) -> Option<ModelType> {
+    let is_gguf = path.is_file()
+        && path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("gguf"));
+    if !is_gguf {
+        return None;
+    }
+    let mut file = std::fs::File::open(path).ok()?;
+    let ct = candle_core::quantized::gguf_file::Content::read(&mut file).ok()?;
+    let arch = ct
+        .metadata
+        .get("general.architecture")?
+        .to_string()
+        .ok()?
+        .to_lowercase();
+    match arch.as_str() {
+        "qwen35" | "qwen3_5" | "qwen3.5" => Some(ModelType::Qwen3_5),
+        "qwen3" | "qwen3moe" => Some(ModelType::Qwen3),
+        "qwen2" => Some(ModelType::Qwen25),
+        a if a.starts_with("hunyuan") => Some(ModelType::HunyuanDense),
+        a if a.starts_with("gemma") => Some(ModelType::Gemma4),
+        other => {
+            tracing::warn!("Unrecognized GGUF architecture '{other}'");
+            None
+        }
     }
 }
 
@@ -239,19 +277,25 @@ fn resolve(model_type: ModelType, model_path: &str) -> ModelType {
 
 /// Create a model backend.
 ///
-/// # Errors
-///
-/// Returns an error if `model_type` resolves to a VLM/TTS type (use
-/// `create_vlm_model()`/`create_tts()` instead) or the model fails to load.
+/// `quant` requests in-situ quantization of a safetensors checkpoint (e.g.
+/// `q4k`, `q8_0`); only backends that support it accept the flag.
 pub fn create_backend(
     model_type: ModelType,
     model_path: &str,
     device: &Device,
     dtype: &DType,
     format: ModelFormat,
+    quant: Option<&str>,
 ) -> Result<Box<dyn ModelBackend>> {
     let model_type = resolve(model_type, model_path);
     tracing::info!("Creating backend: {:?}", model_type);
+
+    if quant.is_some() && model_type != ModelType::Qwen3_5 {
+        anyhow::bail!(
+            "--quant (in-situ quantization) is currently only supported for qwen3_5 models; \
+             for other models use a GGUF checkpoint with --format gguf"
+        );
+    }
 
     match model_type {
         ModelType::HunyuanDense => {
@@ -272,7 +316,19 @@ pub fn create_backend(
         }
         ModelType::Qwen25 => Ok(Box::new(Qwen25Backend::new(model_path, device, dtype)?)),
         ModelType::Qwen3 => Ok(Box::new(Qwen3Backend::new(model_path, device, dtype)?)),
-        ModelType::Qwen3_5 => Ok(Box::new(Qwen3_5Backend::new(model_path, device, dtype)?)),
+        ModelType::Qwen3_5 => {
+            let quant = quant
+                .map(crane_core::ops::linear::parse_ggml_dtype)
+                .transpose()?;
+            let q35_fmt = match format {
+                ModelFormat::Safetensors => crane_core::models::qwen3_5::ModelFormat::Safetensors,
+                ModelFormat::Gguf => crane_core::models::qwen3_5::ModelFormat::Gguf,
+                ModelFormat::Auto => crane_core::models::qwen3_5::ModelFormat::Auto,
+            };
+            Ok(Box::new(Qwen3_5Backend::new_with_options(
+                model_path, device, dtype, q35_fmt, quant,
+            )?))
+        }
         ModelType::PaddleOcrVl => {
             anyhow::bail!("PaddleOCR-VL is a VLM model — use create_vlm_model() instead of create_backend()")
         }
@@ -295,6 +351,16 @@ pub fn create_chat_template(
     model_path: &str,
 ) -> Box<dyn ChatTemplateProcessor> {
     let model_type = resolve(model_type, model_path);
+
+    // For `.gguf` files the tokenizer/template configs live next to the file.
+    let path = Path::new(model_path);
+    let template_dir = if path.is_file() {
+        path.parent()
+            .map_or_else(|| model_path.to_string(), |p| p.to_string_lossy().into_owned())
+    } else {
+        model_path.to_string()
+    };
+    let model_path = template_dir.as_str();
 
     match model_type {
         ModelType::HunyuanDense => {

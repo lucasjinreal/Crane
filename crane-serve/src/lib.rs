@@ -45,6 +45,10 @@ pub struct Args {
     pub decode_tokens_per_seq: usize,
     #[arg(long, default_value = "auto")]
     pub format: String,
+    /// In-situ quantization level for safetensors checkpoints (e.g. q4k,
+    /// q8_0). Currently supported for qwen3_5 only. Overrides `CRANE_ISQ`.
+    #[arg(long)]
+    pub quant: Option<String>,
     #[arg(long, default_value_t = 0)]
     pub max_seq_len: usize,
     #[arg(long)]
@@ -431,7 +435,7 @@ pub async fn run(args: Args) -> Result<()> {
         let eos_id = tokenizer.token_to_id("</s>").or_else(|| tokenizer.token_to_id("<end_of_turn>")) .or_else(|| tokenizer.token_to_id("<|end_of_sentence|>")) .unwrap_or(1);
         (None, tokenizer, vec![eos_id], chat_template, vlm_tx_opt_inner, gemma4_vlm_tx_opt_inner, None)
     } else {
-        let mut backend = engine::model_factory::create_backend(model_type, &args.model_path, &device, &dtype, format)?;
+        let mut backend = engine::model_factory::create_backend(model_type, &args.model_path, &device, &dtype, format, args.quant.as_deref())?;
         info!("Model loaded successfully (type: {:?}, format: {:?})", resolved_type, format);
         backend.warmup();
         info!("Model warmed up");

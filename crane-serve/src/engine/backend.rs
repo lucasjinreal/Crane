@@ -433,7 +433,32 @@ impl Qwen3_5Backend {
     ///
     /// Returns an error if the model fails to load from `model_path`.
     pub fn new(model_path: &str, device: &Device, dtype: &DType) -> Result<Self> {
-        let model = crane_core::models::qwen3_5::Model::new(model_path, device, dtype)?;
+        Self::new_with_options(
+            model_path,
+            device,
+            dtype,
+            crane_core::models::qwen3_5::ModelFormat::Auto,
+            None,
+        )
+    }
+
+    /// `quant` requests in-situ quantization (`--quant` / `CRANE_ISQ`);
+    /// `None` falls back to the `CRANE_ISQ` env var inside the model loader.
+    pub fn new_with_options(
+        model_path: &str,
+        device: &Device,
+        dtype: &DType,
+        format: crane_core::models::qwen3_5::ModelFormat,
+        quant: Option<candle_core::quantized::GgmlDType>,
+    ) -> Result<Self> {
+        let model = match quant {
+            Some(dt) => crane_core::models::qwen3_5::Model::new_with_options(
+                model_path, device, dtype, format, Some(dt),
+            )?,
+            None => crane_core::models::qwen3_5::Model::new_with_format(
+                model_path, device, dtype, format,
+            )?,
+        };
         Ok(Self {
             model,
             dtype: *dtype,
@@ -471,20 +496,18 @@ impl ModelBackend for Qwen3_5Backend {
     }
 
     fn eos_token_id(&self) -> Vec<u32> {
-        // Qwen 3 / 3.5 chat models stop at 151645 () and 151643 ().
+        // Prefer the ids the model read from generation_config.json / GGUF
+        // metadata (Qwen 3.5 uses a multi-id EOS set, e.g. [248044, 248046]).
+        let ids = self.model.eos_token_ids().to_vec();
+        if !ids.is_empty() {
+            return ids;
+        }
+        // Fallback: resolve the ChatML stop tokens through the tokenizer.
         let tok = &self.model.tokenizer.tokenizer;
-        let mut ids = Vec::new();
-        if let Some(id) = tok.token_to_id("") {
-            ids.push(id);
-        }
-        if let Some(id) = tok.token_to_id("") {
-            ids.push(id);
-        }
-        if ids.is_empty() {
-            ids.push(151_645);
-            ids.push(151_643);
-        }
-        ids
+        ["<|im_end|>", "<|endoftext|>"]
+            .iter()
+            .filter_map(|t| tok.token_to_id(t))
+            .collect()
     }
 
     fn warmup(&mut self) {
