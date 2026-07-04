@@ -4,6 +4,7 @@
 //! (Qwen3-TTS, Voxtral TTS) directly on a dedicated thread. The model generates
 //! speech from text input and returns audio bytes (WAV or raw PCM) to the client.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::{
@@ -13,30 +14,15 @@ use axum::{
     Json,
 };
 
+use crane::engine::TtsGenerateRequest;
+use crane_core::generation::SpeechOptions;
+
 use crate::openai_api::*;
-use crate::{make_error, AppState};
+use crate::{encode_tts_audio, make_error, AppState};
 
 // ─────────────────────────────────────────────────────────────
-//  TTS Request Channel Structure
+//  HTTP-encoded TTS result
 // ─────────────────────────────────────────────────────────────
-
-pub struct TtsGenerateRequest {
-    pub input: String,
-    pub voice: Option<String>,
-    pub language: String,
-    pub instructions: Option<String>,
-    pub response_format: AudioResponseFormat,
-    pub temperature: f64,
-    pub top_p: Option<f64>,
-    pub repetition_penalty: f32,
-    pub max_tokens: usize,
-    /// Reference audio path for voice cloning (Base model only).
-    pub reference_audio: Option<String>,
-    /// Transcript of the reference audio.
-    pub reference_text: Option<String>,
-    /// Channel to send back the result.
-    pub tx: tokio::sync::oneshot::Sender<Result<TtsResult, String>>,
-}
 
 pub struct TtsResult {
     pub audio_bytes: Vec<u8>,
@@ -54,8 +40,13 @@ pub async fn speech(
     Json(req): Json<SpeechRequest>,
 ) -> Response {
     // Validate that TTS is available.
-    let tts_tx = match &state.tts_tx {
-        Some(tx) => tx,
+    // Both return Some/None together -- register_tts sets them atomically.
+    let (tts_name, tts_handle) = match state
+        .runtime
+        .default_tts_name()
+        .zip(state.runtime.default_tts_handle())
+    {
+        Some(pair) => pair,
         None => {
             let (status, json) = make_error(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -81,39 +72,37 @@ pub async fn speech(
         }
     }
 
-    let temperature = req.temperature.unwrap_or(0.9);
-    let repetition_penalty = req.repetition_penalty.unwrap_or(1.05);
+    let opts = SpeechOptions {
+        max_new_tokens: req.max_tokens,
+        temperature: req.temperature.unwrap_or(0.9),
+        top_p: req.top_p,
+        repetition_penalty: req.repetition_penalty.unwrap_or(1.05),
+    };
     let language = req.language.clone().unwrap_or_else(|| "auto".to_string());
+    let sample_rate = tts_handle.audio_info().sample_rate;
 
     let (tx, rx) = tokio::sync::oneshot::channel();
 
     let tts_req = TtsGenerateRequest {
-        input: req.input,
-        voice: req.voice,
+        text: req.input,
         language,
-        instructions: req.instructions,
-        response_format: req.response_format,
-        temperature,
-        top_p: req.top_p,
-        repetition_penalty,
-        max_tokens: req.max_tokens,
-        reference_audio: req.reference_audio,
+        voice: req.voice,
+        opts,
+        reference_audio: req.reference_audio.map(PathBuf::from),
         reference_text: req.reference_text,
-        tx,
+        response_tx: tx,
     };
 
-    if tts_tx.send(tts_req).is_err() {
-        let (status, json) = make_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "TTS engine thread has stopped.",
-        );
+    if let Err(e) = state.runtime.generate_speech(tts_name, tts_req) {
+        let (status, json) =
+            make_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("TTS engine unavailable: {e}"));
         return (status, json).into_response();
     }
 
     // Wait for TTS result
     match rx.await {
-        Ok(Ok(result)) => {
-            Response::builder()
+        Ok(Ok(audio_tensor)) => match encode_tts_audio(&audio_tensor, sample_rate, &req.response_format) {
+            Ok(result) => Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, result.content_type)
                 .header(
@@ -127,8 +116,13 @@ pub async fn speech(
                         "Failed to build response",
                     )
                         .into_response()
-                })
-        }
+                }),
+            Err(err) => {
+                let (status, json) =
+                    make_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("Audio encoding failed: {err}"));
+                (status, json).into_response()
+            }
+        },
         Ok(Err(err)) => {
             let (status, json) =
                 make_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("TTS generation failed: {err}"));

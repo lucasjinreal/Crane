@@ -41,7 +41,7 @@ pub async fn generate(
     Json(req): Json<GenerateRequest>,
 ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
     // If VLM model is loaded, delegate to VLM handler.
-    if state.vlm_tx.is_some() {
+    if state.runtime.vlm_tx().is_some() {
         return vlm::vlm_generate(state, req).await;
     }
 
@@ -50,7 +50,8 @@ pub async fn generate(
         ids
     } else if let Some(text) = &req.text {
         state
-            .tokenizer
+            .runtime
+            .tokenizer()
             .encode(text.as_str(), true)
             .map_err(|e| make_error(StatusCode::BAD_REQUEST, &format!("Tokenize failed: {e}")))?
             .get_ids()
@@ -67,7 +68,7 @@ pub async fn generate(
         .rid
         .unwrap_or_else(|| format!("gen-{}", uuid::Uuid::new_v4()));
 
-    let engine = state.engine.as_ref().ok_or_else(|| {
+    let engine = state.runtime.engine().ok_or_else(|| {
         make_error(StatusCode::SERVICE_UNAVAILABLE, "Text engine not available (VLM model loaded)")
     })?;
 
@@ -81,7 +82,7 @@ pub async fn generate(
                 top_p: sp.top_p.or(Some(0.95)),
                 top_k: sp.top_k.or(Some(20)),
                 repetition_penalty: sp.repetition_penalty,
-                eos_token_id: state.eos_token_id.clone(),
+                eos_token_id: state.runtime.eos_token_id().to_vec(),
             },
         )
         .map_err(|e| make_error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()))?;
@@ -142,10 +143,10 @@ pub async fn generate(
 pub async fn model_info(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(ModelInfoResponse {
         model_path: state.model_path.clone(),
-        model_type: state.model_type_name.clone(),
+        model_type: state.runtime.model_type().display_name().to_string(),
         is_generation: true,
-        dtype: Some(state.dtype_name.clone()),
-        device: Some(state.device_name.clone()),
+        dtype: Some(state.runtime.dtype_name().to_string()),
+        device: Some(state.runtime.device_name().to_string()),
         max_model_len: None,
     })
 }
@@ -156,11 +157,11 @@ pub async fn model_info(State(state): State<Arc<AppState>>) -> impl IntoResponse
 
 /// `GET /server_info` — server configuration + live stats.
 pub async fn server_info(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let stats = state.engine.as_ref().map(|e| e.stats.snapshot()).unwrap_or_default();
+    let stats = state.runtime.engine().map(|e| e.stats.snapshot()).unwrap_or_default();
     Json(ServerInfoResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
         model_path: state.model_path.clone(),
-        model_type: state.model_type_name.clone(),
+        model_type: state.runtime.model_type().display_name().to_string(),
         host: state.host.clone(),
         port: state.port,
         max_concurrent: state.max_concurrent,
@@ -182,10 +183,10 @@ pub async fn server_info(State(state): State<Arc<AppState>>) -> impl IntoRespons
 pub async fn health_generate(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let probe_tokens = state.eos_token_id.clone(); // minimal input (already a Vec)
+    let probe_tokens = state.runtime.eos_token_id().to_vec(); // minimal input (already a Vec)
     let request_id = format!("health-{}", uuid::Uuid::new_v4());
 
-    let engine = state.engine.as_ref().ok_or_else(|| {
+    let engine = state.runtime.engine().ok_or_else(|| {
         make_error(StatusCode::SERVICE_UNAVAILABLE, "Text engine not available (VLM model loaded)")
     })?;
 
@@ -199,7 +200,7 @@ pub async fn health_generate(
                 top_p: None,
                 top_k: None,
                 repetition_penalty: 1.0,
-                eos_token_id: state.eos_token_id.clone(),
+                eos_token_id: state.runtime.eos_token_id().to_vec(),
             },
         )
         .map_err(|e| {

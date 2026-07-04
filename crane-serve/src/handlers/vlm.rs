@@ -13,33 +13,12 @@ use axum::{
     },
 };
 
+use crane::engine::{Gemma4VlmRequest, VlmRequest};
 use crane_core::models::paddleocr_vl::OcrTask;
 
 use crate::openai_api::*;
 use crate::sglang_api::*;
 use crate::{make_error, now_epoch, AppState};
-
-// ─────────────────────────────────────────────────────────────
-//  PaddleOCR-VL Request Channel
-// ─────────────────────────────────────────────────────────────
-
-pub enum VlmRequest {
-    /// Non-streaming request
-    Recognize {
-        img_path: std::path::PathBuf,
-        task: OcrTask,
-        max_tokens: usize,
-        tx: tokio::sync::oneshot::Sender<Result<String, String>>,
-    },
-    /// Streaming request
-    RecognizeStream {
-        img_path: std::path::PathBuf,
-        task: OcrTask,
-        max_tokens: usize,
-        token_tx: tokio::sync::mpsc::UnboundedSender<String>,
-        done_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
-    },
-}
 
 // ─────────────────────────────────────────────────────────────
 //  Image downloading
@@ -160,7 +139,7 @@ pub async fn vlm_chat_completions(
     state: Arc<AppState>,
     req: ChatCompletionRequest,
 ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
-    let vlm_tx = state.vlm_tx.as_ref().ok_or_else(|| {
+    let vlm_tx = state.runtime.vlm_tx().ok_or_else(|| {
         make_error(StatusCode::INTERNAL_SERVER_ERROR, "VLM model not loaded")
     })?;
 
@@ -179,7 +158,7 @@ pub async fn vlm_chat_completions(
     if req.stream {
         // Streaming mode
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let (done_tx, _done_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        let (done_tx, _done_rx) = tokio::sync::oneshot::channel::<anyhow::Result<()>>();
 
         if vlm_tx.send(VlmRequest::RecognizeStream {
             img_path,
@@ -191,7 +170,7 @@ pub async fn vlm_chat_completions(
             return Err(make_error(StatusCode::INTERNAL_SERVER_ERROR, "VLM engine thread crashed"));
         }
 
-        let model_name = state.model_name.clone();
+        let model_name = state.runtime.model_name().to_string();
         let created = now_epoch();
 
         let stream = async_stream::stream! {
@@ -276,7 +255,7 @@ pub async fn vlm_chat_completions(
             id: request_id,
             object: "chat.completion".into(),
             created: now_epoch(),
-            model: state.model_name.clone(),
+            model: state.runtime.model_name().to_string(),
             choices: vec![ChatChoice {
                 index: 0,
                 message: ChatMessage {
@@ -304,7 +283,7 @@ pub async fn vlm_generate(
     state: Arc<AppState>,
     req: GenerateRequest,
 ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
-    let vlm_tx = state.vlm_tx.as_ref().ok_or_else(|| {
+    let vlm_tx = state.runtime.vlm_tx().ok_or_else(|| {
         make_error(StatusCode::INTERNAL_SERVER_ERROR, "VLM model not loaded")
     })?;
 
@@ -329,7 +308,7 @@ pub async fn vlm_generate(
 
     if req.stream {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let (done_tx, _done_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        let (done_tx, _done_rx) = tokio::sync::oneshot::channel::<anyhow::Result<()>>();
 
         if vlm_tx.send(VlmRequest::RecognizeStream {
             img_path,
@@ -401,19 +380,12 @@ pub async fn vlm_generate(
 //  Gemma4 VLM
 // ─────────────────────────────────────────────────────────────
 
-pub struct Gemma4VlmRequest {
-    pub img_path: std::path::PathBuf,
-    pub text_prompt: String,
-    pub max_tokens: usize,
-    pub tx: tokio::sync::oneshot::Sender<Result<String, String>>,
-}
-
 /// Gemma4VL chat completions handler.
 pub async fn gemma4_vlm_chat_completions(
     state: Arc<AppState>,
     req: ChatCompletionRequest,
 ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
-    let g4vlm_tx = state.gemma4_vlm_tx.as_ref().ok_or_else(|| {
+    let g4vlm_tx = state.runtime.gemma4_vlm_tx().ok_or_else(|| {
         make_error(StatusCode::INTERNAL_SERVER_ERROR, "Gemma4 VLM model not loaded")
     })?;
 
@@ -450,7 +422,7 @@ pub async fn gemma4_vlm_chat_completions(
         id: request_id,
         object: "chat.completion".into(),
         created: now_epoch(),
-        model: state.model_name.clone(),
+        model: state.runtime.model_name().to_string(),
         choices: vec![ChatChoice {
             index: 0,
             message: ChatMessage {

@@ -36,10 +36,10 @@ pub async fn chat_completions(
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
     // If VLM model is loaded, delegate to VLM handler.
-    if state.gemma4_vlm_tx.is_some() {
+    if state.runtime.gemma4_vlm_tx().is_some() {
         return vlm::gemma4_vlm_chat_completions(state, req).await;
     }
-    if state.vlm_tx.is_some() {
+    if state.runtime.vlm_tx().is_some() {
         return vlm::vlm_chat_completions(state, req).await;
     }
 
@@ -51,7 +51,8 @@ pub async fn chat_completions(
 
     // Tokenize.
     let input_ids = state
-        .tokenizer
+        .runtime
+        .tokenizer()
         .encode(formatted.as_str(), true)
         .map_err(|e| make_error(StatusCode::BAD_REQUEST, &format!("Tokenize failed: {e}")))?
         .get_ids()
@@ -63,7 +64,7 @@ pub async fn chat_completions(
         .as_ref()
         .map_or(false, |so| so.include_usage);
 
-    let engine = state.engine.as_ref().ok_or_else(|| {
+    let engine = state.runtime.engine().ok_or_else(|| {
         make_error(StatusCode::SERVICE_UNAVAILABLE, "Text engine not available (VLM model loaded)")
     })?;
 
@@ -77,13 +78,13 @@ pub async fn chat_completions(
                 top_p: req.top_p.or(Some(0.95)),
                 top_k: req.top_k.or(Some(40)),
                 repetition_penalty: req.repetition_penalty.unwrap_or(1.05),
-                eos_token_id: state.eos_token_id.clone(),
+                eos_token_id: state.runtime.eos_token_id().to_vec(),
             },
         )
         .map_err(|e| make_error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()))?;
 
     if req.stream {
-        let model_name = state.model_name.clone();
+        let model_name = state.runtime.model_name().to_string();
         let stream =
             sse::make_chat_sse_stream(request_id, model_name, response_rx, include_usage);
         Ok(Sse::new(stream)
@@ -97,7 +98,7 @@ pub async fn chat_completions(
             id: request_id,
             object: "chat.completion".into(),
             created: now_epoch(),
-            model: state.model_name.clone(),
+            model: state.runtime.model_name().to_string(),
             choices: vec![ChatChoice {
                 index: 0,
                 message: ChatMessage {
@@ -132,7 +133,8 @@ pub async fn completions(
         .map_or(false, |so| so.include_usage);
 
     let input_ids = state
-        .tokenizer
+        .runtime
+        .tokenizer()
         .encode(prompt.as_str(), true)
         .map_err(|e| make_error(StatusCode::BAD_REQUEST, &format!("Tokenize failed: {e}")))?
         .get_ids()
@@ -140,7 +142,7 @@ pub async fn completions(
 
     let request_id = format!("cmpl-{}", uuid::Uuid::new_v4());
 
-    let engine = state.engine.as_ref().ok_or_else(|| {
+    let engine = state.runtime.engine().ok_or_else(|| {
         make_error(StatusCode::SERVICE_UNAVAILABLE, "Text engine not available (VLM model loaded)")
     })?;
 
@@ -154,13 +156,13 @@ pub async fn completions(
                 top_p: req.top_p.or(Some(0.95)),
                 top_k: req.top_k.or(Some(40)),
                 repetition_penalty: req.repetition_penalty.unwrap_or(1.05),
-                eos_token_id: state.eos_token_id.clone(),
+                eos_token_id: state.runtime.eos_token_id().to_vec(),
             },
         )
         .map_err(|e| make_error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()))?;
 
     if req.stream {
-        let model_name = state.model_name.clone();
+        let model_name = state.runtime.model_name().to_string();
         let stream =
             sse::make_completion_sse_stream(request_id, model_name, response_rx, include_usage);
         Ok(Sse::new(stream)
@@ -174,7 +176,7 @@ pub async fn completions(
             id: request_id,
             object: "text_completion".into(),
             created: now_epoch(),
-            model: state.model_name.clone(),
+            model: state.runtime.model_name().to_string(),
             choices: vec![CompletionChoice {
                 index: 0,
                 text: full_text,
@@ -207,19 +209,19 @@ pub async fn retrieve_model(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(model_id): axum::extract::Path<String>,
 ) -> Result<Json<ModelInfo>, (StatusCode, Json<ErrorResponse>)> {
-    if model_id == state.model_name {
+    if model_id == state.runtime.model_name() {
         Ok(Json(make_model_info(&state)))
     } else {
         Err(make_error(
             StatusCode::NOT_FOUND,
-            &format!("Model '{model_id}' not found. Available: {}", state.model_name),
+            &format!("Model '{model_id}' not found. Available: {}", state.runtime.model_name()),
         ))
     }
 }
 
 fn make_model_info(state: &AppState) -> ModelInfo {
     ModelInfo {
-        id: state.model_name.clone(),
+        id: state.runtime.model_name().to_string(),
         object: "model".into(),
         created: state.server_start_time,
         owned_by: "crane".into(),
@@ -254,7 +256,8 @@ pub async fn tokenize(
     };
 
     let encoding = state
-        .tokenizer
+        .runtime
+        .tokenizer()
         .encode(text.as_str(), req.add_special_tokens)
         .map_err(|e| make_error(StatusCode::BAD_REQUEST, &format!("Tokenize failed: {e}")))?;
 
@@ -270,7 +273,8 @@ pub async fn detokenize(
     Json(req): Json<DetokenizeRequest>,
 ) -> Result<Json<DetokenizeResponse>, (StatusCode, Json<ErrorResponse>)> {
     let text = state
-        .tokenizer
+        .runtime
+        .tokenizer()
         .decode(&req.tokens, true)
         .map_err(|e| make_error(StatusCode::BAD_REQUEST, &format!("Detokenize failed: {e}")))?;
 
