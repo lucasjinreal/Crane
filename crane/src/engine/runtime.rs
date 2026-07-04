@@ -24,6 +24,8 @@ use crate::audio::tts::{AudioInfo, Tts, VoiceInfo};
 use crate::engine::cache::{CacheKey, TtsCache};
 use crate::engine::model_factory::{self, ModelType};
 use crate::engine::types::EngineHandle;
+use crate::engine::vlm_types::{Gemma4VlmRequest, VlmRequest};
+use crate::engine::{backend::ModelBackend, InferenceEngine, MemoryConfig};
 
 /// A request to generate speech, sent to a TTS model's dedicated thread.
 ///
@@ -122,6 +124,10 @@ pub struct ModelRuntime {
     default_tts: Option<String>,
     #[cfg(feature = "tts-cache")]
     tts_cache: Option<Arc<TtsCache>>,
+    vlm_tx: Option<mpsc::UnboundedSender<VlmRequest>>,
+    gemma4_vlm_tx: Option<mpsc::UnboundedSender<Gemma4VlmRequest>>,
+    tokenizer: tokenizers::Tokenizer,
+    eos_token_id: Vec<u32>,
     model_name: String,
     model_type: ModelType,
     dtype_name: String,
@@ -136,6 +142,8 @@ impl ModelRuntime {
         model_type: ModelType,
         dtype_name: String,
         device_name: String,
+        tokenizer: tokenizers::Tokenizer,
+        eos_token_id: Vec<u32>,
     ) -> Self {
         Self {
             engine: None,
@@ -143,6 +151,10 @@ impl ModelRuntime {
             default_tts: None,
             #[cfg(feature = "tts-cache")]
             tts_cache: None,
+            vlm_tx: None,
+            gemma4_vlm_tx: None,
+            tokenizer,
+            eos_token_id,
             model_name,
             model_type,
             dtype_name,
@@ -255,6 +267,12 @@ impl ModelRuntime {
         self.default_tts.as_ref().and_then(|name| self.tts.get(name))
     }
 
+    /// Returns the registration name of the default TTS model, if any.
+    #[must_use]
+    pub fn default_tts_name(&self) -> Option<&str> {
+        self.default_tts.as_deref()
+    }
+
     /// Dispatch a TTS request, consulting the cache first if one is configured.
     ///
     /// This is the preferred entry point for TTS generation over calling
@@ -341,6 +359,62 @@ impl ModelRuntime {
     /// Set the LLM engine handle.
     pub fn set_engine(&mut self, engine: EngineHandle) {
         self.engine = Some(engine);
+    }
+
+    /// Create a continuous-batching engine for `backend`, spawn its dedicated
+    /// thread, and store the resulting handle.
+    ///
+    /// `backend` should already be warmed up (see
+    /// [`ModelBackend::warmup`](crate::engine::backend::ModelBackend::warmup)) before
+    /// calling this method.
+    pub fn load_llm_engine(
+        &mut self,
+        backend: Box<dyn ModelBackend>,
+        max_concurrent: usize,
+        decode_tokens_per_seq: usize,
+        memory_config: MemoryConfig,
+    ) {
+        let (engine, handle) =
+            InferenceEngine::new(backend, max_concurrent, decode_tokens_per_seq, memory_config);
+        std::thread::Builder::new()
+            .name("inference-engine".into())
+            .spawn(move || engine.run())
+            .expect("Failed to spawn engine thread");
+        self.set_engine(handle);
+    }
+
+    /// Returns the VLM request channel, if a PaddleOCR-VL model is loaded.
+    #[must_use]
+    pub fn vlm_tx(&self) -> Option<&mpsc::UnboundedSender<VlmRequest>> {
+        self.vlm_tx.as_ref()
+    }
+
+    /// Set the VLM request channel.
+    pub fn set_vlm_tx(&mut self, tx: mpsc::UnboundedSender<VlmRequest>) {
+        self.vlm_tx = Some(tx);
+    }
+
+    /// Returns the Gemma4 VLM request channel, if a Gemma4VL model is loaded.
+    #[must_use]
+    pub fn gemma4_vlm_tx(&self) -> Option<&mpsc::UnboundedSender<Gemma4VlmRequest>> {
+        self.gemma4_vlm_tx.as_ref()
+    }
+
+    /// Set the Gemma4 VLM request channel.
+    pub fn set_gemma4_vlm_tx(&mut self, tx: mpsc::UnboundedSender<Gemma4VlmRequest>) {
+        self.gemma4_vlm_tx = Some(tx);
+    }
+
+    /// Returns the tokenizer for the loaded model.
+    #[must_use]
+    pub fn tokenizer(&self) -> &tokenizers::Tokenizer {
+        &self.tokenizer
+    }
+
+    /// Returns the end-of-sequence token IDs for the loaded model.
+    #[must_use]
+    pub fn eos_token_id(&self) -> &[u32] {
+        &self.eos_token_id
     }
 
     /// Returns the model's display name.
@@ -522,11 +596,14 @@ mod tests {
     }
 
     fn new_runtime() -> ModelRuntime {
+        let tokenizer = tokenizers::Tokenizer::new(tokenizers::models::bpe::BPE::default());
         ModelRuntime::new(
             "test-model".into(),
             ModelType::Qwen3TTS,
             "F32".into(),
             "Cpu".into(),
+            tokenizer,
+            vec![2],
         )
     }
 
@@ -642,6 +719,37 @@ mod tests {
         assert_eq!(rt.device_name(), "Cpu");
         assert!(rt.engine().is_none());
         assert!(rt.default_tts_handle().is_none());
+        assert!(rt.default_tts_name().is_none());
+        assert_eq!(rt.eos_token_id(), &[2]);
+        assert!(rt.vlm_tx().is_none());
+        assert!(rt.gemma4_vlm_tx().is_none());
+    }
+
+    #[test]
+    fn test_vlm_tx_roundtrip() {
+        let mut rt = new_runtime();
+        assert!(rt.vlm_tx().is_none());
+        let (tx, _rx) = mpsc::unbounded_channel::<VlmRequest>();
+        rt.set_vlm_tx(tx);
+        assert!(rt.vlm_tx().is_some());
+    }
+
+    #[test]
+    fn test_gemma4_vlm_tx_roundtrip() {
+        let mut rt = new_runtime();
+        assert!(rt.gemma4_vlm_tx().is_none());
+        let (tx, _rx) = mpsc::unbounded_channel::<Gemma4VlmRequest>();
+        rt.set_gemma4_vlm_tx(tx);
+        assert!(rt.gemma4_vlm_tx().is_some());
+    }
+
+    #[test]
+    fn test_default_tts_name() {
+        let mut rt = new_runtime();
+        assert!(rt.default_tts_name().is_none());
+        rt.register_tts("m1".into(), "qwen3_tts", Box::new(MockTts::new()))
+            .unwrap();
+        assert_eq!(rt.default_tts_name(), Some("m1"));
     }
 
     #[test]
@@ -943,5 +1051,68 @@ mod tests {
             .filter_map(std::result::Result::ok)
             .any(|e| e.path().is_dir());
         assert!(!has_entries);
+    }
+
+    struct MockModelBackend {
+        device: Device,
+        tokenizer: tokenizers::Tokenizer,
+    }
+
+    impl MockModelBackend {
+        fn new() -> Self {
+            Self {
+                device: Device::Cpu,
+                tokenizer: tokenizers::Tokenizer::new(tokenizers::models::bpe::BPE::default()),
+            }
+        }
+    }
+
+    impl ModelBackend for MockModelBackend {
+        fn forward_step(&mut self, _input_ids: &[u32], _start_pos: usize) -> Result<Tensor> {
+            Tensor::zeros(1, DType::F32, &self.device).map_err(Into::into)
+        }
+
+        fn clear_kv_cache(&mut self) {}
+
+        fn num_layers(&self) -> usize {
+            0
+        }
+
+        fn device(&self) -> &Device {
+            &self.device
+        }
+
+        fn dtype(&self) -> DType {
+            DType::F32
+        }
+
+        fn tokenizer(&self) -> &tokenizers::Tokenizer {
+            &self.tokenizer
+        }
+
+        fn eos_token_id(&self) -> Vec<u32> {
+            vec![2]
+        }
+
+        fn warmup(&mut self) {}
+    }
+
+    #[test]
+    fn test_load_llm_engine() {
+        let mut rt = new_runtime();
+        assert!(rt.engine().is_none());
+
+        rt.load_llm_engine(
+            Box::new(MockModelBackend::new()),
+            1,
+            1,
+            MemoryConfig {
+                max_seq_len: 0,
+                gpu_memory_limit_bytes: 0,
+                baseline_gpu_bytes: 0,
+            },
+        );
+
+        assert!(rt.engine().is_some());
     }
 }

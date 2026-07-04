@@ -28,6 +28,7 @@
 //! | `model_factory` | Auto-detection and factory creation               |
 //! | `runtime`       | `ModelRuntime` — protocol-independent model lifecycle |
 //! | `cache`         | `TtsCache` — optional disk cache for TTS responses (behind the `tts-cache` feature) |
+//! | `vlm_types`     | Request types for VLM dedicated threads           |
 
 pub mod backend;
 #[cfg(feature = "tts-cache")]
@@ -39,6 +40,7 @@ pub mod scheduler;
 pub mod sequence;
 pub mod stats;
 pub mod types;
+pub mod vlm_types;
 
 // Re-export commonly used items for convenience.
 #[cfg(feature = "tts-cache")]
@@ -46,6 +48,7 @@ pub use cache::TtsCache;
 pub use runtime::{ModelRuntime, TtsGenerateRequest, TtsHandle};
 pub use stats::{EngineStats, StatsSnapshot};
 pub use types::{EngineHandle, EngineRequest, EngineResponse, GenerationParams};
+pub use vlm_types::{Gemma4VlmRequest, VlmRequest};
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
