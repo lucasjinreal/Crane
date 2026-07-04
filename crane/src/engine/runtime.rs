@@ -49,13 +49,56 @@ pub struct TtsGenerateRequest {
     pub response_tx: oneshot::Sender<Result<Tensor>>,
 }
 
+/// A request to generate speech incrementally, sent to a TTS model's
+/// dedicated thread.
+///
+/// Unlike [`TtsGenerateRequest`], the response is delivered as a series of
+/// chunks over `chunk_tx` rather than a single tensor -- one send per chunk
+/// yielded by [`Tts::generate_speech_stream`], followed by the sender being
+/// dropped to signal completion. An `Err` chunk ends the stream immediately.
+///
+/// # Backpressure
+///
+/// `chunk_tx` is bounded, and the model's worker thread sends on it with a
+/// blocking call. A consumer that stops draining the matching receiver
+/// without dropping it will stall the worker thread indefinitely -- which
+/// also blocks every other request (streaming or blob) queued for the same
+/// model, since they share one thread. Callers must keep draining or drop
+/// the receiver promptly.
+pub(crate) struct TtsStreamRequest {
+    /// Text to synthesize.
+    pub(crate) text: String,
+    /// Target language (e.g. "english", "auto").
+    pub(crate) language: String,
+    /// Voice name from [`TtsHandle::voices`], or `None` for the model default.
+    pub(crate) voice: Option<String>,
+    /// Generation parameters (temperature, max tokens, etc.).
+    pub(crate) opts: SpeechOptions,
+    /// Channel to send generated audio chunks back as they're produced.
+    pub(crate) chunk_tx: mpsc::Sender<Result<Tensor>>,
+}
+
+/// A request queued on a TTS model's dedicated thread: either a blob
+/// [`TtsGenerateRequest`] or an incremental [`TtsStreamRequest`].
+///
+/// Both variants share one channel/thread so streaming and non-streaming
+/// requests for the same model are processed in a single FIFO queue,
+/// matching the "one request at a time" concurrency model documented on
+/// [`TtsHandle`].
+enum TtsRequest {
+    /// Generate the complete waveform and return it in one response.
+    Generate(TtsGenerateRequest),
+    /// Generate the waveform incrementally, streaming chunks as produced.
+    Stream(TtsStreamRequest),
+}
+
 /// Handle to a TTS model running on its dedicated thread.
 ///
 /// Cloneable metadata (audio format, voices) is queried once at load time,
 /// before the model is moved to its thread, so it can be read without
 /// blocking on the generation queue.
 pub struct TtsHandle {
-    tx: mpsc::UnboundedSender<TtsGenerateRequest>,
+    tx: mpsc::UnboundedSender<TtsRequest>,
     audio_info: AudioInfo,
     voices: Vec<VoiceInfo>,
     supports_voice_cloning: bool,
@@ -106,7 +149,20 @@ impl TtsHandle {
     /// Returns an error if the model's thread has stopped.
     pub fn send(&self, req: TtsGenerateRequest) -> Result<()> {
         self.pending_count.fetch_add(1, Ordering::Relaxed);
-        self.tx.send(req).map_err(|_| {
+        self.tx.send(TtsRequest::Generate(req)).map_err(|_| {
+            self.pending_count.fetch_sub(1, Ordering::Relaxed);
+            anyhow::anyhow!("TTS thread has stopped")
+        })
+    }
+
+    /// Send a streaming generation request to the model's thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the model's thread has stopped.
+    fn send_stream(&self, req: TtsStreamRequest) -> Result<()> {
+        self.pending_count.fetch_add(1, Ordering::Relaxed);
+        self.tx.send(TtsRequest::Stream(req)).map_err(|_| {
             self.pending_count.fetch_sub(1, Ordering::Relaxed);
             anyhow::anyhow!("TTS thread has stopped")
         })
@@ -132,6 +188,11 @@ pub struct ModelRuntime {
     model_type: ModelType,
     dtype_name: String,
     device_name: String,
+    /// Whether callers should use
+    /// [`generate_speech_stream`](Self::generate_speech_stream) for
+    /// incremental TTS delivery. Defaults to `true`; see
+    /// [`set_streaming_enabled`](Self::set_streaming_enabled).
+    streaming_enabled: bool,
 }
 
 impl ModelRuntime {
@@ -159,7 +220,25 @@ impl ModelRuntime {
             model_type,
             dtype_name,
             device_name,
+            streaming_enabled: true,
         }
+    }
+
+    /// Enable or disable incremental TTS streaming for this runtime.
+    ///
+    /// Transports whose hardware can't keep up with real-time incremental
+    /// generation (e.g. crane-wyoming on a CPU-only device, where chunked
+    /// audio arrives slower than it plays back) should call this with
+    /// `false` and fall back to the blob
+    /// [`generate_speech`](Self::generate_speech) path instead.
+    pub fn set_streaming_enabled(&mut self, enabled: bool) {
+        self.streaming_enabled = enabled;
+    }
+
+    /// Returns whether incremental TTS streaming is enabled for this runtime.
+    #[must_use]
+    pub fn streaming_enabled(&self) -> bool {
+        self.streaming_enabled
     }
 
     /// Enable disk caching for TTS responses.
@@ -193,7 +272,7 @@ impl ModelRuntime {
         let supports_voice_cloning = tts.supports_voice_cloning();
         let pending_count = Arc::new(AtomicU64::new(0));
 
-        let (tx, rx) = mpsc::unbounded_channel::<TtsGenerateRequest>();
+        let (tx, rx) = mpsc::unbounded_channel::<TtsRequest>();
 
         let thread_name = format!("tts-{name}");
         let log_name = name.clone();
@@ -273,6 +352,19 @@ impl ModelRuntime {
         self.default_tts.as_deref()
     }
 
+    /// Returns an iterator over all registered TTS model names and their handles.
+    ///
+    /// Iteration order is unspecified. Callers that need a deterministic
+    /// ordering (e.g. for voice name conflict resolution) should collect
+    /// and sort, or track registration order separately.
+    #[must_use]
+    pub fn tts_handles(&self) -> impl Iterator<Item = (&str, &TtsHandle)> {
+        self.tts
+            .iter()
+            .map(|(name, handle)| (name.as_str(), handle))
+    }
+
+
     /// Dispatch a TTS request, consulting the cache first if one is configured.
     ///
     /// This is the preferred entry point for TTS generation over calling
@@ -348,6 +440,51 @@ impl ModelRuntime {
             .tts_handle(model_name)
             .ok_or_else(|| anyhow::anyhow!("unknown TTS model: {model_name}"))?;
         handle.send(req)
+    }
+
+    /// Dispatch a TTS request for incremental generation.
+    ///
+    /// Unlike [`generate_speech`](Self::generate_speech), the returned
+    /// receiver yields audio chunks as the model produces them (see
+    /// [`Tts::generate_speech_stream`]) instead of waiting for the complete
+    /// waveform. The channel closes once generation finishes; an `Err` item
+    /// signals generation failed and ends the stream. Streaming requests
+    /// always bypass the TTS cache -- the model regenerates every call.
+    ///
+    /// # Backpressure
+    ///
+    /// The returned receiver is bounded and the model's worker thread sends
+    /// on it with a blocking call. Keep draining it (or drop it) promptly --
+    /// a stalled consumer blocks the worker thread and, with it, every other
+    /// request queued for the same model.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `model_name` is not registered or the model's
+    /// thread has stopped.
+    pub fn generate_speech_stream(
+        &self,
+        model_name: &str,
+        text: String,
+        language: String,
+        voice: Option<String>,
+        opts: SpeechOptions,
+    ) -> Result<mpsc::Receiver<Result<Tensor>>> {
+        let handle = self
+            .tts_handle(model_name)
+            .ok_or_else(|| anyhow::anyhow!("unknown TTS model: {model_name}"))?;
+
+        // Capacity 2: lets the worker produce one chunk ahead of what the
+        // consumer is processing, without buffering the whole waveform.
+        let (chunk_tx, chunk_rx) = mpsc::channel(2);
+        handle.send_stream(TtsStreamRequest {
+            text,
+            language,
+            voice,
+            opts,
+            chunk_tx,
+        })?;
+        Ok(chunk_rx)
     }
 
     /// Returns the LLM engine handle, if a continuous-batching model is loaded.
@@ -450,66 +587,137 @@ fn extract_model_name(model_path: &str) -> String {
 }
 
 /// Run the blocking generation loop for one TTS model on its dedicated thread.
+///
+/// Processes both blob ([`TtsGenerateRequest`]) and incremental
+/// ([`TtsStreamRequest`]) requests from a single FIFO queue, so streaming and
+/// non-streaming requests for the same model never run concurrently.
 fn run_tts_thread(
-    mut rx: mpsc::UnboundedReceiver<TtsGenerateRequest>,
+    mut rx: mpsc::UnboundedReceiver<TtsRequest>,
     mut tts: Box<dyn Tts + Send>,
     model_name: &str,
     pending_count: &AtomicU64,
 ) {
     tracing::info!(model = %model_name, "TTS thread started");
     while let Some(req) = rx.blocking_recv() {
-        let text_len = req.text.chars().count();
-
-        if req.response_tx.is_closed() {
-            tracing::warn!(model = %model_name, text_len, "Caller disconnected, skipping");
-            pending_count.fetch_sub(1, Ordering::Relaxed);
-            continue;
+        match req {
+            TtsRequest::Generate(req) => handle_generate_request(&mut *tts, req, model_name),
+            TtsRequest::Stream(req) => handle_stream_request(&mut *tts, &req, model_name),
         }
-
-        let t0 = std::time::Instant::now();
-
-        let panic_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            if let Some(ref ref_audio) = req.reference_audio {
-                let ref_text = req.reference_text.as_deref().unwrap_or("");
-                tts.generate_voice_clone(&req.text, &req.language, ref_audio, ref_text, &req.opts)
-            } else {
-                tts.generate_speech(&req.text, &req.language, req.voice.as_deref(), &req.opts)
-            }
-        }));
-
-        let result = match panic_result {
-            Ok(result) => result,
-            Err(panic_payload) => {
-                let msg = panic_payload
-                    .downcast_ref::<&str>()
-                    .map(|s| (*s).to_string())
-                    .or_else(|| panic_payload.downcast_ref::<String>().cloned())
-                    .unwrap_or_else(|| "unknown panic".to_string());
-                tracing::error!(model = %model_name, text_len, panic = %msg, "TTS generation panicked");
-                Err(anyhow::anyhow!("TTS generation panicked: {msg}"))
-            }
-        };
-
-        let elapsed_ms = t0.elapsed().as_millis();
-        match &result {
-            Ok(tensor) => {
-                tracing::info!(
-                    model = %model_name,
-                    text_len,
-                    samples = tensor.elem_count(),
-                    elapsed_ms,
-                    "TTS generation complete",
-                );
-            }
-            Err(e) => {
-                tracing::error!(model = %model_name, text_len, elapsed_ms, error = %e, "TTS generation failed");
-            }
-        }
-
-        let _ = req.response_tx.send(result);
         pending_count.fetch_sub(1, Ordering::Relaxed);
     }
     tracing::info!(model = %model_name, "TTS thread stopped (channel closed)");
+}
+
+/// Extract a human-readable message from a caught panic payload.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_string())
+}
+
+/// Handle one blob request: generate the complete waveform and send it back
+/// via `req.response_tx`.
+fn handle_generate_request(tts: &mut dyn Tts, req: TtsGenerateRequest, model_name: &str) {
+    let text_len = req.text.chars().count();
+
+    if req.response_tx.is_closed() {
+        tracing::warn!(model = %model_name, text_len, "Caller disconnected, skipping");
+        return;
+    }
+
+    let t0 = std::time::Instant::now();
+
+    let panic_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        if let Some(ref ref_audio) = req.reference_audio {
+            let ref_text = req.reference_text.as_deref().unwrap_or("");
+            tts.generate_voice_clone(&req.text, &req.language, ref_audio, ref_text, &req.opts)
+        } else {
+            tts.generate_speech(&req.text, &req.language, req.voice.as_deref(), &req.opts)
+        }
+    }));
+
+    let result = match panic_result {
+        Ok(result) => result,
+        Err(panic_payload) => {
+            let msg = panic_message(&*panic_payload);
+            tracing::error!(model = %model_name, text_len, panic = %msg, "TTS generation panicked");
+            Err(anyhow::anyhow!("TTS generation panicked: {msg}"))
+        },
+    };
+
+    let elapsed_ms = t0.elapsed().as_millis();
+    match &result {
+        Ok(tensor) => {
+            tracing::info!(
+                model = %model_name,
+                text_len,
+                samples = tensor.elem_count(),
+                elapsed_ms,
+                "TTS generation complete",
+            );
+        },
+        Err(e) => {
+            tracing::error!(model = %model_name, text_len, elapsed_ms, error = %e, "TTS generation failed");
+        },
+    }
+
+    let _ = req.response_tx.send(result);
+}
+
+/// Handle one streaming request: generate the waveform incrementally,
+/// sending each chunk over `req.chunk_tx` as it's produced.
+///
+/// Stops early (without treating it as an error) if the receiver is
+/// dropped, i.e. the caller disconnected mid-stream.
+fn handle_stream_request(tts: &mut dyn Tts, req: &TtsStreamRequest, model_name: &str) {
+    let text_len = req.text.chars().count();
+
+    if req.chunk_tx.is_closed() {
+        tracing::warn!(model = %model_name, text_len, "Caller disconnected, skipping");
+        return;
+    }
+
+    let t0 = std::time::Instant::now();
+    let mut chunk_count = 0usize;
+
+    // `Ok(true)` means the caller disconnected mid-stream (not an error);
+    // `Ok(false)` means the stream ran to completion.
+    let panic_result = std::panic::catch_unwind(AssertUnwindSafe(|| -> Result<bool> {
+        let mut stream =
+            tts.generate_speech_stream(&req.text, &req.language, req.voice.as_deref(), &req.opts)?;
+        while let Some(chunk) = stream.next_chunk()? {
+            chunk_count += 1;
+            if req.chunk_tx.blocking_send(Ok(chunk)).is_err() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }));
+
+    let result = match panic_result {
+        Ok(result) => result,
+        Err(panic_payload) => {
+            let msg = panic_message(&*panic_payload);
+            tracing::error!(model = %model_name, text_len, panic = %msg, "TTS streaming panicked");
+            Err(anyhow::anyhow!("TTS generation panicked: {msg}"))
+        },
+    };
+
+    let elapsed_ms = t0.elapsed().as_millis();
+    match result {
+        Ok(true) => {
+            tracing::warn!(model = %model_name, text_len, chunk_count, elapsed_ms, "Caller disconnected mid-stream");
+        },
+        Ok(false) => {
+            tracing::info!(model = %model_name, text_len, chunk_count, elapsed_ms, "TTS streaming complete");
+        },
+        Err(e) => {
+            tracing::error!(model = %model_name, text_len, chunk_count, elapsed_ms, error = %e, "TTS streaming failed");
+            let _ = req.chunk_tx.blocking_send(Err(e));
+        },
+    }
 }
 
 #[cfg(test)]
@@ -723,6 +931,17 @@ mod tests {
         assert_eq!(rt.eos_token_id(), &[2]);
         assert!(rt.vlm_tx().is_none());
         assert!(rt.gemma4_vlm_tx().is_none());
+        assert!(rt.streaming_enabled());
+    }
+
+    #[test]
+    fn test_streaming_enabled_roundtrip() {
+        let mut rt = new_runtime();
+        assert!(rt.streaming_enabled());
+        rt.set_streaming_enabled(false);
+        assert!(!rt.streaming_enabled());
+        rt.set_streaming_enabled(true);
+        assert!(rt.streaming_enabled());
     }
 
     #[test]
@@ -764,7 +983,7 @@ mod tests {
 
     #[test]
     fn test_send_after_thread_stopped() {
-        let (tx, rx) = mpsc::unbounded_channel::<TtsGenerateRequest>();
+        let (tx, rx) = mpsc::unbounded_channel::<TtsRequest>();
         drop(rx);
 
         let handle = TtsHandle {
@@ -961,6 +1180,291 @@ mod tests {
             },
         );
         assert!(result.is_err());
+    }
+
+    struct StreamingMockTts {
+        audio_info: AudioInfo,
+        chunks: Vec<f32>,
+    }
+
+    impl StreamingMockTts {
+        fn new(chunks: Vec<f32>) -> Self {
+            Self {
+                audio_info: AudioInfo {
+                    sample_rate: 24000,
+                    channels: 1,
+                    bits_per_sample: 16,
+                },
+                chunks,
+            }
+        }
+    }
+
+    impl Tts for StreamingMockTts {
+        fn audio_info(&self) -> AudioInfo {
+            self.audio_info
+        }
+
+        fn voices(&self) -> Vec<VoiceInfo> {
+            vec![]
+        }
+
+        fn generate_speech(
+            &mut self,
+            _text: &str,
+            _language: &str,
+            _voice: Option<&str>,
+            _opts: &SpeechOptions,
+        ) -> Result<Tensor> {
+            Tensor::new(self.chunks.clone(), &Device::Cpu).map_err(Into::into)
+        }
+
+        fn generate_speech_stream(
+            &mut self,
+            _text: &str,
+            _language: &str,
+            _voice: Option<&str>,
+            _opts: &SpeechOptions,
+        ) -> Result<crate::audio::tts::TtsStream<'_>> {
+            let chunks: Vec<Result<Tensor>> = self
+                .chunks
+                .iter()
+                .map(|&v| Tensor::new(vec![v], &Device::Cpu).map_err(Into::into))
+                .collect();
+            Ok(crate::audio::tts::TtsStream::new(
+                self.audio_info,
+                chunks.into_iter(),
+            ))
+        }
+    }
+
+    #[test]
+    fn test_generate_speech_stream_multiple_chunks() {
+        let mut rt = new_runtime();
+        rt.register_tts(
+            "m1".into(),
+            "qwen3_tts",
+            Box::new(StreamingMockTts::new(vec![0.1, 0.2, 0.3])),
+        )
+        .unwrap();
+
+        let mut rx = rt
+            .generate_speech_stream(
+                "m1",
+                "hello".into(),
+                "en".into(),
+                None,
+                SpeechOptions::default(),
+            )
+            .unwrap();
+
+        let mut received = Vec::new();
+        while let Some(result) = rx.blocking_recv() {
+            let tensor = result.unwrap();
+            received.push(tensor.to_vec1::<f32>().unwrap()[0]);
+        }
+        assert_eq!(received, vec![0.1, 0.2, 0.3]);
+    }
+
+    #[test]
+    fn test_generate_speech_stream_unknown_model() {
+        let rt = new_runtime();
+        let result = rt.generate_speech_stream(
+            "nonexistent",
+            "hello".into(),
+            "en".into(),
+            None,
+            SpeechOptions::default(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_generate_speech_stream_empty() {
+        let mut rt = new_runtime();
+        rt.register_tts(
+            "empty".into(),
+            "qwen3_tts",
+            Box::new(StreamingMockTts::new(vec![])),
+        )
+        .unwrap();
+
+        let mut rx = rt
+            .generate_speech_stream(
+                "empty",
+                "hello".into(),
+                "en".into(),
+                None,
+                SpeechOptions::default(),
+            )
+            .unwrap();
+        assert!(rx.blocking_recv().is_none());
+    }
+
+    #[test]
+    fn test_generate_speech_stream_receiver_dropped() {
+        let mut rt = new_runtime();
+        rt.register_tts(
+            "m1".into(),
+            "qwen3_tts",
+            Box::new(StreamingMockTts::new(vec![0.1, 0.2, 0.3])),
+        )
+        .unwrap();
+
+        let mut rx = rt
+            .generate_speech_stream(
+                "m1",
+                "hello".into(),
+                "en".into(),
+                None,
+                SpeechOptions::default(),
+            )
+            .unwrap();
+        rx.blocking_recv().unwrap().unwrap();
+        drop(rx);
+
+        // The worker thread must notice the dropped receiver and move on --
+        // this blob request would hang forever if it didn't.
+        let (tx, rx2) = oneshot::channel();
+        rt.generate_speech(
+            "m1",
+            TtsGenerateRequest {
+                text: "still alive".into(),
+                language: "en".into(),
+                voice: None,
+                opts: SpeechOptions::default(),
+                reference_audio: None,
+                reference_text: None,
+                response_tx: tx,
+            },
+        )
+        .unwrap();
+
+        assert!(rx2.blocking_recv().unwrap().is_ok());
+    }
+
+    struct PanicOnSecondChunk {
+        index: usize,
+    }
+
+    impl Iterator for PanicOnSecondChunk {
+        type Item = Result<Tensor>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            self.index += 1;
+            match self.index {
+                1 => Some(Tensor::new(vec![0.1f32], &Device::Cpu).map_err(Into::into)),
+                2 => panic!("simulated stream panic"),
+                _ => None,
+            }
+        }
+    }
+
+    struct StreamPanickingTts {
+        call_count: u32,
+    }
+
+    impl StreamPanickingTts {
+        fn new() -> Self {
+            Self { call_count: 0 }
+        }
+    }
+
+    impl Tts for StreamPanickingTts {
+        fn audio_info(&self) -> AudioInfo {
+            AudioInfo {
+                sample_rate: 24000,
+                channels: 1,
+                bits_per_sample: 16,
+            }
+        }
+
+        fn voices(&self) -> Vec<VoiceInfo> {
+            vec![]
+        }
+
+        fn generate_speech(
+            &mut self,
+            _text: &str,
+            _language: &str,
+            _voice: Option<&str>,
+            _opts: &SpeechOptions,
+        ) -> Result<Tensor> {
+            Tensor::new(vec![0.1f32], &Device::Cpu).map_err(Into::into)
+        }
+
+        fn generate_speech_stream(
+            &mut self,
+            _text: &str,
+            _language: &str,
+            _voice: Option<&str>,
+            _opts: &SpeechOptions,
+        ) -> Result<crate::audio::tts::TtsStream<'_>> {
+            self.call_count += 1;
+            let audio_info = self.audio_info();
+            if self.call_count == 1 {
+                Ok(crate::audio::tts::TtsStream::new(
+                    audio_info,
+                    PanicOnSecondChunk { index: 0 },
+                ))
+            } else {
+                let chunks: Vec<Result<Tensor>> = vec![0.5f32, 0.6f32]
+                    .into_iter()
+                    .map(|v| Tensor::new(vec![v], &Device::Cpu).map_err(Into::into))
+                    .collect();
+                Ok(crate::audio::tts::TtsStream::new(
+                    audio_info,
+                    chunks.into_iter(),
+                ))
+            }
+        }
+    }
+
+    #[test]
+    fn test_generate_speech_stream_panic_recovery() {
+        let mut rt = new_runtime();
+        rt.register_tts(
+            "panic_stream".into(),
+            "qwen3_tts",
+            Box::new(StreamPanickingTts::new()),
+        )
+        .unwrap();
+
+        let mut rx = rt
+            .generate_speech_stream(
+                "panic_stream",
+                "boom".into(),
+                "en".into(),
+                None,
+                SpeechOptions::default(),
+            )
+            .unwrap();
+
+        let first = rx.blocking_recv().unwrap();
+        assert!(first.is_ok());
+
+        let second = rx.blocking_recv().unwrap();
+        assert!(second.is_err());
+        assert!(second.unwrap_err().to_string().contains("panicked"));
+
+        assert!(rx.blocking_recv().is_none());
+
+        // The thread must have recovered: the next stream request succeeds.
+        let mut rx2 = rt
+            .generate_speech_stream(
+                "panic_stream",
+                "ok".into(),
+                "en".into(),
+                None,
+                SpeechOptions::default(),
+            )
+            .unwrap();
+
+        let mut received = Vec::new();
+        while let Some(result) = rx2.blocking_recv() {
+            received.push(result.unwrap().to_vec1::<f32>().unwrap()[0]);
+        }
+        assert_eq!(received, vec![0.5, 0.6]);
     }
 
     #[cfg(feature = "tts-cache")]

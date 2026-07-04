@@ -167,6 +167,14 @@ pub trait Tts {
     /// The default implementation calls [`generate_speech`](Tts::generate_speech)
     /// and wraps the result in a single-chunk stream. Models that support true
     /// incremental generation override this method.
+    ///
+    /// # Panics
+    ///
+    /// If generation fails or panics after some chunks have already been
+    /// yielded, the implementation must still leave the model in a state
+    /// where the next call succeeds -- the same contract
+    /// [`generate_speech`](Tts::generate_speech) has for a single failed
+    /// call, just checked mid-stream instead of only at the end.
     fn generate_speech_stream(
         &mut self,
         text: &str,

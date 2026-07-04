@@ -112,6 +112,9 @@ without either transport leaking into it.
 - **`TtsCache`** — optional disk cache for TTS responses (behind the
   `tts-cache` feature), keyed by every input that affects the waveform
   (text, voice, language, sampling params).
+- **Incremental TTS streaming** — `ModelRuntime::generate_speech_stream`
+  dispatches to a TTS model's thread and returns a channel of audio chunks
+  as they're produced, instead of waiting for the full waveform.
 - **Model factory / auto-detection** — maps a `config.json` (or path hint)
   to a concrete `ModelBackend`.
 
@@ -147,7 +150,7 @@ without locking.
 
 | Module          | Responsibility                                          |
 |-----------------|----------------------------------------------------------|
-| `runtime`       | `ModelRuntime`, `TtsHandle`, `TtsGenerateRequest` — protocol-independent model lifecycle |
+| `runtime`       | `ModelRuntime`, `TtsHandle`, `TtsGenerateRequest` — protocol-independent model lifecycle and incremental TTS streaming |
 | `mod` (root)    | `InferenceEngine`, `MemoryConfig` — the LLM continuous batching loop |
 | `backend`       | `ModelBackend` trait + concrete implementations (Gemma4, Hunyuan Dense, Qwen 2.5/3/3.5) |
 | `model_factory` | `ModelType`/`ModelFormat` auto-detection and backend/TTS factory creation |
@@ -204,6 +207,25 @@ that affects the waveform (model, voice, language, text, sampling params)
 with blake3; requests with `reference_audio` set (voice cloning) always
 bypass the cache, since a reference clip can't be captured in a
 fixed-size key.
+
+### TTS streaming
+
+`ModelRuntime::generate_speech_stream` sends a `TtsStreamRequest` to the
+model's dedicated thread and returns a bounded `mpsc::Receiver` of audio
+chunks; the channel closes on completion, or yields an `Err` item if
+generation fails. Streaming and blob (`generate_speech`) requests share one
+FIFO queue per model, so both are served in submission order off the same
+thread. Streaming requests always bypass `TtsCache` — there is no cached
+prefix to serve incrementally.
+
+The receiver is bounded (capacity 2) and the worker thread sends on it with
+a blocking call, so a consumer that stops draining without dropping the
+receiver stalls that model's thread — and every other request queued behind
+it. `ModelRuntime::set_streaming_enabled`/`streaming_enabled` is a
+runtime-level switch transports can check before choosing this path: a
+transport whose hardware can't keep up with real-time incremental playback
+(e.g. `crane-wyoming` on a CPU-only device) should disable it and fall back
+to `generate_speech`.
 
 ### Design constraints
 
