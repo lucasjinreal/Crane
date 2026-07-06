@@ -2,8 +2,8 @@
 
 #[cfg(feature = "onnx")]
 mod asr;
-mod tts;
+mod tts_client;
 
 #[cfg(feature = "onnx")]
 pub use asr::AsrClient;
-pub use tts::TtsClient;
+pub use tts_client::TtsClient;
