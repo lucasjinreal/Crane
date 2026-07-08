@@ -14,6 +14,10 @@
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 
+/// Per-layer KV cache for one sequence: `(K, V)` per layer, or `None` for
+/// layers with no cached state yet.
+pub type SequenceKvCaches = Vec<Option<(Tensor, Tensor)>>;
+
 // ─────────────────────────────────────────────────────────────
 //  Trait
 // ─────────────────────────────────────────────────────────────
@@ -30,6 +34,10 @@ pub trait ModelBackend: Send + 'static {
     /// * `start_pos` — KV cache position (0 for a fresh sequence)
     ///
     /// Returns logits tensor, typically `[1, seq_len, vocab_size]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the forward pass fails.
     fn forward_step(&mut self, input_ids: &[u32], start_pos: usize) -> Result<Tensor>;
 
     /// Clear all KV caches.
@@ -61,12 +69,12 @@ pub trait ModelBackend: Send + 'static {
     }
 
     /// Extract per-layer KV caches from the model.
-    fn get_kv_caches(&self) -> Vec<Option<(Tensor, Tensor)>> {
+    fn get_kv_caches(&self) -> SequenceKvCaches {
         vec![]
     }
 
     /// Restore per-layer KV caches into the model.
-    fn set_kv_caches(&mut self, _caches: Vec<Option<(Tensor, Tensor)>>) {}
+    fn set_kv_caches(&mut self, _caches: SequenceKvCaches) {}
 
     /// Compute bytes held by the model's active KV caches without copying.
     /// Used for memory tracking without the overhead of `get_kv_caches()`.
@@ -83,15 +91,23 @@ pub trait ModelBackend: Send + 'static {
     }
 
     /// Pad and load per-sequence KV caches for batched decoding.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if this backend doesn't support batch decode.
     fn setup_batch_decode(
         &mut self,
-        _seq_kv_caches: &[Vec<Option<(Tensor, Tensor)>>],
+        _seq_kv_caches: &[SequenceKvCaches],
         _extra_room: usize,
     ) -> candle_core::Result<(Vec<usize>, usize)> {
         candle_core::bail!("Batch decode not supported by this backend")
     }
 
     /// Run one batched decode step.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if this backend doesn't support batch decode.
     fn step_batch_decode(
         &mut self,
         _input_ids: &Tensor,
@@ -103,16 +119,24 @@ pub trait ModelBackend: Send + 'static {
     }
 
     /// Extract per-sequence KV caches from batched state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if this backend doesn't support batch decode.
     fn extract_batch_kv(
         &mut self,
         _kv_lens: &[usize],
         _original_max_kv: usize,
         _rounds_done: usize,
-    ) -> candle_core::Result<Vec<Vec<Option<(Tensor, Tensor)>>>> {
+    ) -> candle_core::Result<Vec<SequenceKvCaches>> {
         candle_core::bail!("Batch decode not supported by this backend")
     }
 
     /// Build attention mask for batched decoding.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if this backend doesn't support batch decode.
     fn build_batch_decode_mask(
         &self,
         _kv_lens: &[usize],
@@ -132,6 +156,9 @@ pub struct Gemma4Backend {
 }
 
 impl Gemma4Backend {
+    /// # Errors
+    ///
+    /// Returns an error if the model fails to load from `model_path`.
     pub fn new(
         model_path: &str,
         device: &Device,
@@ -204,6 +231,9 @@ pub struct HunyuanBackend {
 }
 
 impl HunyuanBackend {
+    /// # Errors
+    ///
+    /// Returns an error if the model fails to load from `model_path`.
     pub fn new(
         model_path: &str,
         device: &Device,
@@ -244,7 +274,7 @@ impl ModelBackend for HunyuanBackend {
     }
 
     fn eos_token_id(&self) -> Vec<u32> {
-        vec![120020]
+        vec![120_020]
     }
 
     fn warmup(&mut self) {
@@ -330,6 +360,9 @@ pub struct Qwen25Backend {
 }
 
 impl Qwen25Backend {
+    /// # Errors
+    ///
+    /// Returns an error if the model fails to load from `model_path`.
     pub fn new(model_path: &str, device: &Device, dtype: &DType) -> Result<Self> {
         let model = crane_core::models::qwen25::Model::new(model_path, device, dtype)?;
         Ok(Self {
@@ -372,8 +405,7 @@ impl ModelBackend for Qwen25Backend {
             .tokenizer
             .token_to_id("<|endoftext|>")
             .or_else(|| self.model.tokenizer.tokenizer.token_to_id("<|im_end|>"))
-            .map(|id| vec![id])
-            .unwrap_or_else(|| vec![151643])
+            .map_or_else(|| vec![151_643], |id| vec![id])
     }
 
     fn warmup(&mut self) {
@@ -397,6 +429,9 @@ pub struct Qwen3_5Backend {
 }
 
 impl Qwen3_5Backend {
+    /// # Errors
+    ///
+    /// Returns an error if the model fails to load from `model_path`.
     pub fn new(model_path: &str, device: &Device, dtype: &DType) -> Result<Self> {
         let model = crane_core::models::qwen3_5::Model::new(model_path, device, dtype)?;
         Ok(Self {
@@ -408,9 +443,8 @@ impl Qwen3_5Backend {
 
 impl ModelBackend for Qwen3_5Backend {
     fn forward_step(&mut self, input_ids: &[u32], start_pos: usize) -> Result<Tensor> {
-        self.model
-            .forward_step(input_ids, start_pos)
-            .map_err(Into::into)
+        // The underlying model already returns anyhow::Result — no conversion needed.
+        self.model.forward_step(input_ids, start_pos)
     }
 
     fn clear_kv_cache(&mut self) {
@@ -447,8 +481,8 @@ impl ModelBackend for Qwen3_5Backend {
             ids.push(id);
         }
         if ids.is_empty() {
-            ids.push(151645);
-            ids.push(151643);
+            ids.push(151_645);
+            ids.push(151_643);
         }
         ids
     }
@@ -472,6 +506,9 @@ pub struct Qwen3Backend {
 }
 
 impl Qwen3Backend {
+    /// # Errors
+    ///
+    /// Returns an error if the model fails to load from `model_path`.
     pub fn new(model_path: &str, device: &Device, dtype: &DType) -> Result<Self> {
         let model = crane_core::models::qwen3::Model::new(model_path, device, dtype)?;
         Ok(Self {
@@ -515,7 +552,7 @@ impl ModelBackend for Qwen3Backend {
         let mut ids = Vec::new();
         if let Some(id) = tok.token_to_id("<|im_end|>") { ids.push(id); }
         if let Some(id) = tok.token_to_id("<|endoftext|>") { ids.push(id); }
-        if ids.is_empty() { ids.push(151645); ids.push(151643); }
+        if ids.is_empty() { ids.push(151_645); ids.push(151_643); }
         ids
     }
 

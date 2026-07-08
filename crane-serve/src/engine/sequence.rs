@@ -3,6 +3,7 @@ use candle_transformers::generation::LogitsProcessor;
 use tokio::sync::mpsc;
 
 /// Compute the total GPU memory (in bytes) held by a set of KV caches.
+#[must_use]
 pub fn kv_cache_bytes(caches: &[Option<(Tensor, Tensor)>]) -> u64 {
     caches
         .iter()
@@ -62,19 +63,21 @@ pub struct Sequence {
 
 impl Sequence {
     /// Number of tokens generated so far (excluding prompt).
+    #[must_use]
     pub fn num_generated(&self) -> usize {
         self.tokens.len().saturating_sub(self.prompt_len)
     }
 
     /// Whether generation should stop.
+    #[must_use]
     pub fn should_stop(&self) -> bool {
         if self.num_generated() >= self.max_tokens {
             return true;
         }
-        if let Some(&last) = self.tokens.last() {
-            if self.eos_token_id.contains(&last) {
-                return true;
-            }
+        if let Some(&last) = self.tokens.last()
+            && self.eos_token_id.contains(&last)
+        {
+            return true;
         }
         false
     }
@@ -83,6 +86,7 @@ impl Sequence {
     /// For a fresh sequence, `start_pos = 0`.
     /// After prefill of N prompt tokens, `start_pos = N`.
     /// During decode, `start_pos = tokens.len() - 1` (everything except the latest token).
+    #[must_use]
     pub fn start_pos(&self) -> usize {
         // After prefill the kv_caches cover prompt_len tokens.
         // During decode each step adds one token, so the cache covers
@@ -95,6 +99,7 @@ impl Sequence {
     }
 
     /// Tokens to feed into the next forward step.
+    #[must_use]
     pub fn next_input_ids(&self) -> &[u32] {
         if self.status == SequenceStatus::Waiting {
             // Prefill: feed all prompt tokens.
@@ -105,12 +110,13 @@ impl Sequence {
         }
     }
 
-    /// Finish reason string for the OpenAI response.
+    /// Finish reason string for the `OpenAI` response.
+    #[must_use]
     pub fn finish_reason(&self) -> &'static str {
-        if let Some(&last) = self.tokens.last() {
-            if self.eos_token_id.contains(&last) {
-                return "stop";
-            }
+        if let Some(&last) = self.tokens.last()
+            && self.eos_token_id.contains(&last)
+        {
+            return "stop";
         }
         "length"
     }

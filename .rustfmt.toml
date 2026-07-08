@@ -1,0 +1,9 @@
+# https://rust-lang.github.io/rustfmt/
+style_edition = "2024"
+match_block_trailing_comma = true
+single_line_let_else_max_width = 0
+
+## Currently unstable features
+# force_multiline_blocks = true
+# format_strings = true
+# imports_layout = "HorizontalVertical"
