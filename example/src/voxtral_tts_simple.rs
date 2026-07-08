@@ -85,7 +85,11 @@ fn main() -> anyhow::Result<()> {
 
         let start = std::time::Instant::now();
         let output_path = format!("{output_dir}/{filename}");
-        let saved_path = model.generate_speech_to_file(text, *voice, 2048, &output_path)?;
+        let opts = crane_core::generation::SpeechOptions {
+            max_new_tokens: 2048,
+            ..Default::default()
+        };
+        let saved_path = model.generate_speech_to_file(text, "auto", *voice, &opts, &output_path)?;
         let elapsed = start.elapsed();
         println!("  Saved {saved_path} in {elapsed:.1?}");
     }
