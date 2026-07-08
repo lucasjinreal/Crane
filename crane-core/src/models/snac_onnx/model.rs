@@ -4,8 +4,7 @@
 // mainly for driven Orpheus model
 
 use anyhow::{anyhow, Result};
-use candle_core::{DType, Device, Tensor};
-use hound::{SampleFormat, WavSpec, WavWriter};
+use candle_core::{Device, Tensor};
 
 #[derive(Debug)]
 pub struct SNAC24DecoderONNX {
@@ -46,43 +45,5 @@ impl SNAC24DecoderONNX {
         let output = out.get(&out_names[0].name).unwrap().clone();
         // Extract and return audio_values output
         Ok(output)
-    }
-
-    pub fn save_audio_data_to_file(
-        &self,
-        audio_values: &Tensor,
-        filename: &str,
-        sample_rate: Option<u32>,
-    ) -> Result<String> {
-        let sample_rate = sample_rate.unwrap_or(24000);
-
-        // Convert to f32 and flatten [batch, channels, samples] => [samples]
-        let audio_values = audio_values.to_dtype(DType::F32)?.flatten_all()?;
-
-        // Scale to i16 range and clamp values
-        let scaled = audio_values
-            .affine(32767.0, 0.0)? // Scale to maximum i16 range
-            .clamp(-32768.0, 32767.0)? // Prevent overflow
-            .round()?; // Properly round to nearest integer
-
-        // Convert to i64 (closest available integer type)
-        let audio_i64 = scaled.to_dtype(DType::I64)?;
-
-        // Create WAV specification
-        let spec = WavSpec {
-            channels: 1,
-            sample_rate,
-            bits_per_sample: 16,
-            sample_format: SampleFormat::Int,
-        };
-
-        // Convert to i16 samples during writing
-        let mut writer = WavWriter::create(filename, spec)?;
-        for sample in audio_i64.to_vec1::<i64>()? {
-            writer.write_sample(sample.clamp(i16::MIN as i64, i16::MAX as i64) as i16)?;
-        }
-        writer.finalize()?;
-
-        Ok(filename.to_string())
     }
 }

@@ -57,22 +57,6 @@ impl MoonshineASR {
         Ok(model)
     }
 
-    pub fn load_audio(audio_f: String) -> Result<Vec<f32>> {
-        let mut reader = hound::WavReader::open(audio_f).expect("Failed to open WAV file");
-        let spec = reader.spec();
-        if spec.sample_rate != 16000 || spec.channels != 1 || spec.bits_per_sample != 16 {
-            panic!("Unsupported audio format: expected 16kHz mono 16-bit");
-        }
-        let samples: Vec<i16> = reader.samples().map(Result::unwrap).collect();
-        let audio: Vec<f32> = samples.iter().map(|&s| s as f32 / 32768.0).collect();
-        Ok(audio)
-    }
-
-    pub fn generate_from_audio(&self, audio_file: String) -> Result<Vec<i64>> {
-        let audio = Self::load_audio(audio_file)?;
-        self.generate(audio.as_slice(), None)
-    }
-
     pub fn generate(&self, audio: &[f32], max_len: Option<usize>) -> Result<Vec<i64>> {
         let max_len = max_len.unwrap_or_else(|| {
             ((audio.len() as f64 / 16_000.0) * (self.token_rate as f64)).ceil() as usize

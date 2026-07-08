@@ -1673,4 +1673,22 @@ impl NativeSpeechTokenizerDecoder {
         let refs: Vec<&Tensor> = wavs.iter().collect();
         Ok(Tensor::cat(&refs, D::Minus1)?)
     }
+
+    /// Decode a chunk of codes, trimming left-context frames from the output.
+    ///
+    /// `chunk_codes` shape: `[B, num_quantizers, context_frames + new_frames]`.
+    /// Returns `[B, 1, new_frames * total_upsample]` — only the audio for new frames.
+    ///
+    /// The context frames are decoded but their output is trimmed. With
+    /// `context_frames >= 25` (above the codec receptive field) the output is
+    /// numerically equivalent to full-sequence decoding.
+    pub fn decode_chunk(&self, chunk_codes: &Tensor, context_frames: usize) -> Result<Tensor> {
+        let wav = self.forward(chunk_codes)?;
+        if context_frames == 0 {
+            return Ok(wav);
+        }
+        let trim = context_frames * self.total_upsample;
+        let (_, _, tw) = wav.dims3()?;
+        Ok(wav.narrow(D::Minus1, trim, tw.saturating_sub(trim))?)
+    }
 }

@@ -7,7 +7,6 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::VarBuilder;
-use hound::{SampleFormat, WavSpec, WavWriter};
 use serde::Deserialize;
 use tekken::Tekkenizer;
 
@@ -31,6 +30,15 @@ pub const INST_END: u32 = 36;
 /// End-of-audio semantic code (special value returned by the semantic head to
 /// signal that generation is complete).
 pub const END_AUDIO_CODE: u32 = 1;
+
+// Streaming chunk sizes for `generate_speech_stream`.
+//
+// `STREAM_FIRST_CHUNK_SIZE` controls time-to-first-audio (~0.4 s).
+// `STREAM_CHUNK_SIZE` controls subsequent chunk latency (~2 s).
+// `STREAM_LEFT_CONTEXT` must exceed the codec's receptive field (~15 frames).
+const STREAM_CHUNK_SIZE: usize = 25;
+const STREAM_LEFT_CONTEXT: usize = 25;
+const STREAM_FIRST_CHUNK_SIZE: usize = 5;
 
 // ── Config types ───────────────────────────────────────────────────────────
 
@@ -467,19 +475,14 @@ impl Model {
     ) -> Result<(Tensor, u32)> {
         self.llm.clear_kv_cache();
 
-        let voice_name = match voice {
-            Some(v) => v.to_string(),
-            None => self
-                .voices
-                .keys()
-                .next()
-                .expect("at least one voice")
-                .clone(),
+        let voice_key: &str = match voice {
+            Some(v) => v,
+            None => self.voices.keys().next().expect("at least one voice"),
         };
         let voice_embed = self
             .voices
-            .get(&voice_name)
-            .ok_or_else(|| anyhow::anyhow!("unknown voice '{voice_name}'"))?
+            .get(voice_key)
+            .ok_or_else(|| anyhow::anyhow!("unknown voice '{voice_key}'"))?
             .to_dtype(self.dtype)?;
 
         let token_ids = self
@@ -571,51 +574,6 @@ impl Model {
         Ok((waveform, self.sample_rate()))
     }
 
-    /// Generate speech and write to a WAV file.
-    ///
-    /// Returns the output file path on success.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if generation or WAV writing fails.
-    pub fn generate_speech_to_file(
-        &mut self,
-        text: &str,
-        language: &str,
-        voice: Option<&str>,
-        opts: &SpeechOptions,
-        output_path: &str,
-    ) -> Result<String> {
-        let (audio, sr) = self.generate_speech(text, language, voice, opts)?;
-        Self::save_wav(&audio, output_path, sr)
-    }
-
-    /// Write a waveform tensor to a 16-bit PCM WAV file.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the tensor cannot be converted or the file cannot be
-    /// written.
-    pub fn save_wav(audio: &Tensor, path: &str, sample_rate: u32) -> Result<String> {
-        let audio_f32 = audio.to_dtype(DType::F32)?.flatten_all()?;
-        let samples: Vec<f32> = audio_f32.to_vec1()?;
-
-        let spec = WavSpec {
-            channels: 1,
-            sample_rate,
-            bits_per_sample: 16,
-            sample_format: SampleFormat::Int,
-        };
-        let mut writer = WavWriter::create(path, spec)?;
-        for &s in &samples {
-            #[allow(clippy::cast_possible_truncation)] // value is clamped to i16 range
-            let s16 = (s * 32767.0).clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16;
-            writer.write_sample(s16)?;
-        }
-        writer.finalize()?;
-        Ok(path.to_string())
-    }
-
     /// List the names of available voices.
     #[must_use]
     pub fn available_voices(&self) -> Vec<&str> {
@@ -632,6 +590,248 @@ impl Model {
     pub fn sample_rate(&self) -> u32 {
         u32::try_from(self.config.multimodal.audio_tokenizer_args.sampling_rate)
             .expect("sample rate fits u32")
+    }
+
+    /// Generate speech as an incremental stream of f32 PCM chunks.
+    ///
+    /// Performs the same setup as [`generate_speech`](Self::generate_speech)
+    /// (KV cache reset, voice resolution, tokenization, prompt embedding, LLM
+    /// prefill) and returns a [`SpeechStream`] iterator. The caller drives
+    /// generation by calling `Iterator::next()`.
+    ///
+    /// `language` is accepted for API compatibility but is not used — Voxtral
+    /// TTS language is implicit in the text.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if setup fails (unknown voice, tokenization error, LLM
+    /// prefill error, or sequence length exceeded).
+    #[allow(unused_variables)]
+    pub fn generate_speech_streaming(
+        &mut self,
+        text: &str,
+        language: &str,
+        voice: Option<&str>,
+        opts: &SpeechOptions,
+    ) -> Result<SpeechStream<'_>> {
+        self.llm.clear_kv_cache();
+
+        let voice_key: &str = match voice {
+            Some(v) => v,
+            None => self.voices.keys().next().expect("at least one voice"),
+        };
+        let voice_embed = self
+            .voices
+            .get(voice_key)
+            .ok_or_else(|| anyhow::anyhow!("unknown voice '{voice_key}'"))?
+            .to_dtype(self.dtype)?;
+
+        let token_ids = self
+            .tokenizer
+            .encode(text, false, false)
+            .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))?;
+        let segments = build_prompt_segments(&token_ids);
+        let prompt_embeds = self.build_prompt_embeds(&segments, &voice_embed)?;
+
+        let prefill_h = self
+            .llm
+            .forward(&prompt_embeds, 0)
+            .map_err(|e| anyhow::anyhow!("LLM prefill failed: {e}"))?;
+        let prompt_len = prompt_embeds.dim(1)?;
+        let h_for_frame = prefill_h.i((.., prompt_len - 1, ..))?.unsqueeze(1)?;
+        drop(prefill_h);
+
+        anyhow::ensure!(
+            prompt_len + opts.max_new_tokens <= self.config.max_seq_len,
+            "prompt ({prompt_len}) + max_new_tokens ({}) exceeds max_seq_len ({})",
+            opts.max_new_tokens,
+            self.config.max_seq_len,
+        );
+
+        let n_codebooks = 1 + self.config.multimodal.audio_model_args.n_acoustic_codebook;
+
+        Ok(SpeechStream {
+            model: self,
+            h_for_frame,
+            prompt_len,
+            frame_idx: 0,
+            max_frames: opts.max_new_tokens,
+            n_codebooks,
+            chunk_size: STREAM_CHUNK_SIZE,
+            first_chunk_size: STREAM_FIRST_CHUNK_SIZE,
+            left_context: STREAM_LEFT_CONTEXT,
+            all_codes: Vec::new(),
+            emitted_up_to: 0,
+            done: false,
+        })
+    }
+}
+
+// ── Streaming speech generation ────────────────────────────────────────────
+
+/// Incremental speech generator that yields PCM audio chunks on demand.
+///
+/// Returned by [`Model::generate_speech_streaming`]. Implements
+/// `Iterator<Item = anyhow::Result<Tensor>>`, where each `Tensor` contains
+/// a flat `[n_samples]` slice of f32 PCM at 24 kHz.
+///
+/// The first chunk is emitted after [`STREAM_FIRST_CHUNK_SIZE`] codec frames
+/// (approximately 0.4 s). Subsequent chunks are emitted every
+/// [`STREAM_CHUNK_SIZE`] frames (approximately 2 s). [`STREAM_LEFT_CONTEXT`]
+/// frames of overlap between consecutive codec calls ensure the waveform is
+/// numerically equivalent to non-streaming generation.
+///
+/// Errors are returned as `Some(Err(...))` from `next()`. After an error the
+/// iterator is done.
+pub struct SpeechStream<'a> {
+    model: &'a mut Model,
+    h_for_frame: Tensor,
+    prompt_len: usize,
+    frame_idx: usize,
+    max_frames: usize,
+    n_codebooks: usize,
+    chunk_size: usize,
+    first_chunk_size: usize,
+    left_context: usize,
+    all_codes: Vec<Vec<u32>>,
+    emitted_up_to: usize,
+    done: bool,
+}
+
+impl SpeechStream<'_> {
+    /// Generate the next codec frame and append it to `all_codes`.
+    ///
+    /// Returns `Ok(true)` if generation is complete (END_AUDIO_CODE or
+    /// max_frames reached), `Ok(false)` if more frames can be generated.
+    #[allow(clippy::cast_precision_loss)]
+    fn generate_one_frame(&mut self) -> anyhow::Result<bool> {
+        if self.frame_idx >= self.max_frames {
+            return Ok(true);
+        }
+
+        let h_squeezed = self.h_for_frame.reshape((self.model.config.dim,))?;
+
+        let semantic_code = self
+            .model
+            .acoustic
+            .predict_semantic_code(&h_squeezed)
+            .map_err(|e| anyhow::anyhow!("predict_semantic_code failed: {e}"))?;
+
+        if semantic_code == END_AUDIO_CODE {
+            return Ok(true);
+        }
+
+        let acoustic_codes = self
+            .model
+            .acoustic
+            .flow_match_inference(&h_squeezed)
+            .map_err(|e| anyhow::anyhow!("flow_match_inference failed: {e}"))?;
+        let acoustic_vec: Vec<u32> = acoustic_codes.to_vec1()?;
+
+        let mut frame_codes = Vec::with_capacity(self.n_codebooks);
+        frame_codes.push(semantic_code);
+        frame_codes.extend_from_slice(&acoustic_vec);
+
+        let frame_idx = self.frame_idx;
+        if frame_idx + 1 < self.max_frames {
+            let codes_tensor =
+                Tensor::new(frame_codes.as_slice(), &self.model.device)?;
+            let summed_embed = self
+                .model
+                .codebook_embed
+                .forward(&codes_tensor)
+                .map_err(|e| anyhow::anyhow!("codebook embed failed: {e}"))?
+                .to_dtype(self.model.dtype)?
+                .unsqueeze(0)?
+                .unsqueeze(0)?;
+            let start_pos = self.prompt_len + frame_idx;
+            self.h_for_frame = self
+                .model
+                .llm
+                .forward(&summed_embed, start_pos)
+                .map_err(|e| anyhow::anyhow!("LLM decode step failed: {e}"))?;
+        }
+
+        self.all_codes.push(frame_codes);
+        self.frame_idx += 1;
+        Ok(false)
+    }
+
+    /// Try to produce the next audio chunk, returning `None` when done.
+    fn try_next(&mut self) -> anyhow::Result<Option<Tensor>> {
+        let target = if self.emitted_up_to == 0 {
+            self.first_chunk_size
+        } else {
+            self.chunk_size
+        };
+
+        // Generate frames until we have `target` new frames or generation ends.
+        loop {
+            let new_frames = self.all_codes.len() - self.emitted_up_to;
+            if new_frames >= target {
+                break;
+            }
+            let done = self.generate_one_frame()?;
+            if done {
+                self.done = true;
+                break;
+            }
+        }
+
+        let new_frames = self.all_codes.len() - self.emitted_up_to;
+        if new_frames == 0 {
+            return Ok(None);
+        }
+
+        // Include left_context frames from previous chunks for codec continuity.
+        let ctx = self.emitted_up_to.min(self.left_context);
+        let chunk_start = self.emitted_up_to - ctx;
+        let chunk_end = self.all_codes.len();
+        let n_chunk_frames = chunk_end - chunk_start;
+
+        #[allow(clippy::cast_precision_loss)]
+        let flat: Vec<f32> = self.all_codes[chunk_start..chunk_end]
+            .iter()
+            .flat_map(|f| f.iter().copied().map(|c| c as f32))
+            .collect();
+        let chunk_codes = Tensor::new(flat.as_slice(), &self.model.device)?
+            .reshape((1, n_chunk_frames, self.n_codebooks))?;
+
+        let audio = self
+            .model
+            .codec
+            .decode_chunk(&chunk_codes, ctx)
+            .map_err(|e| anyhow::anyhow!("codec decode_chunk failed: {e}"))?
+            .flatten_all()?;
+
+        self.emitted_up_to = chunk_end;
+
+        // Drop frames older than left_context — they will never be accessed again.
+        let keep_from = self.emitted_up_to.saturating_sub(self.left_context);
+        if keep_from > 0 {
+            self.all_codes.drain(..keep_from);
+            self.emitted_up_to -= keep_from;
+        }
+
+        Ok(Some(audio))
+    }
+}
+
+impl Iterator for SpeechStream<'_> {
+    type Item = anyhow::Result<Tensor>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done && self.emitted_up_to >= self.all_codes.len() {
+            return None;
+        }
+        match self.try_next() {
+            Ok(Some(chunk)) => Some(Ok(chunk)),
+            Ok(None) => None,
+            Err(e) => {
+                self.done = true;
+                Some(Err(e))
+            }
+        }
     }
 }
 

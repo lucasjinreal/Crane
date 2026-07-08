@@ -12,6 +12,7 @@ path = "src/lib.rs"
 
 [dependencies]
 crane-core = { path = "../crane-core" }
+crane = { path = "../crane" }
 anyhow = "1.0.100"
 axum = { version = "0.8", features = ["json"] }
 tokio = { version = "1", features = ["full"] }
@@ -30,12 +31,11 @@ candle-nn = { workspace = true }
 candle-transformers = { workspace = true }
 reqwest = { version = "0.12", features = ["stream"] }
 tempfile = "3"
-hound = "3.5.1"
 
 [features]
-cuda = ["crane-core/cuda"]
-cudnn = ["crane-core/cudnn"]
-mkl = ["crane-core/mkl"]
+cuda = ["crane-core/cuda", "crane/cuda"]
+cudnn = ["crane-core/cudnn", "crane/cudnn"]
+mkl = ["crane-core/mkl", "crane/mkl"]
 
 [dev-dependencies]
 tempfile = "3"
