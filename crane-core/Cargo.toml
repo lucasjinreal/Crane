@@ -25,7 +25,7 @@ serde = "1.0.219"
 # preserve_order: JSON object keys keep insertion order (matches Python's
 # json.dumps / HF chat templates — needed for byte-identical tool rendering).
 serde_json = { version = "1.0.140", features = ["preserve_order"] }
-tokenizers = "0.23.1"
+tokenizers = { workspace = true }
 ribo = "0.1.3"
 base64 = "0.22"
 fancy-regex = "0.13"
