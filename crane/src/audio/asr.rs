@@ -51,8 +51,10 @@ impl AsrClient {
         )
         .map_err(|e| CraneError::ModelError(e.to_string()))?;
 
+        let audio = load_wav_16k_mono(audio_file.as_ref())?;
+
         let token_ids = model
-            .generate_from_audio(audio_file.as_ref().to_string_lossy().to_string())
+            .generate(&audio, None)
             .map_err(|e| CraneError::ModelError(e.to_string()))?;
 
         Ok(format!("{token_ids:?}"))
@@ -65,4 +67,23 @@ impl AsrClient {
             "Audio data input not implemented yet".to_string(),
         ))
     }
+}
+
+/// Loads a 16kHz mono 16-bit PCM WAV file as f32 samples in `[-1, 1]`.
+///
+/// Moonshine ASR requires this exact format.
+fn load_wav_16k_mono(path: &Path) -> CraneResult<Vec<f32>> {
+    let mut reader = hound::WavReader::open(path)
+        .map_err(|e| CraneError::Other(format!("failed to open WAV file: {e}")))?;
+    let spec = reader.spec();
+    if spec.sample_rate != 16000 || spec.channels != 1 || spec.bits_per_sample != 16 {
+        return Err(CraneError::Other(
+            "unsupported audio format: expected 16kHz mono 16-bit".to_string(),
+        ));
+    }
+    reader
+        .samples::<i16>()
+        .map(|s| s.map(|v| f32::from(v) / 32768.0))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| CraneError::Other(format!("failed to read WAV samples: {e}")))
 }
