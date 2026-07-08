@@ -4,7 +4,6 @@
 //! `Box<dyn Tts>` and never import model-specific types.
 
 use std::io::Cursor;
-use std::path::Path;
 
 use anyhow::Result;
 use candle_core::{DType, Tensor};
@@ -151,7 +150,7 @@ pub trait Tts {
         &mut self,
         _text: &str,
         _language: &str,
-        _ref_audio: &Path,
+        _ref_audio: &str,
         _ref_text: &str,
         _opts: &SpeechOptions,
     ) -> Result<Tensor> {
@@ -495,7 +494,7 @@ mod tests {
     #[test]
     fn test_default_generate_voice_clone_errors() {
         let opts = SpeechOptions::default();
-        let result = MockTts.generate_voice_clone("hello", "en", Path::new("/ref.wav"), "hello", &opts);
+        let result = MockTts.generate_voice_clone("hello", "en", "/ref.wav", "hello", &opts);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("voice cloning not supported"));
     }

@@ -1,7 +1,5 @@
 //! [`Tts`] trait implementation for [`crane_core::models::qwen3_tts::Model`].
 
-use std::path::Path;
-
 use anyhow::Result;
 use candle_core::Tensor;
 use crane_core::generation::SpeechOptions;
@@ -92,21 +90,16 @@ impl Tts for Model {
     }
 
     /// Delegates to the inherent [`Model::generate_voice_clone`].
-    ///
-    /// Converts `ref_audio: &Path` to `&str`; returns an error for non-UTF-8 paths.
     fn generate_voice_clone(
         &mut self,
         text: &str,
         language: &str,
-        ref_audio: &Path,
+        ref_audio: &str,
         ref_text: &str,
         opts: &SpeechOptions,
     ) -> Result<Tensor> {
-        let ref_audio_str = ref_audio
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("reference audio path is not valid UTF-8"))?;
         let (tensor, _sample_rate) =
-            Model::generate_voice_clone(self, text, language, ref_audio_str, ref_text, opts)?;
+            Model::generate_voice_clone(self, text, language, ref_audio, ref_text, opts)?;
         Ok(tensor)
     }
 

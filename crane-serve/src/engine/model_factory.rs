@@ -242,7 +242,7 @@ fn resolve(model_type: ModelType, model_path: &str) -> ModelType {
 /// # Errors
 ///
 /// Returns an error if `model_type` resolves to a VLM/TTS type (use
-/// `create_vlm_model()`/`create_tts_model()` instead) or the model fails to load.
+/// `create_vlm_model()`/`create_tts()` instead) or the model fails to load.
 pub fn create_backend(
     model_type: ModelType,
     model_path: &str,
@@ -280,10 +280,10 @@ pub fn create_backend(
             anyhow::bail!("Gemma4-VL is a VLM model — use the VLM endpoint instead of create_backend()")
         }
         ModelType::Qwen3TTS => {
-            anyhow::bail!("Qwen3-TTS is a TTS model — use create_tts_model() instead of create_backend()")
+            anyhow::bail!("Qwen3-TTS is a TTS model — use create_tts() instead of create_backend()")
         }
         ModelType::VoxtralTTS => {
-            anyhow::bail!("Voxtral-TTS is a TTS model — use create_voxtral_tts_model() instead of create_backend()")
+            anyhow::bail!("Voxtral-TTS is a TTS model — use create_tts() instead of create_backend()")
         }
         ModelType::Auto => unreachable!(),
     }
@@ -328,32 +328,33 @@ pub fn create_vlm_model(
     crane_core::models::paddleocr_vl::PaddleOcrVL::from_local(model_path, use_cpu, use_bf16)
 }
 
-/// Create a Qwen3-TTS model for TTS inference.
+/// Create a TTS model as a trait object.
+///
+/// Unified entrypoint for all TTS model types; the returned `Box<dyn Tts + Send>`
+/// can be moved into a dedicated thread without model-specific branching.
 ///
 /// # Errors
 ///
-/// Returns an error if the model fails to load from `model_path`.
-pub fn create_tts_model(
+/// Returns an error if `model_type` does not resolve to a TTS variant or the
+/// model fails to load from `model_path`.
+pub fn create_tts(
+    model_type: ModelType,
     model_path: &str,
     device: &Device,
     dtype: &DType,
-) -> Result<crane_core::models::qwen3_tts::Model> {
-    tracing::info!("Creating Qwen3-TTS model from: {}", model_path);
-    crane_core::models::qwen3_tts::Model::new(model_path, device, dtype)
-}
-
-/// Create a Voxtral TTS model for TTS inference.
-///
-/// # Errors
-///
-/// Returns an error if the model fails to load from `model_path`.
-pub fn create_voxtral_tts_model(
-    model_path: &str,
-    device: &Device,
-    dtype: &DType,
-) -> Result<crane_core::models::voxtral_tts::Model> {
-    tracing::info!("Creating Voxtral-TTS model from: {}", model_path);
-    crane_core::models::voxtral_tts::Model::new(model_path, device, dtype)
+) -> Result<Box<dyn crane::audio::Tts + Send>> {
+    tracing::info!("Creating {} model from: {}", model_type.display_name(), model_path);
+    match model_type {
+        ModelType::Qwen3TTS => {
+            let model = crane_core::models::qwen3_tts::Model::new(model_path, device, dtype)?;
+            Ok(Box::new(model))
+        }
+        ModelType::VoxtralTTS => {
+            let model = crane_core::models::voxtral_tts::Model::new(model_path, device, dtype)?;
+            Ok(Box::new(model))
+        }
+        other => anyhow::bail!("{other:?} is not a TTS model type"),
+    }
 }
 
 #[cfg(test)]

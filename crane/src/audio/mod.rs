@@ -9,5 +9,5 @@ mod tts_voxtral;
 
 #[cfg(feature = "onnx")]
 pub use asr::AsrClient;
-pub use tts::{AudioInfo, Tts, TtsStream, VoiceInfo, pcm_f32_to_i16};
+pub use tts::{AudioInfo, Tts, TtsStream, VoiceInfo, encode_wav, pcm_f32_to_i16};
 pub use tts_client::TtsClient;
