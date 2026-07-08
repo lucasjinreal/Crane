@@ -17,6 +17,8 @@ nvml-wrapper = { version = "0.10", optional = true }
 
 crane-core = { path = "../crane-core" }
 hound = "3"
+rubato = "3.0.0"
+audioadapter-buffers = "3.0.0"
 ribo = "0.1.3"
 tokenizers = { workspace = true }
 

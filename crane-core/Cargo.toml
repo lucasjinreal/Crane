@@ -34,12 +34,9 @@ zip = "2"
 
 
 intel-mkl-src = { version = "0.8.1", optional = true }
-hound = "3.5.1"
 rustfft = "6"
 image = "0.25.9"
 half = "2"
-rubato = "3.0.0"
-audioadapter-buffers = "3.0.0"
 
 # candle-core = { workspace = true, features = ["accelerate"] }
 

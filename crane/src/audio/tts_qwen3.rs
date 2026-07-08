@@ -6,7 +6,7 @@ use crane_core::generation::SpeechOptions;
 use crane_core::models::qwen3_tts::Model;
 use crane_core::models::qwen3_tts::modeling::TalkerConfig;
 
-use super::tts::{AudioInfo, Tts, TtsStream, VoiceInfo};
+use super::tts::{load_wav_f32, AudioInfo, Tts, TtsStream, VoiceInfo};
 
 /// Maps a `codec_language_id` language name to its ISO 639-1 code.
 ///
@@ -89,7 +89,8 @@ impl Tts for Model {
         Ok(tensor)
     }
 
-    /// Delegates to the inherent [`Model::generate_voice_clone`].
+    /// Loads `ref_audio` at the speaker encoder's sample rate, then delegates
+    /// to the inherent [`Model::generate_voice_clone`].
     fn generate_voice_clone(
         &mut self,
         text: &str,
@@ -98,8 +99,10 @@ impl Tts for Model {
         ref_text: &str,
         opts: &SpeechOptions,
     ) -> Result<Tensor> {
+        let spk_sr = self.speaker_encoder_sample_rate();
+        let ref_samples = load_wav_f32(ref_audio, spk_sr)?;
         let (tensor, _sample_rate) =
-            Model::generate_voice_clone(self, text, language, ref_audio, ref_text, opts)?;
+            Model::generate_voice_clone(self, text, language, &ref_samples, ref_text, opts)?;
         Ok(tensor)
     }
 

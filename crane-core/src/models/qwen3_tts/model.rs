@@ -6,7 +6,6 @@
 use anyhow::{Error as E, Result};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
-use hound::SampleFormat;
 use tokenizers::Tokenizer;
 
 use super::modeling::{Qwen3TTSConfig, Qwen3TTSModel, StreamingState};
@@ -367,6 +366,12 @@ impl Model {
             .unwrap_or(24000)
     }
 
+    /// Get the sample rate expected by the speaker encoder, for use with
+    /// [`Model::generate_voice_clone`]'s `ref_samples` argument.
+    pub fn speaker_encoder_sample_rate(&self) -> u32 {
+        self.config.speaker_encoder_config.sample_rate
+    }
+
     /// Compute a mel spectrogram matching the Python reference:
     ///   n_fft=1024, num_mels=128, sr=24000, hop=256, win=1024, fmin=0, fmax=12000
     ///   Hann window, reflect-padded, log-compressed.
@@ -523,87 +528,11 @@ impl Model {
         filters
     }
 
-    /// Load a WAV file and return f32 samples normalized to [-1, 1].
-    /// Resamples to `target_sr` if needed (high-quality sinc resampling).
-    fn load_wav_f32(path: &str, target_sr: u32) -> Result<Vec<f32>> {
-        let mut reader = hound::WavReader::open(path)?;
-        let spec = reader.spec();
-        let raw_sr = spec.sample_rate;
-
-        let samples_f32: Vec<f32> = match (spec.sample_format, spec.bits_per_sample) {
-            (SampleFormat::Float, 32) => reader.samples::<f32>().map(|s| s.map_err(|e| anyhow::anyhow!(e))).collect::<Result<Vec<_>>>()?,
-            (SampleFormat::Int, 16) => reader.samples::<i16>().map(|s| s.map(|v| v as f32 / 32768.0).map_err(|e| anyhow::anyhow!(e))).collect::<Result<Vec<_>>>()?,
-            (SampleFormat::Int, 32) => reader.samples::<i32>().map(|s| s.map(|v| v as f32 / 2147483648.0).map_err(|e| anyhow::anyhow!(e))).collect::<Result<Vec<_>>>()?,
-            _ => anyhow::bail!("Unsupported WAV format: {:?} {}bit", spec.sample_format, spec.bits_per_sample),
-        };
-
-        // Mix down to mono if stereo
-        let mono: Vec<f32> = if spec.channels == 1 {
-            samples_f32
-        } else {
-            let ch = spec.channels as usize;
-            samples_f32.chunks(ch).map(|c| c.iter().sum::<f32>() / ch as f32).collect()
-        };
-
-        // Resample if needed (linear interpolation)
-        if raw_sr == target_sr {
-            return Ok(mono);
-        }
-
-        use audioadapter_buffers::direct::SequentialSliceOfVecs;
-        use rubato::{
-            audioadapter::Adapter, Async, FixedAsync, Resampler as RubatoResampler,
-            SincInterpolationParameters, SincInterpolationType, WindowFunction,
-        };
-
-        let ratio = target_sr as f64 / raw_sr as f64;
-        let chunk_size = 1024usize;
-        let params = SincInterpolationParameters {
-            sinc_len: 128,
-            f_cutoff: 0.95,
-            interpolation: SincInterpolationType::Linear,
-            oversampling_factor: 128,
-            window: WindowFunction::BlackmanHarris2,
-        };
-        let mut resampler = Async::<f32>::new_sinc(
-            ratio,
-            1.0,
-            &params,
-            chunk_size,
-            1,
-            FixedAsync::Input,
-        )?;
-
-        let mut output = Vec::new();
-        let mut pos = 0usize;
-        while pos < mono.len() {
-            let end = (pos + chunk_size).min(mono.len());
-            let chunk = &mono[pos..end];
-            let data = if chunk.len() < chunk_size {
-                let mut padded = chunk.to_vec();
-                padded.resize(chunk_size, 0.0);
-                padded
-            } else {
-                chunk.to_vec()
-            };
-
-            let input_vecs = vec![data];
-            let input = SequentialSliceOfVecs::new(&input_vecs, 1, chunk_size)?;
-            let result = resampler.process(&input, 0, None)?;
-
-            let frames = result.frames();
-            for i in 0..frames {
-                output.push(result.read_sample(0, i).unwrap_or(0.0));
-            }
-            pos += chunk_size;
-        }
-
-        Ok(output)
-    }
-
-    /// Voice-clone: synthesize `text` in the voice of the speaker from `ref_audio_path`.
+    /// Voice-clone: synthesize `text` in the voice of the speaker from `ref_samples`.
     ///
-    /// `ref_audio_path`: path to a WAV file of the reference speaker (any SR, mono or stereo).
+    /// `ref_samples`: reference speaker audio, mono f32 in `[-1, 1]`, already
+    /// resampled to the speaker encoder's sample rate
+    /// ([`Model::speaker_encoder_sample_rate`]).
     /// `ref_text`: transcript of the reference audio (required for ICL mode).
     /// `language`: target language ("japanese", "chinese", "english", "auto", …).
     ///
@@ -612,7 +541,7 @@ impl Model {
         &mut self,
         text: &str,
         language: &str,
-        ref_audio_path: &str,
+        ref_samples_spk: &[f32],
         ref_text: &str,
         opts: &SpeechOptions,
     ) -> Result<(Tensor, u32)> {
@@ -625,12 +554,8 @@ impl Model {
             ),
         }
 
-        let spk_sr = self.config.speaker_encoder_config.sample_rate;
-
-        // 2. Load reference audio at speaker encoder SR (24kHz)
-        let ref_samples_spk = Self::load_wav_f32(ref_audio_path, spk_sr)?;
         if ref_samples_spk.is_empty() {
-            anyhow::bail!("Reference audio file is empty: {ref_audio_path}");
+            anyhow::bail!("Reference audio is empty");
         }
 
         // 3. Extract speaker embedding via ECAPA-TDNN
@@ -639,7 +564,7 @@ impl Model {
         let spk_embed = {
             let enc = self.inner.speaker_encoder.as_ref()
                 .ok_or_else(|| anyhow::anyhow!("Speaker encoder not loaded (base model required)"))?;
-            let mels = Self::compute_mel_spectrogram(&ref_samples_spk, &self.device, DType::F32)?;
+            let mels = Self::compute_mel_spectrogram(ref_samples_spk, &self.device, DType::F32)?;
             let embed = enc.forward(&mels)?.squeeze(0)?; // [enc_dim], F32
             if Self::tts_debug_enabled() {
                 let norm: f32 = embed.sqr()?.sum_all()?.sqrt()?.to_scalar()?;
@@ -660,7 +585,7 @@ impl Model {
             match speech_dec {
                 SpeechDecoderBackend::Native(native) => {
                     // Encode: samples [1, 1, N] → codes [1, T, n_q] → squeeze → [T, n_q]
-                    let ref_tensor = Tensor::new(ref_samples_spk.as_slice(), &self.device)?
+                    let ref_tensor = Tensor::new(ref_samples_spk, &self.device)?
                         .unsqueeze(0)?.unsqueeze(0)?; // [1, 1, N]
                     let codes = native.encode(&ref_tensor)?.squeeze(0)?; // [T, n_q]
                     if Self::tts_debug_enabled() {

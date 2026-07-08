@@ -295,6 +295,92 @@ pub fn save_wav(audio: &Tensor, path: &str, sample_rate: u32) -> Result<String> 
     Ok(path.to_string())
 }
 
+/// Loads a WAV file and returns f32 samples normalized to `[-1, 1]`.
+///
+/// Mixes down to mono if the file is stereo, and resamples to `target_sr` if
+/// needed (high-quality sinc interpolation).
+///
+/// # Errors
+///
+/// Returns an error if the file can't be opened, uses an unsupported sample
+/// format (only 32-bit float and 16/32-bit integer PCM are supported), or if
+/// resampling fails.
+pub fn load_wav_f32(path: &str, target_sr: u32) -> Result<Vec<f32>> {
+    let mut reader = hound::WavReader::open(path)?;
+    let spec = reader.spec();
+    let raw_sr = spec.sample_rate;
+
+    let samples_f32: Vec<f32> = match (spec.sample_format, spec.bits_per_sample) {
+        (SampleFormat::Float, 32) => reader.samples::<f32>().map(|s| s.map_err(|e| anyhow::anyhow!(e))).collect::<Result<Vec<_>>>()?,
+        (SampleFormat::Int, 16) => reader.samples::<i16>().map(|s| s.map(|v| v as f32 / 32768.0).map_err(|e| anyhow::anyhow!(e))).collect::<Result<Vec<_>>>()?,
+        (SampleFormat::Int, 32) => reader.samples::<i32>().map(|s| s.map(|v| v as f32 / 2147483648.0).map_err(|e| anyhow::anyhow!(e))).collect::<Result<Vec<_>>>()?,
+        _ => anyhow::bail!("Unsupported WAV format: {:?} {}bit", spec.sample_format, spec.bits_per_sample),
+    };
+
+    // Mix down to mono if stereo
+    let mono: Vec<f32> = if spec.channels == 1 {
+        samples_f32
+    } else {
+        let ch = spec.channels as usize;
+        samples_f32.chunks(ch).map(|c| c.iter().sum::<f32>() / ch as f32).collect()
+    };
+
+    // Resample if needed (linear interpolation)
+    if raw_sr == target_sr {
+        return Ok(mono);
+    }
+
+    use audioadapter_buffers::direct::SequentialSliceOfVecs;
+    use rubato::{
+        audioadapter::Adapter, Async, FixedAsync, Resampler as RubatoResampler,
+        SincInterpolationParameters, SincInterpolationType, WindowFunction,
+    };
+
+    let ratio = target_sr as f64 / raw_sr as f64;
+    let chunk_size = 1024usize;
+    let params = SincInterpolationParameters {
+        sinc_len: 128,
+        f_cutoff: 0.95,
+        interpolation: SincInterpolationType::Linear,
+        oversampling_factor: 128,
+        window: WindowFunction::BlackmanHarris2,
+    };
+    let mut resampler = Async::<f32>::new_sinc(
+        ratio,
+        1.0,
+        &params,
+        chunk_size,
+        1,
+        FixedAsync::Input,
+    )?;
+
+    let mut output = Vec::new();
+    let mut pos = 0usize;
+    while pos < mono.len() {
+        let end = (pos + chunk_size).min(mono.len());
+        let chunk = &mono[pos..end];
+        let data = if chunk.len() < chunk_size {
+            let mut padded = chunk.to_vec();
+            padded.resize(chunk_size, 0.0);
+            padded
+        } else {
+            chunk.to_vec()
+        };
+
+        let input_vecs = vec![data];
+        let input = SequentialSliceOfVecs::new(&input_vecs, 1, chunk_size)?;
+        let result = resampler.process(&input, 0, None)?;
+
+        let frames = result.frames();
+        for i in 0..frames {
+            output.push(result.read_sample(0, i).unwrap_or(0.0));
+        }
+        pos += chunk_size;
+    }
+
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

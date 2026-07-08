@@ -70,6 +70,8 @@ fn run_voice_clone(model: &mut crane_core::models::qwen3_tts::Model, output_dir:
     println!("Reference audio : {ref_audio}");
     println!("Reference text  : {ref_text}");
 
+    let ref_samples = crane::audio::load_wav_f32(ref_audio, model.speaker_encoder_sample_rate())?;
+
     let examples: &[(&str, &str, &str)] = &[
         (
             "こうして君に直接ありがとうを言える時間をくれたこと それが多分一番私は嬉しい",
@@ -95,7 +97,7 @@ fn run_voice_clone(model: &mut crane_core::models::qwen3_tts::Model, output_dir:
             top_p: Some(1.0),
             repetition_penalty: 1.05,
         };
-        let (audio, sr) = model.generate_voice_clone(text, lang, ref_audio, ref_text, &opts)?;
+        let (audio, sr) = model.generate_voice_clone(text, lang, &ref_samples, ref_text, &opts)?;
         let saved_path = crane::audio::save_wav(&audio, &output_path, sr)?;
         let elapsed = start.elapsed();
         println!("  Saved {saved_path} in {elapsed:.1?}");
