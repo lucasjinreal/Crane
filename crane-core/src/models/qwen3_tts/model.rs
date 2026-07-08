@@ -6,7 +6,7 @@
 use anyhow::{Error as E, Result};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
-use hound::{SampleFormat, WavSpec, WavWriter};
+use hound::SampleFormat;
 use tokenizers::Tokenizer;
 
 use super::modeling::{Qwen3TTSConfig, Qwen3TTSModel, StreamingState};
@@ -92,30 +92,6 @@ impl SpeechTokenizerDecoder {
         let out_names = &self.model.graph.as_ref().unwrap().output;
         let audio = out.get(&out_names[0].name).unwrap().clone();
         Ok(audio)
-    }
-
-    /// Convenience: decode and write a WAV file.
-    pub fn decode_to_wav(&self, codes: &Tensor, filename: &str) -> Result<String> {
-        let audio = self.decode(codes)?;
-        Self::save_wav(&audio, filename, self.sample_rate)
-    }
-
-    pub fn save_wav(audio_values: &Tensor, filename: &str, sample_rate: u32) -> Result<String> {
-        let audio = audio_values.to_dtype(DType::F32)?.flatten_all()?;
-        let scaled = audio.affine(32767.0, 0.0)?.clamp(-32768.0, 32767.0)?.round()?;
-        let audio_i64 = scaled.to_dtype(DType::I64)?;
-        let spec = WavSpec {
-            channels: 1,
-            sample_rate,
-            bits_per_sample: 16,
-            sample_format: SampleFormat::Int,
-        };
-        let mut writer = WavWriter::create(filename, spec)?;
-        for sample in audio_i64.to_vec1::<i64>()? {
-            writer.write_sample(sample.clamp(i16::MIN as i64, i16::MAX as i64) as i16)?;
-        }
-        writer.finalize()?;
-        Ok(filename.to_string())
     }
 }
 
@@ -334,19 +310,6 @@ impl Model {
             emitted_up_to: 0,
             done: false,
         })
-    }
-
-    /// Generate speech and write directly to a WAV file.
-    pub fn generate_speech_to_file(
-        &mut self,
-        text: &str,
-        language: &str,
-        speaker: Option<&str>,
-        opts: &SpeechOptions,
-        output_path: &str,
-    ) -> Result<String> {
-        let (audio, sr) = self.generate_speech(text, language, speaker, opts)?;
-        Self::save_wav(&audio, output_path, sr)
     }
 
     /// Generate only the codec codes (no waveform decode).
@@ -810,38 +773,6 @@ impl Model {
         let audio = audio_full.narrow(2, cut, total_samples - cut)?;
 
         Ok((audio, speech_decoder.sample_rate()))
-    }
-
-    /// Voice-clone and write to WAV file.
-    pub fn generate_voice_clone_to_file(
-        &mut self,
-        text: &str,
-        language: &str,
-        ref_audio_path: &str,
-        ref_text: &str,
-        opts: &SpeechOptions,
-        output_path: &str,
-    ) -> Result<String> {
-        let (audio, sr) = self.generate_voice_clone(text, language, ref_audio_path, ref_text, opts)?;
-        Self::save_wav(&audio, output_path, sr)
-    }
-
-    fn save_wav(audio_values: &Tensor, filename: &str, sample_rate: u32) -> Result<String> {
-        let audio = audio_values.to_dtype(DType::F32)?.flatten_all()?;
-        let scaled = audio.affine(32767.0, 0.0)?.clamp(-32768.0, 32767.0)?.round()?;
-        let audio_i64 = scaled.to_dtype(DType::I64)?;
-        let spec = WavSpec {
-            channels: 1,
-            sample_rate,
-            bits_per_sample: 16,
-            sample_format: SampleFormat::Int,
-        };
-        let mut writer = WavWriter::create(filename, spec)?;
-        for sample in audio_i64.to_vec1::<i64>()? {
-            writer.write_sample(sample.clamp(i16::MIN as i64, i16::MAX as i64) as i16)?;
-        }
-        writer.finalize()?;
-        Ok(filename.to_string())
     }
 }
 

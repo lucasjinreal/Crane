@@ -89,7 +89,8 @@ fn main() -> anyhow::Result<()> {
             max_new_tokens: 2048,
             ..Default::default()
         };
-        let saved_path = model.generate_speech_to_file(text, "auto", *voice, &opts, &output_path)?;
+        let (audio, sr) = model.generate_speech(text, "auto", *voice, &opts)?;
+        let saved_path = crane::audio::save_wav(&audio, &output_path, sr)?;
         let elapsed = start.elapsed();
         println!("  Saved {saved_path} in {elapsed:.1?}");
     }

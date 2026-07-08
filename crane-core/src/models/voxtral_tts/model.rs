@@ -7,7 +7,6 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::VarBuilder;
-use hound::{SampleFormat, WavSpec, WavWriter};
 use serde::Deserialize;
 use tekken::Tekkenizer;
 
@@ -573,51 +572,6 @@ impl Model {
             .map_err(|e| anyhow::anyhow!("codec decode failed: {e}"))?;
 
         Ok((waveform, self.sample_rate()))
-    }
-
-    /// Generate speech and write to a WAV file.
-    ///
-    /// Returns the output file path on success.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if generation or WAV writing fails.
-    pub fn generate_speech_to_file(
-        &mut self,
-        text: &str,
-        language: &str,
-        voice: Option<&str>,
-        opts: &SpeechOptions,
-        output_path: &str,
-    ) -> Result<String> {
-        let (audio, sr) = self.generate_speech(text, language, voice, opts)?;
-        Self::save_wav(&audio, output_path, sr)
-    }
-
-    /// Write a waveform tensor to a 16-bit PCM WAV file.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the tensor cannot be converted or the file cannot be
-    /// written.
-    pub fn save_wav(audio: &Tensor, path: &str, sample_rate: u32) -> Result<String> {
-        let audio_f32 = audio.to_dtype(DType::F32)?.flatten_all()?;
-        let samples: Vec<f32> = audio_f32.to_vec1()?;
-
-        let spec = WavSpec {
-            channels: 1,
-            sample_rate,
-            bits_per_sample: 16,
-            sample_format: SampleFormat::Int,
-        };
-        let mut writer = WavWriter::create(path, spec)?;
-        for &s in &samples {
-            #[allow(clippy::cast_possible_truncation)] // value is clamped to i16 range
-            let s16 = (s * 32767.0).clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16;
-            writer.write_sample(s16)?;
-        }
-        writer.finalize()?;
-        Ok(path.to_string())
     }
 
     /// List the names of available voices.
