@@ -644,8 +644,24 @@ pub struct Qwen3Model {
 impl Qwen3Model {
     /// Construct from safetensors / HuggingFace checkpoint.
     pub fn new(config: &Config, vb: VarBuilder) -> Result<Self> {
-        let dtype = vb.dtype();
-        let model_vb = vb.pp("model");
+        Self::new_inner(config, vb.pp("model"), vb)
+    }
+
+    /// Construct from a checkpoint where the decoder is nested under a
+    /// deeper prefix than the standard `model.*` layout (e.g. Qwen3-ASR's
+    /// `model.language_model.*`). `model_vb` must already be scoped to the
+    /// decoder's root (what would otherwise be `vb.pp("model")`); `root_vb`
+    /// is the checkpoint root, used to resolve an untied `lm_head` sibling.
+    pub fn new_from_model_vb(
+        config: &Config,
+        model_vb: VarBuilder,
+        root_vb: VarBuilder,
+    ) -> Result<Self> {
+        Self::new_inner(config, model_vb, root_vb)
+    }
+
+    fn new_inner(config: &Config, model_vb: VarBuilder, root_vb: VarBuilder) -> Result<Self> {
+        let dtype = model_vb.dtype();
         let embed_tokens = candle_nn::embedding(
             config.vocab_size,
             config.hidden_size,
@@ -667,7 +683,7 @@ impl Qwen3Model {
             LinearLayer::Standard(linear_no_bias(
                 config.hidden_size,
                 config.vocab_size,
-                vb.pp("lm_head"),
+                root_vb.pp("lm_head"),
             )?)
         };
 
@@ -675,7 +691,7 @@ impl Qwen3Model {
             config.head_dim(),
             config.max_position_embeddings,
             config.rope_theta,
-            vb.device(),
+            model_vb.device(),
         )?;
 
         Ok(Self {
@@ -815,7 +831,41 @@ impl Qwen3Model {
         let _event_guard = EventTrackingGuard::disable(input_ids.device());
 
         let hidden_states = self.embed_tokens.forward(input_ids)?.to_dtype(self.dtype)?;
+        self.decode(hidden_states, seq_len, start_pos, input_ids.device())
+    }
 
+    /// Same as [`Self::forward`], but starting from a caller-supplied
+    /// embedding sequence instead of doing the token embedding lookup
+    /// internally. Used by callers (e.g. Qwen3-ASR) that splice in
+    /// non-text embeddings (audio, etc.) at specific positions before
+    /// running the decoder.
+    pub fn forward_embeds(&mut self, inputs_embeds: &Tensor, start_pos: usize) -> Result<Tensor> {
+        let (_b_sz, seq_len, hidden) = inputs_embeds.dims3()?;
+        if hidden != self.config.hidden_size {
+            candle_core::bail!(
+                "forward_embeds: expected hidden_size {}, got {hidden}",
+                self.config.hidden_size,
+            );
+        }
+
+        #[cfg(feature = "cuda")]
+        let _event_guard = EventTrackingGuard::disable(inputs_embeds.device());
+
+        let hidden_states = inputs_embeds.to_dtype(self.dtype)?;
+        self.decode(hidden_states, seq_len, start_pos, inputs_embeds.device())
+    }
+
+    /// Shared decoder body: rotary embeddings, causal mask, transformer
+    /// layers, final norm, and the `lm_head` projection of the last
+    /// position. Called by both [`Self::forward`] and
+    /// [`Self::forward_embeds`] once they've produced `hidden_states`.
+    fn decode(
+        &mut self,
+        hidden_states: Tensor,
+        seq_len: usize,
+        start_pos: usize,
+        device: &Device,
+    ) -> Result<Tensor> {
         let total_len = start_pos + seq_len;
         let (cos, sin) = self.rotary_emb.forward(start_pos, seq_len)?;
         let cos = cos.to_dtype(self.dtype)?;
@@ -831,9 +881,9 @@ impl Qwen3Model {
                     }
                 }
             }
-            let mask = Tensor::from_vec(mask_data, (seq_len, total_len), input_ids.device())?;
+            let mask = Tensor::from_vec(mask_data, (seq_len, total_len), device)?;
             let mask = mask
-                .broadcast_lt(&Tensor::new(0.5f32, input_ids.device())?)?
+                .broadcast_lt(&Tensor::new(0.5f32, device)?)?
                 .to_dtype(self.dtype)?;
             let mask = (mask * (-1e9f64))?;
             Some(mask.unsqueeze(0)?.unsqueeze(0)?)
@@ -852,6 +902,13 @@ impl Qwen3Model {
             .lm_head
             .forward(&hidden_states.narrow(1, seq_len - 1, 1)?)?;
         Ok(logits)
+    }
+
+    /// The token embedding table, exposed for callers that need to embed
+    /// text tokens themselves before splicing in other embeddings (e.g.
+    /// Qwen3-ASR's audio/text embedding merge).
+    pub fn embed_tokens(&self) -> &candle_nn::Embedding {
+        &self.embed_tokens
     }
 
     // ── KV Cache Management ─────────────────────────────────────────────
@@ -1156,4 +1213,88 @@ fn pad_and_stack_kv_caches(
     let stacked_k = Tensor::cat(&padded_ks, 0)?.contiguous()?;
     let stacked_v = Tensor::cat(&padded_vs, 0)?.contiguous()?;
     Ok(Some((stacked_k, stacked_v)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_nn::VarMap;
+
+    fn tiny_config() -> Config {
+        let json = r#"{
+            "vocab_size": 32,
+            "hidden_size": 16,
+            "intermediate_size": 32,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 4,
+            "max_position_embeddings": 32,
+            "rms_norm_eps": 1e-5,
+            "rope_theta": 10000.0,
+            "attention_bias": false,
+            "use_qk_norm": true,
+            "tie_word_embeddings": true
+        }"#;
+        serde_json::from_str(json).expect("tiny_config parse")
+    }
+
+    fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
+        (a - b)
+            .expect("sub")
+            .abs()
+            .expect("abs")
+            .max_all()
+            .expect("max_all")
+            .to_scalar::<f32>()
+            .expect("to_scalar")
+    }
+
+    /// `new()` and `new_from_model_vb()` must be equivalent when given
+    /// equivalent `VarBuilder` scoping — the split constructor is a pure
+    /// refactor, not a behavior change.
+    #[test]
+    fn test_new_and_new_from_model_vb_equivalence() {
+        let cfg = tiny_config();
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+
+        let mut model_a = Qwen3Model::new(&cfg, vb.clone()).expect("new");
+        let mut model_b = Qwen3Model::new_from_model_vb(&cfg, vb.pp("model"), vb)
+            .expect("new_from_model_vb");
+
+        let input_ids = Tensor::new(&[[1u32, 2, 3]], &device).expect("input_ids");
+        let out_a = model_a.forward(&input_ids, 0).expect("forward a");
+        let out_b = model_b.forward(&input_ids, 0).expect("forward b");
+
+        assert_eq!(out_a.dims(), out_b.dims());
+        assert!(max_abs_diff(&out_a, &out_b) < 1e-5);
+    }
+
+    /// `forward_embeds` fed the decoder's own token embeddings must match
+    /// `forward` given the same token ids.
+    #[test]
+    fn test_forward_and_forward_embeds_equivalence() {
+        let cfg = tiny_config();
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let mut model = Qwen3Model::new(&cfg, vb).expect("new");
+
+        let input_ids = Tensor::new(&[[1u32, 2, 3]], &device).expect("input_ids");
+        let out_forward = model.forward(&input_ids, 0).expect("forward");
+        model.clear_kv_cache();
+
+        let embeds = model
+            .embed_tokens()
+            .forward(&input_ids)
+            .expect("embed lookup")
+            .to_dtype(model.model_dtype())
+            .expect("dtype cast");
+        let out_embeds = model.forward_embeds(&embeds, 0).expect("forward_embeds");
+
+        assert_eq!(out_forward.dims(), out_embeds.dims());
+        assert!(max_abs_diff(&out_forward, &out_embeds) < 1e-5);
+    }
 }
