@@ -7,13 +7,13 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-anyhow = "1.0.97"
+anyhow = "1.0"
 colored = "3.0.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 serde = {version = "1.0", features = ["derive"]}
 serde_json = "1.0"
 thiserror = "2.0"
-nvml-wrapper = { version = "0.10", optional = true }
+nvml-wrapper = { version = "0.12", optional = true }
 
 crane-core = { path = "../crane-core" }
 hound = "3"
