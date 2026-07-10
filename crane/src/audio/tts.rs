@@ -340,7 +340,7 @@ pub fn load_wav_f32(path: &str, target_sr: u32) -> Result<Vec<f32>> {
     let chunk_size = 1024usize;
     let params = SincInterpolationParameters {
         sinc_len: 128,
-        f_cutoff: 0.95,
+        f_cutoff: Some(0.95),
         interpolation: SincInterpolationType::Linear,
         oversampling_factor: 128,
         window: WindowFunction::BlackmanHarris2,
@@ -369,7 +369,7 @@ pub fn load_wav_f32(path: &str, target_sr: u32) -> Result<Vec<f32>> {
 
         let input_vecs = vec![data];
         let input = SequentialSliceOfVecs::new(&input_vecs, 1, chunk_size)?;
-        let result = resampler.process(&input, 0, None)?;
+        let result = resampler.process(&input, None)?;
 
         let frames = result.frames();
         for i in 0..frames {
