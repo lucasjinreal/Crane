@@ -13,7 +13,7 @@ path = "src/lib.rs"
 [dependencies]
 crane-core = { path = "../crane-core" }
 crane = { path = "../crane" }
-anyhow = "1.0.100"
+anyhow = "1.0"
 axum = { version = "0.8", features = ["json"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -29,7 +29,7 @@ tokenizers = { workspace = true }
 candle-core = { workspace = true }
 candle-nn = { workspace = true }
 candle-transformers = { workspace = true }
-reqwest = { version = "0.12", features = ["stream"] }
+reqwest = { version = "0.13", features = ["stream"] }
 tempfile = "3"
 
 [features]
