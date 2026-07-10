@@ -28,6 +28,44 @@ pub struct MelSpectrogramConfig {
     pub fmax: f64,
 }
 
+/// Periodic Hann window of length `n`, matching `torch.hann_window(n,
+/// periodic=True)`.
+pub(crate) fn hann_window(n: usize) -> Vec<f32> {
+    // n is an STFT window/FFT size, far below f64's exact-integer range, so
+    // the usize -> f64 casts below lose no precision; the window magnitude
+    // is in [0, 1], so the final f64 -> f32 cast cannot truncate meaningfully.
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+    let window: Vec<f32> = (0..n)
+        .map(|i| {
+            let v = 0.5 * (1.0 - (2.0 * std::f64::consts::PI * i as f64 / n as f64).cos());
+            v as f32
+        })
+        .collect();
+    window
+}
+
+/// Reflect-pads `samples` by `pad` on each side (`torch.stft`'s
+/// `pad_mode="reflect"` centering, excluding the edge sample itself —
+/// matches `numpy.pad(mode="reflect")`).
+pub(crate) fn reflect_pad(samples: &[f32], pad: usize) -> Vec<f32> {
+    let n = samples.len();
+    let mut out = Vec::with_capacity(n + 2 * pad);
+    for i in (1..=pad.min(n.saturating_sub(1))).rev() {
+        out.push(samples[i]);
+    }
+    while out.len() < pad {
+        out.push(0.0);
+    }
+    out.extend_from_slice(samples);
+    for i in (n.saturating_sub(1 + pad)..n.saturating_sub(1)).rev() {
+        out.push(samples[i]);
+    }
+    while out.len() < n + 2 * pad {
+        out.push(0.0);
+    }
+    out
+}
+
 /// Compute a log-mel spectrogram from raw audio samples.
 ///
 /// Applies a Hann window, reflect-pads the signal by `(n_fft - hop_length) / 2`
@@ -59,35 +97,11 @@ pub fn compute_mel_spectrogram(
         );
     }
 
-    // Hann window
-    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-    let hann: Vec<f32> = (0..win)
-        .map(|i| {
-            let v = 0.5 * (1.0 - (2.0 * std::f64::consts::PI * i as f64 / win as f64).cos());
-            v as f32
-        })
-        .collect();
+    let hann = hann_window(win);
 
     // Reflect pad: (n_fft - hop) / 2
     let pad = (n_fft - hop) / 2;
-    let mut padded = Vec::with_capacity(samples.len() + 2 * pad);
-    // left: mirror samples[1..pad+1] reversed
-    for i in (1..=pad.min(samples.len().saturating_sub(1))).rev() {
-        padded.push(samples[i]);
-    }
-    // fill if not enough
-    while padded.len() < pad {
-        padded.push(0.0);
-    }
-    padded.extend_from_slice(samples);
-    // right: mirror last pad samples reversed
-    let n = samples.len();
-    for i in (n.saturating_sub(1 + pad)..n.saturating_sub(1)).rev() {
-        padded.push(samples[i]);
-    }
-    while padded.len() < samples.len() + 2 * pad {
-        padded.push(0.0);
-    }
+    let padded = reflect_pad(samples, pad);
 
     // STFT: compute frames
     let n_frames = (padded.len().saturating_sub(win)) / hop + 1;
