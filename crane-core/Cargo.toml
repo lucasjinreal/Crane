@@ -19,23 +19,23 @@ candle-transformers = { workspace = true }
 candle-onnx = { workspace = true, optional = true }
 clap = { version = "4.5.32", features = ["derive"] }
 hf-hub = "0.5.0"
-minijinja = { version = "2.15.1", features = ["builtins", "preserve_order"] }
-minijinja-contrib = { version = "2.15.1", features = ["pycompat"] }
-serde = "1.0.219"
+minijinja = { version = "2.21", features = ["builtins", "preserve_order"] }
+minijinja-contrib = { version = "2.21", features = ["pycompat"] }
+serde = "1.0"
 # preserve_order: JSON object keys keep insertion order (matches Python's
 # json.dumps / HF chat templates — needed for byte-identical tool rendering).
 serde_json = { version = "1.0.140", features = ["preserve_order"] }
 tokenizers = { workspace = true }
 ribo = "0.1.3"
 base64 = "0.22"
-fancy-regex = "0.13"
+fancy-regex = "0.18"
 tekken-rs = "0.1.1"
-zip = "2"
+zip = "8"
 
 
 intel-mkl-src = { version = "0.8.1", optional = true }
 rustfft = "6"
-image = "0.25.9"
+image = "0.25"
 half = "2"
 
 # candle-core = { workspace = true, features = ["accelerate"] }
