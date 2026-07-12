@@ -12,6 +12,7 @@ name = "gdn_bench"
 required-features = ["cuda"]
 
 [dependencies]
+ahash = "0.8"
 anyhow = "1.0.97"
 
 candle-nn = { workspace = true }

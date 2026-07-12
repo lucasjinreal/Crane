@@ -45,6 +45,15 @@ pub struct Args {
     pub decode_tokens_per_seq: usize,
     #[arg(long, default_value = "auto")]
     pub format: String,
+    /// In-situ quantization level for safetensors checkpoints (e.g. q4k,
+    /// q8_0). Currently supported for qwen3_5 only. Overrides `CRANE_ISQ`.
+    #[arg(long)]
+    pub quant: Option<String>,
+    /// Compute dtype: f16, bf16 or f32. Defaults per device: BF16 on CUDA,
+    /// F32 on CPU; on Metal F32, except model families validated in F16
+    /// (currently qwen3_5) which default to F16.
+    #[arg(long)]
+    pub dtype: Option<String>,
     #[arg(long, default_value_t = 0)]
     pub max_seq_len: usize,
     #[arg(long)]
@@ -205,6 +214,38 @@ fn run_tts_loop(
     }
 }
 
+/// Resolve the compute dtype. An explicit `--dtype` always wins; otherwise
+/// BF16 on CUDA and F32 elsewhere — except model families validated in F16 on
+/// Metal (currently qwen3_5), which default to F16 there (halves weight,
+/// activation and fp-KV memory vs F32).
+///
+/// F16 stays opt-in for the other families: it has less range than the BF16
+/// most checkpoints are trained in, and models with large intermediate
+/// activations (e.g. Gemma) can overflow to inf/NaN — flip a family's default
+/// only after verifying its output quality in F16.
+fn resolve_dtype(
+    flag: Option<&str>,
+    device: &crane_core::models::Device,
+    model_type: ModelType,
+) -> Result<crane_core::models::DType> {
+    use crane_core::models::DType;
+    if let Some(name) = flag {
+        return match name.to_lowercase().as_str() {
+            "f16" | "fp16" | "half" => Ok(DType::F16),
+            "bf16" => Ok(DType::BF16),
+            "f32" | "fp32" => Ok(DType::F32),
+            other => anyhow::bail!("unsupported --dtype '{other}' (expected f16, bf16 or f32)"),
+        };
+    }
+    if device.is_cuda() {
+        return Ok(DType::BF16);
+    }
+    if device.is_metal() && model_type == ModelType::Qwen3_5 {
+        return Ok(DType::F16);
+    }
+    Ok(DType::F32)
+}
+
 pub async fn run(args: Args) -> Result<()> {
     info!("Loading model from: {}", args.model_path);
 
@@ -228,20 +269,6 @@ pub async fn run(args: Args) -> Result<()> {
         }
     };
 
-    #[cfg(feature = "cuda")]
-    let dtype = if args.cpu {
-        crane_core::models::DType::F32
-    } else {
-        crane_core::models::DType::BF16
-    };
-    #[cfg(not(feature = "cuda"))]
-    let dtype = crane_core::models::DType::F32;
-
-    let device_name = format!("{:?}", device);
-    let dtype_name = format!("{:?}", dtype);
-
-    info!("Device: {}, dtype: {}", device_name, dtype_name);
-
     let model_type = ModelType::from_str(&args.model_type);
     let format = ModelFormat::from_str(&args.format);
 
@@ -257,6 +284,13 @@ pub async fn run(args: Args) -> Result<()> {
     } else {
         model_type
     };
+
+    let dtype = resolve_dtype(args.dtype.as_deref(), &device, resolved_type)?;
+
+    let device_name = format!("{:?}", device);
+    let dtype_name = format!("{:?}", dtype);
+
+    info!("Device: {}, dtype: {}", device_name, dtype_name);
 
     let is_vlm = resolved_type.is_vlm();
     let is_tts = resolved_type.is_tts();
@@ -431,7 +465,7 @@ pub async fn run(args: Args) -> Result<()> {
         let eos_id = tokenizer.token_to_id("</s>").or_else(|| tokenizer.token_to_id("<end_of_turn>")) .or_else(|| tokenizer.token_to_id("<|end_of_sentence|>")) .unwrap_or(1);
         (None, tokenizer, vec![eos_id], chat_template, vlm_tx_opt_inner, gemma4_vlm_tx_opt_inner, None)
     } else {
-        let mut backend = engine::model_factory::create_backend(model_type, &args.model_path, &device, &dtype, format)?;
+        let mut backend = engine::model_factory::create_backend(model_type, &args.model_path, &device, &dtype, format, args.quant.as_deref())?;
         info!("Model loaded successfully (type: {:?}, format: {:?})", resolved_type, format);
         backend.warmup();
         info!("Model warmed up");
@@ -518,4 +552,36 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/flush_cache", get(handlers::sglang::flush_cache).post(handlers::sglang::flush_cache))
         .route("/abort_request", post(handlers::sglang::abort_request))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod dtype_tests {
+    use super::*;
+    use crane_core::models::{DType, Device};
+
+    #[test]
+    fn explicit_flag_wins() {
+        let d = Device::Cpu;
+        assert_eq!(resolve_dtype(Some("f16"), &d, ModelType::Qwen3).unwrap(), DType::F16);
+        assert_eq!(resolve_dtype(Some("BF16"), &d, ModelType::Qwen3_5).unwrap(), DType::BF16);
+        assert_eq!(resolve_dtype(Some("fp32"), &d, ModelType::Qwen3_5).unwrap(), DType::F32);
+        assert!(resolve_dtype(Some("int8"), &d, ModelType::Qwen3).is_err());
+    }
+
+    #[test]
+    fn cpu_defaults_to_f32() {
+        let d = Device::Cpu;
+        assert_eq!(resolve_dtype(None, &d, ModelType::Qwen3_5).unwrap(), DType::F32);
+        assert_eq!(resolve_dtype(None, &d, ModelType::Qwen3).unwrap(), DType::F32);
+    }
+
+    #[test]
+    fn metal_defaults_f16_only_for_qwen3_5() {
+        let Ok(d) = Device::new_metal(0) else {
+            return; // no Metal on this machine/CI
+        };
+        assert_eq!(resolve_dtype(None, &d, ModelType::Qwen3_5).unwrap(), DType::F16);
+        assert_eq!(resolve_dtype(None, &d, ModelType::Qwen3).unwrap(), DType::F32);
+        assert_eq!(resolve_dtype(None, &d, ModelType::Gemma4).unwrap(), DType::F32);
+    }
 }

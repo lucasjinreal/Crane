@@ -12,8 +12,11 @@
 //! (`Grouped`). Both layouts are supported; the dispatch is in
 //! [`GdnInputProjection::forward`].
 
+use candle_core::quantized::GgmlDType;
 use candle_core::{Module, Result, Tensor, D};
-use candle_nn::{linear_no_bias, Linear, VarBuilder};
+use candle_nn::VarBuilder;
+
+use crate::ops::linear::{linear_layer, LinearLayer};
 
 /// Whether the source checkpoint stores projections as 4 separate matrices
 /// (`Split`, used by Qwen 3.5) or 2 fused matrices (`Grouped`).
@@ -28,14 +31,14 @@ pub enum GdnInputProjectionKind {
 /// Holds the four (or two, in `Grouped` mode) linear projections.
 pub enum GdnInputProjection {
     Grouped {
-        in_proj_qkvz: Linear,
-        in_proj_ba: Linear,
+        in_proj_qkvz: LinearLayer,
+        in_proj_ba: LinearLayer,
     },
     Split {
-        in_proj_qkv: Linear,
-        in_proj_z: Linear,
-        in_proj_b: Linear,
-        in_proj_a: Linear,
+        in_proj_qkv: LinearLayer,
+        in_proj_z: LinearLayer,
+        in_proj_b: LinearLayer,
+        in_proj_a: LinearLayer,
     },
 }
 
@@ -44,18 +47,23 @@ impl GdnInputProjection {
         vb: VarBuilder,
         dims: &super::config::GdnDims,
         kind: GdnInputProjectionKind,
+        quant: Option<GgmlDType>,
     ) -> Result<Self> {
         match kind {
             GdnInputProjectionKind::Grouped => {
-                let in_proj_qkvz = linear_no_bias(
+                let in_proj_qkvz = linear_layer(
                     dims.hidden_size,
                     dims.qkvz_out_dim(),
                     vb.pp("in_proj_qkvz"),
+                    quant,
                 )?;
-                let in_proj_ba = linear_no_bias(
+                // The fused B/A matrix is tiny and feeds the numerically
+                // sensitive β/decay path — never quantized (same as `Split`).
+                let in_proj_ba = linear_layer(
                     dims.hidden_size,
                     dims.ba_out_dim(),
                     vb.pp("in_proj_ba"),
+                    None,
                 )?;
                 Ok(Self::Grouped {
                     in_proj_qkvz,
@@ -63,10 +71,16 @@ impl GdnInputProjection {
                 })
             }
             GdnInputProjectionKind::Split => {
-                let in_proj_qkv = linear_no_bias(dims.hidden_size, dims.conv_dim, vb.pp("in_proj_qkv"))?;
-                let in_proj_z = linear_no_bias(dims.hidden_size, dims.value_dim, vb.pp("in_proj_z"))?;
-                let in_proj_b = linear_no_bias(dims.hidden_size, dims.num_v_heads, vb.pp("in_proj_b"))?;
-                let in_proj_a = linear_no_bias(dims.hidden_size, dims.num_v_heads, vb.pp("in_proj_a"))?;
+                let in_proj_qkv =
+                    linear_layer(dims.hidden_size, dims.conv_dim, vb.pp("in_proj_qkv"), quant)?;
+                let in_proj_z =
+                    linear_layer(dims.hidden_size, dims.value_dim, vb.pp("in_proj_z"), quant)?;
+                // B and A are tiny (`hidden → num_v_heads`) and feed the
+                // numerically sensitive β/decay path — never quantized.
+                let in_proj_b =
+                    linear_layer(dims.hidden_size, dims.num_v_heads, vb.pp("in_proj_b"), None)?;
+                let in_proj_a =
+                    linear_layer(dims.hidden_size, dims.num_v_heads, vb.pp("in_proj_a"), None)?;
                 Ok(Self::Split {
                     in_proj_qkv,
                     in_proj_z,

@@ -58,6 +58,7 @@ We include:
 
 ## 🔥 Updates
 
+- **`2026.07.03`**: 🗜️ Qwen 3.5 quantization & memory — load community **GGUF** files directly (`--model-path model.gguf`, llama.cpp `qwen35` layout incl. the hybrid GDN blocks, arch auto-detected from the header, tokenizer + chat-template read from GGUF metadata so **no sibling files required**), or quantize a safetensors checkpoint at load time with **`--quant q4k|q8_0|…`** / `CRANE_ISQ` (in-situ quantization via candle `QMatMul`, no conversion step). New **`--dtype f16|bf16|f32`** flag; Qwen 3.5 now defaults to **F16 on Apple Metal**. Qwen3.5-0.8B on Apple Silicon: ~1.2 GB (Q4_0 GGUF) / ~2.0 GB (F16, new default) / ~3.7 GB (old F32 default).
 - **`2026.06.30`**: 🚀 Qwen 3.5 / Ornith follow-up — K=128 register-resident CUDA recurrence kernel (~5× prefill, ~7.8× recurrence-only on RTX 3090), per-token int8 / int4 K/V cache backends (~2× / ~4× smaller via `CRANE_KV_QUANT`), and Ornith tool-calling support (HF-byte-identical chat template via `AutoTokenizer::apply_chat_template_with_tools`, end-to-end `ornith_tools` example).
 - **`2026.06.29`**: 🌀 Qwen 3.5 support — hybrid Mamba/Transformer (Gated Delta Net + softmax attention), runs on CPU, NVIDIA CUDA, and Apple Metal. New `crane-core/src/ops/gdn/` module with a fused CUDA recurrence kernel for the linear-attention path.
 - **`2026.05.04`**: Gemma 4 support added for text and vision models (audio is not supported);
