@@ -352,15 +352,27 @@ pub fn create_chat_template(
 ) -> Box<dyn ChatTemplateProcessor> {
     let model_type = resolve(model_type, model_path);
 
-    // For `.gguf` files the tokenizer/template configs live next to the file.
+    // `.gguf` files embed their own chat_template; pass the file path itself
+    // so AutoTokenizer::from_pretrained dispatches to its GGUF reader. For
+    // directory-style HF layouts (and for non-GGUF single files like a
+    // standalone `tokenizer_config.json`) pass the path as-is so the parent
+    // resolution can locate the template.
     let path = Path::new(model_path);
-    let template_dir = if path.is_file() {
-        path.parent()
-            .map_or_else(|| model_path.to_string(), |p| p.to_string_lossy().into_owned())
+    let is_gguf = path.is_file()
+        && path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("gguf"));
+    let template_target = if path.is_file() && !is_gguf {
+        // Non-GGUF file: assume it's a `tokenizer_config.json` (or sibling
+        // templates are alongside — nothing to resolve).
+        model_path.to_string()
+    } else if is_gguf {
+        model_path.to_string()
     } else {
+        // Directory: tokenizer_config.json + tokenizer.json live inside.
         model_path.to_string()
     };
-    let model_path = template_dir.as_str();
+    let model_path = template_target.as_str();
 
     match model_type {
         ModelType::HunyuanDense => {

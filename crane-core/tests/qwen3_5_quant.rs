@@ -99,13 +99,38 @@ fn greedy_isq_q4k() {
 }
 
 #[test]
-#[ignore = "needs a local Qwen3.5 GGUF (CRANE_QWEN35_GGUF) with tokenizer.json alongside"]
+#[ignore = "needs a local Qwen3.5 GGUF (CRANE_QWEN35_GGUF) — tokenizer is read from the GGUF itself"]
 fn greedy_gguf() {
     let path = std::env::var("CRANE_QWEN35_GGUF").expect("set CRANE_QWEN35_GGUF to a .gguf file");
     let (device, dtype) = device_and_dtype();
     let mut model = Model::new_with_options(&path, &device, &dtype, ModelFormat::Auto, None)
         .expect("load GGUF model");
     run_greedy(&mut model, "gguf");
+}
+
+/// Loads the GGUF from a fresh tempdir that has NO sibling `tokenizer.json` /
+/// `chat_template.jinja` / `tokenizer_config.json`. Regression test for the
+/// GGUF-embedded-tokenizer path; if `Model::from_gguf_file` regresses to
+/// requiring a sibling tokenizer, this test will fail with a "Tokenizer not
+/// found" error.
+#[test]
+#[ignore = "needs a local Qwen3.5 GGUF (CRANE_QWEN35_GGUF); copies to a fresh tempdir"]
+fn greedy_gguf_isolated() {
+    let path = std::env::var("CRANE_QWEN35_GGUF").expect("set CRANE_QWEN35_GGUF to a .gguf file");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let dest = dir.path().join("qwen35.gguf");
+    std::fs::copy(&path, &dest).expect("copy gguf to tempdir");
+
+    let (device, dtype) = device_and_dtype();
+    let mut model = Model::new_with_options(
+        dest.to_str().unwrap(),
+        &device,
+        &dtype,
+        ModelFormat::Auto,
+        None,
+    )
+    .expect("load GGUF from tempdir (no sibling files)");
+    run_greedy(&mut model, "gguf-isolated");
 }
 
 /// Diagnostic: print every metadata key and tensor name in a GGUF file.
