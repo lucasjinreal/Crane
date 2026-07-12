@@ -40,10 +40,10 @@ const MIN_LENGTH: usize = 8_000;
 const FMAX: f64 = 8000.0;
 /// Raw mel frames per second (`HOP_LENGTH` at `SAMPLE_RATE`); also the
 /// window size (`n_window * 2`) the audio encoder chunks on (§3).
-const FRAMES_PER_WINDOW: usize = 100;
+pub(crate) const FRAMES_PER_WINDOW: usize = 100;
 /// Encoder output tokens produced by one full `FRAMES_PER_WINDOW`-sized
 /// chunk (§3).
-const TOKENS_PER_WINDOW: usize = 13;
+pub(crate) const TOKENS_PER_WINDOW: usize = 13;
 
 /// Output of [`WhisperFeatureExtractor::extract`].
 #[derive(Debug, Clone)]
@@ -151,7 +151,7 @@ impl WhisperFeatureExtractor {
 }
 
 /// Output length of one stride-2, kernel-3, padding-1 `Conv2d` pass.
-fn conv_output_len(len: usize) -> usize {
+pub(crate) fn conv_output_len(len: usize) -> usize {
     if len == 0 {
         return 0;
     }
