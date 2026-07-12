@@ -2,6 +2,8 @@
 
 > Crane focusing on accelerate LLM inference speed with the power of kernels in candle framework, while reducing development overhead, make it portable and fast run model on both CPU and GPU.
 
+![GGUF support out-of-box](data/assets/crane-qwen3-5-2b.gif)
+
 ![](data/aa.gif)
 
 
@@ -10,13 +12,15 @@ A high-performance inference framework leveraging Rust's Candle for maximum spee
 
 **Supported Models**:
 
-- [x] Qwen3 (0.6B ~ 30B+)
-- [x] Qwen 2.5 (0.5B ~ 72B)
+- [ ] more to come....
+- [ ] Qwen3-VLA, Qwen3.5-GR00T;
 - [x] Qwen 3.5 (0.8B; hybrid Gated Delta Net + softmax attention, CPU/CUDA/Metal) + Ornith-1.0-9B (agentic, tool calling)
 - [x] Hunyuan Dense
 - [x] Gemma 4 (text and vision; no audio)
 - [x] Qwen3 VL (2B, 4B)
 - [x] PaddleOCR VL 0.9B / 1.5
+- [x] Qwen3 (0.6B ~ 30B+)
+- [x] Qwen 2.5 (0.5B ~ 72B)
 - [x] Moonshine ASR
 - [x] Silero VAD
 - [x] 🎙️ Qwen3-TTS (12Hz, 24kHz, 16-codebook RVQGAN + native Candle decoder, voice cloning)
