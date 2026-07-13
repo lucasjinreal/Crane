@@ -33,6 +33,10 @@ pub enum ModelType {
 }
 
 impl ModelType {
+    // Infallible convenience constructor, not the fallible std::str::FromStr
+    // trait (unknown strings fall back to `Auto` instead of erroring).
+    #[allow(clippy::should_implement_trait)]
+    #[must_use]
     pub fn from_str(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "gemma4" | "gemma-4" | "gemma4_e2b" => Self::Gemma4,
@@ -48,6 +52,7 @@ impl ModelType {
         }
     }
 
+    #[must_use]
     pub fn display_name(&self) -> &'static str {
         match self {
             Self::Auto => "auto",
@@ -64,11 +69,13 @@ impl ModelType {
     }
 
     /// Whether this model type is a vision-language model.
+    #[must_use]
     pub fn is_vlm(&self) -> bool {
         matches!(self, Self::PaddleOcrVl | Self::Gemma4VL)
     }
 
     /// Whether this model type is a TTS model.
+    #[must_use]
     pub fn is_tts(&self) -> bool {
         matches!(self, Self::Qwen3TTS | Self::VoxtralTTS)
     }
@@ -83,6 +90,10 @@ pub enum ModelFormat {
 }
 
 impl ModelFormat {
+    // Infallible convenience constructor, not the fallible std::str::FromStr
+    // trait (unknown strings fall back to `Auto` instead of erroring).
+    #[allow(clippy::should_implement_trait)]
+    #[must_use]
     pub fn from_str(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "safetensors" => Self::Safetensors,
@@ -96,7 +107,7 @@ impl ModelFormat {
 //  Detection
 // ─────────────────────────────────────────────────────────────
 
-/// Minimal subset of HuggingFace `config.json` for architecture detection.
+/// Minimal subset of `HuggingFace` `config.json` for architecture detection.
 #[derive(Deserialize, Default)]
 struct HfConfig {
     model_type: Option<String>,
@@ -121,55 +132,54 @@ pub fn detect_model_type(model_path: &str) -> ModelType {
         Some(path.join("config.json"))
     };
 
-    if let Some(config_path) = config_path {
-        if let Ok(data) = std::fs::read(&config_path) {
-            if let Ok(config) = serde_json::from_slice::<HfConfig>(&data) {
-                // 1. Check `model_type` field
-                if let Some(ref mt) = config.model_type {
-                    match mt.to_lowercase().as_str() {
-                        "gemma4" => {
-                            return if config.vision_config.is_some() {
-                                ModelType::Gemma4VL
-                            } else {
-                                ModelType::Gemma4
-                            };
-                        }
-                        "qwen2" | "qwen2.5" => return ModelType::Qwen25,
-                        "qwen3" => return ModelType::Qwen3,
-                        "qwen3_5" | "qwen3.5" => return ModelType::Qwen3_5,
-                        "qwen3_tts" | "qwen3tts" => return ModelType::Qwen3TTS,
-                        m if m.contains("hunyuan") => return ModelType::HunyuanDense,
-                        m if m.contains("paddleocr") => return ModelType::PaddleOcrVl,
-                        _ => {}
-                    }
+    if let Some(config_path) = config_path
+        && let Ok(data) = std::fs::read(&config_path)
+        && let Ok(config) = serde_json::from_slice::<HfConfig>(&data)
+    {
+        // 1. Check `model_type` field
+        if let Some(ref mt) = config.model_type {
+            match mt.to_lowercase().as_str() {
+                "gemma4" => {
+                    return if config.vision_config.is_some() {
+                        ModelType::Gemma4VL
+                    } else {
+                        ModelType::Gemma4
+                    };
                 }
+                "qwen2" | "qwen2.5" => return ModelType::Qwen25,
+                "qwen3" => return ModelType::Qwen3,
+                "qwen3_5" | "qwen3.5" => return ModelType::Qwen3_5,
+                "qwen3_tts" | "qwen3tts" => return ModelType::Qwen3TTS,
+                m if m.contains("hunyuan") => return ModelType::HunyuanDense,
+                m if m.contains("paddleocr") => return ModelType::PaddleOcrVl,
+                _ => {}
+            }
+        }
 
-                // 2. Check `architectures` field
-                if let Some(ref archs) = config.architectures {
-                    for arch in archs {
-                        let a = arch.to_lowercase();
-                        if a.contains("paddleocr") {
-                            return ModelType::PaddleOcrVl;
-                        }
-                        if a.contains("hunyuan") {
-                            return ModelType::HunyuanDense;
-                        }
-                        if a.contains("gemma4") {
-                            return ModelType::Gemma4;
-                        }
-                        if a.contains("qwen3ttsforconditional") || a.contains("qwen3_tts") {
-                            return ModelType::Qwen3TTS;
-                        }
-                        if a.contains("qwen3_5") || a.contains("qwen3.5") {
-                            return ModelType::Qwen3_5;
-                        }
-                        if a.contains("qwen3") {
-                            return ModelType::Qwen3;
-                        }
-                        if a.contains("qwen2") {
-                            return ModelType::Qwen25;
-                        }
-                    }
+        // 2. Check `architectures` field
+        if let Some(ref archs) = config.architectures {
+            for arch in archs {
+                let a = arch.to_lowercase();
+                if a.contains("paddleocr") {
+                    return ModelType::PaddleOcrVl;
+                }
+                if a.contains("hunyuan") {
+                    return ModelType::HunyuanDense;
+                }
+                if a.contains("gemma4") {
+                    return ModelType::Gemma4;
+                }
+                if a.contains("qwen3ttsforconditional") || a.contains("qwen3_tts") {
+                    return ModelType::Qwen3TTS;
+                }
+                if a.contains("qwen3_5") || a.contains("qwen3.5") {
+                    return ModelType::Qwen3_5;
+                }
+                if a.contains("qwen3") {
+                    return ModelType::Qwen3;
+                }
+                if a.contains("qwen2") {
+                    return ModelType::Qwen25;
                 }
             }
         }
@@ -181,19 +191,22 @@ pub fn detect_model_type(model_path: &str) -> ModelType {
     } else {
         Some(path.join("params.json"))
     };
-    if let Some(params_path) = params_path {
-        if let Ok(data) = std::fs::read(&params_path) {
-            if let Ok(config) = serde_json::from_slice::<MistralConfig>(&data) {
-                if let Some(ref mt) = config.model_type {
-                    if mt == "voxtral_tts" {
-                        return ModelType::VoxtralTTS;
-                    }
-                }
-            }
-        }
+    if let Some(params_path) = params_path
+        && let Ok(data) = std::fs::read(&params_path)
+        && let Ok(config) = serde_json::from_slice::<MistralConfig>(&data)
+        && let Some(ref mt) = config.model_type
+        && mt == "voxtral_tts"
+    {
+        return ModelType::VoxtralTTS;
     }
 
-    // 4. Heuristic: check the model path name
+    // 4. GGUF files: the architecture is recorded in the header — far more
+    // reliable than the path name.
+    if let Some(mt) = detect_from_gguf_header(path) {
+        return mt;
+    }
+
+    // 5. Heuristic: check the model path name
     let path_lower = model_path.to_lowercase();
     if path_lower.contains("voxtral") {
         ModelType::VoxtralTTS
@@ -205,6 +218,8 @@ pub fn detect_model_type(model_path: &str) -> ModelType {
         ModelType::HunyuanDense
     } else if path_lower.contains("qwen3-tts") || path_lower.contains("qwen3_tts") || path_lower.contains("qwen3tts") {
         ModelType::Qwen3TTS
+    } else if path_lower.contains("qwen3.5") || path_lower.contains("qwen3_5") || path_lower.contains("qwen35") {
+        ModelType::Qwen3_5
     } else if path_lower.contains("qwen3") {
         ModelType::Qwen3
     } else if path_lower.contains("qwen2") || path_lower.contains("qwen25") {
@@ -214,6 +229,36 @@ pub fn detect_model_type(model_path: &str) -> ModelType {
             "Could not auto-detect model type from '{model_path}', defaulting to Qwen25"
         );
         ModelType::Qwen25
+    }
+}
+
+/// Read `general.architecture` from a `.gguf` file's header.
+fn detect_from_gguf_header(path: &Path) -> Option<ModelType> {
+    let is_gguf = path.is_file()
+        && path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("gguf"));
+    if !is_gguf {
+        return None;
+    }
+    let mut file = std::fs::File::open(path).ok()?;
+    let ct = candle_core::quantized::gguf_file::Content::read(&mut file).ok()?;
+    let arch = ct
+        .metadata
+        .get("general.architecture")?
+        .to_string()
+        .ok()?
+        .to_lowercase();
+    match arch.as_str() {
+        "qwen35" | "qwen3_5" | "qwen3.5" => Some(ModelType::Qwen3_5),
+        "qwen3" | "qwen3moe" => Some(ModelType::Qwen3),
+        "qwen2" => Some(ModelType::Qwen25),
+        a if a.starts_with("hunyuan") => Some(ModelType::HunyuanDense),
+        a if a.starts_with("gemma") => Some(ModelType::Gemma4),
+        other => {
+            tracing::warn!("Unrecognized GGUF architecture '{other}'");
+            None
+        }
     }
 }
 
@@ -231,15 +276,26 @@ fn resolve(model_type: ModelType, model_path: &str) -> ModelType {
 }
 
 /// Create a model backend.
+///
+/// `quant` requests in-situ quantization of a safetensors checkpoint (e.g.
+/// `q4k`, `q8_0`); only backends that support it accept the flag.
 pub fn create_backend(
     model_type: ModelType,
     model_path: &str,
     device: &Device,
     dtype: &DType,
     format: ModelFormat,
+    quant: Option<&str>,
 ) -> Result<Box<dyn ModelBackend>> {
     let model_type = resolve(model_type, model_path);
     tracing::info!("Creating backend: {:?}", model_type);
+
+    if quant.is_some() && model_type != ModelType::Qwen3_5 {
+        anyhow::bail!(
+            "--quant (in-situ quantization) is currently only supported for qwen3_5 models; \
+             for other models use a GGUF checkpoint with --format gguf"
+        );
+    }
 
     match model_type {
         ModelType::HunyuanDense => {
@@ -260,7 +316,19 @@ pub fn create_backend(
         }
         ModelType::Qwen25 => Ok(Box::new(Qwen25Backend::new(model_path, device, dtype)?)),
         ModelType::Qwen3 => Ok(Box::new(Qwen3Backend::new(model_path, device, dtype)?)),
-        ModelType::Qwen3_5 => Ok(Box::new(Qwen3_5Backend::new(model_path, device, dtype)?)),
+        ModelType::Qwen3_5 => {
+            let quant = quant
+                .map(crane_core::ops::linear::parse_ggml_dtype)
+                .transpose()?;
+            let q35_fmt = match format {
+                ModelFormat::Safetensors => crane_core::models::qwen3_5::ModelFormat::Safetensors,
+                ModelFormat::Gguf => crane_core::models::qwen3_5::ModelFormat::Gguf,
+                ModelFormat::Auto => crane_core::models::qwen3_5::ModelFormat::Auto,
+            };
+            Ok(Box::new(Qwen3_5Backend::new_with_options(
+                model_path, device, dtype, q35_fmt, quant,
+            )?))
+        }
         ModelType::PaddleOcrVl => {
             anyhow::bail!("PaddleOCR-VL is a VLM model — use create_vlm_model() instead of create_backend()")
         }
@@ -268,10 +336,10 @@ pub fn create_backend(
             anyhow::bail!("Gemma4-VL is a VLM model — use the VLM endpoint instead of create_backend()")
         }
         ModelType::Qwen3TTS => {
-            anyhow::bail!("Qwen3-TTS is a TTS model — use create_tts_model() instead of create_backend()")
+            anyhow::bail!("Qwen3-TTS is a TTS model — use create_tts() instead of create_backend()")
         }
         ModelType::VoxtralTTS => {
-            anyhow::bail!("Voxtral-TTS is a TTS model — use create_voxtral_tts_model() instead of create_backend()")
+            anyhow::bail!("Voxtral-TTS is a TTS model — use create_tts() instead of create_backend()")
         }
         ModelType::Auto => unreachable!(),
     }
@@ -283,6 +351,28 @@ pub fn create_chat_template(
     model_path: &str,
 ) -> Box<dyn ChatTemplateProcessor> {
     let model_type = resolve(model_type, model_path);
+
+    // `.gguf` files embed their own chat_template; pass the file path itself
+    // so AutoTokenizer::from_pretrained dispatches to its GGUF reader. For
+    // directory-style HF layouts (and for non-GGUF single files like a
+    // standalone `tokenizer_config.json`) pass the path as-is so the parent
+    // resolution can locate the template.
+    let path = Path::new(model_path);
+    let is_gguf = path.is_file()
+        && path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("gguf"));
+    let template_target = if path.is_file() && !is_gguf {
+        // Non-GGUF file: assume it's a `tokenizer_config.json` (or sibling
+        // templates are alongside — nothing to resolve).
+        model_path.to_string()
+    } else if is_gguf {
+        model_path.to_string()
+    } else {
+        // Directory: tokenizer_config.json + tokenizer.json live inside.
+        model_path.to_string()
+    };
+    let model_path = template_target.as_str();
 
     match model_type {
         ModelType::HunyuanDense => {
@@ -303,6 +393,10 @@ pub fn create_chat_template(
 }
 
 /// Create a PaddleOCR-VL model for VLM inference.
+///
+/// # Errors
+///
+/// Returns an error if the model fails to load from `model_path`.
 pub fn create_vlm_model(
     model_path: &str,
     use_cpu: bool,
@@ -312,24 +406,33 @@ pub fn create_vlm_model(
     crane_core::models::paddleocr_vl::PaddleOcrVL::from_local(model_path, use_cpu, use_bf16)
 }
 
-/// Create a Qwen3-TTS model for TTS inference.
-pub fn create_tts_model(
+/// Create a TTS model as a trait object.
+///
+/// Unified entrypoint for all TTS model types; the returned `Box<dyn Tts + Send>`
+/// can be moved into a dedicated thread without model-specific branching.
+///
+/// # Errors
+///
+/// Returns an error if `model_type` does not resolve to a TTS variant or the
+/// model fails to load from `model_path`.
+pub fn create_tts(
+    model_type: ModelType,
     model_path: &str,
     device: &Device,
     dtype: &DType,
-) -> Result<crane_core::models::qwen3_tts::Model> {
-    tracing::info!("Creating Qwen3-TTS model from: {}", model_path);
-    crane_core::models::qwen3_tts::Model::new(model_path, device, dtype)
-}
-
-/// Create a Voxtral TTS model for TTS inference.
-pub fn create_voxtral_tts_model(
-    model_path: &str,
-    device: &Device,
-    dtype: &DType,
-) -> Result<crane_core::models::voxtral_tts::Model> {
-    tracing::info!("Creating Voxtral-TTS model from: {}", model_path);
-    crane_core::models::voxtral_tts::Model::new(model_path, device, dtype)
+) -> Result<Box<dyn crane::audio::Tts + Send>> {
+    tracing::info!("Creating {} model from: {}", model_type.display_name(), model_path);
+    match model_type {
+        ModelType::Qwen3TTS => {
+            let model = crane_core::models::qwen3_tts::Model::new(model_path, device, dtype)?;
+            Ok(Box::new(model))
+        }
+        ModelType::VoxtralTTS => {
+            let model = crane_core::models::voxtral_tts::Model::new(model_path, device, dtype)?;
+            Ok(Box::new(model))
+        }
+        other => anyhow::bail!("{other:?} is not a TTS model type"),
+    }
 }
 
 #[cfg(test)]

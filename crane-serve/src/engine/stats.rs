@@ -18,7 +18,14 @@ pub struct EngineStats {
     pub waiting_sequences: AtomicU64,
 }
 
+impl Default for EngineStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EngineStats {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             total_requests: AtomicU64::new(0),
@@ -40,6 +47,7 @@ impl EngineStats {
     pub fn snapshot(&self) -> StatsSnapshot {
         let total_decode = self.total_decode_steps.load(Ordering::Relaxed);
         let total_decode_us = self.total_decode_time_us.load(Ordering::Relaxed);
+        #[allow(clippy::cast_precision_loss)]
         let avg_decode_tok_s = if total_decode_us > 0 {
             (total_decode as f64) / (total_decode_us as f64 / 1_000_000.0)
         } else {
@@ -47,6 +55,7 @@ impl EngineStats {
         };
         let total_prefill_us = self.total_prefill_time_us.load(Ordering::Relaxed);
         let total_prompt = self.total_prompt_tokens.load(Ordering::Relaxed);
+        #[allow(clippy::cast_precision_loss)]
         let avg_prefill_tok_s = if total_prefill_us > 0 {
             (total_prompt as f64) / (total_prefill_us as f64 / 1_000_000.0)
         } else {
@@ -158,8 +167,12 @@ mod tests {
         s.total_decode_steps.store(50, Ordering::Relaxed);
         // time stays 0
         let snap = s.snapshot();
-        assert_eq!(snap.avg_decode_tokens_per_sec, 0.0);
-        assert_eq!(snap.avg_prefill_tokens_per_sec, 0.0);
+        // The zero-time branch returns the literal 0.0, so exact comparison is correct here.
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(snap.avg_decode_tokens_per_sec, 0.0);
+            assert_eq!(snap.avg_prefill_tokens_per_sec, 0.0);
+        }
     }
 
     #[test]

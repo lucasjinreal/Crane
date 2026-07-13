@@ -16,6 +16,7 @@
 
 use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::{linear, linear_no_bias, Embedding, Linear, RmsNorm, VarBuilder};
+use candle_transformers::generation::LogitsProcessor;
 use crate::generation::SpeechOptions;
 use crate::models::modules::attention::{AttentionConfig, RopeMode};
 use crate::models::modules::rotary::RotaryEmbedding;
@@ -1212,6 +1213,34 @@ impl SpeakerEncoder {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+//  Streaming state
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Per-generation mutable state for incremental speech synthesis.
+///
+/// Holds all state needed to continue the autoregressive loop across multiple
+/// calls to [`Qwen3TTSModel::generate_one_frame`]. Created by
+/// [`Qwen3TTSModel::prepare_streaming`] and owned by [`crate::models::qwen3_tts::model::SpeechStream`].
+pub struct StreamingState {
+    /// Last hidden state from the talker transformer, shape `[1, 1, D]`.
+    pub past_hidden: Tensor,
+    /// Number of tokens in the prefill (positions 0..prefill_len in the KV cache).
+    pub prefill_len: usize,
+    /// Number of codec frames generated so far.
+    pub step: usize,
+    pub(super) logits_processor: LogitsProcessor,
+    pub(super) suppress_mask: Tensor,
+    pub(super) eos_suppress_mask: Tensor,
+    pub(super) eos_token_id: u32,
+    pub(super) trailing_text_hidden: Tensor,
+    pub(super) trailing_len: usize,
+    pub(super) tts_pad_embed: Tensor,
+    pub(super) repetition_penalty: f32,
+    pub(super) temperature: f64,
+    pub(super) top_p: Option<f64>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 //  Full Qwen3-TTS Model
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -1457,6 +1486,160 @@ impl Qwen3TTSModel {
 
         self.clear_kv_cache();
         Ok(all_codes)
+    }
+
+    /// Set up the autoregressive loop for incremental streaming generation.
+    ///
+    /// Performs the same KV-cache setup and prefill as [`generate_speech_codes`],
+    /// but returns a [`StreamingState`] instead of running the loop to completion.
+    /// The caller drives generation frame-by-frame via [`generate_one_frame`].
+    pub fn prepare_streaming(
+        &mut self,
+        text_token_ids: &[u32],
+        language: &str,
+        speaker: Option<&str>,
+        opts: &SpeechOptions,
+    ) -> Result<StreamingState> {
+        self.clear_kv_cache();
+
+        let (prefill_embeds, trailing_text_hidden, tts_pad_embed) =
+            self.talker.build_prefill_embeds(
+                text_token_ids,
+                language,
+                speaker,
+                self.config.tts_bos_token_id,
+                self.config.tts_eos_token_id,
+                self.config.tts_pad_token_id,
+                &self.device,
+                self.dtype,
+            )?;
+
+        let prefill_len = prefill_embeds.dim(1)?;
+        let causal_mask = Self::build_causal_mask(prefill_len, &self.device, self.dtype)?;
+        let hidden_states =
+            self.talker.forward_embeds(&prefill_embeds, Some(&causal_mask), 0)?;
+
+        let eos_token_id = self.config.talker_config.codec_eos_token_id as u32;
+        let logits_processor = LogitsProcessor::from_sampling(
+            42,
+            candle_transformers::generation::Sampling::TopKThenTopP {
+                k: 50,
+                p: opts.top_p.unwrap_or(1.0),
+                temperature: opts.temperature,
+            },
+        );
+
+        let vocab_size = self.config.talker_config.vocab_size;
+        let suppress_start = vocab_size.saturating_sub(1024);
+        let mut suppress_mask_data = vec![0f32; vocab_size];
+        for i in suppress_start..vocab_size {
+            if i as u32 != eos_token_id {
+                suppress_mask_data[i] = f32::NEG_INFINITY;
+            }
+        }
+        let suppress_mask = Tensor::new(suppress_mask_data.as_slice(), &self.device)?;
+        let mut eos_suppress_data = vec![0f32; vocab_size];
+        eos_suppress_data[eos_token_id as usize] = f32::NEG_INFINITY;
+        let eos_suppress_mask = Tensor::new(eos_suppress_data.as_slice(), &self.device)?;
+
+        let seq_len = hidden_states.dim(1)?;
+        let past_hidden = hidden_states.narrow(1, seq_len - 1, 1)?;
+        let trailing_len = trailing_text_hidden.dim(1)?;
+
+        Ok(StreamingState {
+            past_hidden,
+            prefill_len,
+            step: 0,
+            logits_processor,
+            suppress_mask,
+            eos_suppress_mask,
+            eos_token_id,
+            trailing_text_hidden,
+            trailing_len,
+            tts_pad_embed,
+            repetition_penalty: opts.repetition_penalty,
+            temperature: opts.temperature,
+            top_p: opts.top_p,
+        })
+    }
+
+    /// Generate one codec frame in the autoregressive loop.
+    ///
+    /// Returns `Some(frame_codes)` if a frame was produced, or `None` when
+    /// generation is complete (EOS token seen). The caller is responsible for
+    /// checking the step count against `max_new_tokens` before calling this.
+    ///
+    /// `all_codes` is the accumulation of previously generated frames, used
+    /// for repetition penalty computation.
+    pub fn generate_one_frame(
+        &mut self,
+        state: &mut StreamingState,
+        all_codes: &[Vec<u32>],
+    ) -> Result<Option<Vec<u32>>> {
+        let step = state.step;
+
+        let logits = self.talker.predict_first_code(&state.past_hidden)?
+            .squeeze(0)?.squeeze(0)?
+            .to_dtype(DType::F32)?;
+
+        let logits = if state.repetition_penalty != 1.0 && !all_codes.is_empty() {
+            let recent: Vec<u32> = all_codes.iter().map(|c: &Vec<u32>| c[0]).collect();
+            candle_transformers::utils::apply_repeat_penalty(
+                &logits,
+                state.repetition_penalty,
+                &recent,
+            )?
+        } else {
+            logits
+        };
+
+        let logits = if step < 2 {
+            (logits + &state.suppress_mask + &state.eos_suppress_mask)?
+        } else {
+            (logits + &state.suppress_mask)?
+        };
+
+        let first_code = state.logits_processor.sample(&logits)?;
+        if first_code == state.eos_token_id {
+            return Ok(None);
+        }
+
+        let talker_hidden_1d = state.past_hidden.squeeze(0)?.squeeze(0)?;
+        let remaining_codes = self.talker.code_predictor.predict(
+            &talker_hidden_1d,
+            first_code,
+            &self.talker.codec_embedding,
+            &self.device,
+            state.temperature,
+            state.top_p,
+        )?;
+
+        let mut frame_codes = vec![first_code];
+        frame_codes.extend(remaining_codes);
+
+        let mut sum_embed = self.talker.codec_embedding.forward(
+            &Tensor::new(&[first_code], &self.device)?,
+        )?;
+        for (i, &code) in frame_codes[1..].iter().enumerate() {
+            let embed = self.talker.code_predictor.codec_embeddings[i].forward(
+                &Tensor::new(&[code], &self.device)?,
+            )?;
+            sum_embed = (sum_embed + embed)?;
+        }
+
+        let text_contrib = if step < state.trailing_len {
+            state.trailing_text_hidden.squeeze(0)?.narrow(0, step, 1)?
+        } else {
+            state.tts_pad_embed.squeeze(0)?
+        };
+        let next_input = (sum_embed + text_contrib)?.unsqueeze(0)?;
+
+        let pos_offset = state.prefill_len + step;
+        let hs = self.talker.forward_embeds(&next_input, None, pos_offset)?;
+        state.past_hidden = hs.narrow(1, hs.dim(1)? - 1, 1)?;
+        state.step += 1;
+
+        Ok(Some(frame_codes))
     }
 
     /// Generate speech codec tokens using voice-clone (ICL) mode.

@@ -156,6 +156,79 @@ impl AutoTokenizer {
         self.tokenizer.decode(ids, skip_special_tokens)
     }
 
+    /// Build an `AutoTokenizer` from a `.gguf` file using its embedded
+    /// tokenizer and chat_template metadata. Returns an error if the GGUF
+    /// lacks `tokenizer.ggml.tokens` (older / third-party quantizers).
+    pub fn from_gguf<P: AsRef<std::path::Path>>(
+        path: P,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        use crate::utils::tokenizer_utils::{
+            build_tokenizer_from_gguf_path, extract_chat_template_from_gguf,
+        };
+        use candle_core::quantized::gguf_file::Content;
+
+        let path = path.as_ref();
+        let mut file = std::fs::File::open(path)?;
+        let ct = Content::read(&mut file)?;
+
+        let tokenizer = build_tokenizer_from_gguf_path(path)?
+            .ok_or_else(|| "GGUF lacks tokenizer.ggml.tokens / merges".to_string())?;
+
+        // Populate the chat-template-relevant fields of AutoTokenizerConfig
+        // from GGUF metadata. bos/eos/pad ids are read when available; the
+        // other special-token strings are resolved through the tokenizer's
+        // own vocabulary (added/special tokens registered by
+        // `build_tokenizer_from_gguf`).
+        let resolve_str = |id: u32| -> Option<String> {
+            tokenizer
+                .decode(&[id], /* skip_special_tokens */ false)
+                .ok()
+                .and_then(|s| {
+                    let trimmed = s.trim().to_string();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed)
+                    }
+                })
+        };
+
+        let bos_token = ct
+            .metadata
+            .get("tokenizer.ggml.bos_token_id")
+            .and_then(|v| v.to_u32().ok())
+            .and_then(resolve_str)
+            .map(Token::String);
+        let eos_token = ct
+            .metadata
+            .get("tokenizer.ggml.eos_token_id")
+            .and_then(|v| v.to_u32().ok())
+            .and_then(resolve_str)
+            .map(Token::String);
+        let pad_token = ct
+            .metadata
+            .get("tokenizer.ggml.padding_token_id")
+            .and_then(|v| v.to_u32().ok())
+            .and_then(resolve_str)
+            .map(Token::String);
+        let chat_template = extract_chat_template_from_gguf(&ct);
+
+        let config = AutoTokenizerConfig {
+            add_bos_token: Some(false),
+            add_eos_token: Some(false),
+            clean_up_tokenization_spaces: true,
+            legacy: Some(false),
+            tokenizer_class: "PreTrainedTokenizerFast".to_string(),
+            model_max_length: usize::MAX,
+            bos_token,
+            eos_token,
+            pad_token,
+            unk_token: None,
+            chat_template,
+        };
+        Ok(Self { config, tokenizer })
+    }
+
     pub fn from_pretrained(
         identifier: &str,
         params: Option<FromPretrainedParameters>,
@@ -164,6 +237,15 @@ impl AutoTokenizer {
 
         if try_path.exists() {
             if try_path.is_file() {
+                // GGUF files embed their own tokenizer + chat template;
+                // the HF layout (tokenizer_config.json + tokenizer.json)
+                // does not exist next to a `.gguf`.
+                if try_path
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("gguf"))
+                {
+                    return AutoTokenizer::from_gguf(identifier);
+                }
                 AutoTokenizer::from_file(identifier)
             } else {
                 let tokenizer_config_file = try_path.join("tokenizer_config.json");

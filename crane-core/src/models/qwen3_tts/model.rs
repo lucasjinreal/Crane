@@ -6,10 +6,9 @@
 use anyhow::{Error as E, Result};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
-use hound::{SampleFormat, WavSpec, WavWriter};
 use tokenizers::Tokenizer;
 
-use super::modeling::{Qwen3TTSConfig, Qwen3TTSModel};
+use super::modeling::{Qwen3TTSConfig, Qwen3TTSModel, StreamingState};
 use super::speech_tokenizer_v2::NativeSpeechTokenizerDecoder;
 use crate::generation::SpeechOptions;
 use crate::utils::utils;
@@ -46,6 +45,23 @@ impl SpeechDecoderBackend {
             Self::Onnx(m) => m.sample_rate,
         }
     }
+
+    fn decode_chunk(&self, codes: &Tensor, context_frames: usize) -> Result<Tensor> {
+        match self {
+            Self::Native(m) => m.decode_chunk(codes, context_frames),
+            #[cfg(feature = "onnx")]
+            Self::Onnx(m) => {
+                let wav = m.decode(codes)?;
+                if context_frames == 0 {
+                    return Ok(wav);
+                }
+                // total_upsample=1920 for Qwen3-TTS speech tokenizer
+                let trim = context_frames * 1920usize;
+                let tw = wav.dim(candle_core::D::Minus1)?;
+                wav.narrow(candle_core::D::Minus1, trim, tw.saturating_sub(trim))
+            }
+        }
+    }
 }
 
 #[cfg(feature = "onnx")]
@@ -75,30 +91,6 @@ impl SpeechTokenizerDecoder {
         let out_names = &self.model.graph.as_ref().unwrap().output;
         let audio = out.get(&out_names[0].name).unwrap().clone();
         Ok(audio)
-    }
-
-    /// Convenience: decode and write a WAV file.
-    pub fn decode_to_wav(&self, codes: &Tensor, filename: &str) -> Result<String> {
-        let audio = self.decode(codes)?;
-        Self::save_wav(&audio, filename, self.sample_rate)
-    }
-
-    pub fn save_wav(audio_values: &Tensor, filename: &str, sample_rate: u32) -> Result<String> {
-        let audio = audio_values.to_dtype(DType::F32)?.flatten_all()?;
-        let scaled = audio.affine(32767.0, 0.0)?.clamp(-32768.0, 32767.0)?.round()?;
-        let audio_i64 = scaled.to_dtype(DType::I64)?;
-        let spec = WavSpec {
-            channels: 1,
-            sample_rate,
-            bits_per_sample: 16,
-            sample_format: SampleFormat::Int,
-        };
-        let mut writer = WavWriter::create(filename, spec)?;
-        for sample in audio_i64.to_vec1::<i64>()? {
-            writer.write_sample(sample.clamp(i16::MIN as i64, i16::MAX as i64) as i16)?;
-        }
-        writer.finalize()?;
-        Ok(filename.to_string())
     }
 }
 
@@ -291,17 +283,32 @@ impl Model {
         Ok((audio, speech_decoder.sample_rate()))
     }
 
-    /// Generate speech and write directly to a WAV file.
-    pub fn generate_speech_to_file(
+    /// Generate speech as an incremental stream of f32 PCM chunks.
+    ///
+    /// Returns a [`SpeechStream`] that yields audio chunks as codec frames are
+    /// generated. The first chunk arrives after [`STREAM_FIRST_CHUNK_SIZE`] frames
+    /// (~0.4 s); subsequent chunks every [`STREAM_CHUNK_SIZE`] frames (~2 s).
+    pub fn generate_speech_streaming(
         &mut self,
         text: &str,
         language: &str,
         speaker: Option<&str>,
         opts: &SpeechOptions,
-        output_path: &str,
-    ) -> Result<String> {
-        let (audio, sr) = self.generate_speech(text, language, speaker, opts)?;
-        Self::save_wav(&audio, output_path, sr)
+    ) -> Result<SpeechStream<'_>> {
+        self.validate_tts_generation_mode()?;
+        let input_ids = self.prepare_tts_input(text)?;
+        let state = self.inner.prepare_streaming(&input_ids, language, speaker, opts)?;
+        Ok(SpeechStream {
+            model: self,
+            state,
+            max_new_tokens: opts.max_new_tokens,
+            chunk_size: STREAM_CHUNK_SIZE,
+            first_chunk_size: STREAM_FIRST_CHUNK_SIZE,
+            left_context: STREAM_LEFT_CONTEXT,
+            all_codes: Vec::new(),
+            emitted_up_to: 0,
+            done: false,
+        })
     }
 
     /// Generate only the codec codes (no waveform decode).
@@ -357,6 +364,12 @@ impl Model {
             .as_ref()
             .map(|d| d.sample_rate())
             .unwrap_or(24000)
+    }
+
+    /// Get the sample rate expected by the speaker encoder, for use with
+    /// [`Model::generate_voice_clone`]'s `ref_samples` argument.
+    pub fn speaker_encoder_sample_rate(&self) -> u32 {
+        self.config.speaker_encoder_config.sample_rate
     }
 
     /// Compute a mel spectrogram matching the Python reference:
@@ -515,87 +528,11 @@ impl Model {
         filters
     }
 
-    /// Load a WAV file and return f32 samples normalized to [-1, 1].
-    /// Resamples to `target_sr` if needed (high-quality sinc resampling).
-    fn load_wav_f32(path: &str, target_sr: u32) -> Result<Vec<f32>> {
-        let mut reader = hound::WavReader::open(path)?;
-        let spec = reader.spec();
-        let raw_sr = spec.sample_rate;
-
-        let samples_f32: Vec<f32> = match (spec.sample_format, spec.bits_per_sample) {
-            (SampleFormat::Float, 32) => reader.samples::<f32>().map(|s| s.map_err(|e| anyhow::anyhow!(e))).collect::<Result<Vec<_>>>()?,
-            (SampleFormat::Int, 16) => reader.samples::<i16>().map(|s| s.map(|v| v as f32 / 32768.0).map_err(|e| anyhow::anyhow!(e))).collect::<Result<Vec<_>>>()?,
-            (SampleFormat::Int, 32) => reader.samples::<i32>().map(|s| s.map(|v| v as f32 / 2147483648.0).map_err(|e| anyhow::anyhow!(e))).collect::<Result<Vec<_>>>()?,
-            _ => anyhow::bail!("Unsupported WAV format: {:?} {}bit", spec.sample_format, spec.bits_per_sample),
-        };
-
-        // Mix down to mono if stereo
-        let mono: Vec<f32> = if spec.channels == 1 {
-            samples_f32
-        } else {
-            let ch = spec.channels as usize;
-            samples_f32.chunks(ch).map(|c| c.iter().sum::<f32>() / ch as f32).collect()
-        };
-
-        // Resample if needed (linear interpolation)
-        if raw_sr == target_sr {
-            return Ok(mono);
-        }
-
-        use audioadapter_buffers::direct::SequentialSliceOfVecs;
-        use rubato::{
-            audioadapter::Adapter, Async, FixedAsync, Resampler as RubatoResampler,
-            SincInterpolationParameters, SincInterpolationType, WindowFunction,
-        };
-
-        let ratio = target_sr as f64 / raw_sr as f64;
-        let chunk_size = 1024usize;
-        let params = SincInterpolationParameters {
-            sinc_len: 128,
-            f_cutoff: 0.95,
-            interpolation: SincInterpolationType::Linear,
-            oversampling_factor: 128,
-            window: WindowFunction::BlackmanHarris2,
-        };
-        let mut resampler = Async::<f32>::new_sinc(
-            ratio,
-            1.0,
-            &params,
-            chunk_size,
-            1,
-            FixedAsync::Input,
-        )?;
-
-        let mut output = Vec::new();
-        let mut pos = 0usize;
-        while pos < mono.len() {
-            let end = (pos + chunk_size).min(mono.len());
-            let chunk = &mono[pos..end];
-            let data = if chunk.len() < chunk_size {
-                let mut padded = chunk.to_vec();
-                padded.resize(chunk_size, 0.0);
-                padded
-            } else {
-                chunk.to_vec()
-            };
-
-            let input_vecs = vec![data];
-            let input = SequentialSliceOfVecs::new(&input_vecs, 1, chunk_size)?;
-            let result = resampler.process(&input, 0, None)?;
-
-            let frames = result.frames();
-            for i in 0..frames {
-                output.push(result.read_sample(0, i).unwrap_or(0.0));
-            }
-            pos += chunk_size;
-        }
-
-        Ok(output)
-    }
-
-    /// Voice-clone: synthesize `text` in the voice of the speaker from `ref_audio_path`.
+    /// Voice-clone: synthesize `text` in the voice of the speaker from `ref_samples`.
     ///
-    /// `ref_audio_path`: path to a WAV file of the reference speaker (any SR, mono or stereo).
+    /// `ref_samples`: reference speaker audio, mono f32 in `[-1, 1]`, already
+    /// resampled to the speaker encoder's sample rate
+    /// ([`Model::speaker_encoder_sample_rate`]).
     /// `ref_text`: transcript of the reference audio (required for ICL mode).
     /// `language`: target language ("japanese", "chinese", "english", "auto", …).
     ///
@@ -604,7 +541,7 @@ impl Model {
         &mut self,
         text: &str,
         language: &str,
-        ref_audio_path: &str,
+        ref_samples_spk: &[f32],
         ref_text: &str,
         opts: &SpeechOptions,
     ) -> Result<(Tensor, u32)> {
@@ -617,12 +554,8 @@ impl Model {
             ),
         }
 
-        let spk_sr = self.config.speaker_encoder_config.sample_rate;
-
-        // 2. Load reference audio at speaker encoder SR (24kHz)
-        let ref_samples_spk = Self::load_wav_f32(ref_audio_path, spk_sr)?;
         if ref_samples_spk.is_empty() {
-            anyhow::bail!("Reference audio file is empty: {ref_audio_path}");
+            anyhow::bail!("Reference audio is empty");
         }
 
         // 3. Extract speaker embedding via ECAPA-TDNN
@@ -631,7 +564,7 @@ impl Model {
         let spk_embed = {
             let enc = self.inner.speaker_encoder.as_ref()
                 .ok_or_else(|| anyhow::anyhow!("Speaker encoder not loaded (base model required)"))?;
-            let mels = Self::compute_mel_spectrogram(&ref_samples_spk, &self.device, DType::F32)?;
+            let mels = Self::compute_mel_spectrogram(ref_samples_spk, &self.device, DType::F32)?;
             let embed = enc.forward(&mels)?.squeeze(0)?; // [enc_dim], F32
             if Self::tts_debug_enabled() {
                 let norm: f32 = embed.sqr()?.sum_all()?.sqrt()?.to_scalar()?;
@@ -652,7 +585,7 @@ impl Model {
             match speech_dec {
                 SpeechDecoderBackend::Native(native) => {
                     // Encode: samples [1, 1, N] → codes [1, T, n_q] → squeeze → [T, n_q]
-                    let ref_tensor = Tensor::new(ref_samples_spk.as_slice(), &self.device)?
+                    let ref_tensor = Tensor::new(ref_samples_spk, &self.device)?
                         .unsqueeze(0)?.unsqueeze(0)?; // [1, 1, N]
                     let codes = native.encode(&ref_tensor)?.squeeze(0)?; // [T, n_q]
                     if Self::tts_debug_enabled() {
@@ -692,7 +625,7 @@ impl Model {
         let ref_token_ids = ref_encoding.get_ids().to_vec();
 
         // 6. Generate codec codes (voice-clone mode)
-        let (new_codes, ref_code_len) = self.inner.generate_voice_clone_codes(
+        let (new_codes, _ref_code_len) = self.inner.generate_voice_clone_codes(
             &input_ids,
             &ref_token_ids,
             &ref_codes,
@@ -764,39 +697,135 @@ impl Model {
         }
         let audio = audio_full.narrow(2, cut, total_samples - cut)?;
 
-        let _ = ref_code_len;
         Ok((audio, speech_decoder.sample_rate()))
     }
+}
 
-    /// Voice-clone and write to WAV file.
-    pub fn generate_voice_clone_to_file(
-        &mut self,
-        text: &str,
-        language: &str,
-        ref_audio_path: &str,
-        ref_text: &str,
-        opts: &SpeechOptions,
-        output_path: &str,
-    ) -> Result<String> {
-        let (audio, sr) = self.generate_voice_clone(text, language, ref_audio_path, ref_text, opts)?;
-        Self::save_wav(&audio, output_path, sr)
+// ── Streaming speech generation ────────────────────────────────────────────
+
+/// Number of codec frames in each chunk after the first.
+/// 25 frames × 1920 samples/frame = 48 000 samples ≈ 2 s at 24 kHz.
+const STREAM_CHUNK_SIZE: usize = 25;
+/// Number of codec frames in the first emitted chunk.
+/// 5 frames × 1920 samples/frame = 9 600 samples ≈ 0.4 s — fast first audio.
+const STREAM_FIRST_CHUNK_SIZE: usize = 5;
+/// Number of overlap frames prepended to each codec decode call.
+/// Must exceed the codec's causal receptive field (~25 frames) for exact output.
+const STREAM_LEFT_CONTEXT: usize = 25;
+
+/// Incremental speech generator that yields PCM audio chunks on demand.
+///
+/// Returned by [`Model::generate_speech_streaming`]. Implements
+/// `Iterator<Item = anyhow::Result<Tensor>>`, where each `Tensor` is a flat
+/// `[n_samples]` f32 PCM slice at 24 kHz.
+///
+/// The first chunk arrives after [`STREAM_FIRST_CHUNK_SIZE`] codec frames
+/// (~0.4 s). Subsequent chunks are emitted every [`STREAM_CHUNK_SIZE`] frames
+/// (~2 s). [`STREAM_LEFT_CONTEXT`] frames of overlap between consecutive codec
+/// calls ensure the waveform is numerically equivalent to non-streaming output.
+pub struct SpeechStream<'a> {
+    model: &'a mut Model,
+    state: StreamingState,
+    max_new_tokens: usize,
+    chunk_size: usize,
+    first_chunk_size: usize,
+    left_context: usize,
+    all_codes: Vec<Vec<u32>>,
+    emitted_up_to: usize,
+    done: bool,
+}
+
+impl SpeechStream<'_> {
+    fn generate_one_frame(&mut self) -> Result<bool> {
+        if self.state.step >= self.max_new_tokens {
+            return Ok(true);
+        }
+        match self.model.inner.generate_one_frame(&mut self.state, &self.all_codes)? {
+            None => Ok(true),
+            Some(frame) => {
+                self.all_codes.push(frame);
+                Ok(false)
+            }
+        }
     }
 
-    fn save_wav(audio_values: &Tensor, filename: &str, sample_rate: u32) -> Result<String> {
-        let audio = audio_values.to_dtype(DType::F32)?.flatten_all()?;
-        let scaled = audio.affine(32767.0, 0.0)?.clamp(-32768.0, 32767.0)?.round()?;
-        let audio_i64 = scaled.to_dtype(DType::I64)?;
-        let spec = WavSpec {
-            channels: 1,
-            sample_rate,
-            bits_per_sample: 16,
-            sample_format: SampleFormat::Int,
+    fn try_next(&mut self) -> Result<Option<Tensor>> {
+        let target = if self.emitted_up_to == 0 {
+            self.first_chunk_size
+        } else {
+            self.chunk_size
         };
-        let mut writer = WavWriter::create(filename, spec)?;
-        for sample in audio_i64.to_vec1::<i64>()? {
-            writer.write_sample(sample.clamp(i16::MIN as i64, i16::MAX as i64) as i16)?;
+
+        loop {
+            let new_frames = self.all_codes.len() - self.emitted_up_to;
+            if new_frames >= target {
+                break;
+            }
+            let done = self.generate_one_frame()?;
+            if done {
+                self.done = true;
+                break;
+            }
         }
-        writer.finalize()?;
-        Ok(filename.to_string())
+
+        let new_frames = self.all_codes.len() - self.emitted_up_to;
+        if new_frames == 0 {
+            return Ok(None);
+        }
+
+        let ctx = self.emitted_up_to.min(self.left_context);
+        let chunk_start = self.emitted_up_to - ctx;
+        let chunk_end = self.all_codes.len();
+        let n_chunk_frames = chunk_end - chunk_start;
+        let num_groups = self.all_codes[0].len();
+
+        // Normalize and flatten codes into [1, num_groups, n_chunk_frames] i64 tensor.
+        let codebook_size = self.model.config.talker_config.code_predictor_config.vocab_size as u32;
+        let flat: Vec<i64> = self.all_codes[chunk_start..chunk_end]
+            .iter()
+            .flat_map(|frame| {
+                frame.iter().map(move |&c| {
+                    let normalized = if codebook_size == 0 { c } else { c.min(codebook_size - 1) };
+                    normalized as i64
+                })
+            })
+            .collect();
+        let codes_tensor = Tensor::new(flat.as_slice(), &self.model.device)?
+            .reshape((n_chunk_frames, num_groups))?
+            .transpose(0, 1)?
+            .unsqueeze(0)?;
+
+        let speech_decoder = self.model.speech_decoder.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("speech decoder not loaded"))?;
+        let audio = speech_decoder.decode_chunk(&codes_tensor, ctx)?.flatten_all()?;
+
+        self.emitted_up_to = chunk_end;
+
+        let keep_from = self.emitted_up_to.saturating_sub(self.left_context);
+        if keep_from > 0 {
+            self.all_codes.drain(..keep_from);
+            self.emitted_up_to -= keep_from;
+        }
+
+        Ok(Some(audio))
     }
 }
+
+impl Iterator for SpeechStream<'_> {
+    type Item = Result<Tensor>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done && self.emitted_up_to >= self.all_codes.len() {
+            return None;
+        }
+        match self.try_next() {
+            Ok(Some(chunk)) => Some(Ok(chunk)),
+            Ok(None) => None,
+            Err(e) => {
+                self.done = true;
+                Some(Err(e))
+            }
+        }
+    }
+}
+

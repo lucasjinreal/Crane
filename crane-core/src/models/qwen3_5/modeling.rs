@@ -14,8 +14,13 @@
 //! Per-layer GDN state is held by [`super::Qwen3_5TextModel`] (not by the
 //! layer), so that continuous-batching can save/restore state per request.
 
+use candle_core::quantized::GgmlDType;
 use candle_core::{DType, Device, Module, Result, Tensor, D};
-use candle_nn::{linear_no_bias, VarBuilder};
+use candle_nn::VarBuilder;
+use std::io::{Read, Seek};
+
+use crate::models::hunyuan_dense::modeling::Gguf;
+use crate::ops::linear::{linear_layer, LinearLayer};
 
 // ── Qwen 3.5 RMSNorm (unit-offset) ───────────────────────────────────────
 
@@ -33,12 +38,22 @@ use candle_nn::{linear_no_bias, VarBuilder};
 pub struct Qwen35RmsNorm {
     weight: Tensor,
     eps: f64,
+    /// Whether to add the unit offset (`1 + weight`) at runtime. True for HF
+    /// safetensors weights (stored raw, mean ~0.24); false for GGUF weights,
+    /// where llama.cpp's converter already folded the `+1` in (mean ~1.24).
+    unit_offset: bool,
 }
 
 impl Qwen35RmsNorm {
     pub fn load(size: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
         let weight = vb.get(size, "weight")?;
-        Ok(Self { weight, eps })
+        Ok(Self { weight, eps, unit_offset: true })
+    }
+
+    /// Construct from a weight that already includes the `+1` unit offset
+    /// (GGUF layout).
+    pub fn from_folded(weight: Tensor, eps: f64) -> Self {
+        Self { weight, eps, unit_offset: false }
     }
 
     pub fn weight(&self) -> &Tensor {
@@ -52,15 +67,19 @@ impl Module for Qwen35RmsNorm {
         let x = x.to_dtype(DType::F32)?;
         let var = x.sqr()?.mean_keepdim(D::Minus1)?;
         let x_normed = x.broadcast_div(&(var + self.eps)?.sqrt()?)?;
-        // `1 + weight` (unit offset), in f32.
-        let scale = self.weight.to_dtype(DType::F32)?.affine(1.0, 1.0)?;
+        let scale = self.weight.to_dtype(DType::F32)?;
+        // `1 + weight` (unit offset), in f32 — unless already folded in.
+        let scale = if self.unit_offset { scale.affine(1.0, 1.0)? } else { scale };
         x_normed.broadcast_mul(&scale)?.to_dtype(dtype)
     }
 }
 
 use super::config::{LayerType, TextConfig};
 use super::kv_cache::KvCache;
-use crate::ops::gdn::{GatedDeltaNet, GdnDims, GdnInputProjectionKind, GdnLayerCache};
+use crate::ops::gdn::{
+    GatedDeltaNet, GdnDims, GdnInputProjection, GdnInputProjectionKind, GdnLayerCache,
+    RmsNormGated,
+};
 
 // ── MRoPE rotary embedding ─────────────────────────────────────────────
 
@@ -168,10 +187,10 @@ pub fn apply_mrope(
 /// - Per-head QK-norm is always present (`q_norm`, `k_norm` of size `head_dim`).
 /// - RoPE is MRoPE-interleaved applied only to the first `rot_dim` components.
 pub struct FullAttention {
-    q_proj: candle_nn::Linear,
-    k_proj: candle_nn::Linear,
-    v_proj: candle_nn::Linear,
-    o_proj: candle_nn::Linear,
+    q_proj: LinearLayer,
+    k_proj: LinearLayer,
+    v_proj: LinearLayer,
+    o_proj: LinearLayer,
     q_norm: Qwen35RmsNorm,
     k_norm: Qwen35RmsNorm,
     num_heads: usize,
@@ -181,7 +200,7 @@ pub struct FullAttention {
 }
 
 impl FullAttention {
-    pub fn load(cfg: &TextConfig, vb: VarBuilder) -> Result<Self> {
+    pub fn load(cfg: &TextConfig, vb: VarBuilder, quant: Option<GgmlDType>) -> Result<Self> {
         let num_heads = cfg.num_attention_heads;
         let num_kv_heads = cfg.num_key_value_heads;
         let head_dim = cfg.head_dim;
@@ -191,10 +210,10 @@ impl FullAttention {
         } else {
             num_heads * head_dim
         };
-        let q_proj = linear_no_bias(cfg.hidden_size, q_out, vb.pp("q_proj"))?;
-        let k_proj = linear_no_bias(cfg.hidden_size, num_kv_heads * head_dim, vb.pp("k_proj"))?;
-        let v_proj = linear_no_bias(cfg.hidden_size, num_kv_heads * head_dim, vb.pp("v_proj"))?;
-        let o_proj = linear_no_bias(num_heads * head_dim, cfg.hidden_size, vb.pp("o_proj"))?;
+        let q_proj = linear_layer(cfg.hidden_size, q_out, vb.pp("q_proj"), quant)?;
+        let k_proj = linear_layer(cfg.hidden_size, num_kv_heads * head_dim, vb.pp("k_proj"), quant)?;
+        let v_proj = linear_layer(cfg.hidden_size, num_kv_heads * head_dim, vb.pp("v_proj"), quant)?;
+        let o_proj = linear_layer(num_heads * head_dim, cfg.hidden_size, vb.pp("o_proj"), quant)?;
 
         let q_norm = Qwen35RmsNorm::load(head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?;
         let k_norm = Qwen35RmsNorm::load(head_dim, cfg.rms_norm_eps, vb.pp("k_norm"))?;
@@ -209,6 +228,45 @@ impl FullAttention {
             num_heads,
             num_kv_heads,
             head_dim,
+            has_output_gate: cfg.attn_output_gate,
+        })
+    }
+
+    /// Construct from GGUF quantized weights (llama.cpp `qwen35` layout).
+    ///
+    /// `attn_q` keeps HF's fused `[query | gate]` per-head layout (2× rows
+    /// when `attn_output_gate`); per-head q/k norms are stored with the `+1`
+    /// unit offset already folded in.
+    pub fn from_gguf<R: Read + Seek>(
+        cfg: &TextConfig,
+        gg: &mut Gguf<R>,
+        layer_idx: usize,
+    ) -> Result<Self> {
+        let prefix = format!("blk.{layer_idx}");
+        let q_proj = gg.linear(&format!("{prefix}.attn_q.weight"))?;
+        let k_proj = gg.linear(&format!("{prefix}.attn_k.weight"))?;
+        let v_proj = gg.linear(&format!("{prefix}.attn_v.weight"))?;
+        let o_proj = gg.linear(&format!("{prefix}.attn_output.weight"))?;
+
+        let q_norm = Qwen35RmsNorm::from_folded(
+            gg.dequant_tensor(&format!("{prefix}.attn_q_norm.weight"))?,
+            cfg.rms_norm_eps,
+        );
+        let k_norm = Qwen35RmsNorm::from_folded(
+            gg.dequant_tensor(&format!("{prefix}.attn_k_norm.weight"))?,
+            cfg.rms_norm_eps,
+        );
+
+        Ok(Self {
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            q_norm,
+            k_norm,
+            num_heads: cfg.num_attention_heads,
+            num_kv_heads: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim,
             has_output_gate: cfg.attn_output_gate,
         })
     }
@@ -337,16 +395,25 @@ fn attn_weights_with_mask(
 
 /// Standard SwiGLU MLP: `down(silu(gate(x)) * up(x))`.
 pub struct Mlp {
-    gate_proj: candle_nn::Linear,
-    up_proj: candle_nn::Linear,
-    down_proj: candle_nn::Linear,
+    gate_proj: LinearLayer,
+    up_proj: LinearLayer,
+    down_proj: LinearLayer,
 }
 
 impl Mlp {
-    pub fn load(cfg: &TextConfig, vb: VarBuilder) -> Result<Self> {
-        let gate_proj = linear_no_bias(cfg.hidden_size, cfg.intermediate_size, vb.pp("gate_proj"))?;
-        let up_proj = linear_no_bias(cfg.hidden_size, cfg.intermediate_size, vb.pp("up_proj"))?;
-        let down_proj = linear_no_bias(cfg.intermediate_size, cfg.hidden_size, vb.pp("down_proj"))?;
+    pub fn load(cfg: &TextConfig, vb: VarBuilder, quant: Option<GgmlDType>) -> Result<Self> {
+        let gate_proj = linear_layer(cfg.hidden_size, cfg.intermediate_size, vb.pp("gate_proj"), quant)?;
+        let up_proj = linear_layer(cfg.hidden_size, cfg.intermediate_size, vb.pp("up_proj"), quant)?;
+        let down_proj = linear_layer(cfg.intermediate_size, cfg.hidden_size, vb.pp("down_proj"), quant)?;
+        Ok(Self { gate_proj, up_proj, down_proj })
+    }
+
+    /// Construct from GGUF quantized weights.
+    pub fn from_gguf<R: Read + Seek>(gg: &mut Gguf<R>, layer_idx: usize) -> Result<Self> {
+        let prefix = format!("blk.{layer_idx}");
+        let gate_proj = gg.linear(&format!("{prefix}.ffn_gate.weight"))?;
+        let up_proj = gg.linear(&format!("{prefix}.ffn_up.weight"))?;
+        let down_proj = gg.linear(&format!("{prefix}.ffn_down.weight"))?;
         Ok(Self { gate_proj, up_proj, down_proj })
     }
 
@@ -384,6 +451,7 @@ impl DecoderLayer {
         cfg: &TextConfig,
         layer_type: LayerType,
         vb: VarBuilder,
+        quant: Option<GgmlDType>,
     ) -> Result<Self> {
         let input_layernorm = Qwen35RmsNorm::load(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
         let post_attention_layernorm = Qwen35RmsNorm::load(
@@ -391,16 +459,87 @@ impl DecoderLayer {
             cfg.rms_norm_eps,
             vb.pp("post_attention_layernorm"),
         )?;
-        let mlp = Mlp::load(cfg, vb.pp("mlp"))?;
+        let mlp = Mlp::load(cfg, vb.pp("mlp"), quant)?;
 
         let (layer_impl, gdn_dims) = match layer_type {
             LayerType::FullAttention => (
-                LayerImpl::FullAttention(FullAttention::load(cfg, vb.pp("self_attn"))?),
+                LayerImpl::FullAttention(FullAttention::load(cfg, vb.pp("self_attn"), quant)?),
                 None,
             ),
             LayerType::LinearAttention => {
                 let dims = GdnDims::new(cfg);
-                let gdn = GatedDeltaNet::load(vb, cfg, GdnInputProjectionKind::Split)?;
+                let gdn = GatedDeltaNet::load(vb, cfg, GdnInputProjectionKind::Split, quant)?;
+                (LayerImpl::LinearAttention(gdn), Some(dims))
+            }
+        };
+
+        Ok(Self {
+            layer_impl,
+            input_layernorm,
+            post_attention_layernorm,
+            mlp,
+            gdn_dims,
+        })
+    }
+
+    /// Construct from GGUF quantized weights (llama.cpp `qwen35` layout).
+    ///
+    /// Naming (verified against a real Qwen3.5 GGUF): linear-attention blocks
+    /// store the split GDN projections as `attn_qkv` (Q|K|V), `attn_gate`
+    /// (the z silu-gate), `ssm_beta` (β) and `ssm_alpha` (A); `ssm_conv1d` is
+    /// 2-D `[conv_dim, kernel]`, `ssm_a` is `A_log`, and `ssm_dt.bias` is
+    /// `dt_bias`. Block norms (`attn_norm`, `post_attention_norm`) carry the
+    /// folded `+1` offset; the gated `ssm_norm` is a plain weight as in HF.
+    pub fn from_gguf<R: Read + Seek>(
+        cfg: &TextConfig,
+        layer_type: LayerType,
+        gg: &mut Gguf<R>,
+        layer_idx: usize,
+    ) -> Result<Self> {
+        let prefix = format!("blk.{layer_idx}");
+        let input_layernorm = Qwen35RmsNorm::from_folded(
+            gg.dequant_tensor(&format!("{prefix}.attn_norm.weight"))?,
+            cfg.rms_norm_eps,
+        );
+        let post_attention_layernorm = Qwen35RmsNorm::from_folded(
+            gg.dequant_tensor(&format!("{prefix}.post_attention_norm.weight"))?,
+            cfg.rms_norm_eps,
+        );
+        let mlp = Mlp::from_gguf(gg, layer_idx)?;
+
+        let (layer_impl, gdn_dims) = match layer_type {
+            LayerType::FullAttention => (
+                LayerImpl::FullAttention(FullAttention::from_gguf(cfg, gg, layer_idx)?),
+                None,
+            ),
+            LayerType::LinearAttention => {
+                let dims = GdnDims::new(cfg);
+                let input_proj = GdnInputProjection::Split {
+                    in_proj_qkv: gg.linear(&format!("{prefix}.attn_qkv.weight"))?,
+                    in_proj_z: gg.linear(&format!("{prefix}.attn_gate.weight"))?,
+                    in_proj_b: gg.linear(&format!("{prefix}.ssm_beta.weight"))?,
+                    in_proj_a: gg.linear(&format!("{prefix}.ssm_alpha.weight"))?,
+                };
+                // GGUF stores the conv kernel 2-D; crane expects HF's
+                // `[conv_dim, 1, kernel]`.
+                let conv1d_weight = gg
+                    .dequant_tensor(&format!("{prefix}.ssm_conv1d.weight"))?
+                    .unsqueeze(1)?;
+                let dt_bias = gg.dequant_tensor(&format!("{prefix}.ssm_dt.bias"))?;
+                let a_log = gg.dequant_tensor(&format!("{prefix}.ssm_a"))?;
+                let norm = RmsNormGated::from_weight(
+                    gg.dequant_tensor(&format!("{prefix}.ssm_norm.weight"))?,
+                    cfg.rms_norm_eps,
+                );
+                let out_proj = gg.linear(&format!("{prefix}.ssm_out.weight"))?;
+                let gdn = GatedDeltaNet {
+                    input_proj,
+                    conv1d_weight,
+                    dt_bias,
+                    a_log,
+                    norm,
+                    out_proj,
+                };
                 (LayerImpl::LinearAttention(gdn), Some(dims))
             }
         };

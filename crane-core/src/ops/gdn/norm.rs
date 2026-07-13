@@ -25,6 +25,11 @@ impl RmsNormGated {
         Ok(Self { weight, eps })
     }
 
+    /// Construct from an already-loaded weight (e.g. dequantized from GGUF).
+    pub fn from_weight(weight: Tensor, eps: f64) -> Self {
+        Self { weight, eps }
+    }
+
     /// Forward pass. `x` and `gate` must share shape `[..., size]`.
     pub fn forward(&self, x: &Tensor, gate: &Tensor) -> Result<Tensor> {
         let dtype = x.dtype();

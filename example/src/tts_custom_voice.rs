@@ -75,9 +75,8 @@ fn main() -> anyhow::Result<()> {
             top_p: Some(1.0),
             repetition_penalty: 1.05,
         };
-        let saved_path = model.generate_speech_to_file(
-            text, lang, speaker.as_deref(), &opts, &output_path,
-        )?;
+        let (audio, sr) = model.generate_speech(text, lang, speaker.as_deref(), &opts)?;
+        let saved_path = crane::audio::save_wav(&audio, &output_path, sr)?;
         let elapsed = start.elapsed();
         println!("  Saved {saved_path} in {elapsed:.1?}");
     }

@@ -37,6 +37,7 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
+    #[must_use]
     pub fn new(max_running: usize) -> Self {
         Self {
             waiting: VecDeque::new(),
@@ -66,8 +67,9 @@ impl Scheduler {
     pub fn schedule(&mut self) -> Option<SchedulerOutput> {
         // Priority 1: Prefill a waiting sequence if there's capacity.
         let max = self.effective_max_running.unwrap_or(self.max_running);
-        if !self.waiting.is_empty() && self.running.len() < max {
-            let seq_id = self.waiting.pop_front().unwrap();
+        if self.running.len() < max
+            && let Some(seq_id) = self.waiting.pop_front()
+        {
             return Some(SchedulerOutput {
                 batch: vec![seq_id],
                 is_prefill: true,
@@ -85,8 +87,7 @@ impl Scheduler {
 
         // Priority 3: Nothing running but waiting has items — prefill.
         // (This happens if max is 0, which shouldn't normally happen, but just in case).
-        if !self.waiting.is_empty() {
-            let seq_id = self.waiting.pop_front().unwrap();
+        if let Some(seq_id) = self.waiting.pop_front() {
             return Some(SchedulerOutput {
                 batch: vec![seq_id],
                 is_prefill: true,
@@ -103,12 +104,14 @@ impl Scheduler {
 
     /// Total active sequences (waiting + running).
     #[allow(dead_code)]
+    #[must_use]
     pub fn active_count(&self) -> usize {
         self.waiting.len() + self.running.len()
     }
 
     /// Whether there is any work pending.
     #[allow(dead_code)]
+    #[must_use]
     pub fn has_work(&self) -> bool {
         !self.waiting.is_empty() || !self.running.is_empty()
     }

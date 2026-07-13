@@ -26,7 +26,14 @@ pub struct SamplingBuffers {
     pub topk_neg_vecs: HashMap<usize, Tensor>,
 }
 
+impl Default for SamplingBuffers {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SamplingBuffers {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             topk_cumsum_mats: HashMap::new(),
@@ -36,64 +43,78 @@ impl SamplingBuffers {
         }
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if tensor allocation on `device` fails.
     pub fn get_topk_neg_vec(
         &mut self,
         k: usize,
         device: &Device,
     ) -> candle_core::Result<Tensor> {
-        if let Some(t) = self.topk_neg_vecs.get(&k) {
-            if t.device().same_device(device) {
-                return Ok(t.clone());
-            }
+        if let Some(t) = self.topk_neg_vecs.get(&k)
+            && t.device().same_device(device)
+        {
+            return Ok(t.clone());
         }
         let t = Tensor::full(-1e9f32, k, device)?;
         self.topk_neg_vecs.insert(k, t.clone());
         Ok(t)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if `k <= 1` or tensor allocation on `device` fails.
     pub fn get_topk_shift_idx(
         &mut self,
         k: usize,
         device: &Device,
     ) -> candle_core::Result<Tensor> {
-        if let Some(t) = self.topk_shift_idxs.get(&k) {
-            if t.device().same_device(device) {
-                return Ok(t.clone());
-            }
+        if let Some(t) = self.topk_shift_idxs.get(&k)
+            && t.device().same_device(device)
+        {
+            return Ok(t.clone());
         }
         if k <= 1 {
             candle_core::bail!("get_topk_shift_idx expects k > 1")
         }
+        #[allow(clippy::cast_possible_truncation)]
         let t = Tensor::arange(1u32, k as u32, device)?;
         self.topk_shift_idxs.insert(k, t.clone());
         Ok(t)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if tensor allocation on `device` fails.
     pub fn get_topk_shift_buf(
         &mut self,
         k: usize,
         device: &Device,
         dtype: DType,
     ) -> candle_core::Result<Tensor> {
-        if let Some(t) = self.topk_shift_bufs.get(&k) {
-            if t.device().same_device(device) && t.dtype() == dtype {
-                return Ok(t.clone());
-            }
+        if let Some(t) = self.topk_shift_bufs.get(&k)
+            && t.device().same_device(device)
+            && t.dtype() == dtype
+        {
+            return Ok(t.clone());
         }
         let t = Tensor::zeros(k, dtype, device)?;
         self.topk_shift_bufs.insert(k, t.clone());
         Ok(t)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if tensor allocation on `device` fails.
     pub fn get_topk_cumsum_mat(
         &mut self,
         k: usize,
         device: &Device,
     ) -> candle_core::Result<Tensor> {
-        if let Some(t) = self.topk_cumsum_mats.get(&k) {
-            if t.device().same_device(device) {
-                return Ok(t.clone());
-            }
+        if let Some(t) = self.topk_cumsum_mats.get(&k)
+            && t.device().same_device(device)
+        {
+            return Ok(t.clone());
         }
         let mut data = Vec::with_capacity(k * k);
         for row in 0..k {
@@ -114,6 +135,13 @@ impl SamplingBuffers {
 /// - Top-k filtering with GPU-native Gumbel-max sampling
 /// - Top-p (nucleus) filtering with cumulative softmax masking
 /// - CPU fallback via `LogitsProcessor` when needed
+///
+/// # Errors
+///
+/// Returns an error if a tensor operation fails.
+// The branching by device/top-k/top-p is one cohesive decode path; splitting
+// it up would scatter state across smaller functions rather than clarify it.
+#[allow(clippy::too_many_lines)]
 pub fn sample(
     seq_id: &str,
     seq: &mut Sequence,
@@ -132,14 +160,19 @@ pub fn sample(
     };
     #[cfg(feature = "cuda")]
     {
+        // `repetition_penalty` is compared against the exact "disabled" sentinel
+        // (1.0), not a computed float, so strict equality is correct.
+        #[allow(clippy::float_cmp)]
         if greedy && seq.repetition_penalty == 1.0 && logits.device().is_cuda() {
             let flat = logits.squeeze(0)?.squeeze(0)?;
             let token = crane_core::ops::gpu_argmax(&flat)?;
             if trace {
                 let t_done = Instant::now();
+                #[allow(clippy::cast_possible_truncation)]
+                let total_us = t_done.duration_since(t0).as_micros() as u64;
                 tracing::debug!(
                     id = %seq_id,
-                    total_us = t_done.duration_since(t0).as_micros() as u64,
+                    total_us,
                     "sample(gpu_argmax_fast)"
                 );
             }
@@ -148,14 +181,17 @@ pub fn sample(
     }
 
     let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
-    let t_after_prep = Instant::now();
+    let t_preprocessed = Instant::now();
 
+    // `repetition_penalty` is compared against the exact "disabled" sentinel
+    // (1.0), not a computed float, so strict equality is correct.
+    #[allow(clippy::float_cmp)]
     if seq.repetition_penalty != 1.0 {
         let start_at = seq.tokens.len().saturating_sub(seq.repeat_last_n);
         apply_repeat_penalty_inplace(&logits, seq.repetition_penalty, &seq.tokens[start_at..])
             .map_err(anyhow::Error::from)?;
     }
-    let t_after_rep = Instant::now();
+    let t_penalty_applied = Instant::now();
 
     if greedy {
         return Ok(logits.argmax(0)?.to_scalar::<u32>()?);
@@ -183,12 +219,14 @@ pub fn sample(
                 let next_token = seq.logits_processor.sample(&logits)?;
                 if trace {
                     let t_done = Instant::now();
+                    #[allow(clippy::cast_possible_truncation)]
+                    let total_us = t_done.duration_since(t0).as_micros() as u64;
                     debug!(
                         id = %seq_id,
                         vocab,
                         top_p = ?seq.top_p,
                         temp = ?seq.temperature,
-                        total_us = t_done.duration_since(t0).as_micros() as u64,
+                        total_us,
                         "sample(cpu_logits_processor)"
                     );
                 }
@@ -219,15 +257,22 @@ pub fn sample(
 
                 if trace {
                     let t_done = Instant::now();
+                    #[allow(clippy::cast_possible_truncation)]
+                    let (prep_us, rep_us, topk_us, total_us) = (
+                        t_preprocessed.duration_since(t0).as_micros() as u64,
+                        t_penalty_applied.duration_since(t_preprocessed).as_micros() as u64,
+                        t_after_topk.duration_since(t_penalty_applied).as_micros() as u64,
+                        t_done.duration_since(t0).as_micros() as u64,
+                    );
                     debug!(
                         id = %seq_id,
                         top_k,
                         top_p = ?seq.top_p,
                         temp = ?seq.temperature,
-                        prep_us = t_after_prep.duration_since(t0).as_micros() as u64,
-                        rep_us = t_after_rep.duration_since(t_after_prep).as_micros() as u64,
-                        topk_us = t_after_topk.duration_since(t_after_rep).as_micros() as u64,
-                        total_us = t_done.duration_since(t0).as_micros() as u64,
+                        prep_us,
+                        rep_us,
+                        topk_us,
+                        total_us,
                         "sample(topk->cpu)"
                     );
                 }
@@ -285,6 +330,12 @@ pub fn sample(
 }
 
 /// Gumbel-max trick for GPU-native categorical sampling.
+///
+/// # Errors
+///
+/// Returns an error if a tensor operation fails.
+// `temperature == 1.0` is the exact "no scaling" sentinel, not a computed value.
+#[allow(clippy::float_cmp)]
 pub fn sample_gumbel_max_idx(logits: &Tensor, temperature: f64) -> candle_core::Result<Tensor> {
     if temperature <= 0.0 {
         return logits.argmax(candle_core::D::Minus1);
@@ -298,6 +349,10 @@ pub fn sample_gumbel_max_idx(logits: &Tensor, temperature: f64) -> candle_core::
 }
 
 /// Apply repetition penalty in-place (GPU-friendly scatter/gather).
+///
+/// # Errors
+///
+/// Returns an error if a tensor operation fails.
 pub fn apply_repeat_penalty_inplace(
     logits: &Tensor,
     penalty: f32,
@@ -320,17 +375,21 @@ pub fn apply_repeat_penalty_inplace(
     let idx = Tensor::new(token_ids.as_slice(), logits.device())?;
     let selected = logits.gather(&idx, candle_core::D::Minus1)?;
     let mask = selected.ge(0f64)?;
-    let on_true = (&selected / penalty as f64)?;
-    let on_false = (&selected * penalty as f64)?;
+    let on_true = (&selected / f64::from(penalty))?;
+    let on_false = (&selected * f64::from(penalty))?;
     let updated = mask.where_cond(&on_true, &on_false)?;
     logits.scatter_set(&idx, &updated, candle_core::D::Minus1)
 }
 
 /// Generate a random seed from system time.
+#[must_use]
 pub fn rand_seed() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
+    let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_nanos() as u64
+        .as_nanos();
+    #[allow(clippy::cast_possible_truncation)]
+    let seed = nanos as u64;
+    seed
 }

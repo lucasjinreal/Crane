@@ -2,8 +2,12 @@
 
 #[cfg(feature = "onnx")]
 mod asr;
-mod tts;
+pub mod tts;
+mod tts_client;
+mod tts_qwen3;
+mod tts_voxtral;
 
 #[cfg(feature = "onnx")]
 pub use asr::AsrClient;
-pub use tts::TtsClient;
+pub use tts::{AudioInfo, Tts, TtsStream, VoiceInfo, encode_wav, load_wav_f32, pcm_f32_to_i16, save_wav};
+pub use tts_client::TtsClient;
