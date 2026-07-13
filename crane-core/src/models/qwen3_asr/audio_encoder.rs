@@ -19,16 +19,18 @@
 //!    learned), sliced to the chunk's actual token count.
 //! 5. Concatenate all chunk outputs along the time axis ([`AudioEncoderFrontend`]).
 //! 6. Run the concatenated sequence through `encoder_layers` pre-norm
-//!    LayerNorm+GELU transformer blocks, with self-attention masked into
-//!    block-diagonal ~8s windows (`n_window_infer` raw frames per block —
-//!    a hard correctness requirement, not an optional streaming mode), then
-//!    a final `ln_post` ([`AudioEncoder`]).
+//!    LayerNorm+GELU transformer blocks, with self-attention restricted via
+//!    `cu_seqlens` boundaries to independent ~8s windows (`n_window_infer`
+//!    raw frames per block — a hard correctness requirement, not an
+//!    optional streaming mode), then a final `ln_post` ([`AudioEncoder`]).
 
 use candle_core::{D, DType, Device, Module, Result, Tensor};
 use candle_nn::{Activation, Conv2dConfig, VarBuilder};
 
 use super::config::AudioConfig;
-use super::feature_extractor::{FRAMES_PER_WINDOW, TOKENS_PER_WINDOW, chunk_split, conv_output_len};
+use super::feature_extractor::{
+    FRAMES_PER_WINDOW, TOKENS_PER_WINDOW, chunk_split, conv_output_len,
+};
 use crate::models::with_tracing;
 
 /// `LayerNorm` epsilon for the audio encoder's transformer layers and
@@ -264,8 +266,8 @@ impl AudioEncoderFrontend {
 /// [`TOKENS_PER_WINDOW`] tokens, and a trailing partial chunk contributes
 /// whatever the triple stride-2 conv-output-length formula gives its
 /// (smaller) frame count. Mirrors [`AudioEncoderFrontend::forward`]'s own
-/// chunking exactly, so the block-diagonal mask built from these counts
-/// lines up with the frontend's actual token boundaries.
+/// chunking exactly, so the `cu_seqlens` boundaries built from these counts
+/// line up with the frontend's actual token boundaries.
 fn chunk_token_counts(n_frames: usize) -> Vec<usize> {
     if n_frames == 0 {
         return Vec::new();
@@ -279,55 +281,35 @@ fn chunk_token_counts(n_frames: usize) -> Vec<usize> {
     counts
 }
 
-/// Builds the additive block-diagonal attention mask that restricts each
-/// encoder token to attending only within its own `chunks_per_block`-sized
-/// group of conv chunks (an ~8s window, per `n_window_infer`) — a hard
-/// correctness requirement of the reference implementation, not an optional
-/// streaming mode (§3).
+/// Builds cumulative sequence-length boundaries that restrict each encoder
+/// token to attending only within its own `chunks_per_block`-sized group of
+/// conv chunks (an ~8s window, per `n_window_infer`) — a hard correctness
+/// requirement of the reference implementation, not an optional streaming
+/// mode (§3).
 ///
-/// Returns `None` when the whole clip fits in a single block (all chunks
-/// mutually visible, no masking needed).
-///
-/// This mirrors the reference implementation's own approach: a full
-/// `total_tokens x total_tokens` dense mask applied to full dense attention,
-/// rather than reshaping into per-block batches. That is O(n^2) in both
-/// memory and attention matmul cost — for very long clips this is
-/// significant (e.g. ~10 minutes of audio is ~7,800 tokens, so a
-/// `[1, n_heads, 7800, 7800]` f32 attention-weights tensor is already ~3.4GB
-/// per layer). Fine for typical utterance-length ASR input; a true windowed
-/// (block-batched) attention implementation would be needed to process
-/// long-form audio efficiently.
-fn build_block_diagonal_mask(
-    n_frames: usize,
-    chunks_per_block: usize,
-    device: &Device,
-    dtype: DType,
-) -> Result<Option<Tensor>> {
+/// Returns `[0, block_0_len, block_0_len + block_1_len, ..., total_tokens]`
+/// (always at least `[0, total_tokens]`, even for a single block) — a window
+/// over consecutive pairs gives each block's `(start, end)` token range.
+/// Attention is computed independently per block (`AudioEncoderAttention::
+/// forward`), so this replaces a dense `total_tokens x total_tokens` mask
+/// (O(n^2) memory and matmul cost — e.g. ~10 minutes of audio is ~7,800
+/// tokens, making a `[1, n_heads, 7800, 7800]` f32 attention-weights tensor
+/// ~3.4GB per layer) with O(n) total attention cost across blocks.
+fn build_cu_seqlens(n_frames: usize, chunks_per_block: usize) -> Vec<usize> {
     let counts = chunk_token_counts(n_frames);
-    if counts.len() <= chunks_per_block {
-        return Ok(None);
-    }
-
-    let total_tokens: usize = counts.iter().sum();
     let block_sizes: Vec<usize> = counts
         .chunks(chunks_per_block)
         .map(|group| group.iter().sum())
         .collect();
 
-    // Fill everything as masked, then zero out each block's on-diagonal
-    // square in one slice fill per row, rather than branching per cell.
-    let mut mask = vec![f32::NEG_INFINITY; total_tokens * total_tokens];
-    let mut offset = 0;
+    let mut cu_seqlens = Vec::with_capacity(block_sizes.len() + 1);
+    cu_seqlens.push(0);
+    let mut acc = 0;
     for &block_len in &block_sizes {
-        for i in 0..block_len {
-            let row_start = (offset + i) * total_tokens + offset;
-            mask[row_start..row_start + block_len].fill(0.0);
-        }
-        offset += block_len;
+        acc += block_len;
+        cu_seqlens.push(acc);
     }
-
-    let mask = Tensor::from_vec(mask, (1, 1, total_tokens, total_tokens), device)?;
-    Ok(Some(mask.to_dtype(dtype)?))
+    cu_seqlens
 }
 
 /// Self-attention for one audio encoder transformer layer.
@@ -388,11 +370,26 @@ impl AudioEncoderAttention {
         })
     }
 
-    /// `hidden_states`: `[batch, seq_len, d_model]`. `attention_mask`, if
-    /// given, is an additive mask broadcastable to
-    /// `[batch, n_heads, seq_len, seq_len]` (`f32::NEG_INFINITY` for blocked
-    /// positions).
-    fn forward(&self, hidden_states: &Tensor, attention_mask: Option<&Tensor>) -> Result<Tensor> {
+    /// `hidden_states`: `[batch, seq_len, d_model]`. `cu_seqlens` is a list
+    /// of cumulative sequence-length boundaries (as built by
+    /// [`build_cu_seqlens`]); each consecutive pair `(cu_seqlens[i],
+    /// cu_seqlens[i + 1])` is one attention block, computed independently of
+    /// every other block — no cross-block masking needed since blocks are
+    /// never mixed. `cu_seqlens` must have at least 2 elements to define any
+    /// block; fewer (i.e. a 0-token sequence) short-circuits to an empty
+    /// output.
+    fn forward(&self, hidden_states: &Tensor, cu_seqlens: &[usize]) -> Result<Tensor> {
+        if cu_seqlens.len() < 2 {
+            // No tokens to attend over; `hidden_states` is already
+            // correctly shaped (0-length), nothing further to compute.
+            debug_assert_eq!(
+                hidden_states.dim(1)?,
+                0,
+                "cu_seqlens has fewer than 2 entries but hidden_states has non-zero seq_len"
+            );
+            return self.out_proj.forward(hidden_states);
+        }
+
         let (batch, seq_len, _d) = hidden_states.dims3()?;
         let shape = (batch, seq_len, self.n_heads, self.head_dim);
 
@@ -412,20 +409,30 @@ impl AudioEncoderAttention {
             .reshape(shape)?
             .transpose(1, 2)?;
 
-        let attn_weights = (query
-            .contiguous()?
-            .matmul(&key.transpose(2, 3)?.contiguous()?)?
-            * self.scale)?;
-        let attn_weights = match attention_mask {
-            Some(mask) => attn_weights.broadcast_add(mask)?,
-            None => attn_weights,
-        };
-        // Softmax in f32 for numerical stability, matching GqaAttention's
-        // convention, then cast back to the working dtype.
-        let attn_weights = candle_nn::ops::softmax(&attn_weights.to_dtype(DType::F32)?, D::Minus1)?
-            .to_dtype(value.dtype())?;
+        // Run attention independently per block (narrowed along the seq_len
+        // axis) instead of one dense [seq_len, seq_len] matmul + mask — each
+        // block only ever attends within itself, so this is O(n) total
+        // matmul/softmax cost across blocks rather than O(n^2) (see
+        // `build_cu_seqlens`'s doc comment).
+        let mut outputs = Vec::with_capacity(cu_seqlens.len() - 1);
+        for window in cu_seqlens.windows(2) {
+            let start = window[0];
+            let len = window[1] - start;
 
-        let attn_output = attn_weights.matmul(&value.contiguous()?)?;
+            let q_block = query.narrow(2, start, len)?.contiguous()?;
+            let k_block = key.narrow(2, start, len)?.contiguous()?;
+            let v_block = value.narrow(2, start, len)?.contiguous()?;
+
+            let attn_weights = (q_block.matmul(&k_block.transpose(2, 3)?)? * self.scale)?;
+            // Softmax in f32 for numerical stability, matching
+            // GqaAttention's convention, then cast back to the working dtype.
+            let attn_weights =
+                candle_nn::ops::softmax(&attn_weights.to_dtype(DType::F32)?, D::Minus1)?
+                    .to_dtype(v_block.dtype())?;
+            outputs.push(attn_weights.matmul(&v_block)?);
+        }
+        let attn_output = Tensor::cat(&outputs, 2)?;
+
         let attn_output = attn_output.transpose(1, 2)?.contiguous()?.reshape((
             batch,
             seq_len,
@@ -473,7 +480,7 @@ impl AudioEncoderMlp {
 /// block shape, §3):
 ///
 /// ```text
-/// h = h + self_attn(self_attn_layer_norm(h), mask)
+/// h = h + self_attn(self_attn_layer_norm(h), cu_seqlens)
 /// h = h + mlp(final_layer_norm(h))
 /// ```
 ///
@@ -509,10 +516,10 @@ impl AudioEncoderLayer {
         })
     }
 
-    fn forward(&self, hidden_states: &Tensor, attention_mask: Option<&Tensor>) -> Result<Tensor> {
+    fn forward(&self, hidden_states: &Tensor, cu_seqlens: &[usize]) -> Result<Tensor> {
         let residual = hidden_states;
         let hs = self.self_attn_layer_norm.forward(hidden_states)?;
-        let hs = self.self_attn.forward(&hs, attention_mask)?;
+        let hs = self.self_attn.forward(&hs, cu_seqlens)?;
         let hidden_states = (residual + hs)?;
 
         let residual = &hidden_states;
@@ -561,14 +568,20 @@ impl AudioEncoder {
         let ln_post = with_tracing::layer_norm(config.d_model, LAYER_NORM_EPS, vb.pp("ln_post"))?;
 
         debug_assert_eq!(
-            FRAMES_PER_WINDOW, config.n_window * 2,
+            FRAMES_PER_WINDOW,
+            config.n_window * 2,
             "FRAMES_PER_WINDOW must equal n_window * 2"
         );
         debug_assert_eq!(
-            config.n_window_infer % FRAMES_PER_WINDOW, 0,
+            config.n_window_infer % FRAMES_PER_WINDOW,
+            0,
             "n_window_infer must be a multiple of FRAMES_PER_WINDOW"
         );
         let chunks_per_block = config.n_window_infer / FRAMES_PER_WINDOW;
+        debug_assert!(
+            chunks_per_block >= 1,
+            "n_window_infer must be at least FRAMES_PER_WINDOW ({FRAMES_PER_WINDOW})"
+        );
 
         Ok(Self {
             frontend,
@@ -590,15 +603,10 @@ impl AudioEncoder {
         let (_batch, _mels, n_frames) = mel.dims3()?;
 
         let mut hidden_states = self.frontend.forward(mel)?;
-        let mask = build_block_diagonal_mask(
-            n_frames,
-            self.chunks_per_block,
-            hidden_states.device(),
-            hidden_states.dtype(),
-        )?;
+        let cu_seqlens = build_cu_seqlens(n_frames, self.chunks_per_block);
 
         for layer in &self.layers {
-            hidden_states = layer.forward(&hidden_states, mask.as_ref())?;
+            hidden_states = layer.forward(&hidden_states, &cu_seqlens)?;
         }
 
         self.ln_post.forward(&hidden_states)
@@ -964,71 +972,35 @@ mod tests {
     }
 
     #[test]
-    fn block_diagonal_mask_single_block() {
+    fn cu_seqlens_single_block() {
         // 200 frames = 2 full chunks; chunks_per_block=8 means both chunks
-        // fit in one block, so no masking is needed.
-        let mask = build_block_diagonal_mask(200, 8, &Device::Cpu, DType::F32).expect("mask");
-        assert!(mask.is_none());
+        // fit in one block, so cu_seqlens has a single [0, total] window.
+        let cu_seqlens = build_cu_seqlens(200, 8);
+        assert_eq!(cu_seqlens, vec![0, 26]);
     }
 
     #[test]
-    fn block_diagonal_mask_shape_and_values() {
+    fn cu_seqlens_multiple_blocks() {
         // 300 frames = 3 full chunks (13 tokens each -> 39 total). With
         // chunks_per_block=2: chunks {0,1} form block 0 (26 tokens), chunk
         // {2} forms block 1 (13 tokens).
-        let mask = build_block_diagonal_mask(300, 2, &Device::Cpu, DType::F32)
-            .expect("mask")
-            .expect("mask should be Some for 3 chunks over a 2-chunk block");
-        assert_eq!(mask.dims(), &[1, 1, 39, 39]);
-
-        let data = mask
-            .flatten_all()
-            .expect("flatten")
-            .to_vec1::<f32>()
-            .expect("to_vec1");
-        let at = |i: usize, j: usize| data[i * 39 + j];
-
-        // Within block 0 (tokens 0..26): unmasked.
-        assert_eq!(at(0, 25), 0.0);
-        // Within block 1 (tokens 26..39): unmasked.
-        assert_eq!(at(26, 38), 0.0);
-        // Across the block 0 / block 1 boundary: masked.
-        assert_eq!(at(0, 26), f32::NEG_INFINITY);
-        assert_eq!(at(25, 26), f32::NEG_INFINITY);
-        assert_eq!(at(26, 0), f32::NEG_INFINITY);
+        let cu_seqlens = build_cu_seqlens(300, 2);
+        assert_eq!(cu_seqlens, vec![0, 26, 39]);
     }
 
     #[test]
-    fn block_diagonal_mask_isolates_windows() {
-        // Same 3-chunk / 2-chunks-per-block layout as above: exhaustively
-        // check every (i, j) pair agrees with the expected block membership,
-        // proving no attention leaks across the ~8s (here, 2-chunk) boundary.
-        let mask = build_block_diagonal_mask(300, 2, &Device::Cpu, DType::F32)
-            .expect("mask")
-            .expect("mask should be Some");
-        let data = mask
-            .flatten_all()
-            .expect("flatten")
-            .to_vec1::<f32>()
-            .expect("to_vec1");
+    fn cu_seqlens_zero_frames() {
+        let cu_seqlens = build_cu_seqlens(0, 8);
+        assert_eq!(cu_seqlens, vec![0]);
+    }
 
-        let counts = chunk_token_counts(300);
-        let mut block_of_token = Vec::new();
-        for (chunk_idx, &count) in counts.iter().enumerate() {
-            block_of_token.extend(std::iter::repeat_n(chunk_idx / 2, count));
-        }
-        let total = block_of_token.len();
-
-        for i in 0..total {
-            for j in 0..total {
-                let v = data[i * total + j];
-                if block_of_token[i] == block_of_token[j] {
-                    assert_eq!(v, 0.0, "expected unmasked at ({i}, {j})");
-                } else {
-                    assert_eq!(v, f32::NEG_INFINITY, "expected masked at ({i}, {j})");
-                }
-            }
-        }
+    #[test]
+    #[should_panic(expected = "chunk size must be non-zero")]
+    fn cu_seqlens_zero_chunks_per_block_panics() {
+        // `chunks_per_block == 0` is an invalid config (guarded against by
+        // the `debug_assert!` in `AudioEncoder::new`); document that
+        // `build_cu_seqlens` panics rather than silently misbehaving.
+        let _ = build_cu_seqlens(200, 0);
     }
 
     /// A tiny `AudioConfig` for encoder-layer/full-encoder tests: small
@@ -1122,11 +1094,11 @@ mod tests {
     fn encoder_layer_mask_isolates_blocks() {
         // With non-zero attention weights (V is non-zero, so attention
         // actually mixes information across tokens), varying block 1's
-        // input must leave block 0's output untouched — proving the mask
-        // is wired through `AudioEncoderLayer::forward`, not just
-        // structurally correct in isolation (unlike the `v_proj=0` layer
-        // tests above, which would pass identically even if the mask were
-        // silently dropped).
+        // input must leave block 0's output untouched — proving the
+        // cu_seqlens block boundaries are wired through
+        // `AudioEncoderLayer::forward`, not just structurally correct in
+        // isolation (unlike the `v_proj=0` layer tests above, which would
+        // pass identically even if the boundaries were silently dropped).
         let config = small_encoder_config();
         let vb = make_nonzero_attn_layer_vb(&config, 0.01);
         let layer = AudioEncoderLayer::new(&config, vb).expect("new");
@@ -1135,9 +1107,8 @@ mod tests {
         // own block, so tokens 0..13 and 13..26 must be mutually invisible.
         let block_len = TOKENS_PER_WINDOW;
         let total = 2 * block_len;
-        let mask = build_block_diagonal_mask(200, 1, &Device::Cpu, DType::F32)
-            .expect("mask")
-            .expect("mask should be Some for 2 blocks");
+        let cu_seqlens = build_cu_seqlens(200, 1);
+        assert_eq!(cu_seqlens, vec![0, block_len, total]);
 
         let base = Tensor::randn(0f32, 1f32, (1, total, config.d_model), &Device::Cpu)
             .expect("randn base");
@@ -1149,9 +1120,9 @@ mod tests {
         let block1_perturbed = (&block1 + &perturbation).expect("add");
         let perturbed = Tensor::cat(&[&block0, &block1_perturbed], 1).expect("cat");
 
-        let out_base = layer.forward(&base, Some(&mask)).expect("forward base");
+        let out_base = layer.forward(&base, &cu_seqlens).expect("forward base");
         let out_perturbed = layer
-            .forward(&perturbed, Some(&mask))
+            .forward(&perturbed, &cu_seqlens)
             .expect("forward perturbed");
 
         let max_abs_diff = |a: &Tensor, b: &Tensor| -> f32 {
@@ -1176,12 +1147,88 @@ mod tests {
 
         let diff_block1 = max_abs_diff(
             &out_base.narrow(1, block_len, block_len).expect("narrow"),
-            &out_perturbed.narrow(1, block_len, block_len).expect("narrow"),
+            &out_perturbed
+                .narrow(1, block_len, block_len)
+                .expect("narrow"),
         );
         assert!(
             diff_block1 > 1e-4,
             "block 1 output must change when its own input changes, diff={diff_block1}"
         );
+    }
+
+    #[test]
+    fn encoder_layer_cu_seqlens_isolates_three_blocks() {
+        // 300 frames = 3 chunks; chunks_per_block=1 puts each chunk in its
+        // own block, giving 3 blocks of `TOKENS_PER_WINDOW` tokens each.
+        // Unlike `encoder_layer_mask_isolates_blocks` (2 blocks, so neither
+        // block has a neighbor on both sides), this exercises the middle
+        // block flanked on both sides — the case most likely to expose an
+        // off-by-one in `cu_seqlens.windows(2)`'s start/end computation.
+        let config = small_encoder_config();
+        let vb = make_nonzero_attn_layer_vb(&config, 0.01);
+        let layer = AudioEncoderLayer::new(&config, vb).expect("new");
+
+        let block_len = TOKENS_PER_WINDOW;
+        let total = 3 * block_len;
+        let cu_seqlens = build_cu_seqlens(300, 1);
+        assert_eq!(cu_seqlens, vec![0, block_len, 2 * block_len, total]);
+
+        let base = Tensor::randn(0f32, 1f32, (1, total, config.d_model), &Device::Cpu)
+            .expect("randn base");
+
+        let max_abs_diff = |a: &Tensor, b: &Tensor| -> f32 {
+            (a - b)
+                .expect("sub")
+                .abs()
+                .expect("abs")
+                .max_all()
+                .expect("max_all")
+                .to_scalar()
+                .expect("scalar")
+        };
+
+        let out_base = layer.forward(&base, &cu_seqlens).expect("forward base");
+
+        for perturbed_block in 0..3 {
+            let perturbation =
+                Tensor::randn(0f32, 1f32, (1, block_len, config.d_model), &Device::Cpu)
+                    .expect("randn perturbation");
+
+            let mut blocks: Vec<Tensor> = (0..3)
+                .map(|b| base.narrow(1, b * block_len, block_len).expect("narrow"))
+                .collect();
+            blocks[perturbed_block] = (&blocks[perturbed_block] + &perturbation).expect("add");
+            let perturbed = Tensor::cat(&blocks.iter().collect::<Vec<_>>(), 1).expect("cat");
+
+            let out_perturbed = layer
+                .forward(&perturbed, &cu_seqlens)
+                .expect("forward perturbed");
+
+            for other_block in 0..3 {
+                let diff = max_abs_diff(
+                    &out_base
+                        .narrow(1, other_block * block_len, block_len)
+                        .expect("narrow"),
+                    &out_perturbed
+                        .narrow(1, other_block * block_len, block_len)
+                        .expect("narrow"),
+                );
+                if other_block == perturbed_block {
+                    assert!(
+                        diff > 1e-4,
+                        "block {other_block} output must change when its own input \
+                         changes, diff={diff}"
+                    );
+                } else {
+                    assert!(
+                        diff < 1e-5,
+                        "block {other_block} output must be unaffected by block \
+                         {perturbed_block}'s input, diff={diff}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1192,7 +1239,7 @@ mod tests {
 
         let hidden =
             Tensor::randn(0f32, 1f32, (1, 5, config.d_model), &Device::Cpu).expect("randn");
-        let out = layer.forward(&hidden, None).expect("forward");
+        let out = layer.forward(&hidden, &[0, 5]).expect("forward");
         assert_eq!(out.dims(), hidden.dims());
     }
 
@@ -1207,7 +1254,7 @@ mod tests {
 
         let hidden =
             Tensor::randn(0f32, 1f32, (1, 5, config.d_model), &Device::Cpu).expect("randn");
-        let out = layer.forward(&hidden, None).expect("forward");
+        let out = layer.forward(&hidden, &[0, 5]).expect("forward");
 
         let diff: f32 = (&out - &hidden)
             .expect("sub")
@@ -1290,9 +1337,10 @@ mod tests {
     }
 
     #[test]
-    fn encoder_single_chunk_no_mask() {
+    fn encoder_single_chunk_single_block() {
         // 100 frames = 1 chunk, well within a single ~8s attention block, so
-        // the encoder must run without ever constructing a mask.
+        // cu_seqlens is just [0, total_tokens] (one block, all tokens
+        // mutually visible).
         let config = small_encoder_config();
         let vb = make_encoder_vb(&config);
         let encoder = AudioEncoder::new(&config, vb).expect("new");
