@@ -158,6 +158,16 @@ pub(crate) fn conv_output_len(len: usize) -> usize {
     (len - 1) / 2 + 1
 }
 
+/// Splits `n_frames` raw mel frames into a whole number of full
+/// [`FRAMES_PER_WINDOW`]-sized chunks plus a trailing remainder, returned as
+/// `(n_full_chunks, remainder)`. Shared by every call site that must chunk
+/// on window boundaries identically (the encoder frontend, the
+/// block-diagonal mask, and the output-length formula below) so they can't
+/// drift out of sync.
+pub(crate) fn chunk_split(n_frames: usize) -> (usize, usize) {
+    (n_frames / FRAMES_PER_WINDOW, n_frames % FRAMES_PER_WINDOW)
+}
+
 /// Number of audio encoder output tokens for `mel_frames` raw (100Hz) mel
 /// frames — mirrors `_get_feat_extract_output_lengths` (§3), used to expand
 /// the `<|audio_pad|>` placeholder to the encoder's actual output length.
@@ -168,8 +178,7 @@ pub(crate) fn conv_output_len(len: usize) -> usize {
 /// `Conv2d` frontend.
 #[must_use]
 pub fn get_feat_extract_output_lengths(mel_frames: usize) -> usize {
-    let remainder = mel_frames % FRAMES_PER_WINDOW;
-    let full_windows = mel_frames / FRAMES_PER_WINDOW;
+    let (full_windows, remainder) = chunk_split(mel_frames);
     let remainder_tokens = conv_output_len(conv_output_len(conv_output_len(remainder)));
     remainder_tokens + full_windows * TOKENS_PER_WINDOW
 }
