@@ -4,8 +4,9 @@
 //! Converts a log-mel spectrogram `[1, n_mels, n_frames]` from
 //! [`WhisperFeatureExtractor`](super::feature_extractor::WhisperFeatureExtractor)
 //! into `[1, total_tokens, output_dim]`-ready token embeddings (the encoder's
-//! own output is `[1, total_tokens, d_model]`; the multi-modal projector,
-//! not yet implemented, maps `d_model` to `output_dim`):
+//! own output is `[1, total_tokens, d_model]`; the multi-modal projector
+//! ([`super::modeling::MultiModalProjector`]) maps `d_model` to
+//! `output_dim`):
 //!
 //! 1. Split mel frames into non-overlapping chunks of
 //!    [`FRAMES_PER_WINDOW`](super::feature_extractor) (100) frames along the
