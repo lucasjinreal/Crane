@@ -60,15 +60,27 @@ impl Qwen3_5TextModel {
             vb.clone()
         };
 
-        let embed_tokens = embedding(text_cfg.vocab_size, text_cfg.hidden_size, vb_lm.pp("embed_tokens"))?;
+        let embed_tokens = embedding(
+            text_cfg.vocab_size,
+            text_cfg.hidden_size,
+            vb_lm.pp("embed_tokens"),
+        )?;
 
         let layer_types = text_cfg.layer_types();
         let mut layers = Vec::with_capacity(text_cfg.num_hidden_layers);
         for (idx, &layer_type) in layer_types.iter().enumerate() {
-            layers.push(DecoderLayer::load(&text_cfg, layer_type, vb_lm.pp("layers").pp(idx))?);
+            layers.push(DecoderLayer::load(
+                &text_cfg,
+                layer_type,
+                vb_lm.pp("layers").pp(idx),
+            )?);
         }
 
-        let norm = Qwen35RmsNorm::load(text_cfg.hidden_size, text_cfg.rms_norm_eps, vb_lm.pp("norm"))?;
+        let norm = Qwen35RmsNorm::load(
+            text_cfg.hidden_size,
+            text_cfg.rms_norm_eps,
+            vb_lm.pp("norm"),
+        )?;
 
         // Resolve the output projection. With `tie_word_embeddings: true`
         // (0.8B/4B) it's the embedding table; untied models (e.g. Ornith-9B)
@@ -244,8 +256,7 @@ fn build_causal_mask(
             data.push(if k > q { f32::NEG_INFINITY } else { 0.0 });
         }
     }
-    let full = candle_core::Tensor::from_vec(data, (total_k, total_k), device)?
-        .to_dtype(dtype)?;
+    let full = candle_core::Tensor::from_vec(data, (total_k, total_k), device)?.to_dtype(dtype)?;
     Ok(full.narrow(0, 0, seq_q)?.unsqueeze(0)?.unsqueeze(0)?)
 }
 
@@ -255,19 +266,22 @@ fn build_causal_mask(
 fn read_eos_token_ids(model_path: &str) -> Vec<u32> {
     fn from_value(v: &serde_json::Value) -> Vec<u32> {
         match v {
-            serde_json::Value::Number(n) => {
-                n.as_u64().map(|x| vec![x as u32]).unwrap_or_default()
-            }
-            serde_json::Value::Array(a) => {
-                a.iter().filter_map(|e| e.as_u64().map(|x| x as u32)).collect()
-            }
+            serde_json::Value::Number(n) => n.as_u64().map(|x| vec![x as u32]).unwrap_or_default(),
+            serde_json::Value::Array(a) => a
+                .iter()
+                .filter_map(|e| e.as_u64().map(|x| x as u32))
+                .collect(),
             _ => Vec::new(),
         }
     }
     for fname in ["generation_config.json", "config.json"] {
         let path = std::path::Path::new(model_path).join(fname);
-        let Ok(data) = std::fs::read(&path) else { continue };
-        let Ok(json) = serde_json::from_slice::<serde_json::Value>(&data) else { continue };
+        let Ok(data) = std::fs::read(&path) else {
+            continue;
+        };
+        let Ok(json) = serde_json::from_slice::<serde_json::Value>(&data) else {
+            continue;
+        };
         if let Some(eos) = json.get("eos_token_id") {
             let ids = from_value(eos);
             if !ids.is_empty() {
@@ -277,7 +291,6 @@ fn read_eos_token_ids(model_path: &str) -> Vec<u32> {
     }
     Vec::new()
 }
-
 
 /// Public-facing `Model` for Qwen 3.5 text-only inference.
 ///
@@ -368,11 +381,7 @@ impl Model {
     }
 
     /// Run a single forward step, returning raw logits `[1, S, vocab]`.
-    pub fn forward_step(
-        &mut self,
-        input_ids: &[u32],
-        start_pos: usize,
-    ) -> Result<Tensor> {
+    pub fn forward_step(&mut self, input_ids: &[u32], start_pos: usize) -> Result<Tensor> {
         let input = Tensor::new(input_ids, &self.device)?.unsqueeze(0)?;
         Ok(self.inner.forward(&input, start_pos, None)?)
     }
@@ -397,11 +406,7 @@ impl Model {
     pub fn warmup(&mut self) {
         // Run a tiny decode-only forward (single token) so warmup succeeds
         // regardless of how the generate loop is implemented.
-        if let Err(e) = self.generate(
-            &[45],
-            &GenerationConfig::with_max_tokens(5),
-            None,
-        ) {
+        if let Err(e) = self.generate(&[45], &GenerationConfig::with_max_tokens(5), None) {
             eprintln!("warmup failed (non-fatal): {e}");
         }
         self.clear_kv_cache();
@@ -422,8 +427,7 @@ impl ModelForCausalLM for Model {
         self.tokenizer.clear();
         self.clear_kv_cache();
 
-        let mut logits_processor =
-            LogitsProcessor::new(1024, config.temperature, config.top_p);
+        let mut logits_processor = LogitsProcessor::new(1024, config.temperature, config.top_p);
 
         let mut tokens = input_ids.to_vec();
         std::io::stdout().flush()?;
@@ -435,11 +439,7 @@ impl ModelForCausalLM for Model {
         let mut stop_ids: Vec<u32> = match config.eos_token_id {
             Some(e) => vec![e],
             None if !self.eos_token_ids.is_empty() => self.eos_token_ids.clone(),
-            None => self
-                .tokenizer
-                .get_token("<|im_end|>")
-                .into_iter()
-                .collect(),
+            None => self.tokenizer.get_token("<|im_end|>").into_iter().collect(),
         };
         stop_ids.sort_unstable();
         stop_ids.dedup();
@@ -452,8 +452,13 @@ impl ModelForCausalLM for Model {
         let full_recompute = std::env::var("CRANE_FULL_RECOMPUTE").is_ok();
 
         let start_gen = std::time::Instant::now();
+        let mut finalized = false;
         for index in 0..config.max_new_tokens {
-            let context_size = if index > 0 && !full_recompute { 1 } else { tokens.len() };
+            let context_size = if index > 0 && !full_recompute {
+                1
+            } else {
+                tokens.len()
+            };
             let start_pos = tokens.len().saturating_sub(context_size);
             let ctxt = &tokens[start_pos..];
 
@@ -481,12 +486,19 @@ impl ModelForCausalLM for Model {
             if stop_ids.binary_search(&next_token).is_ok() {
                 if let Some(ref mut s) = streamer {
                     s.finalize()?;
+                    finalized = true;
                 }
                 break;
             }
 
             if let Some(ref mut s) = streamer {
                 s.append(next_token)?;
+            }
+        }
+
+        if !finalized {
+            if let Some(ref mut s) = streamer {
+                s.finalize()?;
             }
         }
 
@@ -500,4 +512,3 @@ impl ModelForCausalLM for Model {
         Ok(tokens)
     }
 }
-
