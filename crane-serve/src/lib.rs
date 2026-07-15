@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use axum::{
+    extract::DefaultBodyLimit,
     http::StatusCode,
     response::Json,
     routing::{get, post},
@@ -20,6 +21,7 @@ use tracing::info;
 use chat_template::ChatTemplateProcessor;
 use engine::model_factory::{ModelFormat, ModelType};
 use engine::{EngineHandle, InferenceEngine, MemoryConfig};
+use handlers::asr::AsrTranscribeRequest;
 use handlers::tts::TtsGenerateRequest;
 use handlers::vlm::{Gemma4VlmRequest, VlmRequest};
 use openai_api::ErrorResponse;
@@ -70,6 +72,8 @@ pub struct AppState {
     pub vlm_tx: Option<tokio::sync::mpsc::UnboundedSender<VlmRequest>>,
     pub gemma4_vlm_tx: Option<tokio::sync::mpsc::UnboundedSender<Gemma4VlmRequest>>,
     pub tts_tx: Option<tokio::sync::mpsc::UnboundedSender<TtsGenerateRequest>>,
+    /// Channel to the ASR engine thread; `None` unless an ASR model is loaded.
+    pub asr_tx: Option<tokio::sync::mpsc::UnboundedSender<AsrTranscribeRequest>>,
     pub model_path: String,
     pub model_type_name: String,
     pub dtype_name: String,
@@ -214,6 +218,41 @@ fn run_tts_loop(
     }
 }
 
+fn transcribe_audio(asr: &mut dyn crane::audio::Asr, req: &AsrTranscribeRequest) -> Result<String, String> {
+    let tmp_file = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
+    std::fs::write(tmp_file.path(), &req.audio_bytes).map_err(|e| e.to_string())?;
+    let tmp_path = tmp_file
+        .path()
+        .to_str()
+        .ok_or_else(|| "temp audio file path is not valid UTF-8".to_string())?;
+
+    let sample_rate = asr.input_sample_rate();
+    let samples = crane::audio::load_wav_f32(tmp_path, sample_rate).map_err(|e| e.to_string())?;
+
+    let defaults = crane_core::generation::TranscribeOptions::default();
+    let opts = crane_core::generation::TranscribeOptions {
+        temperature: req.temperature.unwrap_or(defaults.temperature),
+        language: req.language.clone(),
+        ..defaults
+    };
+    asr.transcribe(&samples, &opts).map(|t| t.text).map_err(|e| e.to_string())
+}
+
+fn run_asr_loop(
+    mut asr_rx: tokio::sync::mpsc::UnboundedReceiver<AsrTranscribeRequest>,
+    model_name: &str,
+    asr: &mut dyn crane::audio::Asr,
+) {
+    info!("{model_name} engine thread started");
+    while let Some(req) = asr_rx.blocking_recv() {
+        let result = transcribe_audio(asr, &req);
+        if let Err(ref e) = result {
+            tracing::error!("ASR transcription failed: {e}");
+        }
+        let _ = req.tx.send(result);
+    }
+}
+
 /// Resolve the compute dtype. An explicit `--dtype` always wins; otherwise
 /// BF16 on CUDA and F32 elsewhere — except model families validated in F16 on
 /// Metal (currently qwen3_5), which default to F16 there (halves weight,
@@ -294,6 +333,7 @@ pub async fn run(args: Args) -> Result<()> {
 
     let is_vlm = resolved_type.is_vlm();
     let is_tts = resolved_type.is_tts();
+    let is_asr = resolved_type.is_asr();
 
     let (
         engine_handle,
@@ -303,6 +343,7 @@ pub async fn run(args: Args) -> Result<()> {
         vlm_tx_opt,
         gemma4_vlm_tx_opt,
         tts_tx_opt,
+        asr_tx_opt,
     ): (
         Option<EngineHandle>,
         tokenizers::Tokenizer,
@@ -311,6 +352,7 @@ pub async fn run(args: Args) -> Result<()> {
         Option<tokio::sync::mpsc::UnboundedSender<VlmRequest>>,
         Option<tokio::sync::mpsc::UnboundedSender<Gemma4VlmRequest>>,
         Option<tokio::sync::mpsc::UnboundedSender<TtsGenerateRequest>>,
+        Option<tokio::sync::mpsc::UnboundedSender<AsrTranscribeRequest>>,
     ) = if is_tts {
         info!("Loading TTS model ({:?}) from: {}", resolved_type, args.model_path);
         let model_path_clone = args.model_path.clone();
@@ -354,7 +396,51 @@ pub async fn run(args: Args) -> Result<()> {
             });
         let eos_id = tokenizer.token_to_id("<|im_end|>").or_else(|| tokenizer.token_to_id("<|endoftext|>")).unwrap_or(2);
         let chat_template = engine::model_factory::create_chat_template(model_type, &args.model_path);
-        (None, tokenizer, vec![eos_id], chat_template, None, None, Some(tts_tx))
+        (None, tokenizer, vec![eos_id], chat_template, None, None, Some(tts_tx), None)
+    } else if is_asr {
+        info!("Loading ASR model ({:?}) from: {}", resolved_type, args.model_path);
+        let model_path_clone = args.model_path.clone();
+        let use_cpu = args.cpu || {
+            #[cfg(feature = "cuda")]
+            {
+                !candle_core::utils::cuda_is_available()
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                true
+            }
+        };
+        let asr_device = if use_cpu { crane_core::models::Device::Cpu } else { device.clone() };
+        let asr_dtype = dtype;
+        let (asr_tx, asr_rx) = tokio::sync::mpsc::unbounded_channel::<AsrTranscribeRequest>();
+        let resolved_name = resolved_type.display_name().to_string();
+        std::thread::Builder::new()
+            .name("asr-engine".into())
+            .spawn(move || {
+                let mut asr = match engine::model_factory::create_asr(
+                    resolved_type,
+                    &model_path_clone,
+                    &asr_device,
+                    &asr_dtype,
+                ) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::error!("Failed to load ASR model: {e}");
+                        return;
+                    }
+                };
+                run_asr_loop(asr_rx, &resolved_name, asr.as_mut());
+            })
+            .expect("Failed to spawn ASR thread");
+        info!("ASR model routing established (type: {:?})", resolved_type);
+        let tokenizer = crane_core::utils::tokenizer_utils::load_tokenizer_from_model_dir(&args.model_path)
+            .unwrap_or_else(|e| {
+                tracing::warn!("Failed to load HF tokenizer: {e}; creating stub for ASR-only mode");
+                tokenizers::Tokenizer::new(tokenizers::models::bpe::BPE::default())
+            });
+        let eos_id = tokenizer.token_to_id("<|im_end|>").or_else(|| tokenizer.token_to_id("<|endoftext|>")).unwrap_or(2);
+        let chat_template = engine::model_factory::create_chat_template(model_type, &args.model_path);
+        (None, tokenizer, vec![eos_id], chat_template, None, None, None, Some(asr_tx))
     } else if is_vlm {
         let use_cpu = args.cpu || {
             #[cfg(feature = "cuda")]
@@ -463,7 +549,7 @@ pub async fn run(args: Args) -> Result<()> {
         }
         info!("VLM model routing established (type: {:?})", resolved_type);
         let eos_id = tokenizer.token_to_id("</s>").or_else(|| tokenizer.token_to_id("<end_of_turn>")) .or_else(|| tokenizer.token_to_id("<|end_of_sentence|>")) .unwrap_or(1);
-        (None, tokenizer, vec![eos_id], chat_template, vlm_tx_opt_inner, gemma4_vlm_tx_opt_inner, None)
+        (None, tokenizer, vec![eos_id], chat_template, vlm_tx_opt_inner, gemma4_vlm_tx_opt_inner, None, None)
     } else {
         let mut backend = engine::model_factory::create_backend(model_type, &args.model_path, &device, &dtype, format, args.quant.as_deref())?;
         info!("Model loaded successfully (type: {:?}, format: {:?})", resolved_type, format);
@@ -479,7 +565,7 @@ pub async fn run(args: Args) -> Result<()> {
         let (engine, handle) = InferenceEngine::new(backend, args.max_concurrent, args.decode_tokens_per_seq, memory_config);
         std::thread::Builder::new().name("inference-engine".into()).spawn(move || engine.run()).expect("Failed to spawn engine thread");
         info!("Inference engine started (max_concurrent={}, decode_tokens_per_seq={})", args.max_concurrent, args.decode_tokens_per_seq);
-        (Some(handle), tokenizer, eos_token_id, chat_template, None, None, None)
+        (Some(handle), tokenizer, eos_token_id, chat_template, None, None, None, None)
     };
 
     let model_name = args.model_name.clone().unwrap_or_else(|| {
@@ -499,6 +585,7 @@ pub async fn run(args: Args) -> Result<()> {
         vlm_tx: vlm_tx_opt,
         gemma4_vlm_tx: gemma4_vlm_tx_opt,
         tts_tx: tts_tx_opt,
+        asr_tx: asr_tx_opt,
         model_path: args.model_path.clone(),
         model_type_name: resolved_type.display_name().to_string(),
         dtype_name,
@@ -520,6 +607,8 @@ pub async fn run(args: Args) -> Result<()> {
         info!("mode: vlm");
     } else if is_tts {
         info!("mode: tts");
+    } else if is_asr {
+        info!("mode: asr");
     } else {
         info!(max_concurrent = args.max_concurrent, decode_tokens_per_seq = args.decode_tokens_per_seq, "scheduler configured");
         if args.max_seq_len > 0 || state.gpu_memory_limit != "unlimited" {
@@ -532,13 +621,23 @@ pub async fn run(args: Args) -> Result<()> {
     Ok(())
 }
 
+/// Maximum accepted size for `/v1/audio/transcriptions` uploads, matching the
+/// OpenAI transcription API's limit. Axum's default body limit (2 MiB) is far
+/// too small for real audio files.
+const MAX_TRANSCRIPTION_UPLOAD_BYTES: usize = 25 * 1024 * 1024;
+
 pub fn build_router(state: Arc<AppState>) -> Router {
+    let transcriptions_router = Router::new()
+        .route("/v1/audio/transcriptions", post(handlers::asr::transcriptions))
+        .layer(DefaultBodyLimit::max(MAX_TRANSCRIPTION_UPLOAD_BYTES));
+
     Router::new()
         .route("/health", get(handlers::common::health))
         .route("/v1/stats", get(handlers::common::stats))
         .route("/v1/chat/completions", post(handlers::openai::chat_completions))
         .route("/v1/completions", post(handlers::openai::completions))
         .route("/v1/audio/speech", post(handlers::tts::speech))
+        .merge(transcriptions_router)
         .route("/v1/models", get(handlers::openai::list_models))
         .route("/v1/models/{model_id}", get(handlers::openai::retrieve_model))
         .route("/v1/tokenize", post(handlers::openai::tokenize))

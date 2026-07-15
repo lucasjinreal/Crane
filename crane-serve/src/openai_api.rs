@@ -366,6 +366,17 @@ pub struct SpeechRequest {
 }
 
 // ═════════════════════════════════════════════════════════════
+//  Audio Transcriptions  (/v1/audio/transcriptions)
+// ═════════════════════════════════════════════════════════════
+
+/// Response body for `POST /v1/audio/transcriptions`.
+#[derive(Debug, Clone, Serialize)]
+pub struct TranscriptionResponse {
+    /// The transcribed text.
+    pub text: String,
+}
+
+// ═════════════════════════════════════════════════════════════
 //  Common types
 // ═════════════════════════════════════════════════════════════
 

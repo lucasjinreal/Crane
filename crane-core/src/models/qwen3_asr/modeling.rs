@@ -79,10 +79,11 @@ impl Qwen3AsrModel {
     ///
     /// `vb` must be the checkpoint root `VarBuilder`. Weight scoping:
     /// audio encoder under `model.audio_tower`, projector under
-    /// `model.multi_modal_projector`, text decoder under
-    /// `model.language_model.*` (nested one level deeper than a standalone
-    /// Qwen3 checkpoint, hence [`Qwen3Model::new_from_model_vb`] rather than
-    /// [`Qwen3Model::new`]).
+    /// `model.multi_modal_projector`, text decoder directly under
+    /// `model.language_model.*` (the checkpoint's `language_model` is a bare
+    /// `Qwen3Model`, not a `Qwen3ForCausalLM` wrapper, so there's no further
+    /// `model.` nesting — hence [`Qwen3Model::new_from_model_vb`] taking
+    /// `lang_vb` as-is rather than [`Qwen3Model::new`], which would add one).
     ///
     /// # Errors
     ///
@@ -98,7 +99,7 @@ impl Qwen3AsrModel {
 
         let lang_vb = model_vb.pp("language_model");
         let qwen3_config = config.text_config.to_qwen3_config();
-        let decoder = Qwen3Model::new_from_model_vb(&qwen3_config, lang_vb.pp("model"), lang_vb)?;
+        let decoder = Qwen3Model::new_from_model_vb(&qwen3_config, lang_vb, vb)?;
 
         Ok(Self {
             encoder,

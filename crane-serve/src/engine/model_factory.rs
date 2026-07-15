@@ -30,6 +30,7 @@ pub enum ModelType {
     Qwen3TTS,
     VoxtralTTS,
     PaddleOcrVl,
+    Qwen3ASR,
 }
 
 impl ModelType {
@@ -48,6 +49,7 @@ impl ModelType {
             "qwen3_tts" | "qwen3tts" | "qwen3-tts" | "tts" => Self::Qwen3TTS,
             "voxtral_tts" | "voxtral-tts" | "voxtral" | "voxtral_4b" => Self::VoxtralTTS,
             "paddleocr_vl" | "paddleocrv" | "paddleocr" | "paddle_ocr_vl" | "paddleocrvl" => Self::PaddleOcrVl,
+            "qwen3_asr" | "qwen3asr" | "qwen3-asr" | "asr" => Self::Qwen3ASR,
             _ => Self::Auto,
         }
     }
@@ -65,6 +67,7 @@ impl ModelType {
             Self::Qwen3TTS => "qwen3_tts",
             Self::VoxtralTTS => "voxtral_tts",
             Self::PaddleOcrVl => "paddleocr_vl",
+            Self::Qwen3ASR => "qwen3_asr",
         }
     }
 
@@ -78,6 +81,12 @@ impl ModelType {
     #[must_use]
     pub fn is_tts(&self) -> bool {
         matches!(self, Self::Qwen3TTS | Self::VoxtralTTS)
+    }
+
+    /// Whether this model type is an ASR model.
+    #[must_use]
+    pub fn is_asr(&self) -> bool {
+        matches!(self, Self::Qwen3ASR)
     }
 }
 
@@ -150,6 +159,7 @@ pub fn detect_model_type(model_path: &str) -> ModelType {
                 "qwen3" => return ModelType::Qwen3,
                 "qwen3_5" | "qwen3.5" => return ModelType::Qwen3_5,
                 "qwen3_tts" | "qwen3tts" => return ModelType::Qwen3TTS,
+                "qwen3_asr" | "qwen3asr" => return ModelType::Qwen3ASR,
                 m if m.contains("hunyuan") => return ModelType::HunyuanDense,
                 m if m.contains("paddleocr") => return ModelType::PaddleOcrVl,
                 _ => {}
@@ -171,6 +181,9 @@ pub fn detect_model_type(model_path: &str) -> ModelType {
                 }
                 if a.contains("qwen3ttsforconditional") || a.contains("qwen3_tts") {
                     return ModelType::Qwen3TTS;
+                }
+                if a.contains("qwen3asrforconditional") || a.contains("qwen3_asr") {
+                    return ModelType::Qwen3ASR;
                 }
                 if a.contains("qwen3_5") || a.contains("qwen3.5") {
                     return ModelType::Qwen3_5;
@@ -218,6 +231,8 @@ pub fn detect_model_type(model_path: &str) -> ModelType {
         ModelType::HunyuanDense
     } else if path_lower.contains("qwen3-tts") || path_lower.contains("qwen3_tts") || path_lower.contains("qwen3tts") {
         ModelType::Qwen3TTS
+    } else if path_lower.contains("qwen3-asr") || path_lower.contains("qwen3_asr") || path_lower.contains("qwen3asr") {
+        ModelType::Qwen3ASR
     } else if path_lower.contains("qwen3.5") || path_lower.contains("qwen3_5") || path_lower.contains("qwen35") {
         ModelType::Qwen3_5
     } else if path_lower.contains("qwen3") {
@@ -341,6 +356,9 @@ pub fn create_backend(
         ModelType::VoxtralTTS => {
             anyhow::bail!("Voxtral-TTS is a TTS model — use create_tts() instead of create_backend()")
         }
+        ModelType::Qwen3ASR => {
+            anyhow::bail!("Qwen3-ASR is an ASR model — use create_asr() instead of create_backend()")
+        }
         ModelType::Auto => unreachable!(),
     }
 }
@@ -435,6 +453,31 @@ pub fn create_tts(
     }
 }
 
+/// Create an ASR model as a trait object.
+///
+/// Unified entrypoint for all ASR model types; the returned `Box<dyn Asr + Send>`
+/// can be moved into a dedicated thread without model-specific branching.
+///
+/// # Errors
+///
+/// Returns an error if `model_type` does not resolve to an ASR variant or the
+/// model fails to load from `model_path`.
+pub fn create_asr(
+    model_type: ModelType,
+    model_path: &str,
+    device: &Device,
+    dtype: &DType,
+) -> Result<Box<dyn crane::audio::Asr + Send>> {
+    tracing::info!("Creating {} model from: {}", model_type.display_name(), model_path);
+    match model_type {
+        ModelType::Qwen3ASR => {
+            let model = crane_core::models::qwen3_asr::Model::new(model_path, device, dtype)?;
+            Ok(Box::new(model))
+        }
+        other => anyhow::bail!("{other:?} is not an ASR model type"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -483,11 +526,28 @@ mod tests {
     }
 
     #[test]
+    fn model_type_from_str_asr_variants() {
+        assert_eq!(ModelType::from_str("qwen3_asr"), ModelType::Qwen3ASR);
+        assert_eq!(ModelType::from_str("qwen3asr"), ModelType::Qwen3ASR);
+        assert_eq!(ModelType::from_str("qwen3-asr"), ModelType::Qwen3ASR);
+        assert_eq!(ModelType::from_str("asr"), ModelType::Qwen3ASR);
+        assert_eq!(ModelType::from_str("ASR"), ModelType::Qwen3ASR);
+    }
+
+    #[test]
+    fn model_type_is_asr() {
+        assert!(ModelType::Qwen3ASR.is_asr());
+        assert!(!ModelType::Qwen3.is_asr());
+        assert!(!ModelType::Qwen3TTS.is_asr());
+    }
+
+    #[test]
     fn model_type_display_name() {
         assert_eq!(ModelType::Auto.display_name(), "auto");
         assert_eq!(ModelType::HunyuanDense.display_name(), "hunyuan");
         assert_eq!(ModelType::Qwen25.display_name(), "qwen25");
         assert_eq!(ModelType::Qwen3.display_name(), "qwen3");
+        assert_eq!(ModelType::Qwen3ASR.display_name(), "qwen3_asr");
     }
 
     // ── ModelFormat::from_str ──
@@ -519,6 +579,34 @@ mod tests {
         std::fs::write(&config, r#"{"model_type": "qwen3"}"#).unwrap();
         let result = detect_model_type(dir.path().to_str().unwrap());
         assert_eq!(result, ModelType::Qwen3);
+    }
+
+    #[test]
+    fn detect_from_config_json_model_type_qwen3_asr() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.json");
+        std::fs::write(&config, r#"{"model_type": "qwen3_asr"}"#).unwrap();
+        let result = detect_model_type(dir.path().to_str().unwrap());
+        assert_eq!(result, ModelType::Qwen3ASR);
+    }
+
+    #[test]
+    fn detect_from_config_json_architectures_qwen3_asr() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.json");
+        std::fs::write(
+            &config,
+            r#"{"architectures": ["Qwen3ASRForConditionalGeneration"]}"#,
+        )
+        .unwrap();
+        let result = detect_model_type(dir.path().to_str().unwrap());
+        assert_eq!(result, ModelType::Qwen3ASR);
+    }
+
+    #[test]
+    fn detect_path_heuristic_qwen3_asr() {
+        let result = detect_model_type("/models/Qwen3-ASR-0.6B-hf");
+        assert_eq!(result, ModelType::Qwen3ASR);
     }
 
     #[test]

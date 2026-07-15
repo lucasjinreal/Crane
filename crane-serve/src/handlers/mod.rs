@@ -6,7 +6,9 @@
 //! | `openai` | `/v1/chat/completions`, `/v1/completions`, etc. |
 //! | `sglang` | `/generate`, `/model_info`, `/server_info`, etc.|
 //! | `tts`    | `/v1/audio/speech`                              |
+//! | `asr`    | `/v1/audio/transcriptions`                      |
 
+pub mod asr;
 pub mod common;
 pub mod openai;
 pub mod sglang;
