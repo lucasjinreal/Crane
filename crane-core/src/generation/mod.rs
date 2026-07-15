@@ -36,6 +36,8 @@ pub struct TranscribeOptions {
     pub top_p: Option<f64>,
     /// Repetition penalty applied to previously generated tokens; `1.0` means no penalty.
     pub repetition_penalty: f32,
+    /// Number of most recent tokens considered for the repetition penalty.
+    pub repeat_last_n: usize,
     /// Optional language hint (`"auto"` for detection, else e.g. `"en"`/`"zh"`).
     pub language: Option<String>,
 }
@@ -47,6 +49,7 @@ impl Default for TranscribeOptions {
             temperature: 0.9,
             top_p: None,
             repetition_penalty: 1.05,
+            repeat_last_n: 64,
             language: None,
         }
     }

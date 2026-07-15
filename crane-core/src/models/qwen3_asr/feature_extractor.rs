@@ -30,7 +30,7 @@ const N_FFT: usize = 400;
 /// Hop length between STFT frames, in samples — 100Hz frame rate at 16kHz.
 const HOP_LENGTH: usize = 160;
 /// Audio sample rate the feature extractor expects, in Hz.
-const SAMPLE_RATE: usize = 16_000;
+pub(crate) const SAMPLE_RATE: usize = 16_000;
 /// Shortest input `extract` will process, in samples (0.5s at 16kHz) —
 /// `WhisperFeatureExtractor`'s `min_length`; shorter input is zero-padded up
 /// to this length before extraction.
