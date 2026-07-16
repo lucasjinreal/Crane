@@ -4,10 +4,13 @@
 //! audio feature extraction, prompt construction, and the autoregressive
 //! decode loop that turns audio into transcribed text.
 
+use std::time::Instant;
+
 use anyhow::{Context, Result};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::LogitsProcessor;
+use ribo::utils::log;
 
 use super::config::Config;
 use super::feature_extractor::{
@@ -126,14 +129,18 @@ impl Model {
         let eos_token_id = &self.config.eos_token_id;
 
         let mut generated_tokens: Vec<u32> = Vec::new();
+        let prefill_start = Instant::now();
         let mut logits = self
             .inner
             .forward(&input_ids_tensor, &features.input_features)?
             .squeeze(0)?
             .squeeze(0)?
             .to_dtype(DType::F32)?;
+        self.device.synchronize()?;
+        let prefill_elapsed = prefill_start.elapsed();
         let mut pos = prefill_len;
 
+        let decode_start = Instant::now();
         while generated_tokens.len() < opts.max_new_tokens {
             let sampling_logits = if (opts.repetition_penalty - 1.0).abs() < f32::EPSILON {
                 logits
@@ -160,6 +167,19 @@ impl Model {
                 .to_dtype(DType::F32)?;
             pos += 1;
         }
+        self.device.synchronize()?;
+        let decode_elapsed = decode_start.elapsed();
+        // `generated_tokens.len()` is bounded by `opts.max_new_tokens`, far
+        // below f64's 2^53 exact-integer range, so this cast is lossless in
+        // practice.
+        #[allow(clippy::cast_precision_loss)]
+        let decode_tokens_per_sec = generated_tokens.len() as f64 / decode_elapsed.as_secs_f64();
+        log::info!(
+            "qwen3_asr forward: prefill {:.1}ms, decode {} tokens in {:.1}ms ({decode_tokens_per_sec:.1} tok/s)",
+            prefill_elapsed.as_secs_f64() * 1000.0,
+            generated_tokens.len(),
+            decode_elapsed.as_secs_f64() * 1000.0,
+        );
 
         self.inner.clear_kv_cache();
 
