@@ -120,9 +120,10 @@ impl Model {
 
         let temperature = (opts.temperature > 0.0).then_some(opts.temperature);
         let mut logits_processor = LogitsProcessor::new(1024, temperature, opts.top_p);
-        // Cloned because `self.inner` is borrowed mutably inside the decode
-        // loop below.
-        let eos_token_id = self.inner.eos_token_id().to_vec();
+        // Read from `self.config`  so this doesn't need to be cloned.  the decode loop below, but
+        // `self.config` is a disjoint field, and `Qwen3AsrModel::new` clones `config.eos_token_id`
+        // into `self.inner` at load time.
+        let eos_token_id = &self.config.eos_token_id;
 
         let mut generated_tokens: Vec<u32> = Vec::new();
         let mut logits = self
