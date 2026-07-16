@@ -415,23 +415,84 @@ impl AudioEncoderAttention {
         // block only ever attends within itself, so this is O(n) total
         // matmul/softmax cost across blocks rather than O(n^2) (see
         // `build_cu_seqlens`'s doc comment).
-        let mut outputs = Vec::with_capacity(cu_seqlens.len() - 1);
-        for window in cu_seqlens.windows(2) {
-            let start = window[0];
-            let len = window[1] - start;
+        //
+        // Most blocks share the same length (TOKENS_PER_WINDOW-derived),
+        // so we batch all uniform-length blocks into a single matmul call
+        // — reducing N separate kernel launches to one for the common case.
+        // Only a trailing shorter block (if any) falls back to the
+        // per-block path.
+        let n_blocks = cu_seqlens.len() - 1;
+        let block_len = cu_seqlens[1] - cu_seqlens[0];
+        let mut n_full = n_blocks;
+        for i in 1..n_blocks {
+            if cu_seqlens[i + 1] - cu_seqlens[i] != block_len {
+                n_full = i;
+                break;
+            }
+        }
+        // `build_cu_seqlens` groups chunks via `chunks(chunks_per_block)`,
+        // which can only make the *last* group shorter than the rest — so
+        // at most one trailing block may differ in length. The fallback
+        // path below only handles a single trailing block; if this
+        // invariant is ever violated (e.g. `cu_seqlens` built some other
+        // way), the batched reshape below would silently drop all but the
+        // first non-uniform block instead of processing every block.
+        debug_assert!(
+            n_full >= n_blocks - 1,
+            "expected at most one trailing non-uniform block, got {} \
+             non-uniform blocks",
+            n_blocks - n_full
+        );
+
+        // Softmax in f32 for numerical stability, matching GqaAttention's
+        // convention, then cast back to the working dtype.
+        let softmax_f32 = |weights: &Tensor, out_dtype: DType| -> Result<Tensor> {
+            candle_nn::ops::softmax(&weights.to_dtype(DType::F32)?, D::Minus1)?
+                .to_dtype(out_dtype)
+        };
+
+        let mut outputs: Vec<Tensor> = Vec::with_capacity(2);
+
+        // Batched path: reshape all uniform blocks into an extra batch
+        // dimension and run a single matmul/softmax.
+        if n_full > 0 {
+            let total_full_len = n_full * block_len;
+            let v_dtype = value.dtype();
+            let q_all = query
+                .narrow(2, 0, total_full_len)?
+                .contiguous()?
+                .reshape((batch * self.n_heads * n_full, block_len, self.head_dim))?;
+            let k_all = key
+                .narrow(2, 0, total_full_len)?
+                .contiguous()?
+                .reshape((batch * self.n_heads * n_full, block_len, self.head_dim))?;
+            let v_all = value
+                .narrow(2, 0, total_full_len)?
+                .contiguous()?
+                .reshape((batch * self.n_heads * n_full, block_len, self.head_dim))?;
+
+            let attn_weights = (q_all.matmul(&k_all.transpose(1, 2)?)? * self.scale)?;
+            let attn_weights = softmax_f32(&attn_weights, v_dtype)?;
+            let batched = attn_weights
+                .matmul(&v_all)?
+                .reshape((batch, self.n_heads, n_full * block_len, self.head_dim))?;
+            outputs.push(batched);
+        }
+
+        // Fallback: trailing shorter block, if any.
+        if n_full < n_blocks {
+            let start = cu_seqlens[n_full];
+            let len = cu_seqlens[n_full + 1] - start;
 
             let q_block = query.narrow(2, start, len)?.contiguous()?;
             let k_block = key.narrow(2, start, len)?.contiguous()?;
             let v_block = value.narrow(2, start, len)?.contiguous()?;
 
             let attn_weights = (q_block.matmul(&k_block.transpose(2, 3)?)? * self.scale)?;
-            // Softmax in f32 for numerical stability, matching
-            // GqaAttention's convention, then cast back to the working dtype.
-            let attn_weights =
-                candle_nn::ops::softmax(&attn_weights.to_dtype(DType::F32)?, D::Minus1)?
-                    .to_dtype(v_block.dtype())?;
+            let attn_weights = softmax_f32(&attn_weights, v_block.dtype())?;
             outputs.push(attn_weights.matmul(&v_block)?);
         }
+
         let attn_output = Tensor::cat(&outputs, 2)?;
 
         let attn_output = attn_output.transpose(1, 2)?.contiguous()?.reshape((
@@ -1350,5 +1411,163 @@ mod tests {
             Tensor::zeros((1, config.num_mel_bins, 100), DType::F32, &Device::Cpu).expect("mel");
         let out = encoder.forward(&mel).expect("forward");
         assert_eq!(out.dims(), &[1, TOKENS_PER_WINDOW, config.d_model]);
+    }
+
+    #[test]
+    fn encoder_batched_attention_with_trailing_shorter_block() {
+        // Shape-level sanity check that the batched-attention plumbing is
+        // wired correctly through `AudioEncoderLayer::forward`: 1350 frames
+        // = 13 full chunks (13 tokens each) + 50-frame remainder (7 tokens)
+        // = 176 total tokens. With chunks_per_block=8, block 0 has 8 chunks
+        // (104 tokens), block 1 has 5 full + remainder (72 tokens). Block
+        // 0's uniform-length chunks go through the batched path; block 1
+        // (shorter) goes through the per-block fallback. Numeric
+        // correctness of the batched path (including the `n_full >= 2`
+        // case) is covered separately by
+        // `batched_attention_matches_per_block_reference` below.
+        let config = small_encoder_config();
+        let vb = make_layer_vb(&config);
+        let layer = AudioEncoderLayer::new(&config, vb).expect("new");
+
+        let n_frames = 1350;
+        let (n_full_chunks, remainder) = chunk_split(n_frames);
+        assert_eq!(n_full_chunks, 13);
+        assert_eq!(remainder, 50);
+
+        let cu_seqlens = build_cu_seqlens(n_frames, 8);
+        let total_tokens = get_feat_extract_output_lengths(n_frames);
+        assert_eq!(*cu_seqlens.last().unwrap(), total_tokens);
+        assert_eq!(cu_seqlens.len(), 3);
+        // Block 0 = 8 full chunks = 8 * 13 tokens.
+        assert_eq!(cu_seqlens[1] - cu_seqlens[0], 8 * TOKENS_PER_WINDOW);
+
+        let hidden =
+            Tensor::randn(0f32, 1f32, (1, total_tokens, config.d_model), &Device::Cpu)
+                .expect("randn");
+        let out = layer.forward(&hidden, &cu_seqlens).expect("forward");
+        assert_eq!(out.dims(), &[1, total_tokens, config.d_model]);
+    }
+
+    #[test]
+    fn batched_attention_matches_per_block_reference() {
+        // Numeric-equivalence check for the batched-matmul optimization in
+        // `AudioEncoderAttention::forward`: exercises `n_full >= 2` (unlike
+        // `encoder_batched_attention_with_trailing_shorter_block` above,
+        // which only ever produces a single full block) plus a trailing
+        // shorter block, and compares the batched result against a
+        // from-scratch reimplementation of the original per-block loop —
+        // the only way to catch a `batch * n_heads * n_full` reshape/
+        // ordering regression, which a shape-only assertion would miss.
+        //
+        // 350 frames = 3 full chunks (13 tokens each) + 50-frame remainder
+        // (7 tokens). With chunks_per_block=1, each full chunk gets its own
+        // block: cu_seqlens = [0, 13, 26, 39, 46], i.e. 3 uniform full
+        // blocks (n_full=3) followed by one shorter 7-token block.
+        let config = small_encoder_config();
+        let vb = make_nonzero_attn_layer_vb(&config, 0.01);
+        let attn = AudioEncoderAttention::new(&config, vb.pp("self_attn")).expect("new");
+
+        let n_frames = 350;
+        let cu_seqlens = build_cu_seqlens(n_frames, 1);
+        assert_eq!(cu_seqlens, vec![0, 13, 26, 39, 46]);
+        let n_full = 3;
+        assert_eq!(cu_seqlens[n_full + 1] - cu_seqlens[n_full], 7);
+
+        let total_tokens = *cu_seqlens.last().unwrap();
+        let hidden =
+            Tensor::randn(0f32, 1f32, (1, total_tokens, config.d_model), &Device::Cpu)
+                .expect("randn hidden");
+
+        let batched_out = attn.forward(&hidden, &cu_seqlens).expect("batched forward");
+
+        // From-scratch per-block reference: project Q/K/V once (shared with
+        // the code under test — projections aren't what's being verified
+        // here), then run each block's attention independently via plain
+        // narrow/matmul/softmax/matmul, exactly mirroring the pre-optimization
+        // loop that this commit replaced.
+        let (batch, seq_len, _d) = hidden.dims3().expect("dims3");
+        let shape = (batch, seq_len, attn.n_heads, attn.head_dim);
+        let query = attn
+            .q_proj
+            .forward(&hidden)
+            .expect("q_proj")
+            .reshape(shape)
+            .expect("reshape q")
+            .transpose(1, 2)
+            .expect("transpose q");
+        let key = attn
+            .k_proj
+            .forward(&hidden)
+            .expect("k_proj")
+            .reshape(shape)
+            .expect("reshape k")
+            .transpose(1, 2)
+            .expect("transpose k");
+        let value = attn
+            .v_proj
+            .forward(&hidden)
+            .expect("v_proj")
+            .reshape(shape)
+            .expect("reshape v")
+            .transpose(1, 2)
+            .expect("transpose v");
+
+        let mut ref_outputs = Vec::with_capacity(cu_seqlens.len() - 1);
+        for window in cu_seqlens.windows(2) {
+            let start = window[0];
+            let len = window[1] - start;
+
+            let q_block = query
+                .narrow(2, start, len)
+                .expect("narrow q")
+                .contiguous()
+                .expect("contig q");
+            let k_block = key
+                .narrow(2, start, len)
+                .expect("narrow k")
+                .contiguous()
+                .expect("contig k");
+            let v_block = value
+                .narrow(2, start, len)
+                .expect("narrow v")
+                .contiguous()
+                .expect("contig v");
+
+            let attn_weights = (q_block.matmul(&k_block.transpose(2, 3).expect("transpose k_block"))
+                .expect("matmul qk")
+                * attn.scale)
+                .expect("scale");
+            let attn_weights = candle_nn::ops::softmax(
+                &attn_weights.to_dtype(DType::F32).expect("to f32"),
+                D::Minus1,
+            )
+            .expect("softmax")
+            .to_dtype(v_block.dtype())
+            .expect("to dtype");
+            ref_outputs.push(attn_weights.matmul(&v_block).expect("matmul av"));
+        }
+        let ref_attn_output = Tensor::cat(&ref_outputs, 2).expect("cat");
+        let ref_attn_output = ref_attn_output
+            .transpose(1, 2)
+            .expect("transpose out")
+            .contiguous()
+            .expect("contig out")
+            .reshape((batch, seq_len, attn.n_heads * attn.head_dim))
+            .expect("reshape out");
+        let ref_out = attn.out_proj.forward(&ref_attn_output).expect("out_proj");
+
+        let max_abs_diff = (&batched_out - &ref_out)
+            .expect("sub")
+            .abs()
+            .expect("abs")
+            .max_all()
+            .expect("max_all")
+            .to_scalar::<f32>()
+            .expect("scalar");
+        assert!(
+            max_abs_diff < 1e-5,
+            "batched attention output must match per-block reference, \
+             max_abs_diff={max_abs_diff}"
+        );
     }
 }
