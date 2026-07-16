@@ -60,7 +60,11 @@ pub struct AudioFeatures {
 /// `WhisperFeatureExtractor`'s parameters (`n_fft=400`, `hop_length=160`,
 /// `sampling_rate=16000`) as used by `Qwen3ASRProcessor` (§3).
 pub struct WhisperFeatureExtractor {
-    mel_filters: Vec<f32>,
+    /// Slaney mel filterbank, transposed to `[n_bins, n_mels]` and made
+    /// contiguous so `extract` can project a whole utterance's power
+    /// spectrogram through it with a single `matmul` rather than a
+    /// per-frame scalar dot-product loop.
+    mel_filters_t: Tensor,
     hann_window: Vec<f32>,
     /// Precomputed forward FFT plan for [`N_FFT`], built once since the
     /// transform size is a fixed constant.
@@ -73,18 +77,25 @@ pub struct WhisperFeatureExtractor {
 impl WhisperFeatureExtractor {
     /// Builds a feature extractor producing `n_mels` mel bands
     /// (`AudioConfig::num_mel_bins`).
-    #[must_use]
-    pub fn new(n_mels: usize, device: &Device, dtype: DType) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if building the mel filterbank tensor fails.
+    pub fn new(n_mels: usize, device: &Device, dtype: DType) -> Result<Self> {
+        let n_bins = N_FFT / 2 + 1;
         let mel_filters = build_mel_filterbank(SAMPLE_RATE, N_FFT, n_mels, 0.0, FMAX);
+        let mel_filters_t = Tensor::from_vec(mel_filters, (n_mels, n_bins), &Device::Cpu)?
+            .transpose(0, 1)?
+            .contiguous()?;
         let mut planner = FftPlanner::<f32>::new();
-        Self {
-            mel_filters,
+        Ok(Self {
+            mel_filters_t,
             hann_window: hann_window(N_FFT),
             fft: planner.plan_fft_forward(N_FFT),
             n_mels,
             device: device.clone(),
             dtype,
-        }
+        })
     }
 
     /// Extracts log-mel spectrogram features from mono `f32` PCM samples at
@@ -111,8 +122,7 @@ impl WhisperFeatureExtractor {
         let padded = reflect_pad(&samples, N_FFT / 2);
 
         let mut buffer = vec![FftComplex::new(0.0, 0.0); N_FFT];
-        let mut power = vec![0f32; n_bins];
-        let mut mel_frames = Vec::with_capacity(n_frames * self.n_mels);
+        let mut all_power = Vec::with_capacity(n_frames * n_bins);
 
         for frame_idx in 0..n_frames {
             let start = frame_idx * HOP_LENGTH;
@@ -122,16 +132,18 @@ impl WhisperFeatureExtractor {
             self.fft.process(&mut buffer);
 
             // Power spectrum (magnitude-squared), not magnitude.
-            for (k, p) in power.iter_mut().enumerate() {
-                let c = buffer[k];
-                *p = c.re * c.re + c.im * c.im;
-            }
+            all_power.extend(buffer[..n_bins].iter().map(|c| c.re * c.re + c.im * c.im));
+        }
 
-            for m in 0..self.n_mels {
-                let row = &self.mel_filters[m * n_bins..(m + 1) * n_bins];
-                let val: f32 = row.iter().zip(power.iter()).map(|(f, p)| f * p).sum();
-                mel_frames.push(val.max(1e-10).log10());
-            }
+        // Batched mel projection: [n_frames, n_bins] x [n_bins, n_mels] via
+        // a single matmul instead of a per-frame scalar dot-product loop.
+        let power_t = Tensor::from_vec(all_power, (n_frames, n_bins), &Device::Cpu)?;
+        let mut mel_frames = power_t
+            .matmul(&self.mel_filters_t)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        for v in &mut mel_frames {
+            *v = v.max(1e-10).log10();
         }
 
         // Per-utterance dynamic-range clamp + rescale, matching
@@ -210,7 +222,8 @@ mod tests {
 
     #[test]
     fn mel_shape_matches_frame_rate() {
-        let extractor = WhisperFeatureExtractor::new(TEST_N_MELS, &Device::Cpu, DType::F32);
+        let extractor =
+            WhisperFeatureExtractor::new(TEST_N_MELS, &Device::Cpu, DType::F32).expect("new");
         let samples = vec![0.0f32; SAMPLE_RATE]; // 1s of silence
         let features = extractor.extract(&samples).expect("extract");
         assert_eq!(features.real_frame_count, 100);
@@ -219,7 +232,8 @@ mod tests {
 
     #[test]
     fn real_frame_count_scales_with_audio_length() {
-        let extractor = WhisperFeatureExtractor::new(TEST_N_MELS, &Device::Cpu, DType::F32);
+        let extractor =
+            WhisperFeatureExtractor::new(TEST_N_MELS, &Device::Cpu, DType::F32).expect("new");
 
         let one_second = vec![0.0f32; SAMPLE_RATE];
         assert_eq!(
@@ -242,7 +256,8 @@ mod tests {
 
     #[test]
     fn silence_is_constant_log_floor() {
-        let extractor = WhisperFeatureExtractor::new(TEST_N_MELS, &Device::Cpu, DType::F32);
+        let extractor =
+            WhisperFeatureExtractor::new(TEST_N_MELS, &Device::Cpu, DType::F32).expect("new");
         let samples = vec![0.0f32; SAMPLE_RATE];
         let features = extractor.extract(&samples).expect("extract");
         let data = features
@@ -266,7 +281,8 @@ mod tests {
 
     #[test]
     fn short_audio_is_padded_to_min_length() {
-        let extractor = WhisperFeatureExtractor::new(TEST_N_MELS, &Device::Cpu, DType::F32);
+        let extractor =
+            WhisperFeatureExtractor::new(TEST_N_MELS, &Device::Cpu, DType::F32).expect("new");
 
         // Below MIN_LENGTH: zero-padded up to MIN_LENGTH (8000 samples / 50 frames).
         let short = vec![0.0f32; 100];
@@ -293,7 +309,8 @@ mod tests {
         // pipeline against this same implementation; a regression in the
         // window, padding, FFT, filterbank, or normalization math will
         // change them.
-        let extractor = WhisperFeatureExtractor::new(TEST_N_MELS, &Device::Cpu, DType::F32);
+        let extractor =
+            WhisperFeatureExtractor::new(TEST_N_MELS, &Device::Cpu, DType::F32).expect("new");
         let sr = SAMPLE_RATE as f32;
         let samples: Vec<f32> = (0..SAMPLE_RATE)
             .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / sr).sin())

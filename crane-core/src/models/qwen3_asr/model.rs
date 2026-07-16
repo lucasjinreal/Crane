@@ -77,7 +77,7 @@ impl Model {
         let inner = Qwen3AsrModel::new(&config, vb)?;
 
         let feature_extractor =
-            WhisperFeatureExtractor::new(config.audio_config.num_mel_bins, device, *dtype);
+            WhisperFeatureExtractor::new(config.audio_config.num_mel_bins, device, *dtype)?;
 
         Ok(Self {
             inner,
