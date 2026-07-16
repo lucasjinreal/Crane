@@ -20,8 +20,10 @@
 //! `% 100` / `// 100` chunking formula, which only makes sense against the
 //! audio's real length.
 
+use std::sync::Arc;
+
 use candle_core::{DType, Device, Result, Tensor};
-use rustfft::{FftPlanner, num_complex::Complex as FftComplex};
+use rustfft::{Fft, FftPlanner, num_complex::Complex as FftComplex};
 
 use crate::models::modules::mel::{build_mel_filterbank, hann_window, reflect_pad};
 
@@ -60,6 +62,9 @@ pub struct AudioFeatures {
 pub struct WhisperFeatureExtractor {
     mel_filters: Vec<f32>,
     hann_window: Vec<f32>,
+    /// Precomputed forward FFT plan for [`N_FFT`], built once since the
+    /// transform size is a fixed constant.
+    fft: Arc<dyn Fft<f32>>,
     n_mels: usize,
     device: Device,
     dtype: DType,
@@ -71,9 +76,11 @@ impl WhisperFeatureExtractor {
     #[must_use]
     pub fn new(n_mels: usize, device: &Device, dtype: DType) -> Self {
         let mel_filters = build_mel_filterbank(SAMPLE_RATE, N_FFT, n_mels, 0.0, FMAX);
+        let mut planner = FftPlanner::<f32>::new();
         Self {
             mel_filters,
             hann_window: hann_window(N_FFT),
+            fft: planner.plan_fft_forward(N_FFT),
             n_mels,
             device: device.clone(),
             dtype,
@@ -103,8 +110,6 @@ impl WhisperFeatureExtractor {
         let n_frames = samples.len() / HOP_LENGTH;
         let padded = reflect_pad(&samples, N_FFT / 2);
 
-        let mut planner = FftPlanner::<f32>::new();
-        let fft = planner.plan_fft_forward(N_FFT);
         let mut buffer = vec![FftComplex::new(0.0, 0.0); N_FFT];
         let mut power = vec![0f32; n_bins];
         let mut mel_frames = Vec::with_capacity(n_frames * self.n_mels);
@@ -114,7 +119,7 @@ impl WhisperFeatureExtractor {
             for (i, b) in buffer.iter_mut().enumerate() {
                 *b = FftComplex::new(padded[start + i] * self.hann_window[i], 0.0);
             }
-            fft.process(&mut buffer);
+            self.fft.process(&mut buffer);
 
             // Power spectrum (magnitude-squared), not magnitude.
             for (k, p) in power.iter_mut().enumerate() {
