@@ -2,8 +2,11 @@
 //! wide output to the text decoder's `output_dim`-wide (`hidden_size`)
 //! embedding space.
 
+use std::time::Instant;
+
 use candle_core::{Module, Result, Tensor};
 use candle_nn::{Activation, VarBuilder};
+use ribo::utils::log;
 
 use super::audio_encoder::AudioEncoder;
 use super::config::{AudioConfig, Config};
@@ -130,8 +133,13 @@ impl Qwen3AsrModel {
     /// `input_ids` doesn't match the audio encoder's output token count for
     /// `mel`, or if any tensor operation fails.
     pub fn forward(&mut self, input_ids: &Tensor, mel: &Tensor) -> Result<Tensor> {
+        let device = mel.device();
+
+        let embed_start = Instant::now();
         let input_embeds = self.decoder.embed_tokens().forward(input_ids)?;
         let (_batch, seq_len, _hidden_dim) = input_embeds.dims3()?;
+        device.synchronize()?;
+        let embed_elapsed = embed_start.elapsed();
 
         // Indices must be known on the host to locate the placeholder run;
         // this sync happens once per utterance during prefill, not per
@@ -149,8 +157,17 @@ impl Qwen3AsrModel {
             .map_or(ids.len(), |offset| start + offset);
         let placeholder_count = end - start;
 
-        let audio_embeds = self.projector.forward(&self.encoder.forward(mel)?)?;
+        let audio_encoder_start = Instant::now();
+        let audio_encoder_out = self.encoder.forward(mel)?;
+        device.synchronize()?;
+        let audio_encoder_elapsed = audio_encoder_start.elapsed();
+
+        let projector_start = Instant::now();
+        let audio_embeds = self.projector.forward(&audio_encoder_out)?;
         let audio_embeds = audio_embeds.to_dtype(input_embeds.dtype())?;
+        device.synchronize()?;
+        let projector_elapsed = projector_start.elapsed();
+
         let n_audio_tokens = audio_embeds.dim(1)?;
         if placeholder_count != n_audio_tokens {
             candle_core::bail!(
@@ -161,11 +178,29 @@ impl Qwen3AsrModel {
             );
         }
 
+        let splice_start = Instant::now();
         let prefix = input_embeds.narrow(1, 0, start)?;
         let suffix = input_embeds.narrow(1, end, seq_len - end)?;
         let input_embeds = Tensor::cat(&[&prefix, &audio_embeds, &suffix], 1)?;
+        device.synchronize()?;
+        let splice_elapsed = splice_start.elapsed();
 
-        self.decoder.forward_embeds(&input_embeds, 0)
+        let decoder_start = Instant::now();
+        let logits = self.decoder.forward_embeds(&input_embeds, 0)?;
+        device.synchronize()?;
+        let decoder_elapsed = decoder_start.elapsed();
+
+        log::info!(
+            "qwen3_asr prefill breakdown: embed {:.1}ms, audio_encoder {:.1}ms, \
+             projector {:.1}ms, splice {:.1}ms, decoder {:.1}ms",
+            embed_elapsed.as_secs_f64() * 1000.0,
+            audio_encoder_elapsed.as_secs_f64() * 1000.0,
+            projector_elapsed.as_secs_f64() * 1000.0,
+            splice_elapsed.as_secs_f64() * 1000.0,
+            decoder_elapsed.as_secs_f64() * 1000.0,
+        );
+
+        Ok(logits)
     }
 
     /// Autoregressive decode step: runs a single new token through the text
