@@ -31,7 +31,11 @@ by `torch.cuda.synchronize()`. Output:
 Forward time elapsed: 1345.2ms
 Total tokens generated: 87
 Tokens per second: 64.68
+Transcription: Long before modern navigation systems existed, sailors relied on the stars...
 ```
+
+The `Transcription` line lets you diff the torch and Crane output text directly,
+not just timing.
 
 ## Crane side: server log line
 

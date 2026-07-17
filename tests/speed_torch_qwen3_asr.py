@@ -50,9 +50,14 @@ def benchmark_asr(model_path, audio_path):
     total_tokens = output_ids.shape[1] - prompt_len
     tokens_per_sec = total_tokens / elapsed
 
+    transcription = processor.batch_decode(
+        output_ids[:, prompt_len:], skip_special_tokens=True
+    )[0]
+
     print(f"Forward time elapsed: {elapsed * 1000:.1f}ms")
     print(f"Total tokens generated: {total_tokens}")
     print(f"Tokens per second: {tokens_per_sec:.2f}")
+    print(f"Transcription: {transcription}")
 
 
 if __name__ == "__main__":
