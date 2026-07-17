@@ -15,10 +15,13 @@
 //!      compute-bound or an explicit per-sequence mask is required, and to
 //!      a standard SDPA for GPU or batched (B>1) prefill, or when
 //!      num_heads == num_kv_heads (no GQA grouping needed).
-//! 3. **Fused RoPE kernel** via `candle_nn::rotary_emb::rope()`
+//! 3. **Fused `RoPE` kernel** via `candle_nn::rotary_emb::rope_thd()`
 //!    — One CUDA launch per Q/K instead of 5 manual tensor ops.
+//!    — Applied in BSHD layout (before the transpose to BHSD), so the
+//!      reshape output is already contiguous — no `contiguous()` copy
+//!      needed before `RoPE`, and QK norm hits the fast fused RmsNorm path.
 //!    — Precomputed `[max_pos, head_dim/2]` cos/sin tables (half-width, as
-//!      required by the `rope()` API).
+//!      required by the `rope_thd()` API).
 //! 4. **GGUF quantization** via the polymorphic `LinearLayer` enum
 //!    — Same model code serves both safetensors (f16/f32/bf16) and GGUF weights.
 //! 5. **Batched decode infrastructure**
@@ -36,7 +39,7 @@
 use candle_core::quantized::gguf_file;
 use candle_core::{DType, Device, Module, Result, Tensor, D};
 use candle_nn::attention::{flash_attn, AttnMask};
-use candle_nn::rotary_emb::rope;
+use candle_nn::rotary_emb::rope_thd;
 use candle_nn::{linear_no_bias, Linear, RmsNorm, VarBuilder};
 use serde::Deserialize;
 use std::io::{Read, Seek};
@@ -341,6 +344,7 @@ impl Attention {
         let (b_sz, seq_len, _) = hidden_states.dims3()?;
 
         // Use merged QKV if available — one gemv instead of three.
+        // q/k/v are each [B, S, num_heads * head_dim] here.
         let (q, k, v) = if let Some(ref qkv_proj) = self.qkv_proj {
             let qkv = qkv_proj.forward(hidden_states)?; // [B, S, q_dim+2*kv_dim]
             let q = qkv.narrow(D::Minus1, 0, self.q_dim)?;
@@ -354,21 +358,19 @@ impl Attention {
             (q, k, v)
         };
 
-        // [B, S, num_heads * head_dim] → [B, num_heads, S, head_dim]
-        let q = q
-            .reshape((b_sz, seq_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let k = k
-            .reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
+        // reshape() always returns a contiguous tensor (zero-copy when the
+        // input already is, e.g. the separate-projections path; a copy when
+        // it isn't, e.g. the merged QKV narrow() path — same as before this
+        // change).
+        let q = q.reshape((b_sz, seq_len, self.num_heads, self.head_dim))?;
+        let k = k.reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?;
         let v = v
             .reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
 
-        // Per-head QK norm (Qwen3 applies before RoPE).
-        // RmsNorm normalises over the last dim, so it operates directly on
-        // [B, H, S, D] without the reshape that would trigger an extra
-        // contiguous copy on the non-contiguous q/k after transpose.
+        // Per-head QK norm (Qwen3 applies before RoPE), applied in BSHD
+        // layout while q/k are still contiguous — this hits RmsNorm's fast
+        // fused kernel instead of the non-contiguous element-wise fallback.
         let q = if let Some(ref norm) = self.q_norm {
             norm.forward(&q)?
         } else {
@@ -380,9 +382,15 @@ impl Attention {
             k
         };
 
-        // Fused RoPE
-        let q = rope(&q.contiguous()?, cos, sin)?;
-        let k = rope(&k.contiguous()?, cos, sin)?;
+        // Fused RoPE in BSHD layout — q/k are still contiguous here, so no
+        // contiguous() copy is needed before rope_thd (unlike rope(), which
+        // requires BHSD and would force a copy after the transpose below).
+        let q = rope_thd(&q, cos, sin)?;
+        let k = rope_thd(&k, cos, sin)?;
+
+        // [B, S, H, D] → [B, H, S, D] for the KV cache and attention below.
+        let q = q.transpose(1, 2)?;
+        let k = k.transpose(1, 2)?;
 
         // Update KV cache (pre-allocated with slice_set)
         let (k, v) = self.update_kv_cache(k, v)?;
@@ -523,6 +531,12 @@ impl Attention {
             v
         };
 
+        // cuBLAS's strided-batched matmul needs q's (seq, head_dim) slice to
+        // be plain row/col-major; after the BSHD->BHSD transpose above it
+        // isn't (row stride is num_heads*head_dim, not head_dim) whenever
+        // num_heads > 1. The CPU flash-attn fast paths above return before
+        // reaching this line and never pay this cost.
+        let q = q.contiguous()?;
         let attn_weights = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?)? * scale)?;
         let attn_weights = match attention_mask {
             Some(mask) => attn_weights.broadcast_add(mask)?,
