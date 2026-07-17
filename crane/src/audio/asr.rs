@@ -112,7 +112,7 @@ mod tests {
     fn test_transcribe_options_default() {
         let opts = TranscribeOptions::default();
         assert_eq!(opts.max_new_tokens, 8192);
-        assert!((opts.temperature - 0.9).abs() < f64::EPSILON);
+        assert!((opts.temperature - 0.0).abs() < f64::EPSILON);
         assert_eq!(opts.top_p, None);
         assert!((opts.repetition_penalty - 1.05).abs() < f32::EPSILON);
         assert_eq!(opts.language, None);

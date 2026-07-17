@@ -76,10 +76,11 @@ kernel-launch time.
 Notes:
 - Use the **same audio file, model size, device, and dtype** on both sides —
   the checkpoint's native dtype is `bfloat16`.
-- Token counts won't match exactly between the two runs (different sampling
-  defaults: Crane's `TranscribeOptions` default is temperature 0.9 vs. the
-  torch script's greedy `do_sample=False`), so compare **tokens/sec**, not
-  raw elapsed time, when transcript lengths differ.
+- Token counts should match closely between the two runs — both sides decode
+  greedily by default (Crane's `TranscribeOptions` default is
+  `temperature: 0.0`, matching the torch script's `do_sample=False`). Still
+  compare **tokens/sec** rather than raw elapsed time if transcript lengths
+  ever diverge (e.g. a caller overrode temperature on one side).
 - Always run a warmup call before timing (both scripts already do this) —
   first-call latency includes CUDA kernel compilation/caching and isn't
   representative.

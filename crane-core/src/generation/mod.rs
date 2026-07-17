@@ -30,7 +30,8 @@ impl Default for SpeechOptions {
 pub struct TranscribeOptions {
     /// Maximum number of tokens to generate before stopping.
     pub max_new_tokens: usize,
-    /// Sampling temperature; higher values increase randomness.
+    /// Sampling temperature; higher values increase randomness. `0.0`
+    /// (the default) selects greedy (argmax) decoding.
     pub temperature: f64,
     /// Nucleus sampling threshold; `None` disables top-p filtering.
     pub top_p: Option<f64>,
@@ -43,10 +44,15 @@ pub struct TranscribeOptions {
 }
 
 impl Default for TranscribeOptions {
+    /// Defaults to greedy decoding (`temperature: 0.0`): unlike TTS, ASR has
+    /// one correct transcription per utterance, so stochastic sampling only
+    /// adds transcription errors — and does so more on lower-confidence
+    /// (e.g. smaller) models. Matches reference implementations, which
+    /// decode ASR with `do_sample=False`.
     fn default() -> Self {
         Self {
             max_new_tokens: 8192,
-            temperature: 0.9,
+            temperature: 0.0,
             top_p: None,
             repetition_penalty: 1.05,
             repeat_last_n: 64,
