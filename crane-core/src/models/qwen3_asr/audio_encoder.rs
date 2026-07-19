@@ -324,12 +324,13 @@ fn build_cu_seqlens(n_frames: usize, chunks_per_block: usize) -> Vec<usize> {
 /// The supplied [`VarBuilder`] must be scoped to one layer's `self_attn`
 /// prefix. Loaded tensors: `q_proj.{weight,bias}`, `k_proj.{weight,bias}`,
 /// `v_proj.{weight,bias}`, `out_proj.{weight,bias}`, each `[d_model, d_model]`
-/// (checkpoint uses `out_proj`, not `o_proj`).
+/// (checkpoint uses `out_proj`, not `o_proj`). `q_proj`/`k_proj`/`v_proj` are
+/// concatenated into a single `qkv_proj` at construction time (mirroring
+/// `qwen3::Attention`'s merged QKV) so `forward` dispatches one gemm instead
+/// of three.
 #[derive(Debug, Clone)]
 struct AudioEncoderAttention {
-    q_proj: with_tracing::Linear,
-    k_proj: with_tracing::Linear,
-    v_proj: with_tracing::Linear,
+    qkv_proj: with_tracing::Linear,
     out_proj: with_tracing::Linear,
     n_heads: usize,
     head_dim: usize,
@@ -356,14 +357,21 @@ impl AudioEncoderAttention {
         let v_proj = with_tracing::linear(d_model, d_model, vb.pp("v_proj"))?;
         let out_proj = with_tracing::linear(d_model, d_model, vb.pp("out_proj"))?;
 
+        // Merge q/k/v into one gemm + narrow() splits, same pattern as
+        // qwen3::Attention::new's qkv_proj.
+        let qkv_w = Tensor::cat(&[q_proj.weight(), k_proj.weight(), v_proj.weight()], 0)?;
+        let qkv_b = match (q_proj.bias(), k_proj.bias(), v_proj.bias()) {
+            (Some(qb), Some(kb), Some(vb)) => Some(Tensor::cat(&[qb, kb, vb], 0)?),
+            _ => None,
+        };
+        let qkv_proj = with_tracing::Linear::from_weights(qkv_w, qkv_b);
+
         // head_dim is at most a few hundred in practice, exact in f64.
         #[allow(clippy::cast_precision_loss)]
         let scale = 1f64 / (head_dim as f64).sqrt();
 
         Ok(Self {
-            q_proj,
-            k_proj,
-            v_proj,
+            qkv_proj,
             out_proj,
             n_heads,
             head_dim,
@@ -392,22 +400,21 @@ impl AudioEncoderAttention {
         }
 
         let (batch, seq_len, _d) = hidden_states.dims3()?;
-        let shape = (batch, seq_len, self.n_heads, self.head_dim);
 
-        let query = self
-            .q_proj
-            .forward(hidden_states)?
-            .reshape(shape)?
+        // One gemm for q/k/v, then reshape to [B, S, 3H, D] *before*
+        // splitting so narrow() operates on the head axis rather than the
+        // last axis — the accumulated non-contiguity is absorbed by the
+        // .contiguous() calls already required below, without adding any
+        // extra copies.
+        let qkv = self.qkv_proj.forward(hidden_states)?;
+        let qkv = qkv.reshape((batch, seq_len, 3 * self.n_heads, self.head_dim))?;
+
+        let query = qkv.narrow(2, 0, self.n_heads)?.transpose(1, 2)?;
+        let key = qkv
+            .narrow(2, self.n_heads, self.n_heads)?
             .transpose(1, 2)?;
-        let key = self
-            .k_proj
-            .forward(hidden_states)?
-            .reshape(shape)?
-            .transpose(1, 2)?;
-        let value = self
-            .v_proj
-            .forward(hidden_states)?
-            .reshape(shape)?
+        let value = qkv
+            .narrow(2, 2 * self.n_heads, self.n_heads)?
             .transpose(1, 2)?;
 
         // Run attention independently per block (narrowed along the seq_len
@@ -484,9 +491,9 @@ impl AudioEncoderAttention {
             let start = cu_seqlens[n_full];
             let len = cu_seqlens[n_full + 1] - start;
 
-            let q_block = query.narrow(2, start, len)?.contiguous()?;
-            let k_block = key.narrow(2, start, len)?.contiguous()?;
-            let v_block = value.narrow(2, start, len)?.contiguous()?;
+            let q_block = query.narrow(2, start, len)?;
+            let k_block = key.narrow(2, start, len)?;
+            let v_block = value.narrow(2, start, len)?;
 
             let attn_weights = (q_block.matmul(&k_block.transpose(2, 3)?)? * self.scale)?;
             let attn_weights = softmax_f32(&attn_weights, v_block.dtype())?;
@@ -1480,31 +1487,38 @@ mod tests {
 
         let batched_out = attn.forward(&hidden, &cu_seqlens).expect("batched forward");
 
-        // From-scratch per-block reference: project Q/K/V once (shared with
-        // the code under test — projections aren't what's being verified
-        // here), then run each block's attention independently via plain
-        // narrow/matmul/softmax/matmul, exactly mirroring the pre-optimization
-        // loop that this commit replaced.
+        // From-scratch per-block reference: `make_nonzero_attn_layer_vb` is
+        // deterministic, so a second call rebuilds identical q/k/v weights
+        // independent of `attn`'s merged `qkv_proj` — then run each block's
+        // attention independently via plain narrow/matmul/softmax/matmul,
+        // exactly mirroring the pre-optimization loop that this commit
+        // replaced.
+        let vb_ref = make_nonzero_attn_layer_vb(&config, 0.01);
+        let sa_ref = vb_ref.pp("self_attn");
+        let q_proj_ref = with_tracing::linear(config.d_model, config.d_model, sa_ref.pp("q_proj"))
+            .expect("q_proj_ref");
+        let k_proj_ref = with_tracing::linear(config.d_model, config.d_model, sa_ref.pp("k_proj"))
+            .expect("k_proj_ref");
+        let v_proj_ref = with_tracing::linear(config.d_model, config.d_model, sa_ref.pp("v_proj"))
+            .expect("v_proj_ref");
+
         let (batch, seq_len, _d) = hidden.dims3().expect("dims3");
         let shape = (batch, seq_len, attn.n_heads, attn.head_dim);
-        let query = attn
-            .q_proj
+        let query = q_proj_ref
             .forward(&hidden)
             .expect("q_proj")
             .reshape(shape)
             .expect("reshape q")
             .transpose(1, 2)
             .expect("transpose q");
-        let key = attn
-            .k_proj
+        let key = k_proj_ref
             .forward(&hidden)
             .expect("k_proj")
             .reshape(shape)
             .expect("reshape k")
             .transpose(1, 2)
             .expect("transpose k");
-        let value = attn
-            .v_proj
+        let value = v_proj_ref
             .forward(&hidden)
             .expect("v_proj")
             .reshape(shape)
