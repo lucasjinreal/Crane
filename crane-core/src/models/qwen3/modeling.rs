@@ -38,12 +38,13 @@
 
 use candle_core::quantized::gguf_file;
 use candle_core::{DType, Device, Module, Result, Tensor, D};
-use candle_nn::attention::{flash_attn, AttnMask};
+use candle_nn::attention::AttnMask;
 use candle_nn::rotary_emb::rope_thd;
 use candle_nn::{linear_no_bias, Linear, RmsNorm, VarBuilder};
 use serde::Deserialize;
 use std::io::{Read, Seek};
 
+use crate::models::modules::flash_attn::dispatch_flash_attn;
 use crate::models::modules::rotary::RotaryEmbedding;
 
 // Reuse the polymorphic linear layer and GGUF loader from the shared Hunyuan module.
@@ -557,16 +558,6 @@ impl Attention {
     fn clear_kv_cache(&mut self) {
         self.kv_cache = None;
         self.cache_seq_len = 0;
-    }
-}
-
-/// Dispatch `flash_attn` to the monomorphised instantiation matching `q`'s dtype.
-fn dispatch_flash_attn(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32, mask: AttnMask) -> Result<Tensor> {
-    match q.dtype() {
-        DType::F32 => flash_attn::<f32>(q, k, v, scale, mask, None, None),
-        DType::F16 => flash_attn::<half::f16>(q, k, v, scale, mask, None, None),
-        DType::BF16 => flash_attn::<half::bf16>(q, k, v, scale, mask, None, None),
-        dt => candle_core::bail!("flash_attn: unsupported dtype {dt:?}"),
     }
 }
 
@@ -1330,6 +1321,7 @@ fn pad_and_stack_kv_caches(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_nn::attention::flash_attn;
     use candle_nn::VarMap;
 
     fn tiny_config() -> Config {

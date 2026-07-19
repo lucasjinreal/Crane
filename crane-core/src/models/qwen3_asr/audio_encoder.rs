@@ -26,12 +26,14 @@
 //!    optional streaming mode), then a final `ln_post` ([`AudioEncoder`]).
 
 use candle_core::{D, DType, Device, Module, Result, Tensor};
+use candle_nn::attention::{AttnMask, flash_attn_varlen_cpu};
 use candle_nn::{Activation, Conv2dConfig, VarBuilder};
 
 use super::config::AudioConfig;
 use super::feature_extractor::{
     FRAMES_PER_WINDOW, TOKENS_PER_WINDOW, chunk_split, conv_output_len,
 };
+use crate::models::modules::flash_attn::dispatch_flash_attn;
 use crate::models::with_tracing;
 
 /// `LayerNorm` epsilon for the audio encoder's transformer layers and
@@ -428,13 +430,159 @@ impl AudioEncoderAttention {
         // block only ever attends within itself, so this is O(n) total
         // matmul/softmax cost across blocks rather than O(n^2) (see
         // `build_cu_seqlens`'s doc comment).
-        //
-        // Most blocks share the same length (TOKENS_PER_WINDOW-derived),
-        // so we batch all uniform-length blocks into a single matmul call
-        // — reducing N separate kernel launches to one for the common case.
-        // Only a trailing shorter block (if any) falls back to the
-        // per-block path.
         let n_blocks = cu_seqlens.len() - 1;
+
+        let attn_output = if hidden_states.device().is_cpu() {
+            self.forward_attn_cpu(&query, &key, &value, cu_seqlens, n_blocks)?
+        } else {
+            self.forward_attn_gpu(&query, &key, &value, batch, cu_seqlens, n_blocks)?
+        };
+
+        let attn_output = attn_output.transpose(1, 2)?.contiguous()?.reshape((
+            batch,
+            seq_len,
+            self.n_heads * self.head_dim,
+        ))?;
+
+        self.out_proj.forward(&attn_output)
+    }
+
+    /// CPU-only attention core. `query`/`key`/`value` are `[B, H, S, D]`
+    /// (BHSD); each block runs through `candle_nn::attention::flash_attn`'s
+    /// online-softmax kernel, which streams K/V with an `O(head_dim)` working
+    /// set instead of materializing an `O(block_len^2)` score tensor, needs no
+    /// f32 dtype round-trip for softmax, and parallelizes internally across
+    /// the block's `H * block_len` independent (head, position) pairs —
+    /// unlike `forward_attn_gpu`'s batched matmul, which dispatches one
+    /// `gemm` call per (head, block) slice in a serial loop that only
+    /// requests thread-parallelism per call, not across calls. Not available
+    /// on GPU: candle's `flash_attn` kernels read CPU storage directly and
+    /// error otherwise, so GPU callers use `forward_attn_gpu` instead.
+    ///
+    /// When `batch == 1` and the dtype is `F32`/`F16`, delegates to
+    /// [`Self::forward_attn_cpu_varlen`], which fuses every block into a
+    /// single `flash_attn_varlen_cpu` call parallelized across all blocks
+    /// and heads at once, rather than issuing one `flash_attn` call (each
+    /// with its own internal rayon dispatch) per block. `B > 1` or `BF16`
+    /// (unsupported by the varlen kernel) fall back to the per-block loop.
+    fn forward_attn_cpu(
+        &self,
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+        cu_seqlens: &[usize],
+        n_blocks: usize,
+    ) -> Result<Tensor> {
+        // BHSD [B, H, S, D] -> BSHD [B, S, H, D], as flash_attn expects.
+        let q_bshd = query.transpose(1, 2)?;
+        let k_bshd = key.transpose(1, 2)?;
+        let v_bshd = value.transpose(1, 2)?;
+
+        // self.scale is 1/sqrt(head_dim), always small and positive; f64->f32
+        // here only drops precision flash_attn's own f32 accumulator would
+        // discard anyway.
+        #[allow(clippy::cast_possible_truncation)]
+        let scale = self.scale as f32;
+
+        let batch = q_bshd.dim(0)?;
+        if batch == 1 && matches!(q_bshd.dtype(), DType::F32 | DType::F16) {
+            return Self::forward_attn_cpu_varlen(&q_bshd, &k_bshd, &v_bshd, cu_seqlens, scale);
+        }
+
+        let mut outputs = Vec::with_capacity(n_blocks);
+        for i in 0..n_blocks {
+            let start = cu_seqlens[i];
+            let len = cu_seqlens[i + 1] - start;
+            let q_block = q_bshd.narrow(1, start, len)?;
+            let k_block = k_bshd.narrow(1, start, len)?;
+            let v_block = v_bshd.narrow(1, start, len)?;
+            // Each block attends only within itself (no cross-block mixing),
+            // so an unmasked kernel is correct here.
+            outputs.push(dispatch_flash_attn(
+                &q_block,
+                &k_block,
+                &v_block,
+                scale,
+                AttnMask::None,
+            )?);
+        }
+
+        if n_blocks == 1 {
+            Ok(outputs.into_iter().next().expect("n_blocks == 1 checked above"))
+        } else {
+            Tensor::cat(&outputs, 2)
+        }
+    }
+
+    /// Fused CPU path for `forward_attn_cpu`: `q_bshd`/`k_bshd`/`v_bshd` are
+    /// `[1, S, H, D]` (BSHD, batch always 1 since `cu_seqlens`-based
+    /// blocking is inherently a single packed sequence). Drops the batch
+    /// dim to `[S, H, D]` and calls `flash_attn_varlen_cpu` once, passing
+    /// each `cu_seqlens` block's length as an independent "batch" entry —
+    /// matching this module's packed-sequence semantics rather than a
+    /// padded-batch layout — instead of one `flash_attn` call per block.
+    fn forward_attn_cpu_varlen(
+        q_bshd: &Tensor,
+        k_bshd: &Tensor,
+        v_bshd: &Tensor,
+        cu_seqlens: &[usize],
+        scale: f32,
+    ) -> Result<Tensor> {
+        let (_batch, seq_len, n_heads, head_dim) = q_bshd.dims4()?;
+        let q_packed = q_bshd.reshape((seq_len, n_heads, head_dim))?;
+        let k_packed = k_bshd.reshape((seq_len, n_heads, head_dim))?;
+        let v_packed = v_bshd.reshape((seq_len, n_heads, head_dim))?;
+
+        let seqlens_vec: Vec<u32> = cu_seqlens
+            .windows(2)
+            .map(|w| {
+                // Block lengths are bounded by `seq_len` audio tokens per
+                // chunk (at most a few thousand), well within u32 range.
+                #[allow(clippy::cast_possible_truncation)]
+                let len = (w[1] - w[0]) as u32;
+                len
+            })
+            .collect();
+        let max_seqlen = seqlens_vec.iter().copied().max().unwrap_or(0) as usize;
+        let n_blocks = seqlens_vec.len();
+        let seqlens = Tensor::from_vec(seqlens_vec, n_blocks, q_packed.device())?;
+
+        let out = flash_attn_varlen_cpu(
+            &q_packed,
+            &k_packed,
+            &v_packed,
+            None,
+            &seqlens,
+            &seqlens,
+            max_seqlen,
+            max_seqlen,
+            scale,
+            false,
+            None,
+            None,
+        )?;
+
+        // [S, H, D] -> [1, S, H, D] -> [1, H, S, D] (BHSD, matching
+        // `forward_attn_gpu`'s and the per-block loop's return convention).
+        out.reshape((1, seq_len, n_heads, head_dim))?.transpose(1, 2)
+    }
+
+    /// GPU attention core (also used for any non-CPU device): explicit
+    /// matmul + softmax + matmul SDPA, since candle's `flash_attn` kernels
+    /// are CPU-only. Most blocks share the same length
+    /// (`TOKENS_PER_WINDOW`-derived), so all uniform-length blocks are
+    /// batched into one cuBLAS-batched matmul call — reducing N separate
+    /// kernel launches to one for the common case. Only a trailing shorter
+    /// block (if any) falls back to the per-block path.
+    fn forward_attn_gpu(
+        &self,
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+        batch: usize,
+        cu_seqlens: &[usize],
+        n_blocks: usize,
+    ) -> Result<Tensor> {
         let block_len = cu_seqlens[1] - cu_seqlens[0];
         let mut n_full = n_blocks;
         for i in 1..n_blocks {
@@ -506,15 +654,7 @@ impl AudioEncoderAttention {
             outputs.push(attn_weights.matmul(&v_block)?);
         }
 
-        let attn_output = Tensor::cat(&outputs, 2)?;
-
-        let attn_output = attn_output.transpose(1, 2)?.contiguous()?.reshape((
-            batch,
-            seq_len,
-            self.n_heads * self.head_dim,
-        ))?;
-
-        self.out_proj.forward(&attn_output)
+        Tensor::cat(&outputs, 2)
     }
 }
 
@@ -1428,16 +1568,17 @@ mod tests {
 
     #[test]
     fn encoder_batched_attention_with_trailing_shorter_block() {
-        // Shape-level sanity check that the batched-attention plumbing is
-        // wired correctly through `AudioEncoderLayer::forward`: 1350 frames
-        // = 13 full chunks (13 tokens each) + 50-frame remainder (7 tokens)
-        // = 176 total tokens. With chunks_per_block=8, block 0 has 8 chunks
-        // (104 tokens), block 1 has 5 full + remainder (72 tokens). Block
-        // 0's uniform-length chunks go through the batched path; block 1
-        // (shorter) goes through the per-block fallback. Numeric
-        // correctness of the batched path (including the `n_full >= 2`
-        // case) is covered separately by
-        // `batched_attention_matches_per_block_reference` below.
+        // Shape-level sanity check that multi-block attention is wired
+        // correctly through `AudioEncoderLayer::forward`: 1350 frames = 13
+        // full chunks (13 tokens each) + 50-frame remainder (7 tokens) =
+        // 176 total tokens. With chunks_per_block=8, block 0 has 8 chunks
+        // (104 tokens), block 1 has 5 full + remainder (72 tokens). These
+        // are CPU tensors, so both blocks run through `forward_attn_cpu`'s
+        // per-block flash-attention loop (`forward_attn_gpu`'s batched-vs-
+        // fallback matmul split only applies to non-CPU devices). Numeric
+        // correctness is covered separately by
+        // `cpu_flash_attn_matches_per_block_reference` and
+        // `gpu_attention_matches_per_block_reference` below.
         let config = small_encoder_config();
         let vb = make_layer_vb(&config);
         let layer = AudioEncoderLayer::new(&config, vb).expect("new");
@@ -1461,21 +1602,30 @@ mod tests {
         assert_eq!(out.dims(), &[1, total_tokens, config.d_model]);
     }
 
-    #[test]
-    fn batched_attention_matches_per_block_reference() {
-        // Numeric-equivalence check for the batched-matmul optimization in
-        // `AudioEncoderAttention::forward`: exercises `n_full >= 2` (unlike
-        // `encoder_batched_attention_with_trailing_shorter_block` above,
-        // which only ever produces a single full block) plus a trailing
-        // shorter block, and compares the batched result against a
-        // from-scratch reimplementation of the original per-block loop —
-        // the only way to catch a `batch * n_heads * n_full` reshape/
-        // ordering regression, which a shape-only assertion would miss.
-        //
-        // 350 frames = 3 full chunks (13 tokens each) + 50-frame remainder
-        // (7 tokens). With chunks_per_block=1, each full chunk gets its own
-        // block: cu_seqlens = [0, 13, 26, 39, 46], i.e. 3 uniform full
-        // blocks (n_full=3) followed by one shorter 7-token block.
+    /// Shared fixture for `gpu_attention_matches_per_block_reference` and
+    /// `cpu_flash_attn_matches_per_block_reference` below: builds an
+    /// `AudioEncoderAttention` with small non-zero weights, the BHSD
+    /// query/key/value tensors `AudioEncoderAttention::forward` would
+    /// compute internally, and a from-scratch per-block matmul/softmax/
+    /// matmul reference output — the only way to catch a `batch * n_heads *
+    /// n_full` reshape/ordering regression, which a shape-only assertion
+    /// would miss.
+    ///
+    /// 350 frames = 3 full chunks (13 tokens each) + 50-frame remainder (7
+    /// tokens). With chunks_per_block=1, each full chunk gets its own
+    /// block: cu_seqlens = [0, 13, 26, 39, 46], i.e. 3 uniform full blocks
+    /// (n_full=3, enough to exercise `forward_attn_gpu`'s batched path)
+    /// followed by one shorter 7-token block.
+    fn attention_reference_fixture() -> (
+        AudioEncoderAttention,
+        Tensor,
+        Tensor,
+        Tensor,
+        Vec<usize>,
+        usize,
+        usize,
+        Tensor,
+    ) {
         let config = small_encoder_config();
         let vb = make_nonzero_attn_layer_vb(&config, 0.01);
         let attn = AudioEncoderAttention::new(&config, vb.pp("self_attn")).expect("new");
@@ -1490,8 +1640,29 @@ mod tests {
         let hidden =
             Tensor::randn(0f32, 1f32, (1, total_tokens, config.d_model), &Device::Cpu)
                 .expect("randn hidden");
+        let (batch, seq_len, _d) = hidden.dims3().expect("dims3");
 
-        let batched_out = attn.forward(&hidden, &cu_seqlens).expect("batched forward");
+        // query/key/value BHSD via attn's own merged `qkv_proj`, mirroring
+        // `AudioEncoderAttention::forward`'s internal split.
+        let qkv = attn.qkv_proj.forward(&hidden).expect("qkv_proj");
+        let qkv = qkv
+            .reshape((batch, seq_len, 3 * attn.n_heads, attn.head_dim))
+            .expect("reshape qkv");
+        let query = qkv
+            .narrow(2, 0, attn.n_heads)
+            .expect("narrow q")
+            .transpose(1, 2)
+            .expect("transpose q");
+        let key = qkv
+            .narrow(2, attn.n_heads, attn.n_heads)
+            .expect("narrow k")
+            .transpose(1, 2)
+            .expect("transpose k");
+        let value = qkv
+            .narrow(2, 2 * attn.n_heads, attn.n_heads)
+            .expect("narrow v")
+            .transpose(1, 2)
+            .expect("transpose v");
 
         // From-scratch per-block reference: `make_nonzero_attn_layer_vb` is
         // deterministic, so a second call rebuilds identical q/k/v weights
@@ -1508,23 +1679,22 @@ mod tests {
         let v_proj_ref = with_tracing::linear(config.d_model, config.d_model, sa_ref.pp("v_proj"))
             .expect("v_proj_ref");
 
-        let (batch, seq_len, _d) = hidden.dims3().expect("dims3");
         let shape = (batch, seq_len, attn.n_heads, attn.head_dim);
-        let query = q_proj_ref
+        let q_ref = q_proj_ref
             .forward(&hidden)
             .expect("q_proj")
             .reshape(shape)
             .expect("reshape q")
             .transpose(1, 2)
             .expect("transpose q");
-        let key = k_proj_ref
+        let k_ref = k_proj_ref
             .forward(&hidden)
             .expect("k_proj")
             .reshape(shape)
             .expect("reshape k")
             .transpose(1, 2)
             .expect("transpose k");
-        let value = v_proj_ref
+        let v_ref = v_proj_ref
             .forward(&hidden)
             .expect("v_proj")
             .reshape(shape)
@@ -1537,17 +1707,17 @@ mod tests {
             let start = window[0];
             let len = window[1] - start;
 
-            let q_block = query
+            let q_block = q_ref
                 .narrow(2, start, len)
                 .expect("narrow q")
                 .contiguous()
                 .expect("contig q");
-            let k_block = key
+            let k_block = k_ref
                 .narrow(2, start, len)
                 .expect("narrow k")
                 .contiguous()
                 .expect("contig k");
-            let v_block = value
+            let v_block = v_ref
                 .narrow(2, start, len)
                 .expect("narrow v")
                 .contiguous()
@@ -1567,16 +1737,48 @@ mod tests {
             ref_outputs.push(attn_weights.matmul(&v_block).expect("matmul av"));
         }
         let ref_attn_output = Tensor::cat(&ref_outputs, 2).expect("cat");
-        let ref_attn_output = ref_attn_output
+        let ref_out = finish_attn_output(&attn, &ref_attn_output, batch, seq_len);
+
+        (attn, query, key, value, cu_seqlens, batch, seq_len, ref_out)
+    }
+
+    /// Mirrors `AudioEncoderAttention::forward`'s post-attention transpose
+    /// + reshape + `out_proj`, so tests can invoke `forward_attn_cpu`/
+    /// `forward_attn_gpu` directly and still compare like-for-like against
+    /// `attn.forward`'s output shape.
+    fn finish_attn_output(
+        attn: &AudioEncoderAttention,
+        attn_output: &Tensor,
+        batch: usize,
+        seq_len: usize,
+    ) -> Tensor {
+        let out = attn_output
             .transpose(1, 2)
             .expect("transpose out")
             .contiguous()
             .expect("contig out")
             .reshape((batch, seq_len, attn.n_heads * attn.head_dim))
             .expect("reshape out");
-        let ref_out = attn.out_proj.forward(&ref_attn_output).expect("out_proj");
+        attn.out_proj.forward(&out).expect("out_proj")
+    }
 
-        let max_abs_diff = (&batched_out - &ref_out)
+    #[test]
+    fn gpu_attention_matches_per_block_reference() {
+        // Numeric-equivalence check for `forward_attn_gpu`'s batched-matmul
+        // optimization, invoked directly since `attn.forward` would
+        // otherwise dispatch CPU tensors to `forward_attn_cpu` instead (see
+        // `attention_reference_fixture`'s doc comment for the block
+        // layout).
+        let (attn, query, key, value, cu_seqlens, batch, seq_len, ref_out) =
+            attention_reference_fixture();
+        let n_blocks = cu_seqlens.len() - 1;
+
+        let attn_output = attn
+            .forward_attn_gpu(&query, &key, &value, batch, &cu_seqlens, n_blocks)
+            .expect("forward_attn_gpu");
+        let out = finish_attn_output(&attn, &attn_output, batch, seq_len);
+
+        let max_abs_diff = (&out - &ref_out)
             .expect("sub")
             .abs()
             .expect("abs")
@@ -1586,7 +1788,36 @@ mod tests {
             .expect("scalar");
         assert!(
             max_abs_diff < 1e-5,
-            "batched attention output must match per-block reference, \
+            "forward_attn_gpu output must match per-block reference, \
+             max_abs_diff={max_abs_diff}"
+        );
+    }
+
+    #[test]
+    fn cpu_flash_attn_matches_per_block_reference() {
+        // Numeric-equivalence check for `forward_attn_cpu`'s flash-attention
+        // path, invoked directly and compared against the same reference as
+        // `gpu_attention_matches_per_block_reference` above.
+        let (attn, query, key, value, cu_seqlens, batch, seq_len, ref_out) =
+            attention_reference_fixture();
+        let n_blocks = cu_seqlens.len() - 1;
+
+        let attn_output = attn
+            .forward_attn_cpu(&query, &key, &value, &cu_seqlens, n_blocks)
+            .expect("forward_attn_cpu");
+        let out = finish_attn_output(&attn, &attn_output, batch, seq_len);
+
+        let max_abs_diff = (&out - &ref_out)
+            .expect("sub")
+            .abs()
+            .expect("abs")
+            .max_all()
+            .expect("max_all")
+            .to_scalar::<f32>()
+            .expect("scalar");
+        assert!(
+            max_abs_diff < 1e-5,
+            "forward_attn_cpu output must match per-block reference, \
              max_abs_diff={max_abs_diff}"
         );
     }
