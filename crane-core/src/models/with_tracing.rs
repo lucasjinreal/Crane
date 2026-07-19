@@ -51,6 +51,7 @@ impl Linear {
         self.inner.weight()
     }
 
+    /// Returns the layer's bias tensor, if any.
     pub fn bias(&self) -> Option<&Tensor> {
         self.inner.bias()
     }

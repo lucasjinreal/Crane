@@ -343,10 +343,14 @@ impl AudioEncoderAttention {
     // cheap to call repeatedly); matching that convention here.
     #[allow(clippy::needless_pass_by_value)]
     fn new(config: &AudioConfig, vb: VarBuilder) -> Result<Self> {
-        debug_assert_eq!(
-            config.num_key_value_heads, config.encoder_attention_heads,
-            "AudioEncoderAttention only implements plain multi-head attention, not GQA"
-        );
+        if config.num_key_value_heads != config.encoder_attention_heads {
+            candle_core::bail!(
+                "AudioEncoderAttention only implements plain multi-head attention, not GQA \
+                 (num_key_value_heads={}, encoder_attention_heads={})",
+                config.num_key_value_heads,
+                config.encoder_attention_heads
+            );
+        }
 
         let d_model = config.d_model;
         let n_heads = config.encoder_attention_heads;
@@ -362,6 +366,8 @@ impl AudioEncoderAttention {
         let qkv_w = Tensor::cat(&[q_proj.weight(), k_proj.weight(), v_proj.weight()], 0)?;
         let qkv_b = match (q_proj.bias(), k_proj.bias(), v_proj.bias()) {
             (Some(qb), Some(kb), Some(vb)) => Some(Tensor::cat(&[qb, kb, vb], 0)?),
+            // `with_tracing::linear` above always attaches a bias, so this
+            // arm is unreachable in practice.
             _ => None,
         };
         let qkv_proj = with_tracing::Linear::from_weights(qkv_w, qkv_b);
@@ -491,9 +497,9 @@ impl AudioEncoderAttention {
             let start = cu_seqlens[n_full];
             let len = cu_seqlens[n_full + 1] - start;
 
-            let q_block = query.narrow(2, start, len)?;
-            let k_block = key.narrow(2, start, len)?;
-            let v_block = value.narrow(2, start, len)?;
+            let q_block = query.narrow(2, start, len)?.contiguous()?;
+            let k_block = key.narrow(2, start, len)?.contiguous()?;
+            let v_block = value.narrow(2, start, len)?.contiguous()?;
 
             let attn_weights = (q_block.matmul(&k_block.transpose(2, 3)?)? * self.scale)?;
             let attn_weights = softmax_f32(&attn_weights, v_block.dtype())?;
