@@ -385,7 +385,10 @@ pub async fn run(args: Args) -> Result<()> {
                         return;
                     }
                 };
-                run_tts_loop(tts_rx, &resolved_name, tts.as_mut());
+                // Install candle's affinity-pinned rayon pool for this thread's lifetime.
+                tts_device.with_context(|| {
+                    run_tts_loop(tts_rx, &resolved_name, tts.as_mut());
+                });
             })
             .expect("Failed to spawn TTS thread");
         info!("TTS model routing established (type: {:?})", resolved_type);
@@ -429,7 +432,10 @@ pub async fn run(args: Args) -> Result<()> {
                         return;
                     }
                 };
-                run_asr_loop(asr_rx, &resolved_name, asr.as_mut());
+                // Install candle's affinity-pinned rayon pool for this thread's lifetime.
+                asr_device.with_context(|| {
+                    run_asr_loop(asr_rx, &resolved_name, asr.as_mut());
+                });
             })
             .expect("Failed to spawn ASR thread");
         info!("ASR model routing established (type: {:?})", resolved_type);
@@ -479,40 +485,43 @@ pub async fn run(args: Args) -> Result<()> {
                 };
                 info!("Gemma4 VLM engine thread started");
                 let preprocess_config = ImagePreprocessConfig::default();
-                while let Some(req) = g4vlm_rx.blocking_recv() {
-                    let Gemma4VlmRequest { img_path, text_prompt, max_tokens, tx } = req;
-                    let res = (|| -> anyhow::Result<String> {
-                        let preprocessed = load_and_preprocess_image(&img_path, &preprocess_config, &device_clone)?;
-                        let image_embeds = vlm.encode_image(&preprocessed.pixel_values, &preprocessed.pixel_position_ids, &preprocessed.padding_positions)?;
-                        let image_token_id = 258880u32;
-                        let mut prompt_ids: Vec<u32> = vec![2, 105, 2364, 107, 255999];
-                        for _ in 0..preprocessed.num_image_tokens { prompt_ids.push(image_token_id); }
-                        prompt_ids.push(258882);
-                        if !text_prompt.is_empty() {
-                            let text_ids = vlm.tokenizer.tokenizer.encode(text_prompt.as_str(), false).map_err(|e| anyhow::anyhow!("{e}"))?.get_ids().to_vec();
-                            prompt_ids.extend(text_ids);
-                        }
-                        prompt_ids.extend_from_slice(&[106, 107, 105, 4368, 107]);
-                        vlm.clear_kv_cache();
-                        let input_tensor = candle_core::Tensor::new(prompt_ids.as_slice(), &device_clone)?.unsqueeze(0)?;
-                        let logits = vlm.forward(&input_tensor, Some(&image_embeds), 0)?.squeeze(0)?.squeeze(0)?.to_dtype(candle_core::DType::F32)?;
-                        let mut tokens = prompt_ids.clone();
-                        let mut generated = Vec::new();
-                        let mut next_token = candle_nn::ops::softmax_last_dim(&logits)?.argmax(candle_core::D::Minus1)?.to_scalar::<u32>()?;
-                        generated.push(next_token);
-                        tokens.push(next_token);
-                        for _ in 1..max_tokens {
-                            if next_token == 1 || next_token == 106 { break; }
-                            let input = candle_core::Tensor::new(&[next_token], &device_clone)?.unsqueeze(0)?;
-                            let logits = vlm.forward(&input, None, tokens.len() - 1)?.squeeze(0)?.squeeze(0)?.to_dtype(candle_core::DType::F32)?;
-                            next_token = candle_nn::ops::softmax_last_dim(&logits)?.argmax(candle_core::D::Minus1)?.to_scalar::<u32>()?;
+                // Install candle's affinity-pinned rayon pool for this thread's lifetime.
+                device_clone.with_context(|| {
+                    while let Some(req) = g4vlm_rx.blocking_recv() {
+                        let Gemma4VlmRequest { img_path, text_prompt, max_tokens, tx } = req;
+                        let res = (|| -> anyhow::Result<String> {
+                            let preprocessed = load_and_preprocess_image(&img_path, &preprocess_config, &device_clone)?;
+                            let image_embeds = vlm.encode_image(&preprocessed.pixel_values, &preprocessed.pixel_position_ids, &preprocessed.padding_positions)?;
+                            let image_token_id = 258880u32;
+                            let mut prompt_ids: Vec<u32> = vec![2, 105, 2364, 107, 255999];
+                            for _ in 0..preprocessed.num_image_tokens { prompt_ids.push(image_token_id); }
+                            prompt_ids.push(258882);
+                            if !text_prompt.is_empty() {
+                                let text_ids = vlm.tokenizer.tokenizer.encode(text_prompt.as_str(), false).map_err(|e| anyhow::anyhow!("{e}"))?.get_ids().to_vec();
+                                prompt_ids.extend(text_ids);
+                            }
+                            prompt_ids.extend_from_slice(&[106, 107, 105, 4368, 107]);
+                            vlm.clear_kv_cache();
+                            let input_tensor = candle_core::Tensor::new(prompt_ids.as_slice(), &device_clone)?.unsqueeze(0)?;
+                            let logits = vlm.forward(&input_tensor, Some(&image_embeds), 0)?.squeeze(0)?.squeeze(0)?.to_dtype(candle_core::DType::F32)?;
+                            let mut tokens = prompt_ids.clone();
+                            let mut generated = Vec::new();
+                            let mut next_token = candle_nn::ops::softmax_last_dim(&logits)?.argmax(candle_core::D::Minus1)?.to_scalar::<u32>()?;
                             generated.push(next_token);
                             tokens.push(next_token);
-                        }
-                        Ok(vlm.tokenizer.tokenizer.decode(&generated, true).unwrap_or_default())
-                    })();
-                    let _ = tx.send(res.map_err(|e| e.to_string()));
-                }
+                            for _ in 1..max_tokens {
+                                if next_token == 1 || next_token == 106 { break; }
+                                let input = candle_core::Tensor::new(&[next_token], &device_clone)?.unsqueeze(0)?;
+                                let logits = vlm.forward(&input, None, tokens.len() - 1)?.squeeze(0)?.squeeze(0)?.to_dtype(candle_core::DType::F32)?;
+                                next_token = candle_nn::ops::softmax_last_dim(&logits)?.argmax(candle_core::D::Minus1)?.to_scalar::<u32>()?;
+                                generated.push(next_token);
+                                tokens.push(next_token);
+                            }
+                            Ok(vlm.tokenizer.tokenizer.decode(&generated, true).unwrap_or_default())
+                        })();
+                        let _ = tx.send(res.map_err(|e| e.to_string()));
+                    }
+                });
             }).expect("Failed to spawn Gemma4 VLM thread");
             gemma4_vlm_tx_opt_inner = Some(g4vlm_tx);
         } else {
@@ -528,22 +537,27 @@ pub async fn run(args: Args) -> Result<()> {
                     }
                 };
                 info!("VLM engine thread started");
-                while let Some(req) = vlm_rx.blocking_recv() {
-                    match req {
-                        VlmRequest::Recognize { img_path, task, max_tokens, tx } => {
-                            let res = vlm.recognize(&img_path, task, max_tokens).map(|r| r.text);
-                            if let Err(ref e) = res { tracing::error!("VLM Recognize failed: {:?}", e); }
-                            let _ = tx.send(res.map_err(|e| e.to_string()));
-                        }
-                        VlmRequest::RecognizeStream { img_path, task, max_tokens, token_tx, done_tx } => {
-                            let res = vlm.recognize_stream(&img_path, task, max_tokens, |token_text: &str| {
-                                let _ = token_tx.send(token_text.to_string());
-                            });
-                            if let Err(ref e) = res { tracing::error!("VLM RecognizeStream failed: {:?}", e); }
-                            let _ = done_tx.send(res.map(|_| ()).map_err(|e| e.to_string()));
+                // Clone device: with_context borrows &self, which would overlap the &mut vlm borrows below.
+                let vlm_device = vlm.device.clone();
+                // Install candle's affinity-pinned rayon pool for this thread's lifetime.
+                vlm_device.with_context(|| {
+                    while let Some(req) = vlm_rx.blocking_recv() {
+                        match req {
+                            VlmRequest::Recognize { img_path, task, max_tokens, tx } => {
+                                let res = vlm.recognize(&img_path, task, max_tokens).map(|r| r.text);
+                                if let Err(ref e) = res { tracing::error!("VLM Recognize failed: {:?}", e); }
+                                let _ = tx.send(res.map_err(|e| e.to_string()));
+                            }
+                            VlmRequest::RecognizeStream { img_path, task, max_tokens, token_tx, done_tx } => {
+                                let res = vlm.recognize_stream(&img_path, task, max_tokens, |token_text: &str| {
+                                    let _ = token_tx.send(token_text.to_string());
+                                });
+                                if let Err(ref e) = res { tracing::error!("VLM RecognizeStream failed: {:?}", e); }
+                                let _ = done_tx.send(res.map(|_| ()).map_err(|e| e.to_string()));
+                            }
                         }
                     }
-                }
+                });
             }).expect("Failed to spawn VLM thread");
             vlm_tx_opt_inner = Some(vlm_tx);
         }
@@ -551,9 +565,12 @@ pub async fn run(args: Args) -> Result<()> {
         let eos_id = tokenizer.token_to_id("</s>").or_else(|| tokenizer.token_to_id("<end_of_turn>")) .or_else(|| tokenizer.token_to_id("<|end_of_sentence|>")) .unwrap_or(1);
         (None, tokenizer, vec![eos_id], chat_template, vlm_tx_opt_inner, gemma4_vlm_tx_opt_inner, None, None)
     } else {
+        // Only one of the TTS/ASR/VLM/LLM branches runs per process, so each is
+        // the sole long-lived consumer of candle's process-wide rayon pool.
         let mut backend = engine::model_factory::create_backend(model_type, &args.model_path, &device, &dtype, format, args.quant.as_deref())?;
         info!("Model loaded successfully (type: {:?}, format: {:?})", resolved_type, format);
-        backend.warmup();
+        // Install candle's affinity-pinned rayon pool so warmup's forward passes run on warm threads.
+        device.with_context(|| backend.warmup());
         info!("Model warmed up");
         let tokenizer = backend.tokenizer().clone();
         let eos_token_id = backend.eos_token_id();
