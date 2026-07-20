@@ -371,6 +371,9 @@ impl Attention {
 
         // ── SDPA ──
         let n_rep = self.num_heads / self.num_kv_heads;
+        // head_dim is a small model hyperparameter (e.g. <= a few hundred),
+        // far below f64's 52-bit mantissa limit.
+        #[allow(clippy::cast_precision_loss)]
         let scale = 1.0 / (self.head_dim as f64).sqrt();
         // 1/sqrt(head_dim) is always small and positive; f64->f32 here
         // only drops precision flash_attn's own f32 accumulator would
