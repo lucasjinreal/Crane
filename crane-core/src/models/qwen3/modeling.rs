@@ -1013,17 +1013,11 @@ impl Qwen3Model {
         self.layers
             .iter()
             .map(|l| {
-                l.self_attn
-                    .kv_cache
-                    .as_ref()
-                    .map(|(k, v)| {
-                        let k_bytes =
-                            k.elem_count() as u64 * k.dtype().size_in_bytes() as u64;
-                        let v_bytes =
-                            v.elem_count() as u64 * v.dtype().size_in_bytes() as u64;
-                        k_bytes + v_bytes
-                    })
-                    .unwrap_or(0)
+                l.self_attn.kv_cache.as_ref().map_or(0, |(k, v)| {
+                    let k_bytes = k.elem_count() as u64 * k.dtype().size_in_bytes() as u64;
+                    let v_bytes = v.elem_count() as u64 * v.dtype().size_in_bytes() as u64;
+                    k_bytes + v_bytes
+                })
             })
             .sum()
     }
@@ -1059,8 +1053,7 @@ impl Qwen3Model {
         for (layer, cache) in self.layers.iter_mut().zip(caches.into_iter()) {
             let seq_len = cache
                 .as_ref()
-                .map(|(k, _)| k.dim(2).unwrap_or(0))
-                .unwrap_or(0);
+                .map_or(0, |(k, _)| k.dim(2).unwrap_or(0));
             layer.self_attn.kv_cache = cache;
             layer.self_attn.cache_seq_len = seq_len;
         }
@@ -1089,8 +1082,7 @@ impl Qwen3Model {
                 caches
                     .first()
                     .and_then(|c| c.as_ref())
-                    .map(|(k, _)| k.dim(2).unwrap_or(0))
-                    .unwrap_or(0)
+                    .map_or(0, |(k, _)| k.dim(2).unwrap_or(0))
             })
             .collect();
         let max_kv_len = kv_lens.iter().copied().max().unwrap_or(0);
