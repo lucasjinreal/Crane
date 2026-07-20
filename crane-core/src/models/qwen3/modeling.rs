@@ -974,7 +974,7 @@ impl Qwen3Model {
         };
 
         let mut hidden_states = hidden_states;
-        for layer in self.layers.iter_mut() {
+        for layer in &mut self.layers {
             hidden_states =
                 layer.forward(&hidden_states, &cos, &sin, attention_mask.as_ref())?;
         }
@@ -997,7 +997,7 @@ impl Qwen3Model {
     // ── KV Cache Management ─────────────────────────────────────────────
 
     pub fn clear_kv_cache(&mut self) {
-        for layer in self.layers.iter_mut() {
+        for layer in &mut self.layers {
             layer.clear_kv_cache();
         }
     }
@@ -1150,7 +1150,7 @@ impl Qwen3Model {
             .unsqueeze(1)?;
 
         let mut hidden_states = hidden_states;
-        for layer in self.layers.iter_mut() {
+        for layer in &mut self.layers {
             hidden_states =
                 layer.forward(&hidden_states, &cos, &sin, attention_mask)?;
         }
@@ -1172,7 +1172,7 @@ impl Qwen3Model {
             .map(|_| Vec::with_capacity(num_layers))
             .collect();
 
-        for layer in self.layers.iter_mut() {
+        for layer in &mut self.layers {
             if let Some((ref full_k, ref full_v)) = layer.self_attn.kv_cache {
                 for i in 0..n_seqs {
                     let row_k = full_k.narrow(0, i, 1)?;
