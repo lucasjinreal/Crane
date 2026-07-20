@@ -219,15 +219,9 @@ fn run_tts_loop(
 }
 
 fn transcribe_audio(asr: &mut dyn crane::audio::Asr, req: &AsrTranscribeRequest) -> Result<String, String> {
-    let tmp_file = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
-    std::fs::write(tmp_file.path(), &req.audio_bytes).map_err(|e| e.to_string())?;
-    let tmp_path = tmp_file
-        .path()
-        .to_str()
-        .ok_or_else(|| "temp audio file path is not valid UTF-8".to_string())?;
-
     let sample_rate = asr.input_sample_rate();
-    let samples = crane::audio::load_wav_f32(tmp_path, sample_rate).map_err(|e| e.to_string())?;
+    let samples = crane::audio::decode_wav(&req.audio_bytes, sample_rate).map_err(|e|
+        e.to_string())?;
 
     let defaults = crane_core::generation::TranscribeOptions::default();
     let opts = crane_core::generation::TranscribeOptions {

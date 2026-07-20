@@ -5,7 +5,8 @@ use candle_core::Tensor;
 use crane_core::generation::SpeechOptions;
 use crane_core::models::voxtral_tts::Model;
 
-use super::tts::{AudioInfo, Tts, TtsStream, VoiceInfo};
+use super::pcm::AudioInfo;
+use super::tts::{Tts, TtsStream, VoiceInfo};
 
 /// ISO 639-1 codes used as voice-name prefixes for non-English presets.
 const VOICE_LANGUAGE_PREFIXES: &[&str] = &["ar", "de", "es", "fr", "hi", "it", "nl", "pt"];
