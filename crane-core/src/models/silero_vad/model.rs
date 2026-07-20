@@ -174,13 +174,17 @@ impl fmt::Debug for Vad {
 
 impl Default for Vad {
     fn default() -> Self {
-        Vad::new(VadConfig::default())
+        Vad::new(VadConfig::default()).expect("default VadConfig is always valid")
     }
 }
 
 impl Vad {
     /// Creates a new `Vad` instance.
-    pub fn new(config: VadConfig) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if device selection fails.
+    pub fn new(config: VadConfig) -> Result<Self> {
         let sr = config.sample_rate;
         let chunk_size = if sr == 8000 {
             CHUNKS_SR8K
@@ -197,10 +201,10 @@ impl Vad {
             .saturating_sub(2 * speech_pad);
         let min_silence = sr * config.min_silence / 1000;
         let min_silence_at_max_speech = sr * config.min_silence_at_max_speech / 1000;
-        let device = select_device(config.use_cpu).unwrap();
+        let device = select_device(config.use_cpu).map_err(Error::wrap)?;
         let neg_threshold = (config.threshold - config.hysteresis).max(0.01);
 
-        Vad {
+        Ok(Vad {
             sample_rate: sr,
             chunk_size: chunk_size,
             min_speech,
@@ -228,7 +232,7 @@ impl Vad {
             padded: true,
             segments: vec![],
             buffer: vec![],
-        }
+        })
     }
 
     pub fn apply_config(&mut self) -> Result<()> {
@@ -810,7 +814,7 @@ mod tests {
 
     #[test]
     fn test_verify_default_config() {
-        let mut vad = Vad::new(cpu_config());
+        let mut vad = Vad::new(cpu_config()).unwrap();
         assert!(vad.apply_config().is_ok());
     }
 
@@ -818,7 +822,7 @@ mod tests {
     fn test_verify_rejects_invalid_sample_rate() {
         let mut config = cpu_config();
         config.sample_rate = 44100;
-        let mut vad = Vad::new(config);
+        let mut vad = Vad::new(config).unwrap();
         assert!(vad.apply_config().is_err());
     }
 
@@ -826,7 +830,7 @@ mod tests {
     fn test_verify_rejects_context_size_zero() {
         let mut config = cpu_config();
         config.context_size = 0;
-        let mut vad = Vad::new(config);
+        let mut vad = Vad::new(config).unwrap();
         assert!(vad.apply_config().is_err());
     }
 
@@ -834,7 +838,7 @@ mod tests {
     fn test_verify_rejects_context_size_ge_chunk() {
         let mut config = cpu_config();
         config.context_size = CHUNKS_SR16K;
-        let mut vad = Vad::new(config);
+        let mut vad = Vad::new(config).unwrap();
         assert!(vad.apply_config().is_err());
     }
 
@@ -842,7 +846,7 @@ mod tests {
     fn test_verify_rejects_hysteresis_above_threshold() {
         let mut config = cpu_config();
         config.hysteresis = config.threshold + 0.1;
-        let mut vad = Vad::new(config);
+        let mut vad = Vad::new(config).unwrap();
         assert!(vad.apply_config().is_err());
     }
 
@@ -850,7 +854,7 @@ mod tests {
     fn test_verify_rejects_negative_hysteresis() {
         let mut config = cpu_config();
         config.hysteresis = -0.1;
-        let mut vad = Vad::new(config);
+        let mut vad = Vad::new(config).unwrap();
         assert!(vad.apply_config().is_err());
     }
 
@@ -858,13 +862,13 @@ mod tests {
     fn test_verify_rejects_small_max_speech() {
         let mut config = cpu_config();
         config.max_speech = 1;
-        let mut vad = Vad::new(config);
+        let mut vad = Vad::new(config).unwrap();
         assert!(vad.apply_config().is_err());
     }
 
     #[test]
     fn test_apply_config_no_mutation_on_failure() {
-        let mut vad = Vad::new(cpu_config());
+        let mut vad = Vad::new(cpu_config()).unwrap();
         vad.apply_config().unwrap();
         let good_max_speech = vad.max_speech;
 
