@@ -826,16 +826,18 @@ impl Qwen3Model {
             .get(&format!("{arch}.context_length"))
             .and_then(|v| v.to_u32().ok())
             .unwrap_or(32768) as usize;
-        let rms_norm_eps = gg
-            .metadata()
-            .get(&format!("{arch}.attention.layer_norm_rms_epsilon"))
-            .and_then(|v| v.to_f32().ok())
-            .unwrap_or(1e-6) as f64;
-        let rope_theta = gg
-            .metadata()
-            .get(&format!("{arch}.rope.freq_base"))
-            .and_then(|v| v.to_f32().ok())
-            .unwrap_or(1_000_000.0) as f64;
+        let rms_norm_eps = f64::from(
+            gg.metadata()
+                .get(&format!("{arch}.attention.layer_norm_rms_epsilon"))
+                .and_then(|v| v.to_f32().ok())
+                .unwrap_or(1e-6),
+        );
+        let rope_theta = f64::from(
+            gg.metadata()
+                .get(&format!("{arch}.rope.freq_base"))
+                .and_then(|v| v.to_f32().ok())
+                .unwrap_or(1_000_000.0),
+        );
 
         let use_qk_norm = gg.ct.tensor_infos.contains_key("blk.0.attn_q_norm.weight");
         let tie_word_embeddings = !gg.ct.tensor_infos.contains_key("output.weight");
