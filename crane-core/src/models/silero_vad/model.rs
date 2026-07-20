@@ -189,8 +189,12 @@ impl Vad {
         };
         let min_speech = sr * config.min_speech / 1000;
         let speech_pad = sr * config.speech_pad / 1000;
-        // Refine max_speech to avoid cutting speech.
-        let max_speech = sr * config.max_speech / 1000 - chunk_size - 2 * speech_pad;
+        // Refine max_speech to avoid cutting speech. Saturates instead of
+        // underflowing on an invalid config; `verify()` rejects the config
+        // before this value is ever used for inference.
+        let max_speech = (sr * config.max_speech / 1000)
+            .saturating_sub(chunk_size)
+            .saturating_sub(2 * speech_pad);
         let min_silence = sr * config.min_silence / 1000;
         let min_silence_at_max_speech = sr * config.min_silence_at_max_speech / 1000;
         let device = select_device(config.use_cpu).unwrap();
@@ -229,25 +233,46 @@ impl Vad {
 
     pub fn apply_config(&mut self) -> Result<()> {
         let sr = self.config.sample_rate;
-        self.sample_rate = sr;
-        self.chunk_size = if sr == 8000 {
+        let chunk_size = if sr == 8000 {
             CHUNKS_SR8K
         } else {
             CHUNKS_SR16K
         };
-        self.min_speech = sr * self.config.min_speech / 1000;
-        self.speech_pad = sr * self.config.speech_pad / 1000;
-        self.max_speech =
-            sr * self.config.max_speech / 1000 - self.chunk_size - 2 * self.speech_pad;
-        self.min_silence = sr * self.config.min_silence / 1000;
-        self.min_silence_at_max_speech = sr * self.config.min_silence_at_max_speech / 1000;
-        self.neg_threshold = self.config.threshold - self.config.hysteresis;
+        let min_speech = sr * self.config.min_speech / 1000;
+        let speech_pad = sr * self.config.speech_pad / 1000;
+        let max_speech = (sr * self.config.max_speech / 1000)
+            .saturating_sub(chunk_size)
+            .saturating_sub(2 * speech_pad);
+        let min_silence = sr * self.config.min_silence / 1000;
+        let min_silence_at_max_speech = sr * self.config.min_silence_at_max_speech / 1000;
+        let neg_threshold = self.config.threshold - self.config.hysteresis;
+        let context_size = self.config.context_size;
+
+        // Validate the new values before touching `self`, so a rejected
+        // config leaves the instance unchanged instead of half-applied.
+        Self::validate(
+            sr,
+            context_size,
+            chunk_size,
+            self.config.hysteresis,
+            self.config.threshold,
+            max_speech,
+        )?;
+
+        self.sample_rate = sr;
+        self.chunk_size = chunk_size;
+        self.min_speech = min_speech;
+        self.speech_pad = speech_pad;
+        self.max_speech = max_speech;
+        self.min_silence = min_silence;
+        self.min_silence_at_max_speech = min_silence_at_max_speech;
+        self.neg_threshold = neg_threshold;
         self.threshold = self.config.threshold;
         self.hysteresis = self.config.hysteresis;
-        self.context_size = self.config.context_size;
+        self.context_size = context_size;
         self.timestamp_offset = self.config.timestamp_offset;
 
-        self.verify()
+        Ok(())
     }
 
     /// Loads the VAD model.
@@ -405,17 +430,59 @@ impl Vad {
         self.head = offset.max(self.head);
     }
 
-    fn verify(&self) -> Result<()> {
-        if !SAMPLE_RATES.contains(&self.sample_rate) {
+    fn validate(
+        sample_rate: usize,
+        context_size: usize,
+        chunk_size: usize,
+        hysteresis: f32,
+        threshold: f32,
+        max_speech: usize,
+    ) -> Result<()> {
+        if !SAMPLE_RATES.contains(&sample_rate) {
             bail!(
                 "invalid sample rate: {}, only support 8000 or 16000.",
-                self.sample_rate
+                sample_rate
             );
         }
 
-        //TODO: add more checks for config values.
+        if context_size == 0 || context_size >= chunk_size {
+            bail!(
+                "invalid context_size: {}, must be greater than 0 and less than chunk_size ({})",
+                context_size,
+                chunk_size
+            );
+        }
+
+        if hysteresis < 0.0 || hysteresis > threshold {
+            bail!(
+                "invalid hysteresis: {}, must be within [0, threshold={}]",
+                hysteresis,
+                threshold
+            );
+        }
+
+        // `max_speech` is already the saturating-subtracted value computed in
+        // `new()`/`apply_config()`; checking it directly (instead of
+        // re-deriving the same arithmetic here) means this can't drift out of
+        // sync with that computation.
+        if max_speech == 0 {
+            bail!(
+                "invalid max_speech: computed 0 samples after subtracting chunk_size and speech_pad padding, increase max_speech or decrease speech_pad"
+            );
+        }
 
         Ok(())
+    }
+
+    fn verify(&self) -> Result<()> {
+        Self::validate(
+            self.sample_rate,
+            self.context_size,
+            self.chunk_size,
+            self.hysteresis,
+            self.threshold,
+            self.max_speech,
+        )
     }
 
     #[inline]
@@ -728,5 +795,81 @@ impl AudioBuffer {
         }
         let chunk = self.start + self.offset - position;
         Some(Segment::new(position, chunk, self.sample_rate))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cpu_config() -> VadConfig {
+        let mut config = VadConfig::new(400, 16000);
+        config.use_cpu = true;
+        config
+    }
+
+    #[test]
+    fn test_verify_default_config() {
+        let mut vad = Vad::new(cpu_config());
+        assert!(vad.apply_config().is_ok());
+    }
+
+    #[test]
+    fn test_verify_rejects_invalid_sample_rate() {
+        let mut config = cpu_config();
+        config.sample_rate = 44100;
+        let mut vad = Vad::new(config);
+        assert!(vad.apply_config().is_err());
+    }
+
+    #[test]
+    fn test_verify_rejects_context_size_zero() {
+        let mut config = cpu_config();
+        config.context_size = 0;
+        let mut vad = Vad::new(config);
+        assert!(vad.apply_config().is_err());
+    }
+
+    #[test]
+    fn test_verify_rejects_context_size_ge_chunk() {
+        let mut config = cpu_config();
+        config.context_size = CHUNKS_SR16K;
+        let mut vad = Vad::new(config);
+        assert!(vad.apply_config().is_err());
+    }
+
+    #[test]
+    fn test_verify_rejects_hysteresis_above_threshold() {
+        let mut config = cpu_config();
+        config.hysteresis = config.threshold + 0.1;
+        let mut vad = Vad::new(config);
+        assert!(vad.apply_config().is_err());
+    }
+
+    #[test]
+    fn test_verify_rejects_negative_hysteresis() {
+        let mut config = cpu_config();
+        config.hysteresis = -0.1;
+        let mut vad = Vad::new(config);
+        assert!(vad.apply_config().is_err());
+    }
+
+    #[test]
+    fn test_verify_rejects_small_max_speech() {
+        let mut config = cpu_config();
+        config.max_speech = 1;
+        let mut vad = Vad::new(config);
+        assert!(vad.apply_config().is_err());
+    }
+
+    #[test]
+    fn test_apply_config_no_mutation_on_failure() {
+        let mut vad = Vad::new(cpu_config());
+        vad.apply_config().unwrap();
+        let good_max_speech = vad.max_speech;
+
+        vad.config.max_speech = 1;
+        assert!(vad.apply_config().is_err());
+        assert_eq!(vad.max_speech, good_max_speech);
     }
 }
