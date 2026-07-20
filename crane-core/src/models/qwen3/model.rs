@@ -24,7 +24,7 @@ use crate::utils::utils;
 pub enum ModelFormat {
     /// Auto-detect from path (default).
     Auto,
-    /// Standard HuggingFace safetensors.
+    /// Standard `HuggingFace` safetensors.
     Safetensors,
     /// GGUF quantized format.
     Gguf,
