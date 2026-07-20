@@ -118,6 +118,7 @@ pub struct Config {
 }
 
 impl Config {
+    #[must_use]
     pub fn head_dim(&self) -> usize {
         self.head_dim
             .unwrap_or(self.hidden_size / self.num_attention_heads)
@@ -965,6 +966,7 @@ impl Qwen3Model {
     /// The token embedding table, exposed for callers that need to embed
     /// text tokens themselves before splicing in other embeddings (e.g.
     /// Qwen3-ASR's audio/text embedding merge).
+    #[must_use]
     pub fn embed_tokens(&self) -> &candle_nn::Embedding {
         &self.embed_tokens
     }
@@ -977,11 +979,13 @@ impl Qwen3Model {
         }
     }
 
+    #[must_use]
     pub fn num_layers(&self) -> usize {
         self.layers.len()
     }
 
     /// Total bytes held by the model's KV caches (no GPU copies).
+    #[must_use]
     pub fn active_kv_cache_bytes(&self) -> u64 {
         self.layers
             .iter()
@@ -1007,6 +1011,7 @@ impl Qwen3Model {
     /// that need to free the buffer (e.g. batch-decode extract) should use
     /// `Tensor::contiguous()` on their side, or clear `seq.kv_caches` after
     /// consuming the views.
+    #[must_use]
     pub fn get_kv_caches(&self) -> Vec<Option<(Tensor, Tensor)>> {
         self.layers
             .iter()
@@ -1176,11 +1181,13 @@ impl Qwen3Model {
     }
 
     /// Access the model config.
+    #[must_use]
     pub fn config(&self) -> &Config {
         &self.config
     }
 
     /// Access the model dtype.
+    #[must_use]
     pub fn model_dtype(&self) -> DType {
         self.dtype
     }
