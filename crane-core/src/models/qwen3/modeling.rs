@@ -1295,8 +1295,8 @@ fn pad_and_stack_kv_caches(
     }
 
     let n = caches.len();
-    let mut padded_k_list = Vec::with_capacity(n);
-    let mut padded_v_list = Vec::with_capacity(n);
+    let mut padded_keys = Vec::with_capacity(n);
+    let mut padded_values = Vec::with_capacity(n);
 
     let max_pad_needed = caches
         .iter()
@@ -1322,21 +1322,21 @@ fn pad_and_stack_kv_caches(
             let pad_len = max_len - cur_len;
             if pad_len > 0 {
                 let pad = zero_pad.as_ref().unwrap().narrow(2, 0, pad_len)?;
-                padded_k_list.push(Tensor::cat(&[&pad, k], 2)?);
-                padded_v_list.push(Tensor::cat(&[&pad, v], 2)?);
+                padded_keys.push(Tensor::cat(&[&pad, k], 2)?);
+                padded_values.push(Tensor::cat(&[&pad, v], 2)?);
             } else {
-                padded_k_list.push(k.clone());
-                padded_v_list.push(v.clone());
+                padded_keys.push(k.clone());
+                padded_values.push(v.clone());
             }
         } else {
             let zeros = Tensor::zeros((1, kv_heads, max_len, head_dim), dtype, device)?;
-            padded_k_list.push(zeros.clone());
-            padded_v_list.push(zeros);
+            padded_keys.push(zeros.clone());
+            padded_values.push(zeros);
         }
     }
 
-    let stacked_k = Tensor::cat(&padded_k_list, 0)?.contiguous()?;
-    let stacked_v = Tensor::cat(&padded_v_list, 0)?.contiguous()?;
+    let stacked_k = Tensor::cat(&padded_keys, 0)?.contiguous()?;
+    let stacked_v = Tensor::cat(&padded_values, 0)?.contiguous()?;
     Ok(Some((stacked_k, stacked_v)))
 }
 
