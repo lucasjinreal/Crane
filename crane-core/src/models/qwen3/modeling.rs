@@ -149,6 +149,10 @@ struct Attention {
 }
 
 impl Attention {
+    // `VarBuilder` is conventionally passed by value throughout this
+    // codebase (its `pp`/`device`/`dtype` accessors take `&self` and are
+    // cheap to call repeatedly); matching that convention here.
+    #[allow(clippy::needless_pass_by_value)]
     fn new(config: &Config, vb: VarBuilder) -> Result<Self> {
         let head_dim = config.head_dim();
         let num_heads = config.num_attention_heads;
@@ -533,6 +537,8 @@ struct Mlp {
 }
 
 impl Mlp {
+    // See `Attention::new`'s comment on `VarBuilder` by-value.
+    #[allow(clippy::needless_pass_by_value)]
     fn new(config: &Config, vb: VarBuilder) -> Result<Self> {
         let gate_proj = linear_no_bias(
             config.hidden_size,
@@ -619,6 +625,8 @@ struct DecoderLayer {
 }
 
 impl DecoderLayer {
+    // See `Attention::new`'s comment on `VarBuilder` by-value.
+    #[allow(clippy::needless_pass_by_value)]
     fn new(config: &Config, vb: VarBuilder) -> Result<Self> {
         let self_attn = Attention::new(config, vb.pp("self_attn"))?;
         let mlp = Mlp::new(config, vb.pp("mlp"))?;
@@ -716,6 +724,8 @@ impl Qwen3Model {
         Self::new_inner(config, model_vb, root_vb)
     }
 
+    // See `Attention::new`'s comment on `VarBuilder` by-value.
+    #[allow(clippy::needless_pass_by_value)]
     fn new_inner(config: &Config, model_vb: VarBuilder, root_vb: VarBuilder) -> Result<Self> {
         let dtype = model_vb.dtype();
         let embed_tokens = candle_nn::embedding(
