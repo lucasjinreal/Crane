@@ -1077,7 +1077,7 @@ impl Qwen3Model {
 
     /// Restore per-layer KV caches.
     pub fn set_kv_caches(&mut self, caches: Vec<Option<(Tensor, Tensor)>>) {
-        for (layer, cache) in self.layers.iter_mut().zip(caches.into_iter()) {
+        for (layer, cache) in self.layers.iter_mut().zip(caches) {
             let seq_len = cache
                 .as_ref()
                 .map_or(0, |(k, _)| k.dim(2).unwrap_or(0));
@@ -1255,6 +1255,10 @@ impl Qwen3Model {
 // ── Utilities ───────────────────────────────────────────────────────────
 
 /// Build attention mask for batched decode with padding-aware masking.
+///
+/// # Errors
+///
+/// Returns an error if building the mask tensor fails.
 pub fn build_batch_decode_mask(
     kv_lens: &[usize],
     original_max_kv: usize,
