@@ -1278,8 +1278,8 @@ fn pad_and_stack_kv_caches(
                 let pad_len = max_len - cur_len;
                 if pad_len > 0 {
                     let pad = zero_pad.as_ref().unwrap().narrow(2, 0, pad_len)?;
-                    padded_ks.push(Tensor::cat(&[&pad, k.as_ref()], 2)?);
-                    padded_vs.push(Tensor::cat(&[&pad, v.as_ref()], 2)?);
+                    padded_ks.push(Tensor::cat(&[&pad, k], 2)?);
+                    padded_vs.push(Tensor::cat(&[&pad, v], 2)?);
                 } else {
                     padded_ks.push(k.clone());
                     padded_vs.push(v.clone());
