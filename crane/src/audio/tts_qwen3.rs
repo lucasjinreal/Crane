@@ -6,7 +6,8 @@ use crane_core::generation::SpeechOptions;
 use crane_core::models::qwen3_tts::Model;
 use crane_core::models::qwen3_tts::modeling::TalkerConfig;
 
-use super::tts::{load_wav_f32, AudioInfo, Tts, TtsStream, VoiceInfo};
+use super::pcm::{load_wav_f32, AudioInfo};
+use super::tts::{Tts, TtsStream, VoiceInfo};
 
 /// Maps a `codec_language_id` language name to its ISO 639-1 code.
 ///
