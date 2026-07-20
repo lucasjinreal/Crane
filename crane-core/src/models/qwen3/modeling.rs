@@ -805,7 +805,7 @@ impl Qwen3Model {
             .metadata()
             .get("general.architecture")
             .and_then(|v| v.to_string().ok())
-            .map(|s| s.clone())
+            .cloned()
             .unwrap_or_else(|| "qwen3".to_string());
 
         let num_attention_heads =
