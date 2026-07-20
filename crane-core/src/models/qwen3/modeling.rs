@@ -1140,6 +1140,8 @@ impl Qwen3Model {
         let max_pos = positions.iter().copied().max().unwrap_or(0) + 1;
         let device = input_ids.device();
         let (full_cos, full_sin) = self.rotary_emb.forward(0, max_pos)?;
+        // Sequence positions never approach u32::MAX.
+        #[allow(clippy::cast_possible_truncation)]
         let pos_ids: Vec<u32> = positions.iter().map(|&p| p as u32).collect();
         let pos_tensor = Tensor::new(pos_ids.as_slice(), device)?;
         let cos = full_cos
