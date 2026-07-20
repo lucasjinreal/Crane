@@ -1,40 +1,40 @@
 //! Optimized Qwen3 transformer implementation.
 //!
-//! Adapted from the HunyuanDense model with full parity on all optimizations:
+//! Adapted from the `HunyuanDense` model with full parity on all optimizations:
 //!
 //! 1. **Pre-allocated KV cache** with in-place `slice_set` writes
-//!    — O(new_seq_len) per decode step instead of O(cache_len) `Tensor::cat`.
+//!    — `O(new_seq_len)` per decode step instead of `O(cache_len)` `Tensor::cat`.
 //! 2. **Fused flash attention for decode and prefill** (CPU, B=1)
 //!    — Uses `candle_nn::attention::flash_attn`'s online-softmax kernel
-//!      (O(head_dim) working set, native GQA) instead of materializing an
-//!      O(context_len) scores tensor. Prefill additionally skips the
-//!      GQA K/V expansion (which duplicates K/V n_rep times) and uses
-//!      `AttnMask::Causal` so masking is done via loop bounds, not a
-//!      materialized mask tensor. Falls back to a GQA-grouped matmul SDPA
-//!      on GPU or for batched (B>1) decode, where cuBLAS is already
-//!      compute-bound or an explicit per-sequence mask is required, and to
-//!      a standard SDPA for GPU or batched (B>1) prefill, or when
-//!      num_heads == num_kv_heads (no GQA grouping needed).
+//!    (`O(head_dim)` working set, native GQA) instead of materializing an
+//!    `O(context_len)` scores tensor. Prefill additionally skips the
+//!    GQA K/V expansion (which duplicates `K/V` `n_rep` times) and uses
+//!    `AttnMask::Causal` so masking is done via loop bounds, not a
+//!    materialized mask tensor. Falls back to a GQA-grouped matmul SDPA
+//!    on GPU or for batched (B>1) decode, where cuBLAS is already
+//!    compute-bound or an explicit per-sequence mask is required, and to
+//!    a standard SDPA for GPU or batched (B>1) prefill, or when
+//!    `num_heads` == `num_kv_heads` (no GQA grouping needed).
 //! 3. **Fused `RoPE` kernel** via `candle_nn::rotary_emb::rope_thd()`
 //!    — One CUDA launch per Q/K instead of 5 manual tensor ops.
 //!    — Applied in BSHD layout (before the transpose to BHSD), so the
-//!      reshape output is already contiguous — no `contiguous()` copy
-//!      needed before `RoPE`, and QK norm hits the fast fused RmsNorm path.
+//!    reshape output is already contiguous — no `contiguous()` copy
+//!    needed before `RoPE`, and QK norm hits the fast fused `RmsNorm` path.
 //!    — Precomputed `[max_pos, head_dim/2]` cos/sin tables (half-width, as
-//!      required by the `rope_thd()` API).
+//!    required by the `rope_thd()` API).
 //! 4. **GGUF quantization** via the polymorphic `LinearLayer` enum
 //!    — Same model code serves both safetensors (f16/f32/bf16) and GGUF weights.
 //! 5. **Batched decode infrastructure**
 //!    — `setup_batch_decode`, `step_batch_decode`, `extract_batch_kv` enable
-//!      GPU-efficient concurrent sequence serving in the engine.
+//!    GPU-efficient concurrent sequence serving in the engine.
 //! 6. **KV cache save/restore**
 //!    — `get_kv_caches` / `set_kv_caches` for continuous-batching context swap.
 //! 7. **Fused SiLU-mul MLP gate**
 //!    — `fused_silu_mul` replaces the `narrow + silu + mul` op chain in each
-//!      MLP block, reducing kernel launches and intermediate allocations.
+//!    MLP block, reducing kernel launches and intermediate allocations.
 //! 8. **Merged QKV / gate+up projections**
 //!    — Q, K, V weights fused into one matmul; gate and up weights fused into
-//!      one matmul — halves the number of linear-layer dispatches per layer.
+//!    one matmul — halves the number of linear-layer dispatches per layer.
 
 use candle_core::quantized::gguf_file;
 use candle_core::{DType, Device, Module, Result, Tensor, D};
@@ -74,6 +74,10 @@ impl EventTrackingGuard {
     }
 }
 
+/// Per-layer, per-sequence KV cache tensors, as returned by
+/// [`Qwen3Model::extract_batch_kv`].
+pub type BatchKvCache = Vec<Vec<Option<(Tensor, Tensor)>>>;
+
 // ── Config ──────────────────────────────────────────────────────────────
 
 fn default_true() -> bool {
@@ -83,6 +87,9 @@ fn default_rope_theta() -> f64 {
     1_000_000.0
 }
 
+// Field names and independent bool toggles mirror the HuggingFace
+// config.json schema; grouping them would break Deserialize's field mapping.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub vocab_size: usize,
@@ -114,6 +121,7 @@ pub struct Config {
 }
 
 impl Config {
+    #[must_use]
     pub fn head_dim(&self) -> usize {
         self.head_dim
             .unwrap_or(self.hidden_size / self.num_attention_heads)
@@ -127,7 +135,7 @@ struct Attention {
     k_proj: LinearLayer,
     v_proj: LinearLayer,
     o_proj: LinearLayer,
-    /// Merged QKV weight [q_dim + 2*kv_dim, hidden_size] — one gemv instead of 3.
+    /// Merged QKV weight [`q_dim` + 2*`kv_dim`, `hidden_size`] — one gemv instead of 3.
     /// Only set for Standard (non-quantized) weights.
     qkv_proj: Option<Linear>,
     q_norm: Option<RmsNorm>,
@@ -144,6 +152,10 @@ struct Attention {
 }
 
 impl Attention {
+    // `VarBuilder` is conventionally passed by value throughout this
+    // codebase (its `pp`/`device`/`dtype` accessors take `&self` and are
+    // cheap to call repeatedly); matching that convention here.
+    #[allow(clippy::needless_pass_by_value)]
     fn new(config: &Config, vb: VarBuilder) -> Result<Self> {
         let head_dim = config.head_dim();
         let num_heads = config.num_attention_heads;
@@ -286,6 +298,16 @@ impl Attention {
         Ok((update.k, update.v))
     }
 
+    // q/k/v/b/h/s/d are standard ML tensor-shape notation (query, key,
+    // value, batch, heads, seq_len, head_dim), matching the Q/K/V and BHSD
+    // terminology already used throughout this function's comments.
+    #[allow(clippy::many_single_char_names)]
+    // This function's length comes from four densely-commented fast-path
+    // branches (CPU flash-attn decode, CPU flash-attn prefill, GQA-grouped
+    // SDPA decode, standard SDPA); splitting it up would scatter that
+    // rationale across several small functions without simplifying the
+    // control flow itself.
+    #[allow(clippy::too_many_lines)]
     fn forward(
         &mut self,
         hidden_states: &Tensor,
@@ -349,6 +371,9 @@ impl Attention {
 
         // ── SDPA ──
         let n_rep = self.num_heads / self.num_kv_heads;
+        // head_dim is a small model hyperparameter (e.g. <= a few hundred),
+        // far below f64's 52-bit mantissa limit.
+        #[allow(clippy::cast_precision_loss)]
         let scale = 1.0 / (self.head_dim as f64).sqrt();
         // 1/sqrt(head_dim) is always small and positive; f64->f32 here
         // only drops precision flash_attn's own f32 accumulator would
@@ -528,6 +553,8 @@ struct Mlp {
 }
 
 impl Mlp {
+    // See `Attention::new`'s comment on `VarBuilder` by-value.
+    #[allow(clippy::needless_pass_by_value)]
     fn new(config: &Config, vb: VarBuilder) -> Result<Self> {
         let gate_proj = linear_no_bias(
             config.hidden_size,
@@ -614,6 +641,8 @@ struct DecoderLayer {
 }
 
 impl DecoderLayer {
+    // See `Attention::new`'s comment on `VarBuilder` by-value.
+    #[allow(clippy::needless_pass_by_value)]
     fn new(config: &Config, vb: VarBuilder) -> Result<Self> {
         let self_attn = Attention::new(config, vb.pp("self_attn"))?;
         let mlp = Mlp::new(config, vb.pp("mlp"))?;
@@ -693,7 +722,12 @@ pub struct Qwen3Model {
 }
 
 impl Qwen3Model {
-    /// Construct from safetensors / HuggingFace checkpoint.
+    /// Construct from safetensors / `HuggingFace` checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a required weight tensor is missing or has an
+    /// unexpected shape.
     pub fn new(config: &Config, vb: VarBuilder) -> Result<Self> {
         Self::new_inner(config, vb.pp("model"), vb)
     }
@@ -703,6 +737,11 @@ impl Qwen3Model {
     /// `model.language_model.*`). `model_vb` must already be scoped to the
     /// decoder's root (what would otherwise be `vb.pp("model")`); `root_vb`
     /// is the checkpoint root, used to resolve an untied `lm_head` sibling.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a required weight tensor is missing or has an
+    /// unexpected shape.
     pub fn new_from_model_vb(
         config: &Config,
         model_vb: VarBuilder,
@@ -711,6 +750,8 @@ impl Qwen3Model {
         Self::new_inner(config, model_vb, root_vb)
     }
 
+    // See `Attention::new`'s comment on `VarBuilder` by-value.
+    #[allow(clippy::needless_pass_by_value)]
     fn new_inner(config: &Config, model_vb: VarBuilder, root_vb: VarBuilder) -> Result<Self> {
         let dtype = model_vb.dtype();
         let embed_tokens = candle_nn::embedding(
@@ -757,6 +798,11 @@ impl Qwen3Model {
     }
 
     /// Construct from a GGUF file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a required tensor or metadata entry is missing
+    /// or has an unexpected shape.
     pub fn from_gguf<R: Read + Seek>(
         ct: gguf_file::Content,
         reader: &mut R,
@@ -777,7 +823,7 @@ impl Qwen3Model {
             .metadata()
             .get("general.architecture")
             .and_then(|v| v.to_string().ok())
-            .map(|s| s.clone())
+            .cloned()
             .unwrap_or_else(|| "qwen3".to_string());
 
         let num_attention_heads =
@@ -798,16 +844,18 @@ impl Qwen3Model {
             .get(&format!("{arch}.context_length"))
             .and_then(|v| v.to_u32().ok())
             .unwrap_or(32768) as usize;
-        let rms_norm_eps = gg
-            .metadata()
-            .get(&format!("{arch}.attention.layer_norm_rms_epsilon"))
-            .and_then(|v| v.to_f32().ok())
-            .unwrap_or(1e-6) as f64;
-        let rope_theta = gg
-            .metadata()
-            .get(&format!("{arch}.rope.freq_base"))
-            .and_then(|v| v.to_f32().ok())
-            .unwrap_or(1_000_000.0) as f64;
+        let rms_norm_eps = f64::from(
+            gg.metadata()
+                .get(&format!("{arch}.attention.layer_norm_rms_epsilon"))
+                .and_then(|v| v.to_f32().ok())
+                .unwrap_or(1e-6),
+        );
+        let rope_theta = f64::from(
+            gg.metadata()
+                .get(&format!("{arch}.rope.freq_base"))
+                .and_then(|v| v.to_f32().ok())
+                .unwrap_or(1_000_000.0),
+        );
 
         let use_qk_norm = gg.ct.tensor_infos.contains_key("blk.0.attn_q_norm.weight");
         let tie_word_embeddings = !gg.ct.tensor_infos.contains_key("output.weight");
@@ -872,6 +920,9 @@ impl Qwen3Model {
 
     // ── Forward ─────────────────────────────────────────────────────────
 
+    /// # Errors
+    ///
+    /// Returns an error if the forward pass fails.
     pub fn forward(&mut self, input_ids: &Tensor, start_pos: usize) -> Result<Tensor> {
         let (_b_sz, seq_len) = input_ids.dims2()?;
 
@@ -890,6 +941,10 @@ impl Qwen3Model {
     /// internally. Used by callers (e.g. Qwen3-ASR) that splice in
     /// non-text embeddings (audio, etc.) at specific positions before
     /// running the decoder.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the forward pass fails.
     pub fn forward_embeds(&mut self, inputs_embeds: &Tensor, start_pos: usize) -> Result<Tensor> {
         let (_b_sz, seq_len, hidden) = inputs_embeds.dims3()?;
         if hidden != self.config.hidden_size {
@@ -946,7 +1001,7 @@ impl Qwen3Model {
         };
 
         let mut hidden_states = hidden_states;
-        for layer in self.layers.iter_mut() {
+        for layer in &mut self.layers {
             hidden_states =
                 layer.forward(&hidden_states, &cos, &sin, attention_mask.as_ref())?;
         }
@@ -961,6 +1016,7 @@ impl Qwen3Model {
     /// The token embedding table, exposed for callers that need to embed
     /// text tokens themselves before splicing in other embeddings (e.g.
     /// Qwen3-ASR's audio/text embedding merge).
+    #[must_use]
     pub fn embed_tokens(&self) -> &candle_nn::Embedding {
         &self.embed_tokens
     }
@@ -968,31 +1024,27 @@ impl Qwen3Model {
     // ── KV Cache Management ─────────────────────────────────────────────
 
     pub fn clear_kv_cache(&mut self) {
-        for layer in self.layers.iter_mut() {
+        for layer in &mut self.layers {
             layer.clear_kv_cache();
         }
     }
 
+    #[must_use]
     pub fn num_layers(&self) -> usize {
         self.layers.len()
     }
 
     /// Total bytes held by the model's KV caches (no GPU copies).
+    #[must_use]
     pub fn active_kv_cache_bytes(&self) -> u64 {
         self.layers
             .iter()
             .map(|l| {
-                l.self_attn
-                    .kv_cache
-                    .as_ref()
-                    .map(|(k, v)| {
-                        let k_bytes =
-                            k.elem_count() as u64 * k.dtype().size_in_bytes() as u64;
-                        let v_bytes =
-                            v.elem_count() as u64 * v.dtype().size_in_bytes() as u64;
-                        k_bytes + v_bytes
-                    })
-                    .unwrap_or(0)
+                l.self_attn.kv_cache.as_ref().map_or(0, |(k, v)| {
+                    let k_bytes = k.elem_count() as u64 * k.dtype().size_in_bytes() as u64;
+                    let v_bytes = v.elem_count() as u64 * v.dtype().size_in_bytes() as u64;
+                    k_bytes + v_bytes
+                })
             })
             .sum()
     }
@@ -1003,6 +1055,7 @@ impl Qwen3Model {
     /// that need to free the buffer (e.g. batch-decode extract) should use
     /// `Tensor::contiguous()` on their side, or clear `seq.kv_caches` after
     /// consuming the views.
+    #[must_use]
     pub fn get_kv_caches(&self) -> Vec<Option<(Tensor, Tensor)>> {
         self.layers
             .iter()
@@ -1024,11 +1077,10 @@ impl Qwen3Model {
 
     /// Restore per-layer KV caches.
     pub fn set_kv_caches(&mut self, caches: Vec<Option<(Tensor, Tensor)>>) {
-        for (layer, cache) in self.layers.iter_mut().zip(caches.into_iter()) {
+        for (layer, cache) in self.layers.iter_mut().zip(caches) {
             let seq_len = cache
                 .as_ref()
-                .map(|(k, _)| k.dim(2).unwrap_or(0))
-                .unwrap_or(0);
+                .map_or(0, |(k, _)| k.dim(2).unwrap_or(0));
             layer.self_attn.kv_cache = cache;
             layer.self_attn.cache_seq_len = seq_len;
         }
@@ -1039,6 +1091,13 @@ impl Qwen3Model {
     /// Pad per-sequence KV caches to the same length and load into model layers.
     ///
     /// Returns `(kv_lens, max_kv_len)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if padding or stacking the KV caches fails.
+    // b/h/s/d are standard tensor-shape notation (batch, heads, seq_len,
+    // head_dim), matching the BHSD terminology used elsewhere in this file.
+    #[allow(clippy::many_single_char_names)]
     pub fn setup_batch_decode(
         &mut self,
         seq_kv_caches: &[Vec<Option<(Tensor, Tensor)>>],
@@ -1054,8 +1113,7 @@ impl Qwen3Model {
                 caches
                     .first()
                     .and_then(|c| c.as_ref())
-                    .map(|(k, _)| k.dim(2).unwrap_or(0))
-                    .unwrap_or(0)
+                    .map_or(0, |(k, _)| k.dim(2).unwrap_or(0))
             })
             .collect();
         let max_kv_len = kv_lens.iter().copied().max().unwrap_or(0);
@@ -1099,6 +1157,10 @@ impl Qwen3Model {
     }
 
     /// Run one batched decode step.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the forward pass fails.
     pub fn step_batch_decode(
         &mut self,
         input_ids: &Tensor,
@@ -1111,6 +1173,8 @@ impl Qwen3Model {
         let max_pos = positions.iter().copied().max().unwrap_or(0) + 1;
         let device = input_ids.device();
         let (full_cos, full_sin) = self.rotary_emb.forward(0, max_pos)?;
+        // Sequence positions never approach u32::MAX.
+        #[allow(clippy::cast_possible_truncation)]
         let pos_ids: Vec<u32> = positions.iter().map(|&p| p as u32).collect();
         let pos_tensor = Tensor::new(pos_ids.as_slice(), device)?;
         let cos = full_cos
@@ -1123,7 +1187,7 @@ impl Qwen3Model {
             .unsqueeze(1)?;
 
         let mut hidden_states = hidden_states;
-        for layer in self.layers.iter_mut() {
+        for layer in &mut self.layers {
             hidden_states =
                 layer.forward(&hidden_states, &cos, &sin, attention_mask)?;
         }
@@ -1133,19 +1197,23 @@ impl Qwen3Model {
     }
 
     /// Extract per-sequence KV caches from batched state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if narrowing or copying the KV cache tensors fails.
     pub fn extract_batch_kv(
         &mut self,
         kv_lens: &[usize],
         original_max_kv: usize,
         rounds_done: usize,
-    ) -> Result<Vec<Vec<Option<(Tensor, Tensor)>>>> {
+    ) -> Result<BatchKvCache> {
         let n_seqs = kv_lens.len();
         let num_layers = self.layers.len();
         let mut result: Vec<Vec<Option<(Tensor, Tensor)>>> = (0..n_seqs)
             .map(|_| Vec::with_capacity(num_layers))
             .collect();
 
-        for layer in self.layers.iter_mut() {
+        for layer in &mut self.layers {
             if let Some((ref full_k, ref full_v)) = layer.self_attn.kv_cache {
                 for i in 0..n_seqs {
                     let row_k = full_k.narrow(0, i, 1)?;
@@ -1160,8 +1228,8 @@ impl Qwen3Model {
                     result[i].push(clean);
                 }
             } else {
-                for i in 0..n_seqs {
-                    result[i].push(None);
+                for row in &mut result {
+                    row.push(None);
                 }
             }
             layer.self_attn.kv_cache = None;
@@ -1172,11 +1240,13 @@ impl Qwen3Model {
     }
 
     /// Access the model config.
+    #[must_use]
     pub fn config(&self) -> &Config {
         &self.config
     }
 
     /// Access the model dtype.
+    #[must_use]
     pub fn model_dtype(&self) -> DType {
         self.dtype
     }
@@ -1185,6 +1255,10 @@ impl Qwen3Model {
 // ── Utilities ───────────────────────────────────────────────────────────
 
 /// Build attention mask for batched decode with padding-aware masking.
+///
+/// # Errors
+///
+/// Returns an error if building the mask tensor fails.
 pub fn build_batch_decode_mask(
     kv_lens: &[usize],
     original_max_kv: usize,
@@ -1221,8 +1295,8 @@ fn pad_and_stack_kv_caches(
     }
 
     let n = caches.len();
-    let mut padded_ks = Vec::with_capacity(n);
-    let mut padded_vs = Vec::with_capacity(n);
+    let mut padded_keys = Vec::with_capacity(n);
+    let mut padded_values = Vec::with_capacity(n);
 
     let max_pad_needed = caches
         .iter()
@@ -1243,29 +1317,26 @@ fn pad_and_stack_kv_caches(
     };
 
     for cache in caches {
-        match cache {
-            Some((k, v)) => {
-                let cur_len = k.dim(2)?;
-                let pad_len = max_len - cur_len;
-                if pad_len > 0 {
-                    let pad = zero_pad.as_ref().unwrap().narrow(2, 0, pad_len)?;
-                    padded_ks.push(Tensor::cat(&[&pad, k.as_ref()], 2)?);
-                    padded_vs.push(Tensor::cat(&[&pad, v.as_ref()], 2)?);
-                } else {
-                    padded_ks.push(k.clone());
-                    padded_vs.push(v.clone());
-                }
+        if let Some((k, v)) = cache {
+            let cur_len = k.dim(2)?;
+            let pad_len = max_len - cur_len;
+            if pad_len > 0 {
+                let pad = zero_pad.as_ref().unwrap().narrow(2, 0, pad_len)?;
+                padded_keys.push(Tensor::cat(&[&pad, k], 2)?);
+                padded_values.push(Tensor::cat(&[&pad, v], 2)?);
+            } else {
+                padded_keys.push(k.clone());
+                padded_values.push(v.clone());
             }
-            None => {
-                let zeros = Tensor::zeros((1, kv_heads, max_len, head_dim), dtype, device)?;
-                padded_ks.push(zeros.clone());
-                padded_vs.push(zeros);
-            }
+        } else {
+            let zeros = Tensor::zeros((1, kv_heads, max_len, head_dim), dtype, device)?;
+            padded_keys.push(zeros.clone());
+            padded_values.push(zeros);
         }
     }
 
-    let stacked_k = Tensor::cat(&padded_ks, 0)?.contiguous()?;
-    let stacked_v = Tensor::cat(&padded_vs, 0)?.contiguous()?;
+    let stacked_k = Tensor::cat(&padded_keys, 0)?.contiguous()?;
+    let stacked_v = Tensor::cat(&padded_values, 0)?.contiguous()?;
     Ok(Some((stacked_k, stacked_v)))
 }
 

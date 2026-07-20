@@ -13,7 +13,7 @@ use candle_nn::VarBuilder;
 use candle_transformers::generation::LogitsProcessor;
 use tokenizers::Tokenizer;
 
-use super::modeling::{Config, Qwen3Model};
+use super::modeling::{BatchKvCache, Config, Qwen3Model};
 use crate::generation::based::ModelForCausalLM;
 use crate::generation::GenerationConfig;
 use crate::utils::token_output_stream::TokenOutputStream;
@@ -24,7 +24,7 @@ use crate::utils::utils;
 pub enum ModelFormat {
     /// Auto-detect from path (default).
     Auto,
-    /// Standard HuggingFace safetensors.
+    /// Standard `HuggingFace` safetensors.
     Safetensors,
     /// GGUF quantized format.
     Gguf,
@@ -38,10 +38,16 @@ pub struct Model {
 }
 
 impl Model {
+    /// # Errors
+    ///
+    /// Returns an error if the model files cannot be found or loaded.
     pub fn new(model_path: &str, device: &Device, dtype: &DType) -> Result<Self> {
         Self::new_with_format(model_path, device, dtype, ModelFormat::Auto)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the model files cannot be found or loaded.
     pub fn new_with_format(
         model_path: &str,
         device: &Device,
@@ -51,11 +57,7 @@ impl Model {
         let format = match format {
             ModelFormat::Auto => {
                 let p = std::path::Path::new(model_path);
-                if p.is_file()
-                    && p.extension()
-                        .map(|e| e == "gguf")
-                        .unwrap_or(false)
-                {
+                if p.is_file() && p.extension().is_some_and(|e| e == "gguf") {
                     ModelFormat::Gguf
                 } else {
                     ModelFormat::Safetensors
@@ -66,7 +68,7 @@ impl Model {
 
         match format {
             ModelFormat::Gguf | ModelFormat::Auto => Self::from_gguf(model_path, device),
-            ModelFormat::Safetensors => Self::from_pretrained(model_path, device, dtype),
+            ModelFormat::Safetensors => Self::from_pretrained(model_path, device, *dtype),
         }
     }
 
@@ -78,7 +80,7 @@ impl Model {
         self.inner.clear_kv_cache();
     }
 
-    fn from_pretrained(model_path: &str, device: &Device, dtype: &DType) -> Result<Model> {
+    fn from_pretrained(model_path: &str, device: &Device, dtype: DType) -> Result<Model> {
         let tokenizer_path = std::path::Path::new(model_path).join("tokenizer.json");
         if !tokenizer_path.exists() {
             anyhow::bail!("Tokenizer not found at {}", tokenizer_path.display());
@@ -86,7 +88,7 @@ impl Model {
         let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(E::msg)?;
 
         let filenames = utils::get_safetensors_files(model_path)?;
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, *dtype, device) }?;
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, device) }?;
 
         let config_file = std::path::Path::new(model_path).join("config.json");
         let config_data = std::fs::read(config_file)?;
@@ -97,7 +99,7 @@ impl Model {
         Ok(Self {
             tokenizer: TokenOutputStream::new(tokenizer),
             device: device.clone(),
-            dtype: *dtype,
+            dtype,
             inner,
         })
     }
@@ -152,19 +154,25 @@ impl Model {
         })
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if tokenization fails.
     pub fn prepare_inputs(&self, inputs: &str) -> Result<Vec<u32>> {
         let input_ids = self
             .tokenizer
             .tokenizer
             .encode(inputs, true)
-            .map_err(E::msg)
-            .unwrap()
+            .map_err(E::msg)?
             .get_ids()
             .to_vec();
         Ok(input_ids)
     }
 
     /// Run a single forward step, returning raw logits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the forward pass fails.
     pub fn forward_step(
         &mut self,
         input_ids: &[u32],
@@ -195,6 +203,9 @@ impl Model {
 
     // ── Batched decode (GPU-efficient concurrent serving) ───────────────
 
+    /// # Errors
+    ///
+    /// Returns an error if the batch decode setup fails.
     pub fn setup_batch_decode(
         &mut self,
         seq_kv_caches: &[Vec<Option<(Tensor, Tensor)>>],
@@ -203,6 +214,9 @@ impl Model {
         self.inner.setup_batch_decode(seq_kv_caches, extra_room)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the forward pass fails.
     pub fn step_batch_decode(
         &mut self,
         tokens: &[u32],
@@ -216,6 +230,9 @@ impl Model {
             .step_batch_decode(&input, positions, attention_mask, batch_kv_info)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the forward pass fails.
     pub fn step_batch_decode_with_input_ids(
         &mut self,
         input_ids: &Tensor,
@@ -227,12 +244,15 @@ impl Model {
             .step_batch_decode(input_ids, positions, attention_mask, batch_kv_info)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if extracting the batch KV caches fails.
     pub fn extract_batch_kv(
         &mut self,
         kv_lens: &[usize],
         original_max_kv: usize,
         rounds_done: usize,
-    ) -> candle_core::Result<Vec<Vec<Option<(Tensor, Tensor)>>>> {
+    ) -> candle_core::Result<BatchKvCache> {
         self.inner
             .extract_batch_kv(kv_lens, original_max_kv, rounds_done)
     }
@@ -285,7 +305,7 @@ impl ModelForCausalLM for Model {
 
             let logits = self.forward(&input, start_pos)?;
             let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
-            let logits = if config.repetition_penalty == 1. {
+            let logits = if (config.repetition_penalty - 1.).abs() < f32::EPSILON {
                 logits
             } else {
                 let start_at = tokens.len().saturating_sub(config.repeat_last_n);
@@ -313,17 +333,18 @@ impl ModelForCausalLM for Model {
             }
         }
         let dt = start_gen.elapsed();
-        if let Some(ref mut s) = streamer {
-            if !streamer_finalized {
-                s.finalize()?;
-            }
+        if let Some(ref mut s) = streamer
+            && !streamer_finalized
+        {
+            s.finalize()?;
         }
 
         if config.report_speed {
-            println!(
-                "\n{generated_tokens} tokens generated ({:.2} token/s)\n",
-                generated_tokens as f64 / dt.as_secs_f64(),
-            );
+            // generated_tokens is bounded by config.max_new_tokens, far below
+            // f64's 52-bit mantissa limit.
+            #[allow(clippy::cast_precision_loss)]
+            let tokens_per_sec = generated_tokens as f64 / dt.as_secs_f64();
+            println!("\n{generated_tokens} tokens generated ({tokens_per_sec:.2} token/s)\n");
         }
 
         Ok(tokens)
