@@ -1,25 +1,25 @@
 //! Optimized Qwen3 transformer implementation.
 //!
-//! Adapted from the HunyuanDense model with full parity on all optimizations:
+//! Adapted from the `HunyuanDense` model with full parity on all optimizations:
 //!
 //! 1. **Pre-allocated KV cache** with in-place `slice_set` writes
-//!    — O(new_seq_len) per decode step instead of O(cache_len) `Tensor::cat`.
+//!    — `O(new_seq_len)` per decode step instead of `O(cache_len)` `Tensor::cat`.
 //! 2. **Fused flash attention for decode and prefill** (CPU, B=1)
 //!    — Uses `candle_nn::attention::flash_attn`'s online-softmax kernel
-//!    (O(head_dim) working set, native GQA) instead of materializing an
-//!    O(context_len) scores tensor. Prefill additionally skips the
-//!    GQA K/V expansion (which duplicates K/V n_rep times) and uses
+//!    (`O(head_dim)` working set, native GQA) instead of materializing an
+//!    `O(context_len)` scores tensor. Prefill additionally skips the
+//!    GQA K/V expansion (which duplicates `K/V` n_rep times) and uses
 //!    `AttnMask::Causal` so masking is done via loop bounds, not a
 //!    materialized mask tensor. Falls back to a GQA-grouped matmul SDPA
 //!    on GPU or for batched (B>1) decode, where cuBLAS is already
 //!    compute-bound or an explicit per-sequence mask is required, and to
 //!    a standard SDPA for GPU or batched (B>1) prefill, or when
-//!    num_heads == num_kv_heads (no GQA grouping needed).
+//!    `num_heads` == `num_kv_heads` (no GQA grouping needed).
 //! 3. **Fused `RoPE` kernel** via `candle_nn::rotary_emb::rope_thd()`
 //!    — One CUDA launch per Q/K instead of 5 manual tensor ops.
 //!    — Applied in BSHD layout (before the transpose to BHSD), so the
 //!    reshape output is already contiguous — no `contiguous()` copy
-//!    needed before `RoPE`, and QK norm hits the fast fused RmsNorm path.
+//!    needed before `RoPE`, and QK norm hits the fast fused `RmsNorm` path.
 //!    — Precomputed `[max_pos, head_dim/2]` cos/sin tables (half-width, as
 //!    required by the `rope_thd()` API).
 //! 4. **GGUF quantization** via the polymorphic `LinearLayer` enum
@@ -131,7 +131,7 @@ struct Attention {
     k_proj: LinearLayer,
     v_proj: LinearLayer,
     o_proj: LinearLayer,
-    /// Merged QKV weight [q_dim + 2*kv_dim, hidden_size] — one gemv instead of 3.
+    /// Merged QKV weight [`q_dim` + 2*`kv_dim`, `hidden_size`] — one gemv instead of 3.
     /// Only set for Standard (non-quantized) weights.
     qkv_proj: Option<Linear>,
     q_norm: Option<RmsNorm>,
@@ -697,7 +697,7 @@ pub struct Qwen3Model {
 }
 
 impl Qwen3Model {
-    /// Construct from safetensors / HuggingFace checkpoint.
+    /// Construct from safetensors / `HuggingFace` checkpoint.
     pub fn new(config: &Config, vb: VarBuilder) -> Result<Self> {
         Self::new_inner(config, vb.pp("model"), vb)
     }
