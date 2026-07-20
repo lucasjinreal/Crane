@@ -669,7 +669,7 @@ impl AudioBuffer {
 
     /// Outputs a segment of audio data from the buffer.
     pub fn output(&mut self, from: usize, to: usize) -> Option<Segment> {
-        if self.queue.is_empty() || from < self.start + self.offset || to > self.start + self.length
+        if self.queue.is_empty() || from < self.start + self.offset || to > self.start + self.length || to < from
         {
             return None;
         }
