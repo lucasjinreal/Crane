@@ -59,7 +59,7 @@ impl SpeechDecoderBackend {
                 // total_upsample=1920 for Qwen3-TTS speech tokenizer
                 let trim = context_frames * 1920usize;
                 let tw = wav.dim(candle_core::D::Minus1)?;
-                wav.narrow(candle_core::D::Minus1, trim, tw.saturating_sub(trim))
+                Ok(wav.narrow(candle_core::D::Minus1, trim, tw.saturating_sub(trim))?)
             }
         }
     }
