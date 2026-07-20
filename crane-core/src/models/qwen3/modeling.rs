@@ -1191,8 +1191,8 @@ impl Qwen3Model {
                     result[i].push(clean);
                 }
             } else {
-                for i in 0..n_seqs {
-                    result[i].push(None);
+                for row in &mut result {
+                    row.push(None);
                 }
             }
             layer.self_attn.kv_cache = None;
