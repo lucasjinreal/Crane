@@ -12,7 +12,7 @@ use std::{
 
 /// Result type used by Candle core.
 pub use candle_core::Result;
-use candle_core::{bail, utils, DType, Device, Error, Tensor};
+use candle_core::{DType, Device, Error, Tensor, bail, utils};
 use candle_onnx::onnx::ModelProto;
 use ribo::utils::log;
 
@@ -122,10 +122,9 @@ pub struct Vad {
     tail: usize,
     // To save potential segment end (and tolerate some silence).
     temp_end: usize,
-    // To save potential segment limits in case of maximum segment size reached.
-    prev_end: usize,
-    // Next segment start position.
-    next_start: usize,
+    // Longest recorded silence gap (position, duration) in the current speech
+    // run, for longest-gap max-speech splitting.
+    longest_silence_gap: Option<(usize, usize)>,
     // Current active segment start position.
     current_start: usize,
     // Current active segment stop position.
@@ -161,8 +160,7 @@ impl fmt::Debug for Vad {
             .field("head", &self.head)
             .field("tail", &self.tail)
             .field("temp_end", &self.temp_end)
-            .field("prev_end", &self.prev_end)
-            .field("next_start", &self.next_start)
+            .field("longest_silence_gap", &self.longest_silence_gap)
             .field("current_start", &self.current_start)
             .field("current_end", &self.current_end)
             .field("padded", &self.padded)
@@ -225,8 +223,7 @@ impl Vad {
             head: 0,
             tail: 0,
             temp_end: 0,
-            prev_end: 0,
-            next_start: 0,
+            longest_silence_gap: None,
             current_start: 0,
             current_end: 0,
             padded: true,
@@ -330,9 +327,8 @@ impl Vad {
         self.triggered = false;
         self.current_start = 0;
         self.current_end = 0;
-        self.prev_end = 0;
-        self.next_start = 0;
         self.temp_end = 0;
+        self.longest_silence_gap = None;
         self.tail = self.head;
         self.buffer.clear();
         self.state[1] = Tensor::zeros_like(&self.state[1])?;
@@ -427,8 +423,7 @@ impl Vad {
         self.head = 0;
         self.tail = 0;
         self.temp_end = 0;
-        self.prev_end = 0;
-        self.next_start = 0;
+        self.longest_silence_gap = None;
         self.current_start = 0;
         self.current_end = 0;
         self.padded = true;
@@ -551,9 +546,9 @@ impl Vad {
             .get(&out_names[0].name)
             .ok_or_else(|| Error::Msg(format!("missing VAD output '{}'", out_names[0].name)).bt())?
             .clone();
-        let state_output = out
-            .get(&out_names[1].name)
-            .ok_or_else(|| Error::Msg(format!("missing VAD output '{}'", out_names[1].name)).bt())?;
+        let state_output = out.get(&out_names[1].name).ok_or_else(|| {
+            Error::Msg(format!("missing VAD output '{}'", out_names[1].name)).bt()
+        })?;
         self.update_state(state_output, next_context);
 
         let output = output.flatten_all()?.to_vec1::<f32>()?;
@@ -570,10 +565,15 @@ impl Vad {
         // Straightforward detection.
         if prob >= self.threshold {
             if self.temp_end > 0 {
-                self.temp_end = 0;
-                if self.next_start < self.prev_end {
-                    self.next_start = offset;
+                let sil_dur = offset - self.temp_end;
+                if sil_dur > self.min_silence_at_max_speech
+                    && self
+                        .longest_silence_gap
+                        .is_none_or(|(_, best_dur)| sil_dur > best_dur)
+                {
+                    self.longest_silence_gap = Some((self.temp_end, sil_dur));
                 }
+                self.temp_end = 0;
             }
             if !self.triggered {
                 self.finish_padding(true);
@@ -585,24 +585,24 @@ impl Vad {
         // Maximum active segment size reached.
         if self.triggered && offset - self.current_start > self.max_speech {
             log::debug!("max speech reached: {}", offset - self.current_start);
-            if self.prev_end > 0 {
-                self.current_end = self.prev_end;
+            if let Some((end_pos, dur)) = self.longest_silence_gap {
+                // Use the longest recorded silence gap in the current speech run.
+                self.current_end = end_pos;
                 self.push_segment();
-                if self.next_start < self.prev_end {
+                let next = end_pos + dur;
+                if next < end_pos + offset {
                     // previously reached silence (< neg_thres) and is still not speech (< thres)
-                    self.triggered = false;
+                    self.current_start = next;
                 } else {
-                    self.current_start = self.next_start;
+                    self.triggered = false;
                 }
-                self.prev_end = 0;
-                self.next_start = 0;
                 self.temp_end = 0;
+                self.longest_silence_gap = None;
             } else {
                 self.current_end = offset;
                 self.push_segment();
-                self.prev_end = 0;
-                self.next_start = 0;
                 self.temp_end = 0;
+                self.longest_silence_gap = None;
                 self.triggered = false;
                 return;
             }
@@ -613,10 +613,6 @@ impl Vad {
             if self.temp_end == 0 {
                 self.temp_end = offset;
             }
-            if offset - self.temp_end > self.min_silence_at_max_speech {
-                // condition to avoid cutting in very short silence
-                self.prev_end = self.temp_end;
-            }
             if offset - self.temp_end < self.min_silence {
                 return;
             } else {
@@ -626,9 +622,8 @@ impl Vad {
                 }
                 self.current_start = 0;
                 self.current_end = 0;
-                self.prev_end = 0;
-                self.next_start = 0;
                 self.temp_end = 0;
+                self.longest_silence_gap = None;
                 self.triggered = false;
                 return;
             }
@@ -765,7 +760,10 @@ impl AudioBuffer {
 
     /// Outputs a segment of audio data from the buffer.
     pub fn output(&mut self, from: usize, to: usize) -> Option<Segment> {
-        if self.queue.is_empty() || from < self.start + self.offset || to > self.start + self.length || to < from
+        if self.queue.is_empty()
+            || from < self.start + self.offset
+            || to > self.start + self.length
+            || to < from
         {
             return None;
         }
@@ -900,5 +898,47 @@ mod tests {
         vad.config.max_speech = 1;
         assert!(vad.apply_config().is_err());
         assert_eq!(vad.max_speech, good_max_speech);
+    }
+
+    #[test]
+    fn test_make_segment_cuts_at_longest_silence_gap() {
+        // max_speech (100ms) - chunk_size (512) - 2*speech_pad (0) = 1088 samples.
+        let mut config = VadConfig::new(50, 16000);
+        config.use_cpu = true;
+        config.speech_pad = 0;
+        config.min_silence_at_max_speech = 10;
+        config.max_speech = 100;
+        let mut vad = Vad::new(config).unwrap();
+
+        // Trigger speech at offset 100.
+        vad.head = 100;
+        vad.make_segment(0.9);
+        assert!(vad.triggered);
+        assert_eq!(vad.current_start, 100);
+
+        // Longer silence gap: 300 -> 700 (duration 400).
+        vad.head = 300;
+        vad.make_segment(0.1);
+        vad.head = 700;
+        vad.make_segment(0.9);
+        assert_eq!(vad.longest_silence_gap, Some((300, 400)));
+
+        // Shorter silence gap recorded afterwards: 900 -> 1100 (duration 200).
+        // Must not replace the already-recorded longer gap.
+        vad.head = 900;
+        vad.make_segment(0.1);
+        vad.head = 1100;
+        vad.make_segment(0.9);
+        assert_eq!(vad.longest_silence_gap, Some((300, 400)));
+
+        // Push past max_speech (1088 samples from current_start=100),
+        // triggering the max-speech cut. It must land on the longer gap
+        // (300), not the shorter, more recent one (900).
+        vad.head = 1200;
+        vad.make_segment(0.9);
+
+        assert_eq!(vad.segments, vec![(100, 300)]);
+        assert_eq!(vad.current_start, 700);
+        assert!(vad.triggered);
     }
 }
