@@ -87,6 +87,9 @@ fn default_rope_theta() -> f64 {
     1_000_000.0
 }
 
+// Field names and independent bool toggles mirror the HuggingFace
+// config.json schema; grouping them would break Deserialize's field mapping.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub vocab_size: usize,
