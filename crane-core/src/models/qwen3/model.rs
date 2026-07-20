@@ -68,7 +68,7 @@ impl Model {
 
         match format {
             ModelFormat::Gguf | ModelFormat::Auto => Self::from_gguf(model_path, device),
-            ModelFormat::Safetensors => Self::from_pretrained(model_path, device, dtype),
+            ModelFormat::Safetensors => Self::from_pretrained(model_path, device, *dtype),
         }
     }
 
@@ -80,7 +80,7 @@ impl Model {
         self.inner.clear_kv_cache();
     }
 
-    fn from_pretrained(model_path: &str, device: &Device, dtype: &DType) -> Result<Model> {
+    fn from_pretrained(model_path: &str, device: &Device, dtype: DType) -> Result<Model> {
         let tokenizer_path = std::path::Path::new(model_path).join("tokenizer.json");
         if !tokenizer_path.exists() {
             anyhow::bail!("Tokenizer not found at {}", tokenizer_path.display());
@@ -88,7 +88,7 @@ impl Model {
         let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(E::msg)?;
 
         let filenames = utils::get_safetensors_files(model_path)?;
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, *dtype, device) }?;
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, device) }?;
 
         let config_file = std::path::Path::new(model_path).join("config.json");
         let config_data = std::fs::read(config_file)?;
@@ -99,7 +99,7 @@ impl Model {
         Ok(Self {
             tokenizer: TokenOutputStream::new(tokenizer),
             device: device.clone(),
-            dtype: *dtype,
+            dtype,
             inner,
         })
     }
