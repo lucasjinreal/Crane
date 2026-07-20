@@ -295,6 +295,10 @@ impl Attention {
         Ok((update.k, update.v))
     }
 
+    // q/k/v/b/h/s/d are standard ML tensor-shape notation (query, key,
+    // value, batch, heads, seq_len, head_dim), matching the Q/K/V and BHSD
+    // terminology already used throughout this function's comments.
+    #[allow(clippy::many_single_char_names)]
     fn forward(
         &mut self,
         hidden_states: &Tensor,
@@ -1058,6 +1062,9 @@ impl Qwen3Model {
     /// Pad per-sequence KV caches to the same length and load into model layers.
     ///
     /// Returns `(kv_lens, max_kv_len)`.
+    // b/h/s/d are standard tensor-shape notation (batch, heads, seq_len,
+    // head_dim), matching the BHSD terminology used elsewhere in this file.
+    #[allow(clippy::many_single_char_names)]
     pub fn setup_batch_decode(
         &mut self,
         seq_kv_caches: &[Vec<Option<(Tensor, Tensor)>>],
