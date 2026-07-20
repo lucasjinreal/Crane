@@ -333,10 +333,10 @@ impl ModelForCausalLM for Model {
             }
         }
         let dt = start_gen.elapsed();
-        if let Some(ref mut s) = streamer {
-            if !streamer_finalized {
-                s.finalize()?;
-            }
+        if let Some(ref mut s) = streamer
+            && !streamer_finalized
+        {
+            s.finalize()?;
         }
 
         if config.report_speed {
