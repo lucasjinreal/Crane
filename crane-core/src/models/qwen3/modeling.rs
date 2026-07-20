@@ -45,6 +45,7 @@ use serde::Deserialize;
 use std::io::{Read, Seek};
 
 use crate::models::modules::flash_attn::dispatch_flash_attn;
+use crate::models::modules::kv_cache;
 use crate::models::modules::rotary::RotaryEmbedding;
 
 // Reuse the polymorphic linear layer and GGUF loader from the shared Hunyuan module.
@@ -276,63 +277,13 @@ impl Attention {
     ///
     /// Uses `slice_set` for O(1) in-place writes when the buffer has room.
     /// Falls back to cat + reallocate when the buffer is full.
-    fn update_kv_cache(&mut self, k: Tensor, v: Tensor) -> Result<(Tensor, Tensor)> {
-        let k = k.contiguous()?;
-        let v = v.contiguous()?;
-        let new_seq_len = k.dim(2)?;
-        let cache_seq_len = self.cache_seq_len;
-
-        match self.kv_cache.take() {
-            Some((buf_k, buf_v)) => {
-                let buf_len = buf_k.dim(2)?;
-                let new_total = cache_seq_len + new_seq_len;
-
-                if new_total <= buf_len {
-                    // In-place write — O(new_seq_len).
-                    buf_k.slice_set(&k, 2, cache_seq_len)?;
-                    buf_v.slice_set(&v, 2, cache_seq_len)?;
-                    let k_view = buf_k.narrow(2, 0, new_total)?;
-                    let v_view = buf_v.narrow(2, 0, new_total)?;
-                    self.kv_cache = Some((buf_k, buf_v));
-                    self.cache_seq_len = new_total;
-                    Ok((k_view, v_view))
-                } else {
-                    // Buffer overflow — grow with extra room.
-                    let cur_k = buf_k.narrow(2, 0, cache_seq_len)?;
-                    let cur_v = buf_v.narrow(2, 0, cache_seq_len)?;
-                    drop(buf_k);
-                    drop(buf_v);
-                    let full_k = Tensor::cat(&[&cur_k, &k], 2)?;
-                    let full_v = Tensor::cat(&[&cur_v, &v], 2)?;
-                    drop(cur_k);
-                    drop(cur_v);
-                    let total = full_k.dim(2)?;
-                    let room = 256; // fixed small room — avoids 2x over-allocation
-                    let (b, h, _, d) = full_k.dims4()?;
-                    let new_buf_k =
-                        Tensor::zeros((b, h, total + room, d), k.dtype(), k.device())?;
-                    let new_buf_v =
-                        Tensor::zeros((b, h, total + room, d), v.dtype(), v.device())?;
-                    new_buf_k.slice_set(&full_k, 2, 0)?;
-                    new_buf_v.slice_set(&full_v, 2, 0)?;
-                    self.kv_cache = Some((new_buf_k, new_buf_v));
-                    self.cache_seq_len = total;
-                    Ok((full_k, full_v))
-                }
-            }
-            None => {
-                // First use — allocate buffer with extra room.
-                let (b, h, s, d) = k.dims4()?;
-                let room = 256; // fixed small room — avoids 2x over-allocation
-                let buf_k = Tensor::zeros((b, h, s + room, d), k.dtype(), k.device())?;
-                let buf_v = Tensor::zeros((b, h, s + room, d), v.dtype(), v.device())?;
-                buf_k.slice_set(&k, 2, 0)?;
-                buf_v.slice_set(&v, 2, 0)?;
-                self.kv_cache = Some((buf_k, buf_v));
-                self.cache_seq_len = s;
-                Ok((k, v))
-            }
-        }
+    fn update_kv_cache(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
+        let cache = self.kv_cache.take();
+        let prev_seq_len = std::mem::replace(&mut self.cache_seq_len, 0);
+        let update = kv_cache::update_kv_cache(cache, prev_seq_len, k, v)?;
+        self.kv_cache = Some(update.buffer);
+        self.cache_seq_len = update.seq_len;
+        Ok((update.k, update.v))
     }
 
     fn forward(
@@ -394,7 +345,7 @@ impl Attention {
         let k = k.transpose(1, 2)?;
 
         // Update KV cache (pre-allocated with slice_set)
-        let (k, v) = self.update_kv_cache(k, v)?;
+        let (k, v) = self.update_kv_cache(&k, &v)?;
 
         // ── SDPA ──
         let n_rep = self.num_heads / self.num_kv_heads;

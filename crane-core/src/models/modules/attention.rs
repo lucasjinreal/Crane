@@ -14,8 +14,11 @@
 //! These names match the safetensors checkpoint layout for Qwen3-TTS and Qwen2.5.
 
 use candle_core::{DType, Module, Result, Tensor, D};
+use candle_nn::attention::AttnMask;
 use candle_nn::VarBuilder;
 
+use super::flash_attn::dispatch_flash_attn;
+use super::kv_cache;
 use crate::models::utils::repeat_kv;
 use crate::models::with_tracing::{linear_b, Linear, RmsNorm};
 
@@ -82,6 +85,8 @@ pub struct GqaAttention {
     /// Precomputed `cfg.n_heads / cfg.n_kv_heads`.
     n_kv_groups: usize,
     kv_cache: Option<(Tensor, Tensor)>,
+    /// Number of valid (filled) positions in `kv_cache`'s pre-allocated buffer.
+    cache_seq_len: usize,
 }
 
 impl Clone for GqaAttention {
@@ -101,6 +106,7 @@ impl Clone for GqaAttention {
             cfg: self.cfg,
             n_kv_groups: self.n_kv_groups,
             kv_cache: None,
+            cache_seq_len: 0,
         }
     }
 }
@@ -169,6 +175,7 @@ impl GqaAttention {
             n_kv_groups: cfg.n_heads / cfg.n_kv_heads,
             cfg,
             kv_cache: None,
+            cache_seq_len: 0,
         })
     }
 
@@ -185,7 +192,9 @@ impl GqaAttention {
     /// * `attention_mask` — Optional additive mask broadcastable to
     ///   `[batch, n_heads, q_seq_len, kv_seq_len]`. Set blocked positions to
     ///   `f32::NEG_INFINITY` (or a sufficiently large negative value) to prevent
-    ///   attention flow.
+    ///   attention flow. During single-token decode (`q_seq_len == 1`), the
+    ///   mask's head dimension must be `1` (i.e. must not vary per head) —
+    ///   the decode fast paths broadcast one mask row across all heads.
     ///
     /// # Returns
     ///
@@ -195,7 +204,6 @@ impl GqaAttention {
     ///
     /// Returns a candle error if `cos_sin` is `None` but `rope_mode` is not
     /// `RopeMode::None`, or if any tensor operation fails.
-    #[allow(clippy::cast_precision_loss)]
     pub fn forward(
         &mut self,
         hidden_states: &Tensor,
@@ -257,21 +265,67 @@ impl GqaAttention {
             }
         };
 
-        // 5. KV cache: concat new K/V with cached K/V along the sequence dim
-        let (k, v) = match self.kv_cache.take() {
-            Some((ck, cv)) => (Tensor::cat(&[&ck, &k], 2)?, Tensor::cat(&[&cv, &v], 2)?),
-            None => (k, v),
-        };
-        self.kv_cache = Some((k.clone(), v.clone()));
+        // 5. KV cache: pre-allocated buffer with in-place `slice_set` writes
+        let (k, v) = self.update_kv_cache(&k, &v)?;
 
-        // 6. GQA: repeat KV heads to match the query head count
-        let k = repeat_kv(k, self.n_kv_groups)?.contiguous()?;
-        let v = repeat_kv(v, self.n_kv_groups)?.contiguous()?;
+        // 6. Scaled dot-product attention
+        let n_rep = self.n_kv_groups;
+        // head_dim is bounded by model config (typically 2-256), well within
+        // f64's exact integer range.
+        #[allow(clippy::cast_precision_loss)]
+        let scale = 1.0 / (self.cfg.head_dim as f64).sqrt();
+        // 1/sqrt(head_dim) is always small and positive; f64->f32 here only
+        // drops precision flash_attn's own f32 accumulator would discard anyway.
+        #[allow(clippy::cast_possible_truncation)]
+        let scale_f32 = scale as f32;
 
-        // 7. Scaled dot-product attention; softmax in F32 for numerical stability
+        if q_seq_len == 1 && b_sz == 1 && q.device().is_cpu() {
+            // ── Fused flash attention for decode (seq_len=1), CPU only ──
+            // candle's cpu_flash kernel streams K/V with online softmax
+            // (O(head_dim) working set instead of materializing an O(S)
+            // scores tensor 3 times), and handles GQA natively via integer
+            // division — no K/V repeat needed. b_sz == 1 only: candle's
+            // flash_attn hard-errors for B>1 with an explicit Mask tensor
+            // (only Causal/None are allowed).
+            return self.flash_attn_decode(&q, &k, &v, attention_mask, scale_f32, b_sz);
+        }
+
+        // No unconditional flash-attn prefill fast path here: unlike the
+        // qwen3-specific model (always a causal decoder), `GqaAttention` is
+        // documented to leave causality entirely up to the caller's
+        // `attention_mask` — `None` means full (non-causal) attention, as
+        // used by Voxtral's bidirectional `AcousticTransformer`. Guessing
+        // `AttnMask::Causal` whenever the mask is absent would silently
+        // break that contract for any single-sequence CPU caller.
+
+        if n_rep > 1 && q_seq_len == 1 {
+            // ── GQA-grouped SDPA for decode (seq_len=1), GPU fallback ──
+            // Reshape Q to group queries with their KV head instead of
+            // repeating K/V n_rep times.
+            let q_g = (q.reshape((b_sz, self.cfg.n_kv_heads, n_rep, self.cfg.head_dim))?
+                * scale)?;
+            let k_t = k.transpose(2, 3)?;
+            let attn_weights = q_g.matmul(&k_t)?;
+            let attn_weights = match attention_mask {
+                Some(mask) => attn_weights.broadcast_add(mask)?,
+                None => attn_weights,
+            };
+            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+            let attn_output = attn_weights.matmul(&v)?;
+
+            // [B, n_kv_heads, n_rep, D] → [B, 1, H*D]; flattening (n_kv_heads,
+            // n_rep, D) matches (H, D) since H = n_kv_heads * n_rep.
+            let attn_output =
+                attn_output.reshape((b_sz, 1, self.cfg.n_heads * self.cfg.head_dim))?;
+            return self.o_proj.forward(&attn_output);
+        }
+
+        // ── Standard SDPA for prefill or when n_rep == 1 ──
+        // Softmax in F32 for numerical stability.
+        let k = repeat_kv(k, n_rep)?.contiguous()?;
+        let v = repeat_kv(v, n_rep)?.contiguous()?;
         // Q may be non-contiguous after transpose(1,2) when RoPE was not applied.
         let q = q.contiguous()?;
-        let scale = 1.0 / (self.cfg.head_dim as f64).sqrt();
         let attn_weights = (q.matmul(&k.transpose(D::Minus1, D::Minus2)?)? * scale)?;
         let attn_weights = match attention_mask {
             Some(mask) => attn_weights.broadcast_add(mask)?,
@@ -282,7 +336,7 @@ impl GqaAttention {
             .to_dtype(input_dtype)?;
         let attn_output = attn_weights.matmul(&v)?;
 
-        // 8. Reassemble heads and project back to the hidden dimension
+        // 7. Reassemble heads and project back to the hidden dimension
         let attn_output =
             attn_output
                 .transpose(1, 2)?
@@ -297,6 +351,61 @@ impl GqaAttention {
     /// contaminating the next sequence.
     pub fn clear_kv_cache(&mut self) {
         self.kv_cache = None;
+        self.cache_seq_len = 0;
+    }
+
+    /// Update the pre-allocated KV cache with new K,V tensors.
+    ///
+    /// Uses `slice_set` for O(1) in-place writes when the buffer has room.
+    /// Falls back to cat + reallocate when the buffer is full.
+    fn update_kv_cache(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
+        let cache = self.kv_cache.take();
+        let prev_seq_len = std::mem::replace(&mut self.cache_seq_len, 0);
+        let update = kv_cache::update_kv_cache(cache, prev_seq_len, k, v)?;
+        self.kv_cache = Some(update.buffer);
+        self.cache_seq_len = update.seq_len;
+        Ok((update.k, update.v))
+    }
+
+    /// Fused flash-attention decode path: `q_seq_len == 1`, `b_sz == 1`, CPU only.
+    ///
+    /// `q`, `k`, `v` are in `[batch, heads, seq, head_dim]` layout. See the
+    /// call site in [`Self::forward`] for why this path is gated the way it is.
+    fn flash_attn_decode(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        attention_mask: Option<&Tensor>,
+        scale_f32: f32,
+        b_sz: usize,
+    ) -> Result<Tensor> {
+        // Non-contiguous is fine — the decode kernel indexes by stride.
+        let q_bshd = q.transpose(1, 2)?;
+        let k_bshd = k.transpose(1, 2)?;
+        let v_bshd = v.transpose(1, 2)?;
+
+        let mask = match attention_mask {
+            Some(mask) => {
+                debug_assert!(
+                    mask.dim(1).is_ok_and(|d| d == 1),
+                    "CPU flash-attn decode broadcasts one mask row across all heads; \
+                     a mask with head dim != 1 would be silently misapplied"
+                );
+                // AttnMask::Mask takes ownership; Tensor is Arc-backed, so
+                // this is a refcount bump, not a data copy.
+                AttnMask::Mask(mask.clone())
+            }
+            None => AttnMask::None,
+        };
+
+        let attn_output = dispatch_flash_attn(&q_bshd, &k_bshd, &v_bshd, scale_f32, mask)?;
+
+        // flash_attn output is BHSD [B, H, 1, D] → [B, 1, H*D].
+        let attn_output = attn_output
+            .reshape((b_sz, self.cfg.n_heads, self.cfg.head_dim))?
+            .reshape((b_sz, 1, self.cfg.n_heads * self.cfg.head_dim))?;
+        self.o_proj.forward(&attn_output)
     }
 }
 
@@ -849,6 +958,70 @@ mod tests {
     }
 
     #[test]
+    fn test_kv_cache_buffer_overflow() {
+        // `update_kv_cache` pre-allocates a buffer with 256 slots of room and
+        // reallocates (cat + zeros) once that room is exhausted. Decode past
+        // that boundary and verify the output still matches a single-shot
+        // masked prefill over the same tokens — i.e. the reallocation
+        // preserves all previously cached K/V content.
+        let cfg = base_cfg();
+        let vb1 = nonzero_vb(&cfg, 0.02);
+        let vb2 = nonzero_vb(&cfg, 0.02);
+        let device = &Device::Cpu;
+
+        let mut attn_prefill = GqaAttention::new(cfg, vb1).expect("prefill attn");
+        let mut attn_incr = GqaAttention::new(cfg, vb2).expect("incremental attn");
+
+        // First prefill call allocates a buffer sized seq_len + 256; decoding
+        // 256 more one-token steps exactly exhausts that room, so the next
+        // step (the 257th) must hit the overflow/reallocation branch.
+        let prefill_len = 4usize;
+        let decode_steps = 257usize;
+        let seq_len = prefill_len + decode_steps;
+        let x = varying_input(1, seq_len, cfg.dim);
+
+        let n = seq_len;
+        let mask_data: Vec<f32> = (0..n * n)
+            .map(|i| {
+                if (i % n) > (i / n) {
+                    f32::NEG_INFINITY
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        let mask = Tensor::from_vec(mask_data, (1, 1, n, n), device).expect("causal mask");
+        let out_prefill = attn_prefill
+            .forward(&x, None, Some(&mask))
+            .expect("prefill forward");
+        let last_prefill = out_prefill.narrow(1, seq_len - 1, 1).expect("narrow prefill");
+
+        let prefill_tokens = x.narrow(1, 0, prefill_len).expect("prefill tokens");
+        let mut out_last = attn_incr
+            .forward(&prefill_tokens, None, None)
+            .expect("incremental prefill");
+        for i in 0..decode_steps {
+            let token = x.narrow(1, prefill_len + i, 1).expect("decode token");
+            out_last = attn_incr.forward(&token, None, None).expect("decode step");
+        }
+        // Unnormalized attention over 261 accumulated positions makes the
+        // output magnitude large (no LayerNorm at this layer in isolation),
+        // so compare relative rather than absolute error.
+        let mag = last_prefill
+            .abs()
+            .expect("abs")
+            .max_all()
+            .expect("max_all")
+            .to_scalar::<f32>()
+            .expect("to_scalar");
+        let rel_diff = max_abs_diff(&out_last, &last_prefill) / mag;
+        assert!(
+            rel_diff < 1e-5,
+            "decode past the KV buffer's 256-slot room must match full prefill (rel_diff={rel_diff})"
+        );
+    }
+
+    #[test]
     fn test_clear_kv_cache_resets_to_fresh_state() {
         let cfg = base_cfg();
         let vb = nonzero_vb(&cfg, 0.02);
@@ -919,6 +1092,116 @@ mod tests {
         assert!(
             max_abs_diff(&out_last, &last_prefill) < 1e-5,
             "incremental decode must match full prefill at the last token position"
+        );
+    }
+
+    #[test]
+    fn test_incremental_decode_matches_full_prefill_gqa() {
+        // Same property as `test_incremental_decode_matches_full_prefill`,
+        // but with n_kv_groups > 1 so decode steps exercise the
+        // GQA-grouped SDPA path instead of the n_rep==1 flash-attn path.
+        // b_sz=2 is required for this: the CPU flash-attn decode fast path
+        // (forward's `q_seq_len == 1 && b_sz == 1 && q.device().is_cpu()`
+        // branch) is unconditional on `n_rep`, so a b_sz=1 CPU test would
+        // take that branch instead of the GQA-grouped one being tested here.
+        let cfg = AttentionConfig {
+            dim: 16,
+            n_heads: 8,
+            n_kv_heads: 2,
+            head_dim: 2,
+            ..base_cfg()
+        };
+        let vb1 = nonzero_vb(&cfg, 0.02);
+        let vb2 = nonzero_vb(&cfg, 0.02);
+        let device = &Device::Cpu;
+
+        let mut attn_prefill = GqaAttention::new(cfg, vb1).expect("prefill attn");
+        let mut attn_incr = GqaAttention::new(cfg, vb2).expect("incremental attn");
+
+        let seq_len = 3usize;
+        let x = varying_input(2, seq_len, cfg.dim);
+
+        let n = seq_len;
+        let mask_data: Vec<f32> = (0..n * n)
+            .map(|i| {
+                if (i % n) > (i / n) {
+                    f32::NEG_INFINITY
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        let mask = Tensor::from_vec(mask_data, (1, 1, n, n), device).expect("causal mask");
+        let out_prefill = attn_prefill
+            .forward(&x, None, Some(&mask))
+            .expect("prefill forward");
+        let last_prefill = out_prefill
+            .narrow(1, seq_len - 1, 1)
+            .expect("narrow prefill");
+
+        let t0 = x.narrow(1, 0, 1).expect("t0");
+        let t1 = x.narrow(1, 1, 1).expect("t1");
+        let t2 = x.narrow(1, 2, 1).expect("t2");
+        attn_incr.forward(&t0, None, None).expect("step 0");
+        attn_incr.forward(&t1, None, None).expect("step 1");
+        let out_last = attn_incr.forward(&t2, None, None).expect("step 2");
+
+        assert!(
+            max_abs_diff(&out_last, &last_prefill) < 1e-5,
+            "GQA-grouped incremental decode must match full prefill at the last token position"
+        );
+    }
+
+    #[test]
+    fn test_flash_attn_decode_with_explicit_mask() {
+        // Verify `GqaAttention::forward`'s CPU flash-attn decode branch
+        // (`q_seq_len == 1 && b_sz == 1 && q.device().is_cpu()`) actually
+        // wires an explicit `Some(mask)` through as `AttnMask::Mask` rather
+        // than silently dropping it (e.g. by always passing `AttnMask::None`).
+        let cfg = base_cfg();
+        let vb1 = nonzero_vb(&cfg, 0.02);
+        let vb2 = nonzero_vb(&cfg, 0.02);
+        let device = &Device::Cpu;
+
+        let mut attn_no_mask = GqaAttention::new(cfg, vb1).expect("no mask attn");
+        let mut attn_masked = GqaAttention::new(cfg, vb2).expect("masked attn");
+
+        let prefill_len = 3usize;
+        let x = varying_input(1, prefill_len + 1, cfg.dim);
+        let prefill = x.narrow(1, 0, prefill_len).expect("prefill tokens");
+        let decode_tok = x.narrow(1, prefill_len, 1).expect("decode token");
+
+        attn_no_mask
+            .forward(&prefill, None, None)
+            .expect("prefill no mask");
+        attn_masked
+            .forward(&prefill, None, None)
+            .expect("prefill masked");
+
+        let y_no_mask = attn_no_mask
+            .forward(&decode_tok, None, None)
+            .expect("decode no mask");
+
+        // Non-trivial additive mask: force attention onto only the oldest
+        // KV position (mask every other position to -1e9), matching
+        // crane-serve's -1e9/0.0 padding-mask convention. `nonzero_vb`'s
+        // smoothly-increasing weights make dot products grow with position,
+        // so unmasked softmax already saturates almost entirely on the
+        // newest position — masking down to *that same* position wouldn't
+        // move the output. Forcing attention onto the oldest position
+        // instead guarantees a detectable difference.
+        let kv_len = prefill_len + 1;
+        let mut mask_data = vec![-1e9f32; kv_len];
+        mask_data[0] = 0.0;
+        let mask = Tensor::from_vec(mask_data, (1, 1, 1, kv_len), device).expect("mask");
+        let y_masked = attn_masked
+            .forward(&decode_tok, None, Some(&mask))
+            .expect("decode masked");
+
+        assert_eq!(y_no_mask.dims(), y_masked.dims());
+        assert!(
+            max_abs_diff(&y_no_mask, &y_masked) > 1e-4,
+            "explicit mask must change the CPU flash-attn decode output; diff was too small"
         );
     }
 
