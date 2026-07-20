@@ -74,6 +74,10 @@ impl EventTrackingGuard {
     }
 }
 
+/// Per-layer, per-sequence KV cache tensors, as returned by
+/// [`Qwen3Model::extract_batch_kv`].
+pub type BatchKvCache = Vec<Vec<Option<(Tensor, Tensor)>>>;
+
 // ── Config ──────────────────────────────────────────────────────────────
 
 fn default_true() -> bool {
@@ -1138,7 +1142,7 @@ impl Qwen3Model {
         kv_lens: &[usize],
         original_max_kv: usize,
         rounds_done: usize,
-    ) -> Result<Vec<Vec<Option<(Tensor, Tensor)>>>> {
+    ) -> Result<BatchKvCache> {
         let n_seqs = kv_lens.len();
         let num_layers = self.layers.len();
         let mut result: Vec<Vec<Option<(Tensor, Tensor)>>> = (0..n_seqs)

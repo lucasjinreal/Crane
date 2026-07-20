@@ -13,7 +13,7 @@ use candle_nn::VarBuilder;
 use candle_transformers::generation::LogitsProcessor;
 use tokenizers::Tokenizer;
 
-use super::modeling::{Config, Qwen3Model};
+use super::modeling::{BatchKvCache, Config, Qwen3Model};
 use crate::generation::based::ModelForCausalLM;
 use crate::generation::GenerationConfig;
 use crate::utils::token_output_stream::TokenOutputStream;
@@ -252,7 +252,7 @@ impl Model {
         kv_lens: &[usize],
         original_max_kv: usize,
         rounds_done: usize,
-    ) -> candle_core::Result<Vec<Vec<Option<(Tensor, Tensor)>>>> {
+    ) -> candle_core::Result<BatchKvCache> {
         self.inner
             .extract_batch_kv(kv_lens, original_max_kv, rounds_done)
     }
