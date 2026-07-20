@@ -198,7 +198,7 @@ impl Vad {
         let min_silence = sr * config.min_silence / 1000;
         let min_silence_at_max_speech = sr * config.min_silence_at_max_speech / 1000;
         let device = select_device(config.use_cpu).unwrap();
-        let neg_threshold = config.threshold - config.hysteresis;
+        let neg_threshold = (config.threshold - config.hysteresis).max(0.01);
 
         Vad {
             sample_rate: sr,
@@ -245,7 +245,7 @@ impl Vad {
             .saturating_sub(2 * speech_pad);
         let min_silence = sr * self.config.min_silence / 1000;
         let min_silence_at_max_speech = sr * self.config.min_silence_at_max_speech / 1000;
-        let neg_threshold = self.config.threshold - self.config.hysteresis;
+        let neg_threshold = (self.config.threshold - self.config.hysteresis).max(0.01);
         let context_size = self.config.context_size;
 
         // Validate the new values before touching `self`, so a rejected
