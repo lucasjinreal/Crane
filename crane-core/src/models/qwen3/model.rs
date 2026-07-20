@@ -38,10 +38,16 @@ pub struct Model {
 }
 
 impl Model {
+    /// # Errors
+    ///
+    /// Returns an error if the model files cannot be found or loaded.
     pub fn new(model_path: &str, device: &Device, dtype: &DType) -> Result<Self> {
         Self::new_with_format(model_path, device, dtype, ModelFormat::Auto)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the model files cannot be found or loaded.
     pub fn new_with_format(
         model_path: &str,
         device: &Device,
@@ -152,6 +158,9 @@ impl Model {
         })
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if tokenization fails.
     pub fn prepare_inputs(&self, inputs: &str) -> Result<Vec<u32>> {
         let input_ids = self
             .tokenizer
@@ -164,6 +173,10 @@ impl Model {
     }
 
     /// Run a single forward step, returning raw logits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the forward pass fails.
     pub fn forward_step(
         &mut self,
         input_ids: &[u32],
@@ -194,6 +207,9 @@ impl Model {
 
     // ── Batched decode (GPU-efficient concurrent serving) ───────────────
 
+    /// # Errors
+    ///
+    /// Returns an error if the batch decode setup fails.
     pub fn setup_batch_decode(
         &mut self,
         seq_kv_caches: &[Vec<Option<(Tensor, Tensor)>>],
@@ -202,6 +218,9 @@ impl Model {
         self.inner.setup_batch_decode(seq_kv_caches, extra_room)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the forward pass fails.
     pub fn step_batch_decode(
         &mut self,
         tokens: &[u32],
@@ -215,6 +234,9 @@ impl Model {
             .step_batch_decode(&input, positions, attention_mask, batch_kv_info)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the forward pass fails.
     pub fn step_batch_decode_with_input_ids(
         &mut self,
         input_ids: &Tensor,
@@ -226,6 +248,9 @@ impl Model {
             .step_batch_decode(input_ids, positions, attention_mask, batch_kv_info)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if extracting the batch KV caches fails.
     pub fn extract_batch_kv(
         &mut self,
         kv_lens: &[usize],
