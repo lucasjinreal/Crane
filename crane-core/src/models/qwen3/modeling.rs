@@ -8,7 +8,7 @@
 //!    — Uses `candle_nn::attention::flash_attn`'s online-softmax kernel
 //!    (`O(head_dim)` working set, native GQA) instead of materializing an
 //!    `O(context_len)` scores tensor. Prefill additionally skips the
-//!    GQA K/V expansion (which duplicates `K/V` n_rep times) and uses
+//!    GQA K/V expansion (which duplicates `K/V` `n_rep` times) and uses
 //!    `AttnMask::Causal` so masking is done via loop bounds, not a
 //!    materialized mask tensor. Falls back to a GQA-grouped matmul SDPA
 //!    on GPU or for batched (B>1) decode, where cuBLAS is already
