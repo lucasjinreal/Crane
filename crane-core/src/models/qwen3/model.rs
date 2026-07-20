@@ -305,7 +305,7 @@ impl ModelForCausalLM for Model {
 
             let logits = self.forward(&input, start_pos)?;
             let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
-            let logits = if config.repetition_penalty == 1. {
+            let logits = if (config.repetition_penalty - 1.).abs() < f32::EPSILON {
                 logits
             } else {
                 let start_at = tokens.len().saturating_sub(config.repeat_last_n);
