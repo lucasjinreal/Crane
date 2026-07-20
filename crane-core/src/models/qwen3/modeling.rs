@@ -1276,24 +1276,21 @@ fn pad_and_stack_kv_caches(
     };
 
     for cache in caches {
-        match cache {
-            Some((k, v)) => {
-                let cur_len = k.dim(2)?;
-                let pad_len = max_len - cur_len;
-                if pad_len > 0 {
-                    let pad = zero_pad.as_ref().unwrap().narrow(2, 0, pad_len)?;
-                    padded_ks.push(Tensor::cat(&[&pad, k], 2)?);
-                    padded_vs.push(Tensor::cat(&[&pad, v], 2)?);
-                } else {
-                    padded_ks.push(k.clone());
-                    padded_vs.push(v.clone());
-                }
+        if let Some((k, v)) = cache {
+            let cur_len = k.dim(2)?;
+            let pad_len = max_len - cur_len;
+            if pad_len > 0 {
+                let pad = zero_pad.as_ref().unwrap().narrow(2, 0, pad_len)?;
+                padded_ks.push(Tensor::cat(&[&pad, k], 2)?);
+                padded_vs.push(Tensor::cat(&[&pad, v], 2)?);
+            } else {
+                padded_ks.push(k.clone());
+                padded_vs.push(v.clone());
             }
-            None => {
-                let zeros = Tensor::zeros((1, kv_heads, max_len, head_dim), dtype, device)?;
-                padded_ks.push(zeros.clone());
-                padded_vs.push(zeros);
-            }
+        } else {
+            let zeros = Tensor::zeros((1, kv_heads, max_len, head_dim), dtype, device)?;
+            padded_ks.push(zeros.clone());
+            padded_vs.push(zeros);
         }
     }
 
