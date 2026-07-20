@@ -57,11 +57,7 @@ impl Model {
         let format = match format {
             ModelFormat::Auto => {
                 let p = std::path::Path::new(model_path);
-                if p.is_file()
-                    && p.extension()
-                        .map(|e| e == "gguf")
-                        .unwrap_or(false)
-                {
+                if p.is_file() && p.extension().is_some_and(|e| e == "gguf") {
                     ModelFormat::Gguf
                 } else {
                     ModelFormat::Safetensors
