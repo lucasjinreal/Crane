@@ -13,6 +13,8 @@ mod tts_voxtral;
 pub use asr::{Asr, AsrStream, TranscribeOptions, Transcript};
 #[cfg(feature = "onnx")]
 pub use asr_client::AsrClient;
-pub use pcm::{AudioInfo, encode_wav, load_wav_f32, pcm_f32_to_i16, save_wav};
+pub use pcm::{
+    AudioInfo, decode_wav, encode_wav, load_wav_f32, pcm_f32_to_i16, pcm_i16_to_f32, save_wav,
+};
 pub use tts::{Tts, TtsStream, VoiceInfo};
 pub use tts_client::TtsClient;

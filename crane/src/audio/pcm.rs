@@ -73,6 +73,20 @@ pub fn pcm_f32_to_i16(samples: &[f32]) -> Vec<u8> {
     out
 }
 
+/// Convert raw 16-bit little-endian PCM bytes to f32 samples normalized to `[-1, 1]`.
+///
+/// Inverse of [`pcm_f32_to_i16`]. A trailing odd byte (if `bytes.len()` is
+/// odd) is ignored, since it cannot form a complete sample.
+///
+/// This is the canonical conversion for incoming Wyoming `audio-chunk`
+/// payloads and other raw PCM input.
+pub fn pcm_i16_to_f32(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
+        .collect()
+}
+
 /// Encode f32 PCM samples as an in-memory 16-bit mono WAV buffer.
 ///
 /// Writes a standard RIFF WAV header followed by the PCM data. The
@@ -147,18 +161,13 @@ pub fn save_wav(audio: &Tensor, path: &str, sample_rate: u32) -> Result<String> 
     Ok(path.to_string())
 }
 
-/// Loads a WAV file and returns f32 samples normalized to `[-1, 1]`.
+/// Decode f32 PCM samples (with mono mixdown and resampling) from an open WAV reader.
 ///
-/// Mixes down to mono if the file is stereo, and resamples to `target_sr` if
-/// needed (high-quality sinc interpolation).
-///
-/// # Errors
-///
-/// Returns an error if the file can't be opened, uses an unsupported sample
-/// format (only 32-bit float and 16/32-bit integer PCM are supported), or if
-/// resampling fails.
-pub fn load_wav_f32(path: &str, target_sr: u32) -> Result<Vec<f32>> {
-    let mut reader = hound::WavReader::open(path)?;
+/// Shared by [`load_wav_f32`] (file-backed) and [`decode_wav`] (in-memory).
+fn read_wav_f32<R: std::io::Read>(
+    mut reader: hound::WavReader<R>,
+    target_sr: u32,
+) -> Result<Vec<f32>> {
     let spec = reader.spec();
     let raw_sr = spec.sample_rate;
 
@@ -249,6 +258,37 @@ pub fn load_wav_f32(path: &str, target_sr: u32) -> Result<Vec<f32>> {
     Ok(output)
 }
 
+/// Loads a WAV file and returns f32 samples normalized to `[-1, 1]`.
+///
+/// Mixes down to mono if the file is stereo, and resamples to `target_sr` if
+/// needed (high-quality sinc interpolation).
+///
+/// # Errors
+///
+/// Returns an error if the file can't be opened, uses an unsupported sample
+/// format (only 32-bit float and 16/32-bit integer PCM are supported), or if
+/// resampling fails.
+pub fn load_wav_f32(path: &str, target_sr: u32) -> Result<Vec<f32>> {
+    let reader = hound::WavReader::open(path)?;
+    read_wav_f32(reader, target_sr)
+}
+
+/// Decodes in-memory WAV bytes and returns f32 samples normalized to `[-1, 1]`.
+///
+/// Inverse of [`encode_wav`], and the in-memory counterpart of
+/// [`load_wav_f32`]. Mixes down to mono if the WAV is stereo, and resamples
+/// to `target_sr` if needed (high-quality sinc interpolation).
+///
+/// # Errors
+///
+/// Returns an error if `wav_bytes` is not a valid WAV file, uses an
+/// unsupported sample format (only 32-bit float and 16/32-bit integer PCM
+/// are supported), or if resampling fails.
+pub fn decode_wav(wav_bytes: &[u8], target_sr: u32) -> Result<Vec<f32>> {
+    let reader = hound::WavReader::new(Cursor::new(wav_bytes))?;
+    read_wav_f32(reader, target_sr)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,6 +373,57 @@ mod tests {
         // 0.5 * 32767 = 16383.5, rounds to 16384 rather than truncating to 16383.
         let bytes = pcm_f32_to_i16(&[0.5]);
         assert_eq!(bytes, 16384i16.to_le_bytes().to_vec());
+    }
+
+    // --- pcm_i16_to_f32 ---
+
+    #[test]
+    fn test_pcm_i16_to_f32_silence() {
+        assert_eq!(pcm_i16_to_f32(&[0, 0]), vec![0.0]);
+    }
+
+    #[test]
+    fn test_pcm_i16_to_f32_max_positive() {
+        let bytes = 32767i16.to_le_bytes();
+        let samples = pcm_i16_to_f32(&bytes);
+        assert_eq!(samples.len(), 1);
+        assert!((samples[0] - 32767.0 / 32768.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_pcm_i16_to_f32_max_negative() {
+        let bytes = i16::MIN.to_le_bytes();
+        let samples = pcm_i16_to_f32(&bytes);
+        assert_eq!(samples, vec![-1.0]);
+    }
+
+    #[test]
+    fn test_pcm_i16_to_f32_empty() {
+        assert!(pcm_i16_to_f32(&[]).is_empty());
+    }
+
+    #[test]
+    fn test_pcm_i16_to_f32_odd_trailing_byte_ignored() {
+        // Two full samples (4 bytes) plus one trailing byte that can't form a sample.
+        let mut bytes = pcm_f32_to_i16(&[0.0, 0.0]);
+        bytes.push(0xFF);
+        assert_eq!(pcm_i16_to_f32(&bytes).len(), 2);
+    }
+
+    #[test]
+    fn test_pcm_i16_to_f32_output_length() {
+        let bytes = vec![0u8; 200];
+        assert_eq!(pcm_i16_to_f32(&bytes).len(), 100);
+    }
+
+    #[test]
+    fn test_pcm_roundtrip() {
+        let samples = [-1.0f32, -0.5, 0.0, 0.5, 1.0];
+        let bytes = pcm_f32_to_i16(&samples);
+        let roundtripped = pcm_i16_to_f32(&bytes);
+        for (a, b) in samples.iter().zip(roundtripped.iter()) {
+            assert!((a - b).abs() < 1e-3, "expected {a}, got {b}");
+        }
     }
 
     // --- encode_wav / save_wav ---
@@ -454,6 +545,64 @@ mod tests {
         assert_eq!(reader.spec().sample_rate, 16000);
         let samples: Vec<i16> = reader.samples::<i16>().map(|s| s.unwrap()).collect();
         assert_eq!(samples.len(), 4);
+        Ok(())
+    }
+
+    // --- decode_wav ---
+
+    #[test]
+    fn test_decode_wav_roundtrip_with_encode_wav() -> Result<()> {
+        let samples = [0.0f32, 0.5, -0.5, 1.0, -1.0];
+        let info = AudioInfo {
+            sample_rate: 24000,
+            channels: 1,
+            bits_per_sample: 16,
+        };
+        let wav_bytes = encode_wav(&samples, &info)?;
+
+        let decoded = decode_wav(&wav_bytes, 24000)?;
+        for (a, b) in samples.iter().zip(decoded.iter()) {
+            assert!((a - b).abs() < 1e-3, "expected {a}, got {b}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_decode_wav_rejects_invalid_bytes() {
+        let err = decode_wav(&[0, 1, 2, 3], 16000);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_decode_wav_empty() -> Result<()> {
+        let info = AudioInfo {
+            sample_rate: 16000,
+            channels: 1,
+            bits_per_sample: 16,
+        };
+        let wav_bytes = encode_wav(&[], &info)?;
+        let decoded = decode_wav(&wav_bytes, 16000)?;
+        assert!(decoded.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_decode_wav_matches_load_wav_f32() -> Result<()> {
+        let samples = [0.1f32, -0.2, 0.3, -0.4];
+        let info = AudioInfo {
+            sample_rate: 16000,
+            channels: 1,
+            bits_per_sample: 16,
+        };
+        let wav_bytes = encode_wav(&samples, &info)?;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &wav_bytes).unwrap();
+        let path = tmp.path().to_str().unwrap();
+
+        let from_file = load_wav_f32(path, 16000)?;
+        let from_bytes = decode_wav(&wav_bytes, 16000)?;
+        assert_eq!(from_file, from_bytes);
         Ok(())
     }
 }
