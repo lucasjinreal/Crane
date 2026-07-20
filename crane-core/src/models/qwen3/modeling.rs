@@ -302,6 +302,12 @@ impl Attention {
     // value, batch, heads, seq_len, head_dim), matching the Q/K/V and BHSD
     // terminology already used throughout this function's comments.
     #[allow(clippy::many_single_char_names)]
+    // This function's length comes from four densely-commented fast-path
+    // branches (CPU flash-attn decode, CPU flash-attn prefill, GQA-grouped
+    // SDPA decode, standard SDPA); splitting it up would scatter that
+    // rationale across several small functions without simplifying the
+    // control flow itself.
+    #[allow(clippy::too_many_lines)]
     fn forward(
         &mut self,
         hidden_states: &Tensor,
