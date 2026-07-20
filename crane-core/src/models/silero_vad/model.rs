@@ -263,6 +263,11 @@ impl Vad {
             max_speech,
         )?;
 
+        // `state[2]`'s shape is derived from `context_size`, and `reset()`
+        // rebuilds it from `self.sample_rate`/`self.context_size`; reset
+        // whenever either changes so that shape never goes stale.
+        let needs_reset = self.sample_rate != sr || self.context_size != context_size;
+
         self.sample_rate = sr;
         self.chunk_size = chunk_size;
         self.min_speech = min_speech;
@@ -275,6 +280,10 @@ impl Vad {
         self.hysteresis = self.config.hysteresis;
         self.context_size = context_size;
         self.timestamp_offset = self.config.timestamp_offset;
+
+        if needs_reset {
+            self.reset()?;
+        }
 
         Ok(())
     }
