@@ -52,6 +52,7 @@ pub enum LlmModelType {
     HunyuanDense,
     PaddleOcrVl,
     MoonshineAsr,
+    Qwen3Asr,
     Vision,
     // Add more as needed
 }

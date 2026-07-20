@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use axum::{
+    extract::DefaultBodyLimit,
     http::StatusCode,
     response::Json,
     routing::{get, post},
@@ -20,6 +21,7 @@ use tracing::info;
 use chat_template::ChatTemplateProcessor;
 use engine::model_factory::{ModelFormat, ModelType};
 use engine::{EngineHandle, InferenceEngine, MemoryConfig};
+use handlers::asr::AsrTranscribeRequest;
 use handlers::tts::TtsGenerateRequest;
 use handlers::vlm::{Gemma4VlmRequest, VlmRequest};
 use openai_api::ErrorResponse;
@@ -70,6 +72,8 @@ pub struct AppState {
     pub vlm_tx: Option<tokio::sync::mpsc::UnboundedSender<VlmRequest>>,
     pub gemma4_vlm_tx: Option<tokio::sync::mpsc::UnboundedSender<Gemma4VlmRequest>>,
     pub tts_tx: Option<tokio::sync::mpsc::UnboundedSender<TtsGenerateRequest>>,
+    /// Channel to the ASR engine thread; `None` unless an ASR model is loaded.
+    pub asr_tx: Option<tokio::sync::mpsc::UnboundedSender<AsrTranscribeRequest>>,
     pub model_path: String,
     pub model_type_name: String,
     pub dtype_name: String,
@@ -214,6 +218,41 @@ fn run_tts_loop(
     }
 }
 
+fn transcribe_audio(asr: &mut dyn crane::audio::Asr, req: &AsrTranscribeRequest) -> Result<String, String> {
+    let tmp_file = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
+    std::fs::write(tmp_file.path(), &req.audio_bytes).map_err(|e| e.to_string())?;
+    let tmp_path = tmp_file
+        .path()
+        .to_str()
+        .ok_or_else(|| "temp audio file path is not valid UTF-8".to_string())?;
+
+    let sample_rate = asr.input_sample_rate();
+    let samples = crane::audio::load_wav_f32(tmp_path, sample_rate).map_err(|e| e.to_string())?;
+
+    let defaults = crane_core::generation::TranscribeOptions::default();
+    let opts = crane_core::generation::TranscribeOptions {
+        temperature: req.temperature.unwrap_or(defaults.temperature),
+        language: req.language.clone(),
+        ..defaults
+    };
+    asr.transcribe(&samples, &opts).map(|t| t.text).map_err(|e| e.to_string())
+}
+
+fn run_asr_loop(
+    mut asr_rx: tokio::sync::mpsc::UnboundedReceiver<AsrTranscribeRequest>,
+    model_name: &str,
+    asr: &mut dyn crane::audio::Asr,
+) {
+    info!("{model_name} engine thread started");
+    while let Some(req) = asr_rx.blocking_recv() {
+        let result = transcribe_audio(asr, &req);
+        if let Err(ref e) = result {
+            tracing::error!("ASR transcription failed: {e}");
+        }
+        let _ = req.tx.send(result);
+    }
+}
+
 /// Resolve the compute dtype. An explicit `--dtype` always wins; otherwise
 /// BF16 on CUDA and F32 elsewhere — except model families validated in F16 on
 /// Metal (currently qwen3_5), which default to F16 there (halves weight,
@@ -294,6 +333,7 @@ pub async fn run(args: Args) -> Result<()> {
 
     let is_vlm = resolved_type.is_vlm();
     let is_tts = resolved_type.is_tts();
+    let is_asr = resolved_type.is_asr();
 
     let (
         engine_handle,
@@ -303,6 +343,7 @@ pub async fn run(args: Args) -> Result<()> {
         vlm_tx_opt,
         gemma4_vlm_tx_opt,
         tts_tx_opt,
+        asr_tx_opt,
     ): (
         Option<EngineHandle>,
         tokenizers::Tokenizer,
@@ -311,6 +352,7 @@ pub async fn run(args: Args) -> Result<()> {
         Option<tokio::sync::mpsc::UnboundedSender<VlmRequest>>,
         Option<tokio::sync::mpsc::UnboundedSender<Gemma4VlmRequest>>,
         Option<tokio::sync::mpsc::UnboundedSender<TtsGenerateRequest>>,
+        Option<tokio::sync::mpsc::UnboundedSender<AsrTranscribeRequest>>,
     ) = if is_tts {
         info!("Loading TTS model ({:?}) from: {}", resolved_type, args.model_path);
         let model_path_clone = args.model_path.clone();
@@ -343,7 +385,10 @@ pub async fn run(args: Args) -> Result<()> {
                         return;
                     }
                 };
-                run_tts_loop(tts_rx, &resolved_name, tts.as_mut());
+                // Install candle's affinity-pinned rayon pool for this thread's lifetime.
+                tts_device.with_context(|| {
+                    run_tts_loop(tts_rx, &resolved_name, tts.as_mut());
+                });
             })
             .expect("Failed to spawn TTS thread");
         info!("TTS model routing established (type: {:?})", resolved_type);
@@ -354,7 +399,54 @@ pub async fn run(args: Args) -> Result<()> {
             });
         let eos_id = tokenizer.token_to_id("<|im_end|>").or_else(|| tokenizer.token_to_id("<|endoftext|>")).unwrap_or(2);
         let chat_template = engine::model_factory::create_chat_template(model_type, &args.model_path);
-        (None, tokenizer, vec![eos_id], chat_template, None, None, Some(tts_tx))
+        (None, tokenizer, vec![eos_id], chat_template, None, None, Some(tts_tx), None)
+    } else if is_asr {
+        info!("Loading ASR model ({:?}) from: {}", resolved_type, args.model_path);
+        let model_path_clone = args.model_path.clone();
+        let use_cpu = args.cpu || {
+            #[cfg(feature = "cuda")]
+            {
+                !candle_core::utils::cuda_is_available()
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                true
+            }
+        };
+        let asr_device = if use_cpu { crane_core::models::Device::Cpu } else { device.clone() };
+        let asr_dtype = dtype;
+        let (asr_tx, asr_rx) = tokio::sync::mpsc::unbounded_channel::<AsrTranscribeRequest>();
+        let resolved_name = resolved_type.display_name().to_string();
+        std::thread::Builder::new()
+            .name("asr-engine".into())
+            .spawn(move || {
+                let mut asr = match engine::model_factory::create_asr(
+                    resolved_type,
+                    &model_path_clone,
+                    &asr_device,
+                    &asr_dtype,
+                ) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::error!("Failed to load ASR model: {e}");
+                        return;
+                    }
+                };
+                // Install candle's affinity-pinned rayon pool for this thread's lifetime.
+                asr_device.with_context(|| {
+                    run_asr_loop(asr_rx, &resolved_name, asr.as_mut());
+                });
+            })
+            .expect("Failed to spawn ASR thread");
+        info!("ASR model routing established (type: {:?})", resolved_type);
+        let tokenizer = crane_core::utils::tokenizer_utils::load_tokenizer_from_model_dir(&args.model_path)
+            .unwrap_or_else(|e| {
+                tracing::warn!("Failed to load HF tokenizer: {e}; creating stub for ASR-only mode");
+                tokenizers::Tokenizer::new(tokenizers::models::bpe::BPE::default())
+            });
+        let eos_id = tokenizer.token_to_id("<|im_end|>").or_else(|| tokenizer.token_to_id("<|endoftext|>")).unwrap_or(2);
+        let chat_template = engine::model_factory::create_chat_template(model_type, &args.model_path);
+        (None, tokenizer, vec![eos_id], chat_template, None, None, None, Some(asr_tx))
     } else if is_vlm {
         let use_cpu = args.cpu || {
             #[cfg(feature = "cuda")]
@@ -393,40 +485,43 @@ pub async fn run(args: Args) -> Result<()> {
                 };
                 info!("Gemma4 VLM engine thread started");
                 let preprocess_config = ImagePreprocessConfig::default();
-                while let Some(req) = g4vlm_rx.blocking_recv() {
-                    let Gemma4VlmRequest { img_path, text_prompt, max_tokens, tx } = req;
-                    let res = (|| -> anyhow::Result<String> {
-                        let preprocessed = load_and_preprocess_image(&img_path, &preprocess_config, &device_clone)?;
-                        let image_embeds = vlm.encode_image(&preprocessed.pixel_values, &preprocessed.pixel_position_ids, &preprocessed.padding_positions)?;
-                        let image_token_id = 258880u32;
-                        let mut prompt_ids: Vec<u32> = vec![2, 105, 2364, 107, 255999];
-                        for _ in 0..preprocessed.num_image_tokens { prompt_ids.push(image_token_id); }
-                        prompt_ids.push(258882);
-                        if !text_prompt.is_empty() {
-                            let text_ids = vlm.tokenizer.tokenizer.encode(text_prompt.as_str(), false).map_err(|e| anyhow::anyhow!("{e}"))?.get_ids().to_vec();
-                            prompt_ids.extend(text_ids);
-                        }
-                        prompt_ids.extend_from_slice(&[106, 107, 105, 4368, 107]);
-                        vlm.clear_kv_cache();
-                        let input_tensor = candle_core::Tensor::new(prompt_ids.as_slice(), &device_clone)?.unsqueeze(0)?;
-                        let logits = vlm.forward(&input_tensor, Some(&image_embeds), 0)?.squeeze(0)?.squeeze(0)?.to_dtype(candle_core::DType::F32)?;
-                        let mut tokens = prompt_ids.clone();
-                        let mut generated = Vec::new();
-                        let mut next_token = candle_nn::ops::softmax_last_dim(&logits)?.argmax(candle_core::D::Minus1)?.to_scalar::<u32>()?;
-                        generated.push(next_token);
-                        tokens.push(next_token);
-                        for _ in 1..max_tokens {
-                            if next_token == 1 || next_token == 106 { break; }
-                            let input = candle_core::Tensor::new(&[next_token], &device_clone)?.unsqueeze(0)?;
-                            let logits = vlm.forward(&input, None, tokens.len() - 1)?.squeeze(0)?.squeeze(0)?.to_dtype(candle_core::DType::F32)?;
-                            next_token = candle_nn::ops::softmax_last_dim(&logits)?.argmax(candle_core::D::Minus1)?.to_scalar::<u32>()?;
+                // Install candle's affinity-pinned rayon pool for this thread's lifetime.
+                device_clone.with_context(|| {
+                    while let Some(req) = g4vlm_rx.blocking_recv() {
+                        let Gemma4VlmRequest { img_path, text_prompt, max_tokens, tx } = req;
+                        let res = (|| -> anyhow::Result<String> {
+                            let preprocessed = load_and_preprocess_image(&img_path, &preprocess_config, &device_clone)?;
+                            let image_embeds = vlm.encode_image(&preprocessed.pixel_values, &preprocessed.pixel_position_ids, &preprocessed.padding_positions)?;
+                            let image_token_id = 258880u32;
+                            let mut prompt_ids: Vec<u32> = vec![2, 105, 2364, 107, 255999];
+                            for _ in 0..preprocessed.num_image_tokens { prompt_ids.push(image_token_id); }
+                            prompt_ids.push(258882);
+                            if !text_prompt.is_empty() {
+                                let text_ids = vlm.tokenizer.tokenizer.encode(text_prompt.as_str(), false).map_err(|e| anyhow::anyhow!("{e}"))?.get_ids().to_vec();
+                                prompt_ids.extend(text_ids);
+                            }
+                            prompt_ids.extend_from_slice(&[106, 107, 105, 4368, 107]);
+                            vlm.clear_kv_cache();
+                            let input_tensor = candle_core::Tensor::new(prompt_ids.as_slice(), &device_clone)?.unsqueeze(0)?;
+                            let logits = vlm.forward(&input_tensor, Some(&image_embeds), 0)?.squeeze(0)?.squeeze(0)?.to_dtype(candle_core::DType::F32)?;
+                            let mut tokens = prompt_ids.clone();
+                            let mut generated = Vec::new();
+                            let mut next_token = candle_nn::ops::softmax_last_dim(&logits)?.argmax(candle_core::D::Minus1)?.to_scalar::<u32>()?;
                             generated.push(next_token);
                             tokens.push(next_token);
-                        }
-                        Ok(vlm.tokenizer.tokenizer.decode(&generated, true).unwrap_or_default())
-                    })();
-                    let _ = tx.send(res.map_err(|e| e.to_string()));
-                }
+                            for _ in 1..max_tokens {
+                                if next_token == 1 || next_token == 106 { break; }
+                                let input = candle_core::Tensor::new(&[next_token], &device_clone)?.unsqueeze(0)?;
+                                let logits = vlm.forward(&input, None, tokens.len() - 1)?.squeeze(0)?.squeeze(0)?.to_dtype(candle_core::DType::F32)?;
+                                next_token = candle_nn::ops::softmax_last_dim(&logits)?.argmax(candle_core::D::Minus1)?.to_scalar::<u32>()?;
+                                generated.push(next_token);
+                                tokens.push(next_token);
+                            }
+                            Ok(vlm.tokenizer.tokenizer.decode(&generated, true).unwrap_or_default())
+                        })();
+                        let _ = tx.send(res.map_err(|e| e.to_string()));
+                    }
+                });
             }).expect("Failed to spawn Gemma4 VLM thread");
             gemma4_vlm_tx_opt_inner = Some(g4vlm_tx);
         } else {
@@ -442,32 +537,40 @@ pub async fn run(args: Args) -> Result<()> {
                     }
                 };
                 info!("VLM engine thread started");
-                while let Some(req) = vlm_rx.blocking_recv() {
-                    match req {
-                        VlmRequest::Recognize { img_path, task, max_tokens, tx } => {
-                            let res = vlm.recognize(&img_path, task, max_tokens).map(|r| r.text);
-                            if let Err(ref e) = res { tracing::error!("VLM Recognize failed: {:?}", e); }
-                            let _ = tx.send(res.map_err(|e| e.to_string()));
-                        }
-                        VlmRequest::RecognizeStream { img_path, task, max_tokens, token_tx, done_tx } => {
-                            let res = vlm.recognize_stream(&img_path, task, max_tokens, |token_text: &str| {
-                                let _ = token_tx.send(token_text.to_string());
-                            });
-                            if let Err(ref e) = res { tracing::error!("VLM RecognizeStream failed: {:?}", e); }
-                            let _ = done_tx.send(res.map(|_| ()).map_err(|e| e.to_string()));
+                // Clone device: with_context borrows &self, which would overlap the &mut vlm borrows below.
+                let vlm_device = vlm.device.clone();
+                // Install candle's affinity-pinned rayon pool for this thread's lifetime.
+                vlm_device.with_context(|| {
+                    while let Some(req) = vlm_rx.blocking_recv() {
+                        match req {
+                            VlmRequest::Recognize { img_path, task, max_tokens, tx } => {
+                                let res = vlm.recognize(&img_path, task, max_tokens).map(|r| r.text);
+                                if let Err(ref e) = res { tracing::error!("VLM Recognize failed: {:?}", e); }
+                                let _ = tx.send(res.map_err(|e| e.to_string()));
+                            }
+                            VlmRequest::RecognizeStream { img_path, task, max_tokens, token_tx, done_tx } => {
+                                let res = vlm.recognize_stream(&img_path, task, max_tokens, |token_text: &str| {
+                                    let _ = token_tx.send(token_text.to_string());
+                                });
+                                if let Err(ref e) = res { tracing::error!("VLM RecognizeStream failed: {:?}", e); }
+                                let _ = done_tx.send(res.map(|_| ()).map_err(|e| e.to_string()));
+                            }
                         }
                     }
-                }
+                });
             }).expect("Failed to spawn VLM thread");
             vlm_tx_opt_inner = Some(vlm_tx);
         }
         info!("VLM model routing established (type: {:?})", resolved_type);
         let eos_id = tokenizer.token_to_id("</s>").or_else(|| tokenizer.token_to_id("<end_of_turn>")) .or_else(|| tokenizer.token_to_id("<|end_of_sentence|>")) .unwrap_or(1);
-        (None, tokenizer, vec![eos_id], chat_template, vlm_tx_opt_inner, gemma4_vlm_tx_opt_inner, None)
+        (None, tokenizer, vec![eos_id], chat_template, vlm_tx_opt_inner, gemma4_vlm_tx_opt_inner, None, None)
     } else {
+        // Only one of the TTS/ASR/VLM/LLM branches runs per process, so each is
+        // the sole long-lived consumer of candle's process-wide rayon pool.
         let mut backend = engine::model_factory::create_backend(model_type, &args.model_path, &device, &dtype, format, args.quant.as_deref())?;
         info!("Model loaded successfully (type: {:?}, format: {:?})", resolved_type, format);
-        backend.warmup();
+        // Install candle's affinity-pinned rayon pool so warmup's forward passes run on warm threads.
+        device.with_context(|| backend.warmup());
         info!("Model warmed up");
         let tokenizer = backend.tokenizer().clone();
         let eos_token_id = backend.eos_token_id();
@@ -479,7 +582,7 @@ pub async fn run(args: Args) -> Result<()> {
         let (engine, handle) = InferenceEngine::new(backend, args.max_concurrent, args.decode_tokens_per_seq, memory_config);
         std::thread::Builder::new().name("inference-engine".into()).spawn(move || engine.run()).expect("Failed to spawn engine thread");
         info!("Inference engine started (max_concurrent={}, decode_tokens_per_seq={})", args.max_concurrent, args.decode_tokens_per_seq);
-        (Some(handle), tokenizer, eos_token_id, chat_template, None, None, None)
+        (Some(handle), tokenizer, eos_token_id, chat_template, None, None, None, None)
     };
 
     let model_name = args.model_name.clone().unwrap_or_else(|| {
@@ -499,6 +602,7 @@ pub async fn run(args: Args) -> Result<()> {
         vlm_tx: vlm_tx_opt,
         gemma4_vlm_tx: gemma4_vlm_tx_opt,
         tts_tx: tts_tx_opt,
+        asr_tx: asr_tx_opt,
         model_path: args.model_path.clone(),
         model_type_name: resolved_type.display_name().to_string(),
         dtype_name,
@@ -520,6 +624,8 @@ pub async fn run(args: Args) -> Result<()> {
         info!("mode: vlm");
     } else if is_tts {
         info!("mode: tts");
+    } else if is_asr {
+        info!("mode: asr");
     } else {
         info!(max_concurrent = args.max_concurrent, decode_tokens_per_seq = args.decode_tokens_per_seq, "scheduler configured");
         if args.max_seq_len > 0 || state.gpu_memory_limit != "unlimited" {
@@ -532,13 +638,23 @@ pub async fn run(args: Args) -> Result<()> {
     Ok(())
 }
 
+/// Maximum accepted size for `/v1/audio/transcriptions` uploads, matching the
+/// OpenAI transcription API's limit. Axum's default body limit (2 MiB) is far
+/// too small for real audio files.
+const MAX_TRANSCRIPTION_UPLOAD_BYTES: usize = 25 * 1024 * 1024;
+
 pub fn build_router(state: Arc<AppState>) -> Router {
+    let transcriptions_router = Router::new()
+        .route("/v1/audio/transcriptions", post(handlers::asr::transcriptions))
+        .layer(DefaultBodyLimit::max(MAX_TRANSCRIPTION_UPLOAD_BYTES));
+
     Router::new()
         .route("/health", get(handlers::common::health))
         .route("/v1/stats", get(handlers::common::stats))
         .route("/v1/chat/completions", post(handlers::openai::chat_completions))
         .route("/v1/completions", post(handlers::openai::completions))
         .route("/v1/audio/speech", post(handlers::tts::speech))
+        .merge(transcriptions_router)
         .route("/v1/models", get(handlers::openai::list_models))
         .route("/v1/models/{model_id}", get(handlers::openai::retrieve_model))
         .route("/v1/tokenize", post(handlers::openai::tokenize))

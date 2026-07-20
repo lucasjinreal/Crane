@@ -331,7 +331,11 @@ impl InferenceEngine {
             if self.memory_config.max_seq_len == 0 { "unlimited".to_string() } else { self.memory_config.max_seq_len.to_string() },
         );
 
-        loop {
+        // Install candle's private, affinity-pinned rayon pool for the
+        // engine's lifetime so every forward pass's matmuls run on warm
+        // worker threads instead of rayon's ambient global pool.
+        let device = self.model.device().clone();
+        device.with_context(|| loop {
             self.drain_requests();
             self.check_cancelled();
 
@@ -392,7 +396,7 @@ impl InferenceEngine {
                     }
                 }
             }
-        }
+        });
     }
 
     fn log_stats(&self) {

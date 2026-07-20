@@ -25,6 +25,42 @@ impl Default for SpeechOptions {
     }
 }
 
+/// Generation options for ASR (automatic speech recognition) models.
+#[derive(Clone, Debug)]
+pub struct TranscribeOptions {
+    /// Maximum number of tokens to generate before stopping.
+    pub max_new_tokens: usize,
+    /// Sampling temperature; higher values increase randomness. `0.0`
+    /// (the default) selects greedy (argmax) decoding.
+    pub temperature: f64,
+    /// Nucleus sampling threshold; `None` disables top-p filtering.
+    pub top_p: Option<f64>,
+    /// Repetition penalty applied to previously generated tokens; `1.0` means no penalty.
+    pub repetition_penalty: f32,
+    /// Number of most recent tokens considered for the repetition penalty.
+    pub repeat_last_n: usize,
+    /// Optional language hint (`"auto"` for detection, else e.g. `"en"`/`"zh"`).
+    pub language: Option<String>,
+}
+
+impl Default for TranscribeOptions {
+    /// Defaults to greedy decoding (`temperature: 0.0`): unlike TTS, ASR has
+    /// one correct transcription per utterance, so stochastic sampling only
+    /// adds transcription errors — and does so more on lower-confidence
+    /// (e.g. smaller) models. Matches reference implementations, which
+    /// decode ASR with `do_sample=False`.
+    fn default() -> Self {
+        Self {
+            max_new_tokens: 8192,
+            temperature: 0.0,
+            top_p: None,
+            repetition_penalty: 1.05,
+            repeat_last_n: 64,
+            language: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct GenerationConfig {
     pub max_new_tokens: usize,

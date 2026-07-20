@@ -4,13 +4,24 @@
 //!
 //! 1. **Pre-allocated KV cache** with in-place `slice_set` writes
 //!    — O(new_seq_len) per decode step instead of O(cache_len) `Tensor::cat`.
-//! 2. **GQA-grouped SDPA for decode** (seq_len=1)
-//!    — Reshapes Q into `[B*kv_heads, n_rep, D]` and uses 3-D batch matmul with
-//!      implicit broadcasting, avoiding the expensive N× KV head expansion.
-//! 3. **Fused RoPE kernel** via `candle_nn::rotary_emb::rope()`
+//! 2. **Fused flash attention for decode and prefill** (CPU, B=1)
+//!    — Uses `candle_nn::attention::flash_attn`'s online-softmax kernel
+//!      (O(head_dim) working set, native GQA) instead of materializing an
+//!      O(context_len) scores tensor. Prefill additionally skips the
+//!      GQA K/V expansion (which duplicates K/V n_rep times) and uses
+//!      `AttnMask::Causal` so masking is done via loop bounds, not a
+//!      materialized mask tensor. Falls back to a GQA-grouped matmul SDPA
+//!      on GPU or for batched (B>1) decode, where cuBLAS is already
+//!      compute-bound or an explicit per-sequence mask is required, and to
+//!      a standard SDPA for GPU or batched (B>1) prefill, or when
+//!      num_heads == num_kv_heads (no GQA grouping needed).
+//! 3. **Fused `RoPE` kernel** via `candle_nn::rotary_emb::rope_thd()`
 //!    — One CUDA launch per Q/K instead of 5 manual tensor ops.
+//!    — Applied in BSHD layout (before the transpose to BHSD), so the
+//!      reshape output is already contiguous — no `contiguous()` copy
+//!      needed before `RoPE`, and QK norm hits the fast fused RmsNorm path.
 //!    — Precomputed `[max_pos, head_dim/2]` cos/sin tables (half-width, as
-//!      required by the `rope()` API).
+//!      required by the `rope_thd()` API).
 //! 4. **GGUF quantization** via the polymorphic `LinearLayer` enum
 //!    — Same model code serves both safetensors (f16/f32/bf16) and GGUF weights.
 //! 5. **Batched decode infrastructure**
@@ -27,11 +38,13 @@
 
 use candle_core::quantized::gguf_file;
 use candle_core::{DType, Device, Module, Result, Tensor, D};
-use candle_nn::rotary_emb::rope;
+use candle_nn::attention::AttnMask;
+use candle_nn::rotary_emb::rope_thd;
 use candle_nn::{linear_no_bias, Linear, RmsNorm, VarBuilder};
 use serde::Deserialize;
 use std::io::{Read, Seek};
 
+use crate::models::modules::flash_attn::dispatch_flash_attn;
 use crate::models::modules::rotary::RotaryEmbedding;
 
 // Reuse the polymorphic linear layer and GGUF loader from the shared Hunyuan module.
@@ -332,6 +345,7 @@ impl Attention {
         let (b_sz, seq_len, _) = hidden_states.dims3()?;
 
         // Use merged QKV if available — one gemv instead of three.
+        // q/k/v are each [B, S, num_heads * head_dim] here.
         let (q, k, v) = if let Some(ref qkv_proj) = self.qkv_proj {
             let qkv = qkv_proj.forward(hidden_states)?; // [B, S, q_dim+2*kv_dim]
             let q = qkv.narrow(D::Minus1, 0, self.q_dim)?;
@@ -345,21 +359,19 @@ impl Attention {
             (q, k, v)
         };
 
-        // [B, S, num_heads * head_dim] → [B, num_heads, S, head_dim]
-        let q = q
-            .reshape((b_sz, seq_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let k = k
-            .reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
+        // reshape() always returns a contiguous tensor (zero-copy when the
+        // input already is, e.g. the separate-projections path; a copy when
+        // it isn't, e.g. the merged QKV narrow() path — same as before this
+        // change).
+        let q = q.reshape((b_sz, seq_len, self.num_heads, self.head_dim))?;
+        let k = k.reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?;
         let v = v
             .reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
 
-        // Per-head QK norm (Qwen3 applies before RoPE).
-        // RmsNorm normalises over the last dim, so it operates directly on
-        // [B, H, S, D] without the reshape that would trigger an extra
-        // contiguous copy on the non-contiguous q/k after transpose.
+        // Per-head QK norm (Qwen3 applies before RoPE), applied in BSHD
+        // layout while q/k are still contiguous — this hits RmsNorm's fast
+        // fused kernel instead of the non-contiguous element-wise fallback.
         let q = if let Some(ref norm) = self.q_norm {
             norm.forward(&q)?
         } else {
@@ -371,23 +383,106 @@ impl Attention {
             k
         };
 
-        // Fused RoPE
-        let q = rope(&q.contiguous()?, cos, sin)?;
-        let k = rope(&k.contiguous()?, cos, sin)?;
+        // Fused RoPE in BSHD layout — q/k are still contiguous here, so no
+        // contiguous() copy is needed before rope_thd (unlike rope(), which
+        // requires BHSD and would force a copy after the transpose below).
+        let q = rope_thd(&q, cos, sin)?;
+        let k = rope_thd(&k, cos, sin)?;
+
+        // [B, S, H, D] → [B, H, S, D] for the KV cache and attention below.
+        let q = q.transpose(1, 2)?;
+        let k = k.transpose(1, 2)?;
 
         // Update KV cache (pre-allocated with slice_set)
         let (k, v) = self.update_kv_cache(k, v)?;
 
         // ── SDPA ──
         let n_rep = self.num_heads / self.num_kv_heads;
-        let _kv_s = k.dim(2)?;
+        let scale = 1.0 / (self.head_dim as f64).sqrt();
+        // 1/sqrt(head_dim) is always small and positive; f64->f32 here
+        // only drops precision flash_attn's own f32 accumulator would
+        // discard anyway.
+        #[allow(clippy::cast_possible_truncation)]
+        let scale_f32 = scale as f32;
+
+        if seq_len == 1 && b_sz == 1 && q.device().is_cpu() {
+            // ── Fused flash attention for decode (seq_len=1), CPU only ──
+            // candle's cpu_flash kernel streams K/V with online softmax
+            // (O(head_dim) working set instead of materializing an O(S)
+            // scores tensor 3 times), and handles GQA natively via integer
+            // division — no Q reshape trick needed. Not available on GPU;
+            // cuBLAS matmuls there are compute-bound, so the plain path
+            // below is used instead.
+            //
+            // b_sz == 1 only: candle's flash_attn hard-errors for B>1 with
+            // an explicit Mask tensor (only Causal/None are allowed), and
+            // crane-serve's continuous-batching decode
+            // (`step_batch_decode` / `build_batch_decode_mask`) passes
+            // exactly that — an explicit per-sequence padding mask with
+            // B>1 — whenever batched sequences have different KV-cache
+            // lengths. Single-sequence decode never hits that mask shape,
+            // so it's the only case safe to fast-path here.
+
+            // BHSD [B, H, S, D] → BSHD [B, S, H, D], as flash_attn expects.
+            // Non-contiguous is fine — the decode kernel indexes by stride.
+            let q_bshd = q.transpose(1, 2)?;
+            let k_bshd = k.transpose(1, 2)?;
+            let v_bshd = v.transpose(1, 2)?;
+
+            let mask = match attention_mask {
+                // AttnMask::Mask takes ownership; Tensor is Arc-backed, so
+                // this is a refcount bump, not a data copy.
+                Some(mask) => AttnMask::Mask(mask.clone()),
+                None => AttnMask::None,
+            };
+
+            let attn_output = dispatch_flash_attn(&q_bshd, &k_bshd, &v_bshd, scale_f32, mask)?;
+
+            // flash_attn output is BHSD [B, H, 1, D] → [B, 1, H*D]
+            let attn_output = attn_output
+                .reshape((b_sz, self.num_heads, self.head_dim))?
+                .reshape((b_sz, 1, self.num_heads * self.head_dim))?;
+            return self.o_proj.forward(&attn_output);
+        }
+
+        if b_sz == 1 && q.device().is_cpu() && attention_mask.is_none() {
+            // ── Fused flash attention for prefill (seq_len > 1), CPU only ──
+            // Same benefits as the decode fast path above, plus it avoids
+            // the GQA K/V expansion below (unsqueeze/expand/reshape, which
+            // duplicates K and V n_rep times) and never materializes the
+            // O(H * S_q * S_kv) score tensor. The causal kernel masks via
+            // loop bounds (kv_offset), so no mask tensor is built or read.
+            // attention_mask.is_none() guards this: an explicit mask (e.g.
+            // a future non-causal caller) can't be expressed via
+            // AttnMask::Causal, so such callers fall through to the SDPA
+            // path below instead of having their mask silently dropped.
+
+            // BHSD [B, H, S, D] → BSHD [B, S, H, D]
+            let q_bshd = q.transpose(1, 2)?;
+            let k_bshd = k.transpose(1, 2)?;
+            let v_bshd = v.transpose(1, 2)?;
+
+            // The layer's KV cache tracks `cache_seq_len` filled positions;
+            // after update_kv_cache, the K/V seq dim equals cache_seq_len,
+            // so kv_offset = cache_seq_len - seq_len recovers start_pos.
+            let kv_offset = k_bshd.dim(1)? - seq_len;
+            let mask = AttnMask::Causal { kv_offset };
+
+            let attn_output = dispatch_flash_attn(&q_bshd, &k_bshd, &v_bshd, scale_f32, mask)?;
+
+            // flash_attn output is BHSD [B, H, S, D] → [B, S, H*D]
+            let attn_output = attn_output
+                .transpose(1, 2)?
+                .contiguous()?
+                .reshape((b_sz, seq_len, ()))?;
+            return self.o_proj.forward(&attn_output);
+        }
 
         if n_rep > 1 && seq_len == 1 {
-            // ── GQA-grouped SDPA for decode (seq_len=1) ──
+            // ── GQA-grouped SDPA for decode (seq_len=1), GPU fallback ──
             // Use 4D tensors throughout so candle's matmul only has to
             // flatten+contiguous the non-contiguous K narrow-view ONCE
             // instead of reshape(contiguous) + transpose + contiguous.
-            let scale = 1.0 / (self.head_dim as f64).sqrt();
 
             // Q: [B, H, 1, D] → [B, kv_heads, n_rep, D], pre-scaled
             let q_g =
@@ -437,7 +532,12 @@ impl Attention {
             v
         };
 
-        let scale = 1.0 / (self.head_dim as f64).sqrt();
+        // cuBLAS's strided-batched matmul needs q's (seq, head_dim) slice to
+        // be plain row/col-major; after the BSHD->BHSD transpose above it
+        // isn't (row stride is num_heads*head_dim, not head_dim) whenever
+        // num_heads > 1. The CPU flash-attn fast paths above return before
+        // reaching this line and never pay this cost.
+        let q = q.contiguous()?;
         let attn_weights = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?)? * scale)?;
         let attn_weights = match attention_mask {
             Some(mask) => attn_weights.broadcast_add(mask)?,
@@ -644,8 +744,24 @@ pub struct Qwen3Model {
 impl Qwen3Model {
     /// Construct from safetensors / HuggingFace checkpoint.
     pub fn new(config: &Config, vb: VarBuilder) -> Result<Self> {
-        let dtype = vb.dtype();
-        let model_vb = vb.pp("model");
+        Self::new_inner(config, vb.pp("model"), vb)
+    }
+
+    /// Construct from a checkpoint where the decoder is nested under a
+    /// deeper prefix than the standard `model.*` layout (e.g. Qwen3-ASR's
+    /// `model.language_model.*`). `model_vb` must already be scoped to the
+    /// decoder's root (what would otherwise be `vb.pp("model")`); `root_vb`
+    /// is the checkpoint root, used to resolve an untied `lm_head` sibling.
+    pub fn new_from_model_vb(
+        config: &Config,
+        model_vb: VarBuilder,
+        root_vb: VarBuilder,
+    ) -> Result<Self> {
+        Self::new_inner(config, model_vb, root_vb)
+    }
+
+    fn new_inner(config: &Config, model_vb: VarBuilder, root_vb: VarBuilder) -> Result<Self> {
+        let dtype = model_vb.dtype();
         let embed_tokens = candle_nn::embedding(
             config.vocab_size,
             config.hidden_size,
@@ -667,7 +783,7 @@ impl Qwen3Model {
             LinearLayer::Standard(linear_no_bias(
                 config.hidden_size,
                 config.vocab_size,
-                vb.pp("lm_head"),
+                root_vb.pp("lm_head"),
             )?)
         };
 
@@ -675,7 +791,7 @@ impl Qwen3Model {
             config.head_dim(),
             config.max_position_embeddings,
             config.rope_theta,
-            vb.device(),
+            model_vb.device(),
         )?;
 
         Ok(Self {
@@ -815,14 +931,51 @@ impl Qwen3Model {
         let _event_guard = EventTrackingGuard::disable(input_ids.device());
 
         let hidden_states = self.embed_tokens.forward(input_ids)?.to_dtype(self.dtype)?;
+        self.decode(hidden_states, seq_len, start_pos, input_ids.device())
+    }
 
+    /// Same as [`Self::forward`], but starting from a caller-supplied
+    /// embedding sequence instead of doing the token embedding lookup
+    /// internally. Used by callers (e.g. Qwen3-ASR) that splice in
+    /// non-text embeddings (audio, etc.) at specific positions before
+    /// running the decoder.
+    pub fn forward_embeds(&mut self, inputs_embeds: &Tensor, start_pos: usize) -> Result<Tensor> {
+        let (_b_sz, seq_len, hidden) = inputs_embeds.dims3()?;
+        if hidden != self.config.hidden_size {
+            candle_core::bail!(
+                "forward_embeds: expected hidden_size {}, got {hidden}",
+                self.config.hidden_size,
+            );
+        }
+
+        #[cfg(feature = "cuda")]
+        let _event_guard = EventTrackingGuard::disable(inputs_embeds.device());
+
+        let hidden_states = inputs_embeds.to_dtype(self.dtype)?;
+        self.decode(hidden_states, seq_len, start_pos, inputs_embeds.device())
+    }
+
+    /// Shared decoder body: rotary embeddings, causal mask, transformer
+    /// layers, final norm, and the `lm_head` projection of the last
+    /// position. Called by both [`Self::forward`] and
+    /// [`Self::forward_embeds`] once they've produced `hidden_states`.
+    fn decode(
+        &mut self,
+        hidden_states: Tensor,
+        seq_len: usize,
+        start_pos: usize,
+        device: &Device,
+    ) -> Result<Tensor> {
         let total_len = start_pos + seq_len;
         let (cos, sin) = self.rotary_emb.forward(start_pos, seq_len)?;
         let cos = cos.to_dtype(self.dtype)?;
         let sin = sin.to_dtype(self.dtype)?;
 
-        // Causal mask (only during prefill; skipped for single-token decode)
-        let attention_mask = if seq_len > 1 {
+        // Causal mask (only during prefill; skipped for single-token decode,
+        // and for CPU/B=1 prefill, where Attention::forward's flash_attn
+        // fast path masks via AttnMask::Causal instead of reading this).
+        let b_sz = hidden_states.dim(0)?;
+        let attention_mask = if seq_len > 1 && !(device.is_cpu() && b_sz == 1) {
             let mut mask_data = vec![0f32; seq_len * total_len];
             for i in 0..seq_len {
                 for j in 0..total_len {
@@ -831,9 +984,9 @@ impl Qwen3Model {
                     }
                 }
             }
-            let mask = Tensor::from_vec(mask_data, (seq_len, total_len), input_ids.device())?;
+            let mask = Tensor::from_vec(mask_data, (seq_len, total_len), device)?;
             let mask = mask
-                .broadcast_lt(&Tensor::new(0.5f32, input_ids.device())?)?
+                .broadcast_lt(&Tensor::new(0.5f32, device)?)?
                 .to_dtype(self.dtype)?;
             let mask = (mask * (-1e9f64))?;
             Some(mask.unsqueeze(0)?.unsqueeze(0)?)
@@ -852,6 +1005,13 @@ impl Qwen3Model {
             .lm_head
             .forward(&hidden_states.narrow(1, seq_len - 1, 1)?)?;
         Ok(logits)
+    }
+
+    /// The token embedding table, exposed for callers that need to embed
+    /// text tokens themselves before splicing in other embeddings (e.g.
+    /// Qwen3-ASR's audio/text embedding merge).
+    pub fn embed_tokens(&self) -> &candle_nn::Embedding {
+        &self.embed_tokens
     }
 
     // ── KV Cache Management ─────────────────────────────────────────────
@@ -1156,4 +1316,432 @@ fn pad_and_stack_kv_caches(
     let stacked_k = Tensor::cat(&padded_ks, 0)?.contiguous()?;
     let stacked_v = Tensor::cat(&padded_vs, 0)?.contiguous()?;
     Ok(Some((stacked_k, stacked_v)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_nn::attention::flash_attn;
+    use candle_nn::VarMap;
+
+    fn tiny_config() -> Config {
+        let json = r#"{
+            "vocab_size": 32,
+            "hidden_size": 16,
+            "intermediate_size": 32,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 4,
+            "max_position_embeddings": 32,
+            "rms_norm_eps": 1e-5,
+            "rope_theta": 10000.0,
+            "attention_bias": false,
+            "use_qk_norm": true,
+            "tie_word_embeddings": true
+        }"#;
+        serde_json::from_str(json).expect("tiny_config parse")
+    }
+
+    fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
+        (a - b)
+            .expect("sub")
+            .abs()
+            .expect("abs")
+            .max_all()
+            .expect("max_all")
+            .to_scalar::<f32>()
+            .expect("to_scalar")
+    }
+
+    /// `new()` and `new_from_model_vb()` must be equivalent when given
+    /// equivalent `VarBuilder` scoping — the split constructor is a pure
+    /// refactor, not a behavior change.
+    #[test]
+    fn test_new_and_new_from_model_vb_equivalence() {
+        let cfg = tiny_config();
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+
+        let mut model_a = Qwen3Model::new(&cfg, vb.clone()).expect("new");
+        let mut model_b = Qwen3Model::new_from_model_vb(&cfg, vb.pp("model"), vb)
+            .expect("new_from_model_vb");
+
+        let input_ids = Tensor::new(&[[1u32, 2, 3]], &device).expect("input_ids");
+        let out_a = model_a.forward(&input_ids, 0).expect("forward a");
+        let out_b = model_b.forward(&input_ids, 0).expect("forward b");
+
+        assert_eq!(out_a.dims(), out_b.dims());
+        assert!(max_abs_diff(&out_a, &out_b) < 1e-5);
+    }
+
+    /// `forward_embeds` fed the decoder's own token embeddings must match
+    /// `forward` given the same token ids.
+    #[test]
+    fn test_forward_and_forward_embeds_equivalence() {
+        let cfg = tiny_config();
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let mut model = Qwen3Model::new(&cfg, vb).expect("new");
+
+        let input_ids = Tensor::new(&[[1u32, 2, 3]], &device).expect("input_ids");
+        let out_forward = model.forward(&input_ids, 0).expect("forward");
+        model.clear_kv_cache();
+
+        let embeds = model
+            .embed_tokens()
+            .forward(&input_ids)
+            .expect("embed lookup")
+            .to_dtype(model.model_dtype())
+            .expect("dtype cast");
+        let out_embeds = model.forward_embeds(&embeds, 0).expect("forward_embeds");
+
+        assert_eq!(out_forward.dims(), out_embeds.dims());
+        assert!(max_abs_diff(&out_forward, &out_embeds) < 1e-5);
+    }
+
+    /// The CPU `flash_attn` decode path must compute the same attention
+    /// output (up to float32 rounding) as the naive 3-pass GQA softmax it
+    /// replaced.
+    #[test]
+    fn test_flash_attn_decode_matches_naive_gqa_softmax() {
+        let device = Device::Cpu;
+        let (b, kv_heads, n_rep, head_dim, kv_len) = (1usize, 2usize, 2usize, 4usize, 5usize);
+        let num_heads = kv_heads * n_rep;
+
+        let q = (Tensor::arange(0f32, (b * num_heads * head_dim) as f32, &device)
+            .unwrap()
+            .reshape((b, num_heads, 1, head_dim))
+            .unwrap()
+            * 0.037)
+            .unwrap();
+        let k = (Tensor::arange(0f32, (b * kv_heads * kv_len * head_dim) as f32, &device)
+            .unwrap()
+            .reshape((b, kv_heads, kv_len, head_dim))
+            .unwrap()
+            * 0.021)
+            .unwrap();
+        let v = (Tensor::arange(0f32, (b * kv_heads * kv_len * head_dim) as f32, &device)
+            .unwrap()
+            .reshape((b, kv_heads, kv_len, head_dim))
+            .unwrap()
+            * 0.013)
+            .unwrap();
+        let mask = Tensor::zeros((b, 1, 1, kv_len), DType::F32, &device).unwrap();
+
+        let scale = 1.0 / (head_dim as f64).sqrt();
+
+        // Old algorithm: reshape Q into groups, 3-pass matmul/softmax/matmul.
+        let q_g = (q
+            .reshape((b, kv_heads, n_rep, head_dim))
+            .unwrap()
+            * scale)
+            .unwrap();
+        let k_t = k.transpose(2, 3).unwrap();
+        let attn_weights = q_g.matmul(&k_t).unwrap();
+        let attn_weights = attn_weights.broadcast_add(&mask).unwrap();
+        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights).unwrap();
+        let naive_out = attn_weights.matmul(&v).unwrap();
+        let naive_out = naive_out.reshape((b, num_heads, head_dim)).unwrap();
+
+        // New algorithm: flash_attn on BSHD-transposed views.
+        let q_bshd = q.transpose(1, 2).unwrap();
+        let k_bshd = k.transpose(1, 2).unwrap();
+        let v_bshd = v.transpose(1, 2).unwrap();
+        // 1/sqrt(head_dim) is always small and positive; f64->f32 here
+        // only drops precision flash_attn's own f32 accumulator would
+        // discard anyway.
+        #[allow(clippy::cast_possible_truncation)]
+        let scale_f32 = scale as f32;
+        let flash_out = flash_attn::<f32>(
+            &q_bshd,
+            &k_bshd,
+            &v_bshd,
+            scale_f32,
+            AttnMask::None,
+            None,
+            None,
+        )
+        .unwrap();
+        let flash_out = flash_out.reshape((b, num_heads, head_dim)).unwrap();
+
+        assert!(max_abs_diff(&naive_out, &flash_out) < 1e-4);
+    }
+
+    /// The CPU `flash_attn` decode path's `AttnMask::Mask` branch (used
+    /// when `attention_mask` is `Some`) must apply the mask the same way
+    /// as the naive path's `broadcast_add` before softmax. This branch is
+    /// unreachable from any current production caller (single-sequence
+    /// decode never builds an explicit mask today), so it needs direct
+    /// coverage here.
+    #[test]
+    fn test_flash_attn_decode_with_explicit_mask() {
+        let device = Device::Cpu;
+        let (b, kv_heads, n_rep, head_dim, kv_len) = (1usize, 2usize, 2usize, 4usize, 5usize);
+        let num_heads = kv_heads * n_rep;
+
+        let q = (Tensor::arange(0f32, (b * num_heads * head_dim) as f32, &device)
+            .unwrap()
+            .reshape((b, num_heads, 1, head_dim))
+            .unwrap()
+            * 0.037)
+            .unwrap();
+        let k = (Tensor::arange(0f32, (b * kv_heads * kv_len * head_dim) as f32, &device)
+            .unwrap()
+            .reshape((b, kv_heads, kv_len, head_dim))
+            .unwrap()
+            * 0.021)
+            .unwrap();
+        let v = (Tensor::arange(0f32, (b * kv_heads * kv_len * head_dim) as f32, &device)
+            .unwrap()
+            .reshape((b, kv_heads, kv_len, head_dim))
+            .unwrap()
+            * 0.013)
+            .unwrap();
+
+        // Non-trivial additive mask: mask out the first KV position,
+        // matching `build_batch_decode_mask`'s -1e9/0.0 convention.
+        let mut mask_data = vec![0f32; kv_len];
+        mask_data[0] = -1e9;
+        let mask = Tensor::from_vec(mask_data, (b, 1, 1, kv_len), &device).unwrap();
+
+        let scale = 1.0 / (head_dim as f64).sqrt();
+
+        // Naive algorithm with the mask applied.
+        let q_g = (q
+            .reshape((b, kv_heads, n_rep, head_dim))
+            .unwrap()
+            * scale)
+            .unwrap();
+        let k_t = k.transpose(2, 3).unwrap();
+        let attn_weights = q_g.matmul(&k_t).unwrap();
+        let attn_weights = attn_weights.broadcast_add(&mask).unwrap();
+        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights).unwrap();
+        let naive_out = attn_weights.matmul(&v).unwrap();
+        let naive_out = naive_out.reshape((b, num_heads, head_dim)).unwrap();
+
+        // flash_attn with the same mask via AttnMask::Mask.
+        let q_bshd = q.transpose(1, 2).unwrap();
+        let k_bshd = k.transpose(1, 2).unwrap();
+        let v_bshd = v.transpose(1, 2).unwrap();
+        // 1/sqrt(head_dim) is always small and positive; f64->f32 here
+        // only drops precision flash_attn's own f32 accumulator would
+        // discard anyway.
+        #[allow(clippy::cast_possible_truncation)]
+        let scale_f32 = scale as f32;
+        let flash_out = flash_attn::<f32>(
+            &q_bshd,
+            &k_bshd,
+            &v_bshd,
+            scale_f32,
+            AttnMask::Mask(mask),
+            None,
+            None,
+        )
+        .unwrap();
+        let flash_out = flash_out.reshape((b, num_heads, head_dim)).unwrap();
+
+        assert!(max_abs_diff(&naive_out, &flash_out) < 1e-4);
+    }
+
+    /// End-to-end check that the flash_attn decode fast path is wired
+    /// correctly inside `Attention::forward` (not just numerically
+    /// equivalent in isolation): a prefill followed by a single-token
+    /// decode must be deterministic and reproducible on the same model.
+    #[test]
+    fn test_flash_attn_decode_via_model_forward() {
+        let cfg = tiny_config();
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let mut model = Qwen3Model::new(&cfg, vb).expect("new");
+
+        let prefill_ids = Tensor::new(&[[1u32, 2, 3]], &device).expect("prefill_ids");
+        let decode_ids = Tensor::new(&[[4u32]], &device).expect("decode_ids");
+
+        model.forward(&prefill_ids, 0).expect("prefill");
+        // seq_len == 1, b_sz == 1, CPU: hits the flash_attn decode path.
+        let out_a = model.forward(&decode_ids, 3).expect("decode a");
+
+        model.clear_kv_cache();
+        model.forward(&prefill_ids, 0).expect("prefill again");
+        let out_b = model.forward(&decode_ids, 3).expect("decode b");
+
+        assert_eq!(out_a.dims(), out_b.dims());
+        assert!(max_abs_diff(&out_a, &out_b) < 1e-5);
+    }
+
+    /// The CPU `flash_attn` prefill path (seq_len > 1) must match the naive
+    /// GQA-expand/matmul/softmax/matmul path, for both a first prefill
+    /// (kv_offset=0) and a continued prefill (kv_offset>0). The naive
+    /// reference always runs in F32 (candle's CPU backend doesn't support
+    /// `matmul` for BF16); `dtype` only controls what `dispatch_flash_attn`
+    /// runs in, so the tolerance reflects that dtype's precision loss.
+    fn check_flash_attn_prefill_matches_naive_sdpa(dtype: DType, tol: f32) {
+        let device = Device::Cpu;
+        let (b, kv_heads, n_rep, head_dim) = (1usize, 2usize, 2usize, 4usize);
+        let num_heads = kv_heads * n_rep;
+        let seq_len = 3usize;
+
+        for kv_offset in [0usize, 2usize] {
+            let kv_len = kv_offset + seq_len;
+
+            let q = (Tensor::arange(0f32, (b * num_heads * seq_len * head_dim) as f32, &device)
+                .unwrap()
+                .reshape((b, num_heads, seq_len, head_dim))
+                .unwrap()
+                * 0.037)
+                .unwrap();
+            let k = (Tensor::arange(0f32, (b * kv_heads * kv_len * head_dim) as f32, &device)
+                .unwrap()
+                .reshape((b, kv_heads, kv_len, head_dim))
+                .unwrap()
+                * 0.021)
+                .unwrap();
+            let v = (Tensor::arange(0f32, (b * kv_heads * kv_len * head_dim) as f32, &device)
+                .unwrap()
+                .reshape((b, kv_heads, kv_len, head_dim))
+                .unwrap()
+                * 0.013)
+                .unwrap();
+
+            let scale = 1.0 / (head_dim as f64).sqrt();
+
+            // Naive algorithm (always F32): GQA-expand K/V, explicit causal
+            // mask, 3-pass SDPA.
+            let k_exp = k
+                .unsqueeze(2)
+                .unwrap()
+                .expand((b, kv_heads, n_rep, kv_len, head_dim))
+                .unwrap()
+                .reshape((b, num_heads, kv_len, head_dim))
+                .unwrap();
+            let v_exp = v
+                .unsqueeze(2)
+                .unwrap()
+                .expand((b, kv_heads, n_rep, kv_len, head_dim))
+                .unwrap()
+                .reshape((b, num_heads, kv_len, head_dim))
+                .unwrap();
+
+            let mut mask_data = vec![0f32; seq_len * kv_len];
+            for i in 0..seq_len {
+                for j in 0..kv_len {
+                    if j > kv_offset + i {
+                        mask_data[i * kv_len + j] = -1e9;
+                    }
+                }
+            }
+            let mask = Tensor::from_vec(mask_data, (1, 1, seq_len, kv_len), &device).unwrap();
+
+            let attn_weights = (q.matmul(&k_exp.transpose(2, 3).unwrap()).unwrap() * scale)
+                .unwrap();
+            let attn_weights = attn_weights.broadcast_add(&mask).unwrap();
+            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights).unwrap();
+            let naive_out = attn_weights.matmul(&v_exp).unwrap();
+
+            // flash_attn algorithm, cast to `dtype`: BSHD + AttnMask::Causal.
+            let q_bshd = q.transpose(1, 2).unwrap().to_dtype(dtype).unwrap();
+            let k_bshd = k.transpose(1, 2).unwrap().to_dtype(dtype).unwrap();
+            let v_bshd = v.transpose(1, 2).unwrap().to_dtype(dtype).unwrap();
+            // 1/sqrt(head_dim) is always small and positive; f64->f32 here
+            // only drops precision flash_attn's own f32 accumulator would
+            // discard anyway.
+            #[allow(clippy::cast_possible_truncation)]
+            let scale_f32 = scale as f32;
+            let flash_out = dispatch_flash_attn(
+                &q_bshd,
+                &k_bshd,
+                &v_bshd,
+                scale_f32,
+                AttnMask::Causal { kv_offset },
+            )
+            .unwrap();
+
+            let flash_out_f32 = flash_out.to_dtype(DType::F32).unwrap();
+            assert!(
+                max_abs_diff(&naive_out, &flash_out_f32) < tol,
+                "mismatch at dtype={dtype:?}, kv_offset={kv_offset}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_flash_attn_prefill_matches_naive_sdpa() {
+        check_flash_attn_prefill_matches_naive_sdpa(DType::F32, 1e-4);
+    }
+
+    #[test]
+    fn test_flash_attn_prefill_matches_naive_sdpa_bf16() {
+        check_flash_attn_prefill_matches_naive_sdpa(DType::BF16, 5e-2);
+    }
+
+    #[test]
+    fn test_flash_attn_prefill_matches_naive_sdpa_f16() {
+        check_flash_attn_prefill_matches_naive_sdpa(DType::F16, 5e-2);
+    }
+
+    /// End-to-end check that the flash_attn prefill fast path is wired
+    /// correctly inside `Attention::forward`: a multi-token prefill must be
+    /// deterministic and reproducible on the same model.
+    #[test]
+    fn test_flash_attn_prefill_via_model_forward() {
+        let cfg = tiny_config();
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let mut model = Qwen3Model::new(&cfg, vb).expect("new");
+
+        let prefill_ids = Tensor::new(&[[1u32, 2, 3, 4, 5]], &device).expect("prefill_ids");
+
+        // seq_len > 1, b_sz == 1, CPU: hits the flash_attn prefill path.
+        let out_a = model.forward(&prefill_ids, 0).expect("prefill a");
+
+        model.clear_kv_cache();
+        let out_b = model.forward(&prefill_ids, 0).expect("prefill b");
+
+        assert_eq!(out_a.dims(), out_b.dims());
+        assert!(max_abs_diff(&out_a, &out_b) < 1e-5);
+    }
+
+    /// Chunked prefill (two smaller prefills) must produce the same decode
+    /// output as a single large prefill — exercises the flash_attn prefill
+    /// path's `kv_offset > 0` case through the full model.
+    #[test]
+    fn test_flash_attn_chunked_prefill_matches_single() {
+        let cfg = tiny_config();
+        let device = Device::Cpu;
+
+        // Both models are built from the same VarMap so `VarMap::get`
+        // returns the already-initialized tensors on the second build,
+        // giving identical weights (including each model's own
+        // once-per-construction merged `qkv_proj`, which is a fresh
+        // concatenation `Var::set` can't retroactively update).
+        let varmap = VarMap::new();
+        let mut model_single =
+            Qwen3Model::new(&cfg, VarBuilder::from_varmap(&varmap, DType::F32, &device))
+                .expect("new single");
+        let mut model_chunked =
+            Qwen3Model::new(&cfg, VarBuilder::from_varmap(&varmap, DType::F32, &device))
+                .expect("new chunked");
+
+        let decode_id = Tensor::new(&[[6u32]], &device).expect("decode_id");
+
+        // Single prefill.
+        let single_ids = Tensor::new(&[[1u32, 2, 3, 4, 5]], &device).expect("single_ids");
+        model_single.forward(&single_ids, 0).expect("single prefill");
+        let out_single = model_single.forward(&decode_id, 5).expect("single decode");
+
+        // Chunked prefill: two prefill calls, then decode.
+        let chunk_a = Tensor::new(&[[1u32, 2, 3]], &device).expect("chunk_a");
+        let chunk_b = Tensor::new(&[[4u32, 5]], &device).expect("chunk_b");
+        model_chunked.forward(&chunk_a, 0).expect("chunk a prefill");
+        model_chunked.forward(&chunk_b, 3).expect("chunk b prefill");
+        let out_chunked = model_chunked.forward(&decode_id, 5).expect("chunked decode");
+
+        assert_eq!(out_single.dims(), out_chunked.dims());
+        assert!(max_abs_diff(&out_single, &out_chunked) < 1e-4);
+    }
 }

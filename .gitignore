@@ -12,3 +12,4 @@ outputs/
 # tests/
 .vscode/
 /vendor
+__pycache__/

@@ -11,6 +11,7 @@ use tokenizers::Tokenizer;
 use super::modeling::{Qwen3TTSConfig, Qwen3TTSModel, StreamingState};
 use super::speech_tokenizer_v2::NativeSpeechTokenizerDecoder;
 use crate::generation::SpeechOptions;
+use crate::models::modules::mel::{compute_mel_spectrogram, MelSpectrogramConfig};
 use crate::utils::utils;
 
 // ── Speech Tokenizer decoders (codes → waveform) ───────────────────────
@@ -372,162 +373,6 @@ impl Model {
         self.config.speaker_encoder_config.sample_rate
     }
 
-    /// Compute a mel spectrogram matching the Python reference:
-    ///   n_fft=1024, num_mels=128, sr=24000, hop=256, win=1024, fmin=0, fmax=12000
-    ///   Hann window, reflect-padded, log-compressed.
-    ///
-    /// Input: f32 samples in [-1, 1], length N.
-    /// Output: Tensor `[1, T_frames, num_mels]` on `device` in `dtype`.
-    fn compute_mel_spectrogram(
-        samples: &[f32],
-        device: &Device,
-        dtype: DType,
-    ) -> Result<Tensor> {
-        const N_FFT: usize = 1024;
-        const NUM_MELS: usize = 128;
-        const SR: usize = 24000;
-        const HOP: usize = 256;
-        const WIN: usize = 1024;
-        const FMIN: f64 = 0.0;
-        const FMAX: f64 = 12000.0;
-
-        // Hann window
-        let hann: Vec<f32> = (0..WIN)
-            .map(|i| 0.5 * (1.0 - (2.0 * std::f64::consts::PI * i as f64 / WIN as f64).cos()) as f32)
-            .collect();
-
-        // Reflect pad: (n_fft - hop) / 2 = (1024 - 256) / 2 = 384
-        let pad = (N_FFT - HOP) / 2;
-        let mut padded = Vec::with_capacity(samples.len() + 2 * pad);
-        // left: mirror samples[1..pad+1] reversed
-        for i in (1..=pad.min(samples.len().saturating_sub(1))).rev() {
-            padded.push(samples[i]);
-        }
-        // fill if not enough
-        while padded.len() < pad {
-            padded.push(0.0);
-        }
-        padded.extend_from_slice(samples);
-        // right: mirror last pad samples reversed
-        let n = samples.len();
-        for i in (n.saturating_sub(1 + pad)..n.saturating_sub(1)).rev() {
-            padded.push(samples[i]);
-        }
-        while padded.len() < samples.len() + 2 * pad {
-            padded.push(0.0);
-        }
-
-        // STFT: compute frames
-        let n_frames = (padded.len().saturating_sub(WIN)) / HOP + 1;
-        let n_bins = N_FFT / 2 + 1; // 513
-
-        // Build mel filterbank (Slaney norm, librosa-compatible)
-        let mel_basis = Self::build_mel_filterbank(SR, N_FFT, NUM_MELS, FMIN, FMAX);
-
-        // Compute magnitude spectrogram frame by frame using rustfft (O(N log N))
-        let mut mel_frames: Vec<f32> = Vec::with_capacity(n_frames * NUM_MELS);
-
-        use rustfft::{FftPlanner, num_complex::Complex as FftComplex};
-        let mut planner = FftPlanner::<f32>::new();
-        let fft = planner.plan_fft_forward(N_FFT);
-
-        let mut spec_mag = vec![0f32; n_frames * n_bins];
-        for frame_idx in 0..n_frames {
-            let start = frame_idx * HOP;
-            // Apply Hann window and build complex FFT input
-            let mut buffer: Vec<FftComplex<f32>> = (0..N_FFT)
-                .map(|i| {
-                    let s = if i < WIN && start + i < padded.len() {
-                        padded[start + i] * hann[i]
-                    } else {
-                        0.0
-                    };
-                    FftComplex::new(s, 0.0)
-                })
-                .collect();
-
-            fft.process(&mut buffer);
-
-            // Take magnitude of positive frequencies (n_fft/2 + 1 bins)
-            for k in 0..n_bins {
-                let c = &buffer[k];
-                let mag = (c.re * c.re + c.im * c.im + 1e-9).sqrt();
-                spec_mag[frame_idx * n_bins + k] = mag;
-            }
-        }
-
-        // Apply mel filterbank and log compression
-        for frame_idx in 0..n_frames {
-            for m in 0..NUM_MELS {
-                let mut val = 0f32;
-                for k in 0..n_bins {
-                    val += mel_basis[m * n_bins + k] * spec_mag[frame_idx * n_bins + k];
-                }
-                // log compression: log(max(val, 1e-5))
-                mel_frames.push(val.max(1e-5).ln());
-            }
-        }
-
-        // Shape: [1, NUM_MELS, T_frames] — matches speaker encoder input [B, n_mels, T]
-        let t = Tensor::new(mel_frames.as_slice(), device)?
-            .reshape((n_frames, NUM_MELS))?
-            .transpose(0, 1)?
-            .unsqueeze(0)?
-            .to_dtype(dtype)?;
-        Ok(t)
-    }
-
-    /// Build a Slaney-normalized mel filterbank matching librosa (Slaney mel scale).
-    ///
-    /// Slaney scale: linear below 1000 Hz, logarithmic above.
-    /// This matches `librosa.filters.mel(norm="slaney", htk=False)`.
-    fn build_mel_filterbank(sr: usize, n_fft: usize, n_mels: usize, fmin: f64, fmax: f64) -> Vec<f32> {
-        // Slaney / O'Shaughnessy mel scale
-        const F_SP: f64 = 200.0 / 3.0;    // ~66.667 Hz per mel below breakpoint
-        const MIN_LOG_HZ: f64 = 1000.0;
-        const MIN_LOG_MEL: f64 = MIN_LOG_HZ / F_SP; // 15.0
-        // ln(6.4) / 27 ≈ 0.068751739
-        const LOG_STEP: f64 = 0.068_751_74;
-
-        fn hz_to_mel(f: f64) -> f64 {
-            if f < MIN_LOG_HZ { f / F_SP } else { MIN_LOG_MEL + (f / MIN_LOG_HZ).ln() / LOG_STEP }
-        }
-        fn mel_to_hz(m: f64) -> f64 {
-            if m < MIN_LOG_MEL { m * F_SP } else { MIN_LOG_HZ * ((m - MIN_LOG_MEL) * LOG_STEP).exp() }
-        }
-
-        let n_bins = n_fft / 2 + 1;
-        let fft_freqs: Vec<f64> = (0..n_bins).map(|k| k as f64 * sr as f64 / n_fft as f64).collect();
-
-        let mel_min = hz_to_mel(fmin);
-        let mel_max = hz_to_mel(fmax);
-        let mel_points: Vec<f64> = (0..=n_mels + 1)
-            .map(|i| mel_min + (mel_max - mel_min) * i as f64 / (n_mels + 1) as f64)
-            .collect();
-        let hz_points: Vec<f64> = mel_points.iter().map(|&m| mel_to_hz(m)).collect();
-
-        let mut filters = vec![0f32; n_mels * n_bins];
-        for m in 0..n_mels {
-            let f_left = hz_points[m];
-            let f_center = hz_points[m + 1];
-            let f_right = hz_points[m + 2];
-            // Slaney area-normalization: 2 / bandwidth
-            let enorm = if f_right > f_left { 2.0 / (f_right - f_left) } else { 0.0 };
-            for k in 0..n_bins {
-                let f = fft_freqs[k];
-                let val = if f >= f_left && f <= f_center && f_center > f_left {
-                    (f - f_left) / (f_center - f_left)
-                } else if f > f_center && f <= f_right && f_right > f_center {
-                    (f_right - f) / (f_right - f_center)
-                } else {
-                    0.0
-                };
-                filters[m * n_bins + k] = (val * enorm) as f32;
-            }
-        }
-        filters
-    }
-
     /// Voice-clone: synthesize `text` in the voice of the speaker from `ref_samples`.
     ///
     /// `ref_samples`: reference speaker audio, mono f32 in `[-1, 1]`, already
@@ -564,7 +409,20 @@ impl Model {
         let spk_embed = {
             let enc = self.inner.speaker_encoder.as_ref()
                 .ok_or_else(|| anyhow::anyhow!("Speaker encoder not loaded (base model required)"))?;
-            let mels = Self::compute_mel_spectrogram(ref_samples_spk, &self.device, DType::F32)?;
+            // Speaker encoder mel constants: n_fft=1024, num_mels=128, sr=24000,
+            // hop=256, win=1024, fmin=0, fmax=12000 — Hann window, reflect-padded,
+            // log-compressed.
+            const SPEAKER_MEL_CONFIG: MelSpectrogramConfig = MelSpectrogramConfig {
+                n_fft: 1024,
+                hop_length: 256,
+                win_length: 1024,
+                sample_rate: 24000,
+                n_mels: 128,
+                fmin: 0.0,
+                fmax: 12000.0,
+            };
+            let mels = compute_mel_spectrogram(&SPEAKER_MEL_CONFIG, ref_samples_spk, &self.device, DType::F32)?
+                .unsqueeze(0)?; // [1, n_mels, T_frames] — matches speaker encoder input [B, n_mels, T]
             let embed = enc.forward(&mels)?.squeeze(0)?; // [enc_dim], F32
             if Self::tts_debug_enabled() {
                 let norm: f32 = embed.sqr()?.sum_all()?.sqrt()?.to_scalar()?;

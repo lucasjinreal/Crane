@@ -50,6 +50,11 @@ impl Linear {
     pub fn weight(&self) -> &Tensor {
         self.inner.weight()
     }
+
+    /// Returns the layer's bias tensor, if any.
+    pub fn bias(&self) -> Option<&Tensor> {
+        self.inner.bias()
+    }
 }
 
 pub fn linear_b(d1: usize, d2: usize, b: bool, vb: VarBuilder) -> Result<Linear> {

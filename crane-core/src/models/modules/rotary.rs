@@ -530,6 +530,37 @@ mod tests {
         );
     }
 
+    // qwen3's Attention::forward applies rope_thd() on BSHD [B,S,H,D] before
+    // transposing to BHSD, instead of rope() on BHSD after transposing. Both
+    // must produce numerically identical rotations for that swap to be safe.
+    #[test]
+    fn test_rope_thd_bshd_matches_rope_bhsd() {
+        use candle_nn::rotary_emb::rope_thd;
+
+        let rope_emb = RotaryEmbedding::new(64, 64, 10000.0, &Device::Cpu)
+            .expect("new failed");
+        let (cos, sin) = rope_emb.forward(3, 8).expect("forward failed");
+
+        let data: Vec<f32> = (0..1 * 8 * 4 * 64)
+            .map(|i| (i as f32 + 1.0) * 0.001)
+            .collect();
+        // BSHD [B, S, H, D]
+        let bshd = Tensor::from_vec(data, (1usize, 8, 4, 64), &Device::Cpu)
+            .expect("from_vec bshd");
+        // Same data, BHSD [B, H, S, D]
+        let bhsd = bshd.transpose(1, 2).expect("transpose").contiguous().expect("contiguous");
+
+        let out_thd = rope_thd(&bshd, &cos, &sin).expect("rope_thd");
+        let out_bhsd = rope(&bhsd, &cos, &sin).expect("rope");
+
+        // Bring both to BSHD for comparison.
+        let out_bhsd_as_bshd = out_bhsd.transpose(1, 2).expect("transpose back");
+        assert!(
+            max_abs_diff(&out_thd, &out_bhsd_as_bshd) < 1e-6,
+            "rope_thd(BSHD) must match rope(BHSD) after layout conversion"
+        );
+    }
+
     // --- edge cases ---
 
     // dim=2 is the smallest valid dimension (one frequency pair).
