@@ -720,6 +720,11 @@ pub struct Qwen3Model {
 
 impl Qwen3Model {
     /// Construct from safetensors / `HuggingFace` checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a required weight tensor is missing or has an
+    /// unexpected shape.
     pub fn new(config: &Config, vb: VarBuilder) -> Result<Self> {
         Self::new_inner(config, vb.pp("model"), vb)
     }
@@ -729,6 +734,11 @@ impl Qwen3Model {
     /// `model.language_model.*`). `model_vb` must already be scoped to the
     /// decoder's root (what would otherwise be `vb.pp("model")`); `root_vb`
     /// is the checkpoint root, used to resolve an untied `lm_head` sibling.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a required weight tensor is missing or has an
+    /// unexpected shape.
     pub fn new_from_model_vb(
         config: &Config,
         model_vb: VarBuilder,
@@ -785,6 +795,11 @@ impl Qwen3Model {
     }
 
     /// Construct from a GGUF file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a required tensor or metadata entry is missing
+    /// or has an unexpected shape.
     pub fn from_gguf<R: Read + Seek>(
         ct: gguf_file::Content,
         reader: &mut R,
@@ -902,6 +917,9 @@ impl Qwen3Model {
 
     // ── Forward ─────────────────────────────────────────────────────────
 
+    /// # Errors
+    ///
+    /// Returns an error if the forward pass fails.
     pub fn forward(&mut self, input_ids: &Tensor, start_pos: usize) -> Result<Tensor> {
         let (_b_sz, seq_len) = input_ids.dims2()?;
 
@@ -920,6 +938,10 @@ impl Qwen3Model {
     /// internally. Used by callers (e.g. Qwen3-ASR) that splice in
     /// non-text embeddings (audio, etc.) at specific positions before
     /// running the decoder.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the forward pass fails.
     pub fn forward_embeds(&mut self, inputs_embeds: &Tensor, start_pos: usize) -> Result<Tensor> {
         let (_b_sz, seq_len, hidden) = inputs_embeds.dims3()?;
         if hidden != self.config.hidden_size {
@@ -1066,6 +1088,10 @@ impl Qwen3Model {
     /// Pad per-sequence KV caches to the same length and load into model layers.
     ///
     /// Returns `(kv_lens, max_kv_len)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if padding or stacking the KV caches fails.
     // b/h/s/d are standard tensor-shape notation (batch, heads, seq_len,
     // head_dim), matching the BHSD terminology used elsewhere in this file.
     #[allow(clippy::many_single_char_names)]
@@ -1128,6 +1154,10 @@ impl Qwen3Model {
     }
 
     /// Run one batched decode step.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the forward pass fails.
     pub fn step_batch_decode(
         &mut self,
         input_ids: &Tensor,
@@ -1164,6 +1194,10 @@ impl Qwen3Model {
     }
 
     /// Extract per-sequence KV caches from batched state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if narrowing or copying the KV cache tensors fails.
     pub fn extract_batch_kv(
         &mut self,
         kv_lens: &[usize],
