@@ -535,10 +535,26 @@ impl Vad {
         let chunk = Tensor::from_vec(chunk, (1, self.chunk_size), &self.device)?;
         let chunk = Tensor::cat(&[&self.state[2], &chunk], 1)?;
         let model = self.model()?;
-        let out = candle_onnx::simple_eval(model, self.inputs(chunk)).unwrap();
-        let out_names = &model.graph.as_ref().unwrap().output;
-        let output = out.get(&out_names[0].name).unwrap().clone();
-        self.update_state(out.get(&out_names[1].name).unwrap(), next_context);
+        let out = candle_onnx::simple_eval(model, self.inputs(chunk))?;
+        let out_names = &model
+            .graph
+            .as_ref()
+            .ok_or_else(|| Error::Msg("VAD model has no graph".into()).bt())?
+            .output;
+        if out_names.len() < 2 {
+            bail!(
+                "VAD model graph has {} output(s), expected at least 2",
+                out_names.len()
+            );
+        }
+        let output = out
+            .get(&out_names[0].name)
+            .ok_or_else(|| Error::Msg(format!("missing VAD output '{}'", out_names[0].name)).bt())?
+            .clone();
+        let state_output = out
+            .get(&out_names[1].name)
+            .ok_or_else(|| Error::Msg(format!("missing VAD output '{}'", out_names[1].name)).bt())?;
+        self.update_state(state_output, next_context);
 
         let output = output.flatten_all()?.to_vec1::<f32>()?;
         debug_assert_eq!(output.len(), 1);
