@@ -5,7 +5,20 @@ on:
   pull_request:
 
 jobs:
-  build-and-test:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Format check
+        run: cargo fmt --check
+        continue-on-error: true
+      - name: Clippy (pedantic)
+        run: cargo clippy -- -W clippy::pedantic -D warnings
+        continue-on-error: true
+
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -15,6 +28,3 @@ jobs:
         run: cargo build --release
       - name: Test
         run: cargo test --workspace
-      - name: Clippy (pedantic)
-        run: cargo clippy -- -W clippy::pedantic -D warnings
-        continue-on-error: true
