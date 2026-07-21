@@ -63,6 +63,7 @@ impl Default for VadConfig {
 }
 
 impl VadConfig {
+    #[must_use]
     pub fn new(min_silence: usize, sample_rate: usize) -> Self {
         let context_size = if sample_rate == 8000 { 32 } else { 64 };
         VadConfig {
@@ -132,7 +133,7 @@ pub struct Vad {
     // Whether if both sides of speech segments padded.
     padded: bool,
     // Start-end pairs of active segments.
-    segments: Vec<(usize, usize)>,
+    segments: VecDeque<(usize, usize)>,
     // Buffer for remaining audio data.
     buffer: Vec<f32>,
 }
@@ -204,7 +205,7 @@ impl Vad {
 
         Ok(Vad {
             sample_rate: sr,
-            chunk_size: chunk_size,
+            chunk_size,
             min_speech,
             max_speech,
             min_silence,
@@ -227,7 +228,7 @@ impl Vad {
             current_start: 0,
             current_end: 0,
             padded: true,
-            segments: vec![],
+            segments: VecDeque::new(),
             buffer: vec![],
         })
     }
@@ -334,7 +335,7 @@ impl Vad {
         self.state[1] = Tensor::zeros_like(&self.state[1])?;
         self.state[2] = Tensor::zeros_like(&self.state[2])?;
 
-        Ok(&self.segments)
+        Ok(self.segments.make_contiguous())
     }
 
     /// Yields the next available segment.
@@ -345,7 +346,7 @@ impl Vad {
         if self.segments.len() == 1 && !self.padded {
             return None;
         }
-        let segment = self.segments.remove(0);
+        let segment = self.segments.pop_front()?;
         self.tail = segment.1;
         Some(segment)
     }
@@ -385,6 +386,7 @@ impl Vad {
     }
 
     /// Returns the list of detected speech segments.
+    #[must_use]
     pub fn get_segments(&self) -> Cow<'_, [(usize, usize)]> {
         if self.timestamp_offset {
             Cow::Owned(
@@ -398,23 +400,28 @@ impl Vad {
                     })
                     .collect::<Vec<_>>(),
             )
+        } else if let (front, []) = self.segments.as_slices() {
+            Cow::Borrowed(front)
         } else {
-            Cow::Borrowed(&self.segments)
+            Cow::Owned(self.segments.iter().copied().collect())
         }
     }
 
     /// Returns the number of detected speech segments.
+    #[must_use]
     pub fn count(&self) -> usize {
         self.segments.len()
     }
 
     /// Returns `true` if there are no active speech segments.
+    #[must_use]
     pub fn is_idle(&self) -> bool {
         self.segments.is_empty() && !self.triggered
     }
 
     /// Resets the VAD state.
     pub fn reset(&mut self) -> Result<()> {
+        #[allow(clippy::cast_possible_wrap)] // 8000 or 16000, well within i64 range
         let sr = Tensor::new(self.sample_rate as i64, &self.device)?;
         let previous = Tensor::zeros((2, 1, 128), DType::F32, &self.device)?;
         let context = Tensor::zeros((1, self.context_size), DType::F32, &self.device)?;
@@ -501,7 +508,7 @@ impl Vad {
     }
 
     fn inputs(&self, chunk: Tensor) -> HashMap<String, Tensor> {
-        HashMap::from_iter([
+        HashMap::from([
             ("input".to_string(), chunk),
             ("sr".to_string(), self.state[0].clone()),
             ("state".to_string(), self.state[1].clone()),
@@ -637,7 +644,7 @@ impl Vad {
         if self.padded || (self.triggered && !triggering) {
             return;
         }
-        if let Some(s) = self.segments.last_mut() {
+        if let Some(s) = self.segments.back_mut() {
             let silence = self.head - s.1;
             let pad = if silence > self.speech_pad * 2 {
                 self.speech_pad
@@ -654,21 +661,20 @@ impl Vad {
     fn push_segment(&mut self) {
         debug_assert!(self.current_start < self.current_end);
         let mut start = self.current_start;
-        if self.segments.is_empty() {
-            start = if start > self.tail + self.speech_pad {
-                start - self.speech_pad
-            } else {
-                self.tail
-            };
-        } else {
-            let last = self.segments.last().unwrap().1;
+        if let Some(&(_, last)) = self.segments.back() {
             start = if start > last + self.speech_pad {
                 start - self.speech_pad
             } else {
                 last
             };
+        } else {
+            start = if start > self.tail + self.speech_pad {
+                start - self.speech_pad
+            } else {
+                self.tail
+            };
         }
-        self.segments.push((start, self.current_end));
+        self.segments.push_back((start, self.current_end));
         self.current_start = 0;
         self.current_end = 0;
         self.padded = false;
@@ -701,6 +707,7 @@ impl fmt::Debug for Segment {
 
 impl Segment {
     /// Creates a new `Segment` from audio data.
+    #[must_use]
     pub fn from_audio(audio: Vec<f32>, offset: usize, sample_rate: usize) -> Self {
         Segment {
             position: offset,
@@ -711,12 +718,13 @@ impl Segment {
     }
 
     /// Creates a new empty `Segment` with the specified offset and sample count.
-    pub fn new(offset: usize, simples: usize, sample_rate: usize) -> Self {
+    #[must_use]
+    pub fn new(offset: usize, samples: usize, sample_rate: usize) -> Self {
         Segment {
             audio: vec![],
             position: offset,
             timestamp: offset * 1000 / sample_rate,
-            duration: simples * 1000 / sample_rate,
+            duration: samples * 1000 / sample_rate,
         }
     }
 }
@@ -732,6 +740,7 @@ pub struct AudioBuffer {
 
 impl AudioBuffer {
     /// Creates a new `AudioBuffer` with the specified sample rate.
+    #[must_use]
     pub fn new(sample_rate: usize) -> Self {
         AudioBuffer {
             queue: VecDeque::new(),
@@ -748,6 +757,7 @@ impl AudioBuffer {
     }
 
     /// Returns the length of the audio data.
+    #[must_use]
     pub fn audio_length(&self) -> usize {
         self.length - self.offset
     }
@@ -937,7 +947,7 @@ mod tests {
         vad.head = 1200;
         vad.make_segment(0.9);
 
-        assert_eq!(vad.segments, vec![(100, 300)]);
+        assert_eq!(vad.segments.make_contiguous(), [(100, 300)]);
         assert_eq!(vad.current_start, 700);
         assert!(vad.triggered);
     }
