@@ -30,6 +30,7 @@ static DEFAULT_MODEL_FILE: &str = "onnx/model.onnx";
 static DEFAULT_SAMPLE_RATE: usize = 16000;
 static DEFAULT_SILENCE: usize = 400; // all times are in milliseconds.
 
+/// Configuration for voice activity detection.
 #[derive(Debug, Clone)]
 pub struct VadConfig {
     /// Force inference to use CPU.
@@ -52,7 +53,7 @@ pub struct VadConfig {
     pub hysteresis: f32,
     /// Whether to return timestamps in milliseconds. Default is false, returns sample offsets.
     pub timestamp_offset: bool,
-    // Context size.
+    /// Context size in samples (64 for 16 kHz, 32 for 8 kHz).
     pub context_size: usize,
 }
 
@@ -63,6 +64,9 @@ impl Default for VadConfig {
 }
 
 impl VadConfig {
+    /// Creates a new `VadConfig` with the given minimum silence duration (in
+    /// milliseconds) and sample rate, using default values for all other
+    /// fields.
     #[must_use]
     pub fn new(min_silence: usize, sample_rate: usize) -> Self {
         let context_size = if sample_rate == 8000 { 32 } else { 64 };
@@ -84,6 +88,7 @@ impl VadConfig {
 
 /// Voice Activity Detection (VAD) struct.
 pub struct Vad {
+    /// The current configuration.
     pub config: VadConfig,
     /// Sample rate, default is 16000.
     sample_rate: usize,
@@ -233,6 +238,18 @@ impl Vad {
         })
     }
 
+    /// Recomputes derived fields (chunk size, padding, thresholds, etc.)
+    /// from `self.config` and applies them.
+    ///
+    /// Validates the config first; if validation fails, `self` is left
+    /// unchanged. If `sample_rate` or `context_size` differ from their
+    /// current values, this also calls [`Self::reset`], clearing all
+    /// internal state (segments, buffer, triggered flag, head/tail
+    /// positions).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the config is invalid.
     pub fn apply_config(&mut self) -> Result<()> {
         let sr = self.config.sample_rate;
         let chunk_size = if sr == 8000 {
