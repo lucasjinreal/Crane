@@ -968,4 +968,418 @@ mod tests {
         assert_eq!(vad.current_start, 700);
         assert!(vad.triggered);
     }
+
+    /// `Vad` with small, easy-to-reason-about sample counts for exercising
+    /// the state machine: `min_speech`=320, `speech_pad`=0, `min_silence`=800,
+    /// `min_silence_at_max_speech`=160, `max_speech`=1088 (all in samples).
+    fn segment_test_vad() -> Vad {
+        let mut config = VadConfig::new(50, 16000);
+        config.use_cpu = true;
+        config.speech_pad = 0;
+        config.min_silence_at_max_speech = 10;
+        config.max_speech = 100;
+        config.min_speech = 20;
+        Vad::new(config).unwrap()
+    }
+
+    #[test]
+    fn test_vad_config_new_16khz() {
+        let config = VadConfig::new(400, 16000);
+        assert_eq!(config.context_size, 64);
+        assert_eq!(config.speech_pad, 400);
+        assert_eq!(config.sample_rate, 16000);
+        assert_eq!(config.min_silence, 400);
+        assert!((config.threshold - 0.5).abs() < 1e-6);
+        assert!((config.hysteresis - 0.15).abs() < 1e-6);
+        assert_eq!(config.min_speech, 250);
+        assert_eq!(config.max_speech, 60_000);
+        assert_eq!(config.min_silence_at_max_speech, 98);
+        assert!(!config.use_cpu);
+        assert!(!config.timestamp_offset);
+    }
+
+    #[test]
+    fn test_vad_config_new_8khz() {
+        let config = VadConfig::new(400, 8000);
+        assert_eq!(config.context_size, 32);
+    }
+
+    #[test]
+    fn test_vad_config_default() {
+        let default = VadConfig::default();
+        let expected = VadConfig::new(400, 16000);
+        assert_eq!(default.sample_rate, expected.sample_rate);
+        assert_eq!(default.min_silence, expected.min_silence);
+        assert_eq!(default.context_size, expected.context_size);
+        assert_eq!(default.speech_pad, expected.speech_pad);
+        assert_eq!(default.min_speech, expected.min_speech);
+        assert_eq!(default.max_speech, expected.max_speech);
+        assert_eq!(
+            default.min_silence_at_max_speech,
+            expected.min_silence_at_max_speech
+        );
+    }
+
+    #[test]
+    fn test_vad_new_derived_fields() {
+        let vad = Vad::new(cpu_config()).unwrap();
+        assert_eq!(vad.chunk_size, CHUNKS_SR16K);
+        assert_eq!(vad.min_speech, 4000);
+        assert_eq!(vad.speech_pad, 6400);
+        assert_eq!(vad.min_silence, 6400);
+        assert_eq!(vad.min_silence_at_max_speech, 1568);
+        assert_eq!(vad.max_speech, 960_000 - 512 - 12_800);
+        assert!((vad.neg_threshold - 0.35).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_vad_new_neg_threshold_clamped() {
+        let mut config = cpu_config();
+        config.hysteresis = 0.9; // exceeds threshold; would go negative without the clamp.
+        let vad = Vad::new(config).unwrap();
+        assert!((vad.neg_threshold - 0.01).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_make_segment_speech_onset() {
+        let mut vad = segment_test_vad();
+        vad.head = 100;
+        vad.make_segment(0.9);
+        assert!(vad.triggered);
+        assert_eq!(vad.current_start, 100);
+    }
+
+    #[test]
+    fn test_make_segment_silence_ends_segment() {
+        let mut vad = segment_test_vad();
+        vad.max_speech = 5000; // large enough that this timeline never trips the max-speech cut
+        vad.head = 100;
+        vad.make_segment(0.9);
+        assert!(vad.triggered);
+
+        vad.head = 500;
+        vad.make_segment(0.1);
+        assert!(vad.triggered); // within the silence-tolerance window
+
+        vad.head = 1300;
+        vad.make_segment(0.1);
+        assert!(!vad.triggered);
+        assert_eq!(vad.segments.make_contiguous(), [(100, 500)]);
+    }
+
+    #[test]
+    fn test_make_segment_short_speech_discarded() {
+        let mut vad = segment_test_vad();
+        vad.head = 100;
+        vad.make_segment(0.9);
+
+        vad.head = 150;
+        vad.make_segment(0.1);
+        vad.head = 950;
+        vad.make_segment(0.1);
+
+        assert!(!vad.triggered);
+        assert!(vad.segments.is_empty());
+    }
+
+    #[test]
+    fn test_make_segment_short_silence_tolerated() {
+        let mut vad = segment_test_vad();
+        vad.head = 100;
+        vad.make_segment(0.9);
+
+        vad.head = 300;
+        vad.make_segment(0.1);
+        assert!(vad.triggered);
+
+        vad.head = 350;
+        vad.make_segment(0.9);
+        assert!(vad.triggered);
+        assert_eq!(vad.current_start, 100);
+        assert!(vad.segments.is_empty());
+        assert_eq!(vad.temp_end, 0);
+    }
+
+    #[test]
+    fn test_make_segment_max_speech_hard_cut() {
+        let mut vad = segment_test_vad();
+        vad.head = 0;
+        vad.make_segment(0.9);
+        assert!(vad.triggered);
+
+        vad.head = 1089;
+        vad.make_segment(0.9);
+
+        assert!(!vad.triggered);
+        assert_eq!(vad.segments.make_contiguous(), [(0, 1089)]);
+    }
+
+    #[test]
+    fn test_make_segment_max_speech_untriggers_on_large_gap() {
+        let mut vad = segment_test_vad();
+        vad.triggered = true;
+        vad.current_start = 0;
+        vad.longest_silence_gap = Some((50, 2000));
+        vad.head = 1089;
+
+        vad.make_segment(0.9);
+
+        assert!(!vad.triggered);
+        assert_eq!(vad.segments.make_contiguous(), [(0, 50)]);
+    }
+
+    #[test]
+    fn test_push_segment_start_padding() {
+        let mut vad = segment_test_vad();
+        vad.speech_pad = 100;
+        vad.current_start = 500;
+        vad.current_end = 600;
+        vad.push_segment();
+        assert_eq!(vad.segments.make_contiguous(), [(400, 600)]);
+        assert_eq!(vad.current_start, 0);
+        assert_eq!(vad.current_end, 0);
+        assert!(!vad.padded);
+    }
+
+    #[test]
+    fn test_push_segment_clamped_to_tail() {
+        let mut vad = segment_test_vad();
+        vad.speech_pad = 100;
+        vad.tail = 450;
+        vad.current_start = 500;
+        vad.current_end = 600;
+        vad.push_segment();
+        assert_eq!(vad.segments.make_contiguous(), [(450, 600)]);
+    }
+
+    #[test]
+    fn test_push_segment_clamped_to_prev_segment() {
+        let mut vad = segment_test_vad();
+        vad.speech_pad = 100;
+        vad.segments.push_back((0, 500));
+        vad.current_start = 550;
+        vad.current_end = 700;
+        vad.push_segment();
+        assert_eq!(vad.segments.make_contiguous(), [(0, 500), (500, 700)]);
+    }
+
+    #[test]
+    fn test_finish_padding_end_pad() {
+        let mut vad = segment_test_vad();
+        vad.speech_pad = 50;
+        vad.segments.push_back((0, 200));
+        vad.padded = false;
+        vad.head = 200 + 101; // silence (101) > 2 * speech_pad (100)
+        vad.finish_padding(false);
+        assert_eq!(vad.segments.back().unwrap().1, 250);
+        assert!(vad.padded);
+    }
+
+    #[test]
+    fn test_finish_padding_half_on_trigger() {
+        let mut vad = segment_test_vad();
+        vad.speech_pad = 50;
+        vad.segments.push_back((0, 200));
+        vad.padded = false;
+        vad.head = 200 + 40; // silence (40) <= 2 * speech_pad (100)
+        vad.finish_padding(true);
+        assert_eq!(vad.segments.back().unwrap().1, 220);
+        assert!(vad.padded);
+    }
+
+    #[test]
+    fn test_finish_padding_noop_when_padded() {
+        let mut vad = segment_test_vad();
+        vad.segments.push_back((0, 200));
+        vad.padded = true;
+        vad.head = 500;
+        vad.finish_padding(true);
+        assert_eq!(vad.segments.back().unwrap().1, 200);
+    }
+
+    #[test]
+    fn test_yield_segment_empty() {
+        let mut vad = segment_test_vad();
+        assert_eq!(vad.yield_segment(), None);
+    }
+
+    #[test]
+    fn test_yield_segment_single_unpadded() {
+        let mut vad = segment_test_vad();
+        vad.segments.push_back((0, 100));
+        vad.padded = false;
+        assert_eq!(vad.yield_segment(), None);
+    }
+
+    #[test]
+    fn test_yield_segment_single_padded() {
+        let mut vad = segment_test_vad();
+        vad.segments.push_back((0, 100));
+        vad.padded = true;
+        assert_eq!(vad.yield_segment(), Some((0, 100)));
+        assert_eq!(vad.tail, 100);
+    }
+
+    #[test]
+    fn test_yield_segment_multiple() {
+        let mut vad = segment_test_vad();
+        vad.segments.push_back((0, 100));
+        vad.segments.push_back((100, 200));
+        vad.padded = false;
+        assert_eq!(vad.yield_segment(), Some((0, 100)));
+        assert_eq!(vad.tail, 100);
+    }
+
+    #[test]
+    fn test_get_segments_sample_offsets() {
+        let mut vad = segment_test_vad();
+        vad.segments.push_back((100, 200));
+        vad.segments.push_back((300, 400));
+        assert_eq!(
+            vad.get_segments().into_owned(),
+            vec![(100, 200), (300, 400)]
+        );
+    }
+
+    #[test]
+    fn test_get_segments_timestamp_offsets() {
+        let mut vad = segment_test_vad();
+        vad.timestamp_offset = true;
+        vad.segments.push_back((16000, 32000));
+        assert_eq!(vad.get_segments().into_owned(), vec![(1000, 2000)]);
+    }
+
+    #[test]
+    fn test_count_and_is_idle() {
+        let mut vad = segment_test_vad();
+        assert_eq!(vad.count(), 0);
+        assert!(vad.is_idle());
+
+        vad.triggered = true;
+        assert!(!vad.is_idle());
+        vad.triggered = false;
+
+        vad.segments.push_back((0, 100));
+        assert_eq!(vad.count(), 1);
+        assert!(!vad.is_idle());
+    }
+
+    #[test]
+    fn test_set_offset() {
+        let mut vad = segment_test_vad();
+        vad.head = 500;
+        vad.set_offset(200);
+        assert_eq!(vad.tail, 200);
+        assert_eq!(vad.head, 500);
+
+        vad.set_offset(800);
+        assert_eq!(vad.tail, 800);
+        assert_eq!(vad.head, 800);
+    }
+
+    #[test]
+    fn test_segment_from_audio() {
+        let audio = vec![0.0f32; 800];
+        let segment = Segment::from_audio(audio.clone(), 1600, 16000);
+        assert_eq!(segment.position, 1600);
+        assert_eq!(segment.timestamp, 100);
+        assert_eq!(segment.duration, 50);
+        assert_eq!(segment.audio, audio);
+    }
+
+    #[test]
+    fn test_segment_new() {
+        let segment = Segment::new(1600, 800, 16000);
+        assert_eq!(segment.position, 1600);
+        assert_eq!(segment.timestamp, 100);
+        assert_eq!(segment.duration, 50);
+        assert!(segment.audio.is_empty());
+    }
+
+    #[test]
+    fn test_segment_from_audio_8khz() {
+        let audio = vec![0.0f32; 400];
+        let segment = Segment::from_audio(audio, 800, 8000);
+        assert_eq!(segment.timestamp, 100);
+        assert_eq!(segment.duration, 50);
+    }
+
+    #[test]
+    fn test_audio_buffer_input_and_length() {
+        let mut buf = AudioBuffer::new(16000);
+        buf.input(vec![0.0; 100]);
+        buf.input(vec![0.0; 50]);
+        assert_eq!(buf.audio_length(), 150);
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn test_audio_buffer_output_basic() {
+        let mut buf = AudioBuffer::new(16000);
+        let data: Vec<f32> = (0..100).map(|i| i as f32).collect();
+        buf.input(data.clone());
+        let segment = buf.output(0, 100).unwrap();
+        assert_eq!(segment.audio, data);
+        assert_eq!(segment.position, 0);
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn test_audio_buffer_output_cross_chunk() {
+        let mut buf = AudioBuffer::new(16000);
+        let a: Vec<f32> = (0..50).map(|i| i as f32).collect();
+        let b: Vec<f32> = (50..100).map(|i| i as f32).collect();
+        buf.input(a);
+        buf.input(b);
+        let segment = buf.output(0, 75).unwrap();
+        let expected: Vec<f32> = (0..75).map(|i| i as f32).collect();
+        assert_eq!(segment.audio, expected);
+        assert_eq!(segment.position, 0);
+    }
+
+    #[test]
+    fn test_audio_buffer_output_none_empty() {
+        let mut buf = AudioBuffer::new(16000);
+        assert!(buf.output(0, 10).is_none());
+    }
+
+    #[test]
+    fn test_audio_buffer_output_none_out_of_bounds() {
+        let mut buf = AudioBuffer::new(16000);
+        buf.input(vec![0.0; 100]);
+        assert!(buf.output(0, 200).is_none());
+    }
+
+    #[test]
+    fn test_audio_buffer_output_none_reversed_range() {
+        let mut buf = AudioBuffer::new(16000);
+        buf.input(vec![0.0; 100]);
+        assert!(buf.output(50, 10).is_none());
+    }
+
+    #[test]
+    fn test_audio_buffer_clear() {
+        let mut buf = AudioBuffer::new(16000);
+        buf.input(vec![0.0; 100]);
+        let segment = buf.clear(40).unwrap();
+        assert_eq!(segment.position, 0);
+        assert_eq!(segment.duration, 60 * 1000 / 16000);
+        assert_eq!(buf.audio_length(), 40);
+    }
+
+    #[test]
+    fn test_audio_buffer_clear_nothing_to_discard() {
+        let mut buf = AudioBuffer::new(16000);
+        buf.input(vec![0.0; 40]);
+        assert!(buf.clear(40).is_none());
+    }
+
+    #[test]
+    fn test_audio_buffer_start_point() {
+        let mut buf = AudioBuffer::new(16000);
+        buf.start_point(500);
+        buf.input(vec![0.0; 10]);
+        let segment = buf.output(500, 510).unwrap();
+        assert_eq!(segment.position, 500);
+    }
 }
