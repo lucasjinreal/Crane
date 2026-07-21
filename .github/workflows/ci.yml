@@ -30,3 +30,20 @@ jobs:
         run: cargo build --release --features onnx
       - name: Test
         run: cargo test --workspace --features onnx
+
+  build-cuda:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: Jimver/cuda-toolkit@v0.2.35
+        id: cuda-toolkit
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Build (CUDA)
+        run: cargo build --release --features "cuda,onnx"
+        env:
+          # No GPU on this runner, so candle-kernels' build script can't
+          # call nvidia-smi to auto-detect the compute capability.
+          CUDA_COMPUTE_CAP: "80"
