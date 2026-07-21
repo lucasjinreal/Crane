@@ -78,6 +78,15 @@ pub trait Asr {
         let t = self.transcribe(audio, opts)?;
         Ok(AsrStream::once(t))
     }
+
+    /// BCP-47 language codes this model claims to support (service discovery
+    /// only — not used to reject a `TranscribeOptions::language` request).
+    ///
+    /// Implementations typically allocate on every call; callers that need
+    /// the list more than once should cache the result.
+    fn supported_languages(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 #[cfg(test)]
@@ -226,5 +235,11 @@ mod tests {
     fn test_input_sample_rate() {
         let model = MockAsr;
         assert_eq!(model.input_sample_rate(), 16000);
+    }
+
+    #[test]
+    fn test_default_supported_languages_is_empty() {
+        let model = MockAsr;
+        assert!(model.supported_languages().is_empty());
     }
 }
