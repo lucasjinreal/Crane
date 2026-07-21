@@ -24,7 +24,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Build (CPU)
-        run: cargo build --release
+        run: cargo build --release --features onnx
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --features onnx
