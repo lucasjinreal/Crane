@@ -224,6 +224,26 @@ To use `crane`, here are some notes:
 
 That's it!
 
+#### AMD / ROCm (experimental)
+
+ROCm/HIP support targets AMD Radeon GPUs (developed on an RX 7800 XT, gfx1101). It
+depends on a **local candle fork** with a ROCm backend, wired in via `[patch.crates.io]`
+in the root `Cargo.toml` — adjust those paths if your fork lives elsewhere.
+
+```bash
+export ROCM_PATH=/opt/rocm
+export HIP_PATH=/opt/rocm
+export LD_LIBRARY_PATH=$ROCM_PATH/lib:$LD_LIBRARY_PATH
+cargo build --release --features rocm
+```
+
+Current limitations:
+
+- Quantized weights run **dequant-then-matmul**, so quantized models are functional but
+  not yet fast.
+- **Dense models only** — MoE is not supported by candle's ROCm backend yet.
+- Sampling falls back to CPU on ROCm (the GPU topk path is CUDA-kernel-only).
+
 ### OpenAI API Server
 
 Start a server compatible with OpenAI SDK and SGLang client:
@@ -236,6 +256,8 @@ cargo build -p crane-serve --release
 cargo build -p crane-serve --release --features "metal,accelerate"
 # CUDA
 cargo build -p crane-serve --release --features cuda
+# AMD ROCm (experimental — see "AMD / ROCm" above for required env)
+cargo build -p crane-serve --release --features rocm
 
 # Start (auto-detect model type and device)
 ./target/release/crane --model-path /path/to/Qwen2.5-7B-Instruct

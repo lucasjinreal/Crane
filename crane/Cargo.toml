@@ -36,6 +36,8 @@ onnx = ["crane-core/onnx"]
 metal = ["crane-core/metal", "candle-core/metal"]
 accelerate = ["crane-core/accelerate", "candle-core/accelerate"]
 cuda = ["crane-core/cuda", "dep:nvml-wrapper"]
+# ROCm does not pull `nvml-wrapper` (NVIDIA-only telemetry, cuda-gated).
+rocm = ["crane-core/rocm"]
 cudnn = ["crane-core/cudnn"]
 mkl = ["crane-core/mkl"]
 

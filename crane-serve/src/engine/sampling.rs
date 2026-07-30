@@ -197,6 +197,9 @@ pub fn sample(
         return Ok(logits.argmax(0)?.to_scalar::<u32>()?);
     }
 
+    // GPU topk is gated on `is_cuda()` only. On a ROCm device this is false, so ROCm
+    // deliberately takes the CPU sampling fallback below for now — the topk path is
+    // backed by cuda-only kernels and must not be routed through the rocm backend.
     if logits.device().is_cuda() {
         let top_p = seq.top_p.unwrap_or(1.0);
         let top_p_active = top_p > 0.0 && top_p < 1.0;

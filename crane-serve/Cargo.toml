@@ -51,6 +51,7 @@ accelerate = [
 ]
 onnx = ["crane-core/onnx", "crane/onnx"]
 cuda = ["crane-core/cuda", "crane/cuda"]
+rocm = ["crane-core/rocm", "crane/rocm"]
 cudnn = ["crane-core/cudnn", "crane/cudnn"]
 mkl = ["crane-core/mkl", "crane/mkl"]
 

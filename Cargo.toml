@@ -14,3 +14,14 @@ candle-nn = "0.11"
 candle-transformers = "0.11"
 tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 fst = "0.4"
+
+# All four candle crates are patched to the same local fork so the `--features rocm`
+# build resolves against its ROCm backend. They must all point at one fork checkout
+# (same 0.11.0 workspace version) to avoid linking two incompatible candle-core copies.
+# candle-onnx is patched here too, but its Crane `rocm` feature intentionally forwards
+# nothing — the fork's candle-onnx has no `rocm` feature.
+[patch.crates-io]
+candle-core = { path = "/home/miksa/projects/personal/candle/candle-core" }
+candle-nn = { path = "/home/miksa/projects/personal/candle/candle-nn" }
+candle-transformers = { path = "/home/miksa/projects/personal/candle/candle-transformers" }
+candle-onnx = { path = "/home/miksa/projects/personal/candle/candle-onnx" }
