@@ -5,7 +5,10 @@
 //! - Gumbel-max sampling (GPU-native, no CPU round-trip)
 //! - Top-k / top-p filtering
 //!
-//! All routines are designed for zero-copy GPU operation where possible.
+//! All routines are designed for zero-copy GPU operation where possible: on a
+//! device with the fused ops (CUDA or ROCm) the only host transfer per token is
+//! the sampled index itself. Set `CRANE_SAMPLE_TRACE=1` to log the path taken
+//! and its latency at `debug` level.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -15,6 +18,35 @@ use candle_core::{DType, Device, Tensor};
 use tracing::debug;
 
 use super::sequence::Sequence;
+
+/// Whether `device` has `crane_core::ops::topk_indices` / `gpu_argmax` backed
+/// by real kernels, i.e. whether the device-side sampling path applies.
+///
+/// Off it, sampling copies the whole logits vector to the host and sorts there
+/// — ~1 MB and ~24 ms per decoded token at a 250 K vocabulary. ROCm used to be
+/// excluded here because the fused ops were CUDA-only; they are not any more.
+#[must_use]
+fn has_gpu_sampling(device: &Device) -> bool {
+    device.is_cuda() || device.is_rocm()
+}
+
+/// Emit one `CRANE_SAMPLE_TRACE=1` line naming the path [`sample`] took.
+///
+/// Every exit of [`sample`] traces, including the device-side top-k ones. They
+/// used to be silent, which left the trace facility dead on exactly the
+/// configuration people benchmark (`top_k` + `top_p` together).
+#[allow(clippy::cast_possible_truncation)]
+fn trace_sample(seq_id: &str, path: &'static str, seq: &Sequence, top_k: usize, t0: Instant) {
+    debug!(
+        id = %seq_id,
+        path,
+        top_k,
+        top_p = ?seq.top_p,
+        temp = ?seq.temperature,
+        total_us = t0.elapsed().as_micros() as u64,
+        "sample"
+    );
+}
 
 /// Persistent buffers for GPU-side top-k/top-p sampling.
 ///
@@ -158,12 +190,12 @@ pub fn sample(
         Some(t) => t <= 0.0,
         None => false,
     };
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
     {
         // `repetition_penalty` is compared against the exact "disabled" sentinel
         // (1.0), not a computed float, so strict equality is correct.
         #[allow(clippy::float_cmp)]
-        if greedy && seq.repetition_penalty == 1.0 && logits.device().is_cuda() {
+        if greedy && seq.repetition_penalty == 1.0 && has_gpu_sampling(logits.device()) {
             let flat = logits.squeeze(0)?.squeeze(0)?;
             let token = crane_core::ops::gpu_argmax(&flat)?;
             if trace {
@@ -197,10 +229,7 @@ pub fn sample(
         return Ok(logits.argmax(0)?.to_scalar::<u32>()?);
     }
 
-    // GPU topk is gated on `is_cuda()` only. On a ROCm device this is false, so ROCm
-    // deliberately takes the CPU sampling fallback below for now — the topk path is
-    // backed by cuda-only kernels and must not be routed through the rocm backend.
-    if logits.device().is_cuda() {
+    if has_gpu_sampling(logits.device()) {
         let top_p = seq.top_p.unwrap_or(1.0);
         let top_p_active = top_p > 0.0 && top_p < 1.0;
         let vocab = logits.dim(0)?;
@@ -309,7 +338,11 @@ pub fn sample(
                     pos = pos.unsqueeze(0)?;
                 }
                 let token = topk_idx.gather(&pos, candle_core::D::Minus1)?;
-                return Ok(token.squeeze(0)?.to_scalar::<u32>()?);
+                let token = token.squeeze(0)?.to_scalar::<u32>()?;
+                if trace {
+                    trace_sample(seq_id, "gpu_topk_topp", seq, top_k, t0);
+                }
+                return Ok(token);
             }
 
             let mut pos = sample_gumbel_max_idx(&topk_logits, temperature)?;
@@ -317,7 +350,11 @@ pub fn sample(
                 pos = pos.unsqueeze(0)?;
             }
             let token = topk_idx.gather(&pos, candle_core::D::Minus1)?;
-            return Ok(token.squeeze(0)?.to_scalar::<u32>()?);
+            let token = token.squeeze(0)?.to_scalar::<u32>()?;
+            if trace {
+                trace_sample(seq_id, "gpu_topk", seq, top_k, t0);
+            }
+            return Ok(token);
         }
     }
 
@@ -325,10 +362,17 @@ pub fn sample(
     if top_p <= 0.0 || top_p >= 1.0 {
         let temperature = seq.temperature.unwrap_or(1.0);
         let idx = sample_gumbel_max_idx(&logits, temperature).map_err(anyhow::Error::from)?;
-        return Ok(idx.to_scalar::<u32>()?);
+        let token = idx.to_scalar::<u32>()?;
+        if trace {
+            trace_sample(seq_id, "gumbel_full_vocab", seq, 0, t0);
+        }
+        return Ok(token);
     }
 
     let next_token = seq.logits_processor.sample(&logits)?;
+    if trace {
+        trace_sample(seq_id, "cpu_logits_processor_fallback", seq, 0, t0);
+    }
     Ok(next_token)
 }
 
