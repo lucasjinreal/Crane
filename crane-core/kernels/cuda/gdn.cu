@@ -1,4 +1,6 @@
-// Fused Gated Delta Net recurrence (CUDA), f32.
+// Fused Gated Delta Net recurrence, f32. Compiled to PTX at build time for
+// CUDA and handed to hipcc at runtime for ROCm — one source, two launchers
+// (`ops/gdn/cuda_backend.rs`, `ops/gdn/rocm_backend.rs`).
 //
 // Each value column of each (batch*head) is an INDEPENDENT sequential
 // recurrence (no coupling across V). One thread owns its state column
@@ -31,7 +33,11 @@
 //   S[k,:] += k_t[k] * delta
 //   y_t     = sum_k S[k,:] * q_t[k]
 
+// Under HIP the runtime header is force-included by candle's shim, which does
+// not shadow <cuda_runtime.h>; nvcc includes it implicitly but name it anyway.
+#ifndef __HIP_PLATFORM_AMD__
 #include <cuda_runtime.h>
+#endif
 
 #define GDN_MAX_K 256
 

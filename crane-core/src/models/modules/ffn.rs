@@ -58,12 +58,15 @@ impl SwiGluFfn {
 impl Module for SwiGluFfn {
     /// Compute `activation(x @ gate) * (x @ up) @ down`.
     ///
-    /// On CUDA with `Silu` activation, uses `fused_silu_mul` for a single kernel launch.
+    /// On CUDA/ROCm with `Silu` activation, uses `fused_silu_mul` for a single
+    /// kernel launch.
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let gu = x.apply(&self.gate_up_proj)?;
 
-        #[cfg(feature = "cuda")]
-        if matches!(self.activation, Activation::Silu) && gu.device().is_cuda() {
+        #[cfg(any(feature = "cuda", feature = "rocm"))]
+        if matches!(self.activation, Activation::Silu)
+            && (gu.device().is_cuda() || gu.device().is_rocm())
+        {
             let activated =
                 crate::ops::fused_silu_mul(&gu.contiguous()?, self.intermediate_size)?;
             return self.down_proj.forward(&activated);

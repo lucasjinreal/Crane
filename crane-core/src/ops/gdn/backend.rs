@@ -2,10 +2,10 @@
 //! gated delta rule recurrence, causal Conv1D, and dispatch.
 //!
 //! The portable recurrence is a composition of Candle tensor ops, so it runs
-//! on any device (CPU/CUDA/Metal). On CUDA an optional fused kernel is also
-//! available (see [`super::cuda_backend`]) and is used by default; set
-//! `CRANE_GDN_PORTABLE=1` to force the portable op-by-op path for
-//! cross-checking numerics.
+//! on any device (CPU/CUDA/Metal/ROCm). On CUDA and ROCm a fused kernel is
+//! also available (see [`super::cuda_backend`] / [`super::rocm_backend`]) and
+//! is used by default; set `CRANE_GDN_PORTABLE=1` to force the portable
+//! op-by-op path for cross-checking numerics.
 
 use candle_core::{DType, IndexOp, Result, Tensor, D};
 
@@ -154,10 +154,11 @@ pub fn compute_beta_g(
 /// Compute β and g, run the gated delta rule recurrence, return the output.
 ///
 /// The recurrence is written in pure-Candle tensor ops, so it runs on any
-/// device (CPU/CUDA/Metal) — every op has a native backend kernel. On CUDA
-/// the fused single-launch kernel (see [`super::cuda_backend`]) is used by
-/// default; set `CRANE_GDN_PORTABLE=1` to force the portable op-by-op path
-/// for cross-checking numerics.
+/// device (CPU/CUDA/Metal/ROCm) — every op has a native backend kernel. On
+/// CUDA and ROCm the fused single-launch kernel is used by default (see
+/// [`super::cuda_backend`] / [`super::rocm_backend`]); set
+/// `CRANE_GDN_PORTABLE=1` to force the portable op-by-op path for
+/// cross-checking numerics.
 #[allow(unused_variables)]
 pub fn apply_recurrence(
     q: &Tensor,
@@ -171,22 +172,28 @@ pub fn apply_recurrence(
     cache: &mut GdnLayerCache,
     dtype: DType,
 ) -> Result<Tensor> {
-    #[cfg(feature = "cuda")]
-    if q.device().is_cuda() && std::env::var("CRANE_GDN_PORTABLE").is_err() {
-        return cuda_recurrence(q, k, v, g, beta, dims, batch_size, seq_len, cache, dtype);
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
+    if (q.device().is_cuda() || q.device().is_rocm())
+        && std::env::var("CRANE_GDN_PORTABLE").is_err()
+    {
+        return fused_recurrence(q, k, v, g, beta, dims, batch_size, seq_len, cache, dtype);
     }
 
-    // Device-portable reference (runs on CPU/CUDA/Metal).
+    // Device-portable reference (runs on CPU/CUDA/Metal/ROCm).
     gated_delta_rule_recurrence(q, k, v, g, beta, &mut cache.recurrent_state)
 }
 
-/// Prepare tensors and launch the fused CUDA recurrence kernel.
+/// Prepare tensors and launch the fused recurrence kernel.
 ///
 /// Lays inputs out as the kernel expects (`[BH, S, *]`, contiguous f32),
 /// applies the `1/sqrt(K)` query scale here (the kernel takes plain q), then
 /// reshapes the result back to the portable path's `[B, S, num_v_heads, V]`.
-#[cfg(feature = "cuda")]
-fn cuda_recurrence(
+///
+/// The layout work is identical for both backends; only the launch differs,
+/// and `cuda` and `rocm` never coexist in a working build.
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+#[allow(clippy::too_many_arguments)]
+fn fused_recurrence(
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
@@ -202,17 +209,21 @@ fn cuda_recurrence(
     let bh = batch_size * hv;
     let scale = 1.0 / (kd as f64).sqrt();
 
-    // [B, S, Hv, *] -> [B, Hv, S, *] -> [BH, S, *], contiguous f32.
+    // [B, S, Hv, *] -> [B, Hv, S, *] -> [BH, S, *], contiguous f32. The dtype
+    // cast comes *after* the permutation: casting first makes the copy
+    // `contiguous()` performs an f32 one, which at prefill length is twice the
+    // transient VRAM for no other difference (the cast commutes with the
+    // permutation).
     let prep3 = |t: &Tensor| -> Result<Tensor> {
-        t.to_dtype(DType::F32)?
-            .transpose(1, 2)?
+        t.transpose(1, 2)?
             .contiguous()?
+            .to_dtype(DType::F32)?
             .reshape((bh, seq_len, ()))
     };
     let prep2 = |t: &Tensor| -> Result<Tensor> {
-        t.to_dtype(DType::F32)?
-            .transpose(1, 2)?
+        t.transpose(1, 2)?
             .contiguous()?
+            .to_dtype(DType::F32)?
             .reshape((bh, seq_len))
     };
     let q3 = prep3(q)?.affine(scale, 0.0)?;
@@ -226,104 +237,23 @@ fn cuda_recurrence(
         .reshape((bh, kd, vd))?
         .contiguous()?;
 
+    #[cfg(feature = "cuda")]
     let (y, state_out) =
         super::cuda_backend::gdn_recurrence_cuda(&q3, &k3, &v3, &g2, &beta2, &state3)?;
+    #[cfg(all(feature = "rocm", not(feature = "cuda")))]
+    let (y, state_out) =
+        super::rocm_backend::gdn_recurrence_rocm(&q3, &k3, &v3, &g2, &beta2, &state3)?;
 
     cache.recurrent_state = state_out.reshape((batch_size, hv, kd, vd))?;
-    // [BH, S, V] -> [B, Hv, S, V] -> [B, S, Hv, V], back to model dtype.
+    // [BH, S, V] -> [B, Hv, S, V] -> [B, S, Hv, V], back to model dtype. Cast
+    // before the copy for the same reason `prep3` casts after it: the narrower
+    // side of the conversion is the one worth materialising.
     y.reshape((batch_size, hv, seq_len, vd))?
         .transpose(1, 2)?
-        .contiguous()?
-        .to_dtype(dtype)
+        .to_dtype(dtype)?
+        .contiguous()
 }
 
-/// Causal Conv1D over the QKV channels. Dispatches to a kernel-based
-/// implementation when available, pure-Candle otherwise.
-pub fn causal_conv1d(
-    x: &Tensor,
-    conv1d_weight: &Tensor,
-    dims: &GdnDims,
-    cache: &mut GdnLayerCache,
-    is_decode_step: bool,
-) -> Result<Tensor> {
-    if is_decode_step {
-        causal_conv1d_update(x, conv1d_weight, dims, cache)
-    } else {
-        causal_conv1d_full(x, conv1d_weight, dims, cache)
-    }
-}
-
-/// Single-step Conv1D for autoregressive decode. Concatenates the new token
-/// to the cached conv state, computes one output, then rolls the cache by 1.
-fn causal_conv1d_update(
-    x: &Tensor,
-    conv1d_weight: &Tensor,
-    dims: &GdnDims,
-    cache: &mut GdnLayerCache,
-) -> Result<Tensor> {
-    let (_, seq_len, _) = x.dims3()?;
-    let x_t = x.transpose(1, 2)?.contiguous()?;
-    // `conv_state` is shape `[1, conv_dim, kernel_size]` — the kernel-size
-    // dim is the LAST (matches mistral.rs).
-    let state_len = cache.conv_state.dim(2)?;
-    let hidden_new = Tensor::cat(&[cache.conv_state.clone(), x_t], 2)?;
-    let new_len = hidden_new.dim(2)?;
-    cache.conv_state = hidden_new.narrow(2, new_len - state_len, state_len)?;
-
-    let weight = conv1d_weight.squeeze(1)?.to_dtype(hidden_new.dtype())?;
-    let mut conv_outputs = Vec::with_capacity(seq_len);
-    let total_len = hidden_new.dim(2)?;
-    for i in (total_len - seq_len)..total_len {
-        let window = hidden_new.narrow(2, i + 1 - dims.conv_kernel_size, dims.conv_kernel_size)?;
-        let out = (window * weight.unsqueeze(0)?)?.sum(D::Minus1)?;
-        conv_outputs.push(out);
-    }
-    candle_nn::ops::silu(&Tensor::stack(&conv_outputs, 2)?)?.transpose(1, 2)
-}
-
-/// Multi-step Conv1D used during prefill. Pads on the left by `kernel - 1`,
-/// runs the full convolution, then captures the trailing `kernel - 1` tokens
-/// into the cache for the next decode step.
-fn causal_conv1d_full(
-    x: &Tensor,
-    conv1d_weight: &Tensor,
-    dims: &GdnDims,
-    cache: &mut GdnLayerCache,
-) -> Result<Tensor> {
-    let (batch_size, seq_len, conv_dim) = x.dims3()?;
-    let x_t = x.transpose(1, 2)?.contiguous()?;
-
-    // Pad on the time dim (the last) and capture the trailing `kernel - 1`
-    // tokens into the cache for the next decode step.
-    let pad_width = dims.conv_kernel_size.saturating_sub(seq_len);
-    cache.conv_state = if pad_width > 0 {
-        let zeros = Tensor::zeros((batch_size, conv_dim, pad_width), x_t.dtype(), x_t.device())?;
-        Tensor::cat(&[zeros, x_t.clone()], 2)?
-    } else {
-        x_t.narrow(2, seq_len - dims.conv_kernel_size, dims.conv_kernel_size)?
-    };
-
-    let padded_t = Tensor::cat(
-        &[
-            Tensor::zeros(
-                (batch_size, conv_dim, dims.conv_kernel_size - 1),
-                x_t.dtype(),
-                x_t.device(),
-            )?,
-            x_t,
-        ],
-        2,
-    )?;
-
-    let weight = conv1d_weight.squeeze(1)?.to_dtype(padded_t.dtype())?;
-    let mut conv_outputs = Vec::with_capacity(seq_len);
-    for i in 0..seq_len {
-        let window = padded_t.narrow(2, i, dims.conv_kernel_size)?;
-        let out = (window * weight.unsqueeze(0)?)?.sum(D::Minus1)?;
-        conv_outputs.push(out);
-    }
-    candle_nn::ops::silu(&Tensor::stack(&conv_outputs, 2)?)?.transpose(1, 2)
-}
 // ─────────────────────────────────────────────────────────────────────
 //  Tests
 // ─────────────────────────────────────────────────────────────────────

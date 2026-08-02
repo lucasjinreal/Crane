@@ -602,11 +602,11 @@ impl Mlp {
             MlpGateUp::Merged { gate_up_proj, intermediate_size } => {
                 let gu = gate_up_proj.forward(x)?; // [B, S, 2*intermediate_size]
 
-                // Use fused CUDA kernel when available: eliminates narrow + silu + mul
-                // (3 kernel launches → 1).
-                #[cfg(feature = "cuda")]
+                // Use the fused GPU kernel when available: eliminates
+                // narrow + silu + mul (3 kernel launches → 1).
+                #[cfg(any(feature = "cuda", feature = "rocm"))]
                 {
-                    if gu.device().is_cuda() {
+                    if gu.device().is_cuda() || gu.device().is_rocm() {
                         let activated = crate::ops::fused_silu_mul(
                             &gu.contiguous()?,
                             *intermediate_size,
@@ -810,6 +810,8 @@ impl Qwen3Model {
     ) -> Result<Self> {
         let dtype = if device.is_cuda() {
             DType::BF16
+        } else if device.is_metal() || device.is_rocm() {
+            DType::F16
         } else {
             DType::F32
         };

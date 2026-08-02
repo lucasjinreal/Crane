@@ -271,6 +271,19 @@ pub fn apply_mrope(
     Tensor::cat(&[&x_rot, &x_pass], D::Minus1)?.contiguous()
 }
 
+/// Rotary tables already sliced to the positions of the current forward call,
+/// together with the partial-rotary width they cover.
+///
+/// Under chunked prefill the slice is taken at `start_pos + chunk_offset`, so
+/// carrying it as one value keeps the absolute-position contract in a single
+/// place instead of three parallel parameters threaded through every layer.
+#[derive(Clone, Copy)]
+pub struct RopeSlice<'a> {
+    pub cos: &'a Tensor,
+    pub sin: &'a Tensor,
+    pub rot_dim: usize,
+}
+
 // ── Full-attention layer ────────────────────────────────────────────────
 
 /// Standard softmax attention layer for Qwen 3.5's `full_attention` blocks.
@@ -368,9 +381,7 @@ impl FullAttention {
     pub fn forward(
         &self,
         x: &Tensor,
-        cos: &Tensor,
-        sin: &Tensor,
-        rot_dim: usize,
+        rope: RopeSlice<'_>,
         attention_mask: Option<&Tensor>,
         kv_cache: Option<&mut KvCache>,
     ) -> Result<Tensor> {
@@ -421,8 +432,8 @@ impl FullAttention {
         let q = self.q_norm.forward(&q)?;
         let k = self.k_norm.forward(&k)?;
 
-        let q = apply_mrope(&q, cos, sin, rot_dim)?;
-        let k = apply_mrope(&k, cos, sin, rot_dim)?;
+        let q = apply_mrope(&q, rope.cos, rope.sin, rope.rot_dim)?;
+        let k = apply_mrope(&k, rope.cos, rope.sin, rope.rot_dim)?;
 
         // Append this step's K/V to the cache (post-RoPE, pre-GQA-expand) and
         // continue with the full cached K/V. During incremental decode this is
@@ -482,7 +493,7 @@ fn attn_weights_with_mask(
 ) -> Result<Tensor> {
     // HF applies the mask (shape `[B, 1, S_q, S_k]` for additive causal mask)
     // via `attn_weights + mask` and softmax. We do the same.
-    Ok(attn_logits.broadcast_add(mask)?)
+    attn_logits.broadcast_add(mask)
 }
 
 // ── MLP ────────────────────────────────────────────────────────────────
@@ -663,13 +674,10 @@ impl DecoderLayer {
     pub fn forward(
         &self,
         x: &Tensor,
-        cos: &Tensor,
-        sin: &Tensor,
-        rot_dim: usize,
+        rope: RopeSlice<'_>,
         attention_mask: Option<&Tensor>,
         gdn_cache: Option<&mut GdnLayerCache>,
         attn_cache: Option<&mut KvCache>,
-        is_decode_step: bool,
     ) -> Result<Tensor> {
         let residual = x;
         let normed = self.input_layernorm.forward(x)?;
@@ -677,7 +685,7 @@ impl DecoderLayer {
         let attn_out = match &self.layer_impl {
             LayerImpl::FullAttention(attn) => {
                 debug_assert!(gdn_cache.is_none(), "full-attention layer should not receive a GDN cache");
-                attn.forward(&normed, cos, sin, rot_dim, attention_mask, attn_cache)?
+                attn.forward(&normed, rope, attention_mask, attn_cache)?
             }
             LayerImpl::LinearAttention(gdn) => {
                 debug_assert!(attn_cache.is_none(), "linear-attention layer should not receive a KV cache");
@@ -687,7 +695,7 @@ impl DecoderLayer {
                 let dims = self.gdn_dims.as_ref().ok_or_else(|| {
                     candle_core::Error::Msg("GDN dims missing for linear-attention layer".into())
                 })?;
-                gdn.forward(&normed, dims, cache, is_decode_step)?
+                gdn.forward(&normed, dims, cache)?
             }
         };
 

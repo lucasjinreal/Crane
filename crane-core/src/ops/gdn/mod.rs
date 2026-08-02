@@ -41,17 +41,21 @@
 mod backend;
 mod cache;
 mod config;
+mod conv;
 #[cfg(feature = "cuda")]
 mod cuda_backend;
 mod layer;
 mod norm;
 mod projection;
+#[cfg(all(feature = "rocm", not(feature = "cuda")))]
+mod rocm_backend;
 
-pub use backend::{
-    causal_conv1d, gated_delta_rule_recurrence, l2_norm, softplus, apply_recurrence,
-};
+pub use backend::{apply_recurrence, gated_delta_rule_recurrence, l2_norm, softplus};
+pub use conv::causal_conv1d;
 #[cfg(feature = "cuda")]
 pub use cuda_backend::gdn_recurrence_cuda;
+#[cfg(all(feature = "rocm", not(feature = "cuda")))]
+pub use rocm_backend::gdn_recurrence_rocm;
 pub use cache::GdnLayerCache;
 pub use config::{defaults, GdnConfig, GdnDims, VHeadOrder};
 pub use layer::GatedDeltaNet;

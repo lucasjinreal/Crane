@@ -5,7 +5,8 @@ use candle_core::quantized::GgmlDType;
 use candle_core::{Module, Result, Tensor};
 use candle_nn::VarBuilder;
 
-use super::backend::{apply_recurrence, causal_conv1d, compute_beta_g, l2_norm};
+use super::backend::{apply_recurrence, compute_beta_g, l2_norm};
+use super::conv::causal_conv1d;
 use super::cache::GdnLayerCache;
 use super::config::{GdnConfig, GdnDims, VHeadOrder};
 use super::norm::RmsNormGated;
@@ -62,16 +63,16 @@ pub fn load(
         })
     }
 
-    /// Forward pass over a sequence (prefill or single decode step).
+    /// Forward pass over a sequence: a whole prompt, one prefill chunk, or a
+    /// single decode step — all continue from `cache`, which is updated in
+    /// place.
     ///
-    /// `x: [B, S, hidden_size]`. `cache` is updated in place. Returns
-    /// `[B, S, hidden_size]`.
+    /// `x: [B, S, hidden_size]`. Returns `[B, S, hidden_size]`.
     pub fn forward(
         &self,
         x: &Tensor,
         dims: &GdnDims,
         cache: &mut GdnLayerCache,
-        is_decode_step: bool,
     ) -> Result<Tensor> {
         let (batch_size, seq_len, _) = x.dims3()?;
         let dtype = x.dtype();
@@ -81,13 +82,7 @@ pub fn load(
 
         // 2. Causal Conv1D over [Q|K|V].
         let mixed_qkv = projected.conv_input(dims, batch_size, seq_len)?;
-        let mixed_qkv = causal_conv1d(
-            &mixed_qkv,
-            &self.conv1d_weight,
-            dims,
-            cache,
-            is_decode_step,
-        )?;
+        let mixed_qkv = causal_conv1d(&mixed_qkv, &self.conv1d_weight, dims, cache)?;
 
         // 3. Split → per-head Q, K, V; expand K from num_k_heads → num_v_heads.
         let (q, k, v) = split_qkv(&mixed_qkv, dims, batch_size, seq_len)?;

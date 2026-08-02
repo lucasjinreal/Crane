@@ -20,8 +20,10 @@ fst = "0.4"
 # (same 0.11.0 workspace version) to avoid linking two incompatible candle-core copies.
 # candle-onnx is patched here too, but its Crane `rocm` feature intentionally forwards
 # nothing — the fork's candle-onnx has no `rocm` feature.
+# Paths are relative to this file, assuming Crane and candle checkouts are siblings
+# under the same parent directory.
 [patch.crates-io]
-candle-core = { path = "/home/miksa/projects/personal/candle/candle-core" }
-candle-nn = { path = "/home/miksa/projects/personal/candle/candle-nn" }
-candle-transformers = { path = "/home/miksa/projects/personal/candle/candle-transformers" }
-candle-onnx = { path = "/home/miksa/projects/personal/candle/candle-onnx" }
+candle-core = { path = "../candle/candle-core" }
+candle-nn = { path = "../candle/candle-nn" }
+candle-transformers = { path = "../candle/candle-transformers" }
+candle-onnx = { path = "../candle/candle-onnx" }
