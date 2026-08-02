@@ -205,6 +205,8 @@ fn fused_recurrence(
     cache: &mut GdnLayerCache,
     dtype: DType,
 ) -> Result<Tensor> {
+    use crate::ops::prof::{timed, Span};
+
     let (hv, kd, vd) = (dims.num_v_heads, dims.head_k_dim, dims.head_v_dim);
     let bh = batch_size * hv;
     let scale = 1.0 / (kd as f64).sqrt();
@@ -226,32 +228,46 @@ fn fused_recurrence(
             .to_dtype(DType::F32)?
             .reshape((bh, seq_len))
     };
-    let q3 = prep3(q)?.affine(scale, 0.0)?;
-    let k3 = prep3(k)?;
-    let v3 = prep3(v)?;
-    let g2 = prep2(g)?;
-    let beta2 = prep2(beta)?;
-    let state3 = cache
-        .recurrent_state
-        .to_dtype(DType::F32)?
-        .reshape((bh, kd, vd))?
-        .contiguous()?;
+    // The layout work is charged separately from the launch: at decode's
+    // `seq_len == 1` it is a fixed per-layer cost paid on every token, whereas
+    // in prefill it is amortised over the whole prompt. Whether that fixed cost
+    // matters is the question `CRANE_PROF` exists to settle, so the two must
+    // not be lumped together.
+    let (q3, k3, v3, g2, beta2, state3) = timed(Span::GdnPrep, || -> Result<_> {
+        let q3 = prep3(q)?.affine(scale, 0.0)?;
+        let k3 = prep3(k)?;
+        let v3 = prep3(v)?;
+        let g2 = prep2(g)?;
+        let beta2 = prep2(beta)?;
+        let state3 = cache
+            .recurrent_state
+            .to_dtype(DType::F32)?
+            .reshape((bh, kd, vd))?
+            .contiguous()?;
+        Ok((q3, k3, v3, g2, beta2, state3))
+    })?;
 
-    #[cfg(feature = "cuda")]
-    let (y, state_out) =
-        super::cuda_backend::gdn_recurrence_cuda(&q3, &k3, &v3, &g2, &beta2, &state3)?;
-    #[cfg(all(feature = "rocm", not(feature = "cuda")))]
-    let (y, state_out) =
-        super::rocm_backend::gdn_recurrence_rocm(&q3, &k3, &v3, &g2, &beta2, &state3)?;
+    let (y, state_out) = timed(Span::GdnLaunch, || {
+        #[cfg(feature = "cuda")]
+        {
+            super::cuda_backend::gdn_recurrence_cuda(&q3, &k3, &v3, &g2, &beta2, &state3)
+        }
+        #[cfg(all(feature = "rocm", not(feature = "cuda")))]
+        {
+            super::rocm_backend::gdn_recurrence_rocm(&q3, &k3, &v3, &g2, &beta2, &state3)
+        }
+    })?;
 
-    cache.recurrent_state = state_out.reshape((batch_size, hv, kd, vd))?;
-    // [BH, S, V] -> [B, Hv, S, V] -> [B, S, Hv, V], back to model dtype. Cast
-    // before the copy for the same reason `prep3` casts after it: the narrower
-    // side of the conversion is the one worth materialising.
-    y.reshape((batch_size, hv, seq_len, vd))?
-        .transpose(1, 2)?
-        .to_dtype(dtype)?
-        .contiguous()
+    timed(Span::GdnPost, || {
+        cache.recurrent_state = state_out.reshape((batch_size, hv, kd, vd))?;
+        // [BH, S, V] -> [B, Hv, S, V] -> [B, S, Hv, V], back to model dtype. Cast
+        // before the copy for the same reason `prep3` casts after it: the narrower
+        // side of the conversion is the one worth materialising.
+        y.reshape((batch_size, hv, seq_len, vd))?
+            .transpose(1, 2)?
+            .to_dtype(dtype)?
+            .contiguous()
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────

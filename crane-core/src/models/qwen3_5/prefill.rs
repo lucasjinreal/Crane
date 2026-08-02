@@ -34,7 +34,26 @@ pub fn chunk_size() -> usize {
 
 /// Forward pass, chunking the prefill when the prompt is long enough to be
 /// worth it. Returns next-token logits `[B, vocab_size]`.
+///
+/// Under `CRANE_PROF=1` this is the profiling boundary: it is the outermost
+/// call that covers the whole model forward and nothing else, so the device
+/// sync [`crate::ops::prof::PassTimer::finish`] takes here measures exactly
+/// this pass's GPU work.
 pub(super) fn forward(
+    model: &mut Qwen3_5TextModel,
+    input_ids: &Tensor,
+    start_pos: usize,
+    attention_mask: Option<&Tensor>,
+) -> Result<Tensor> {
+    let timer = crate::ops::prof::pass(input_ids.dim(1)?);
+    let out = forward_inner(model, input_ids, start_pos, attention_mask);
+    if let Some(timer) = timer {
+        timer.finish(model.device());
+    }
+    out
+}
+
+fn forward_inner(
     model: &mut Qwen3_5TextModel,
     input_ids: &Tensor,
     start_pos: usize,

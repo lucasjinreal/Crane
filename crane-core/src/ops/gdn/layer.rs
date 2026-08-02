@@ -74,35 +74,47 @@ pub fn load(
         dims: &GdnDims,
         cache: &mut GdnLayerCache,
     ) -> Result<Tensor> {
+        use crate::ops::prof::{timed, Span};
+
         let (batch_size, seq_len, _) = x.dims3()?;
         let dtype = x.dtype();
 
         // 1. Input projections → Q, K, V, Z, B, A.
-        let projected = self.input_proj.forward(x, dims, batch_size, seq_len)?;
+        let projected = timed(Span::GdnProj, || {
+            self.input_proj.forward(x, dims, batch_size, seq_len)
+        })?;
 
         // 2. Causal Conv1D over [Q|K|V].
-        let mixed_qkv = projected.conv_input(dims, batch_size, seq_len)?;
-        let mixed_qkv = causal_conv1d(&mixed_qkv, &self.conv1d_weight, dims, cache)?;
+        let mixed_qkv = timed(Span::GdnConv, || {
+            let mixed_qkv = projected.conv_input(dims, batch_size, seq_len)?;
+            causal_conv1d(&mixed_qkv, &self.conv1d_weight, dims, cache)
+        })?;
 
-        // 3. Split → per-head Q, K, V; expand K from num_k_heads → num_v_heads.
-        let (q, k, v) = split_qkv(&mixed_qkv, dims, batch_size, seq_len)?;
-        let (q, k) = repeat_kv_heads(&q, &k, dims)?;
-
-        // 4. L2-normalize Q and K (Qwen 3.5 uses QK-norm = L2).
-        let q = l2_norm(&q, 1e-6)?;
-        let k = l2_norm(&k, 1e-6)?;
-
-        // 5. Compute β (write strength) and g (decay) from B, A, A_log, dt_bias.
-        let (beta, g) =
-            compute_beta_g(&projected.b, &projected.a, &self.a_log, &self.dt_bias, dtype)?;
+        // 3-5. Per-head split, QK L2-norm, and the β/g gates.
+        let (q, k, v, beta, g) = timed(Span::GdnQkv, || -> Result<_> {
+            // Split → per-head Q, K, V; expand K from num_k_heads → num_v_heads.
+            let (q, k, v) = split_qkv(&mixed_qkv, dims, batch_size, seq_len)?;
+            let (q, k) = repeat_kv_heads(&q, &k, dims)?;
+            // L2-normalize Q and K (Qwen 3.5 uses QK-norm = L2).
+            let q = l2_norm(&q, 1e-6)?;
+            let k = l2_norm(&k, 1e-6)?;
+            // β (write strength) and g (decay) from B, A, A_log, dt_bias.
+            let (beta, g) =
+                compute_beta_g(&projected.b, &projected.a, &self.a_log, &self.dt_bias, dtype)?;
+            Ok((q, k, v, beta, g))
+        })?;
 
         // 6. Run the gated delta rule recurrence.
-        let y = apply_recurrence(
-            &q, &k, &v, &g, &beta, dims, batch_size, seq_len, cache, dtype,
-        )?;
+        let y = timed(Span::GdnRecur, || {
+            apply_recurrence(
+                &q, &k, &v, &g, &beta, dims, batch_size, seq_len, cache, dtype,
+            )
+        })?;
 
         // 7. Gated RMSNorm + output projection.
-        self.finish_forward(y, projected.z, batch_size, seq_len)
+        timed(Span::GdnFinish, || {
+            self.finish_forward(y, projected.z, batch_size, seq_len)
+        })
     }
 
     fn finish_forward(

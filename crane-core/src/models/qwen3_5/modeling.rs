@@ -679,13 +679,17 @@ impl DecoderLayer {
         gdn_cache: Option<&mut GdnLayerCache>,
         attn_cache: Option<&mut KvCache>,
     ) -> Result<Tensor> {
+        use crate::ops::prof::{timed, Span};
+
         let residual = x;
-        let normed = self.input_layernorm.forward(x)?;
+        let normed = timed(Span::BlockNorm, || self.input_layernorm.forward(x))?;
 
         let attn_out = match &self.layer_impl {
             LayerImpl::FullAttention(attn) => {
                 debug_assert!(gdn_cache.is_none(), "full-attention layer should not receive a GDN cache");
-                attn.forward(&normed, rope, attention_mask, attn_cache)?
+                timed(Span::Attn, || {
+                    attn.forward(&normed, rope, attention_mask, attn_cache)
+                })?
             }
             LayerImpl::LinearAttention(gdn) => {
                 debug_assert!(attn_cache.is_none(), "linear-attention layer should not receive a KV cache");
@@ -695,17 +699,17 @@ impl DecoderLayer {
                 let dims = self.gdn_dims.as_ref().ok_or_else(|| {
                     candle_core::Error::Msg("GDN dims missing for linear-attention layer".into())
                 })?;
-                gdn.forward(&normed, dims, cache)?
+                timed(Span::Gdn, || gdn.forward(&normed, dims, cache))?
             }
         };
 
-        let x = (residual + attn_out)?;
+        let x = timed(Span::Resid, || residual + attn_out)?;
 
         let residual2 = &x;
-        let normed2 = self.post_attention_layernorm.forward(&x)?;
+        let normed2 = timed(Span::BlockNorm, || self.post_attention_layernorm.forward(&x))?;
 
-        let mlp_out = self.mlp.forward(&normed2)?;
+        let mlp_out = timed(Span::Mlp, || self.mlp.forward(&normed2))?;
 
-        residual2 + mlp_out
+        timed(Span::Resid, || residual2 + mlp_out)
     }
 }

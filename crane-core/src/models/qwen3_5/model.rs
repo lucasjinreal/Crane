@@ -382,8 +382,11 @@ impl Qwen3_5TextModel {
         start_pos: usize,
         attention_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
+        use crate::ops::prof::{timed, Span};
+
         let seq_len = input_ids.dim(1)?;
-        let xs = self.embed_tokens.forward(input_ids)?;
+        let xs = timed(Span::Embed, || self.embed_tokens.forward(input_ids))?;
+
         let (cos, sin) = self.rotary.cos_sin(start_pos, seq_len)?;
         let rope = RopeSlice {
             cos: &cos,
@@ -466,9 +469,11 @@ impl Qwen3_5TextModel {
     /// running the head over the whole prompt would put the quadratic memory
     /// term straight back after chunking removed it from attention.
     pub(super) fn head(&self, hidden: &Tensor) -> Result<Tensor> {
-        let (b, _s, _h) = hidden.dims3()?;
-        let xs = self.norm.forward(hidden)?.reshape((b, ()))?;
-        Ok(self.lm_head.forward(&xs)?)
+        crate::ops::prof::timed(crate::ops::prof::Span::Head, || {
+            let (b, _s, _h) = hidden.dims3()?;
+            let xs = self.norm.forward(hidden)?.reshape((b, ()))?;
+            Ok(self.lm_head.forward(&xs)?)
+        })
     }
 }
 
