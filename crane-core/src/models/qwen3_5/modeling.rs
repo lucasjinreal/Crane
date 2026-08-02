@@ -30,47 +30,48 @@ use crate::ops::linear::{linear_layer, LinearLayer};
 /// 3.5 adds a unit offset (`1 + weight`, Gemma-style). HF source:
 /// `output = self._norm(x.float()) * (1.0 + self.weight.float())`. The stored
 /// weights have mean ~0.24, so omitting the `+1` shrinks every normalized
-/// activation ~5x and compounds across layers. Computed in f32 then cast back.
+/// activation ~5x and compounds across layers.
 ///
 /// This is NOT used by the GDN gated norm ([`crate::ops::gdn::RmsNormGated`]), which
 /// scales by plain `weight` in HF.
+///
+/// The unit offset is folded into the stored scale at load rather than applied
+/// per call, which leaves the forward pass as a single fused `rms_norm`. That
+/// matters far more than it looks: this norm runs 48 times per decoded token
+/// (two per block, plus per-head Q/K norms), and as an op chain it was ~10
+/// launches each — 6.2 ms of the 21.8 ms the CPU spent submitting a token's
+/// work, measured with `CRANE_PROF=1`.
 #[derive(Clone)]
 pub struct Qwen35RmsNorm {
-    weight: Tensor,
-    eps: f64,
-    /// Whether to add the unit offset (`1 + weight`) at runtime. True for HF
-    /// safetensors weights (stored raw, mean ~0.24); false for GGUF weights,
-    /// where llama.cpp's converter already folded the `+1` in (mean ~1.24).
-    unit_offset: bool,
+    /// `1 + weight` for HF layouts; plain `weight` for GGUF, where llama.cpp's
+    /// converter already folded the `+1` in (mean ~1.24 vs ~0.24 raw).
+    alpha: Tensor,
+    eps: f32,
 }
 
 impl Qwen35RmsNorm {
     pub fn load(size: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
         let weight = vb.get(size, "weight")?;
-        Ok(Self { weight, eps, unit_offset: true })
+        Ok(Self::from_folded(weight.affine(1.0, 1.0)?, eps))
     }
 
-    /// Construct from a weight that already includes the `+1` unit offset
+    /// Construct from a scale that already includes the `+1` unit offset
     /// (GGUF layout).
-    pub fn from_folded(weight: Tensor, eps: f64) -> Self {
-        Self { weight, eps, unit_offset: false }
-    }
-
-    pub fn weight(&self) -> &Tensor {
-        &self.weight
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn from_folded(alpha: Tensor, eps: f64) -> Self {
+        Self { alpha, eps: eps as f32 }
     }
 }
 
 impl Module for Qwen35RmsNorm {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let dtype = x.dtype();
-        let x = x.to_dtype(DType::F32)?;
-        let var = x.sqr()?.mean_keepdim(D::Minus1)?;
-        let x_normed = x.broadcast_div(&(var + self.eps)?.sqrt()?)?;
-        let scale = self.weight.to_dtype(DType::F32)?;
-        // `1 + weight` (unit offset), in f32 — unless already folded in.
-        let scale = if self.unit_offset { scale.affine(1.0, 1.0)? } else { scale };
-        x_normed.broadcast_mul(&scale)?.to_dtype(dtype)
+        // candle's fused `rms_norm` normalizes in f32 internally regardless of
+        // the tensor dtype, so this keeps the previous f32 accumulation. It
+        // does require `alpha` to share `x`'s dtype and `x` to be contiguous;
+        // both hold already on every call site here, so both conversions are
+        // no-op clones rather than kernels.
+        let alpha = self.alpha.to_dtype(x.dtype())?;
+        candle_nn::ops::rms_norm(&x.contiguous()?, &alpha, self.eps)
     }
 }
 
@@ -403,24 +404,25 @@ impl FullAttention {
             // both back to `[B, S, num_heads*head_dim]` in head order.
             let flat = self.num_heads * self.head_dim;
             let qh = q_out.reshape((b_sz, seq_len, self.num_heads, self.head_dim * 2))?;
+            // Straight to attention layout `[B, H, S, D]`. Materializing the
+            // flat `[B, S, H*D]` form first and transposing afterwards cost two
+            // full copies of Q where narrowing then transposing costs one.
             let q = qh
                 .narrow(D::Minus1, 0, self.head_dim)?
-                .contiguous()?
-                .reshape((b_sz, seq_len, flat))?;
+                .transpose(1, 2)?
+                .contiguous()?;
             let gate = qh
                 .narrow(D::Minus1, self.head_dim, self.head_dim)?
                 .contiguous()?
                 .reshape((b_sz, seq_len, flat))?;
             (q, Some(gate))
         } else {
-            (q_out, None)
+            let q = q_out
+                .reshape((b_sz, seq_len, self.num_heads, self.head_dim))?
+                .transpose(1, 2)?
+                .contiguous()?;
+            (q, None)
         };
-
-
-        let q = q
-            .reshape((b_sz, seq_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?
-            .contiguous()?;
         let k = k
             .reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?
@@ -643,14 +645,15 @@ impl DecoderLayer {
                     cfg.rms_norm_eps,
                 );
                 let out_proj = gg.linear(&format!("{prefix}.ssm_out.weight"))?;
-                let gdn = GatedDeltaNet {
+                let gdn = GatedDeltaNet::with_derived(
                     input_proj,
                     conv1d_weight,
                     dt_bias,
                     a_log,
                     norm,
                     out_proj,
-                };
+                    &dims,
+                )?;
                 (LayerImpl::LinearAttention(gdn), Some(dims))
             }
         };

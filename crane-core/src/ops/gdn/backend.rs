@@ -16,21 +16,56 @@ use super::config::GdnDims;
 //  Elementwise helpers
 // ─────────────────────────────────────────────────────────────────────
 
-/// `x / sqrt(mean(x^2) + eps)` over the last dim — used to normalize Q and K
+/// `x / sqrt(sum(x^2) + eps)` over the last dim — used to normalize Q and K
 /// before the delta-rule recurrence.
+///
+/// Device-portable reference. [`l2_norm_fused`] is the one the layer calls;
+/// this stays as the definition both the tests and the CPU path check against.
 pub fn l2_norm(x: &Tensor, eps: f64) -> Result<Tensor> {
     let inv_norm = x
         .sqr()?
         .sum_keepdim(D::Minus1)?
-        .broadcast_add(&Tensor::new(eps as f32, x.device())?.to_dtype(x.dtype())?)?
+        // `affine`, not `broadcast_add` against a fresh scalar `Tensor::new`:
+        // the latter is a host-to-device copy, and this runs twice per layer
+        // per token.
+        .affine(1.0, eps)?
         .sqrt()?
         .recip()?;
     x.broadcast_mul(&inv_norm)
 }
 
-/// `log(1 + exp(x))` — numerically stable; computed as `log1p(exp(x))`.
+/// [`l2_norm`] as a single fused `rms_norm` launch.
+///
+/// `rms_norm(x, α, ε') = x / sqrt(mean(x²) + ε') * α`, and with `α = 1/sqrt(K)`
+/// and `ε' = eps/K` that is *identically* `x / sqrt(sum(x²) + eps)` — no
+/// approximation, just the constant `K` moved between the two terms:
+///
+/// ```text
+/// x / sqrt(Σx² + ε) = x / sqrt(K·(mean(x²) + ε/K)) = (1/sqrt(K))·x / sqrt(mean(x²) + ε/K)
+/// ```
+///
+/// `alpha` is the precomputed `[K]` vector of `1/sqrt(K)`; building it per call
+/// would reintroduce the host-to-device copy this exists to remove.
+pub fn l2_norm_fused(x: &Tensor, alpha: &Tensor, eps: f64) -> Result<Tensor> {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    let eps_mean = (eps / x.dim(D::Minus1)? as f64) as f32;
+    let alpha = alpha.to_dtype(x.dtype())?;
+    candle_nn::ops::rms_norm(&x.contiguous()?, &alpha, eps_mean)
+}
+
+/// The `[K]` vector of `1/sqrt(K)` that [`l2_norm_fused`] scales by.
+pub fn l2_alpha(head_k_dim: usize, dtype: DType, device: &candle_core::Device) -> Result<Tensor> {
+    #[allow(clippy::cast_precision_loss)]
+    let v = 1.0 / (head_k_dim as f64).sqrt();
+    Tensor::full(v as f32, head_k_dim, device)?.to_dtype(dtype)
+}
+
+/// `log(1 + exp(x))`.
+///
+/// `affine` rather than `ones_like() + …`: it folds the `+1` into the same
+/// launch instead of materializing a whole tensor of ones first.
 pub fn softplus(x: &Tensor) -> Result<Tensor> {
-    (Tensor::ones_like(x)? + x.exp()?)?.log()
+    x.exp()?.affine(1.0, 1.0)?.log()
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -119,8 +154,32 @@ pub fn gated_delta_rule_recurrence(
 //  β/g computation (pre-recurrence)
 // ─────────────────────────────────────────────────────────────────────
 
+/// The two per-head constants [`compute_beta_g`] needs, in the shape and dtype
+/// it needs them.
+///
+/// `A_log` and `dt_bias` are weights: `-exp(A_log)` and the broadcast of
+/// `dt_bias` are the same tensors on every token of every request, but were
+/// being rebuilt per layer per token — four launches each time, for a value
+/// that never changes. Deriving them once at load removes that entirely.
+pub struct GdnGateConsts {
+    /// `-exp(A_log)` as `[1, 1, H]`, f32.
+    pub neg_exp_a_log: Tensor,
+    /// `dt_bias` as `[1, 1, H]`, f32.
+    pub dt_bias: Tensor,
+}
+
+impl GdnGateConsts {
+    /// Derive from the raw `A_log` and `dt_bias` weights (both `[H]`).
+    pub fn new(a_log: &Tensor, dt_bias: &Tensor) -> Result<Self> {
+        Ok(Self {
+            neg_exp_a_log: a_log.to_dtype(DType::F32)?.exp()?.neg()?.unsqueeze(0)?.unsqueeze(0)?,
+            dt_bias: dt_bias.to_dtype(DType::F32)?.unsqueeze(0)?.unsqueeze(0)?,
+        })
+    }
+}
+
 /// Derive the per-head write strength β and per-step decay g from the
-/// projections, A_log, and dt_bias.
+/// projections and the precomputed gate constants.
 ///
 /// `b: [B, S, H]` raw logits → `beta = sigmoid(b)`.
 /// `a: [B, S, H]` raw values → combined with `A_log` (negative log of decay
@@ -128,21 +187,15 @@ pub fn gated_delta_rule_recurrence(
 pub fn compute_beta_g(
     b: &Tensor,
     a: &Tensor,
-    a_log: &Tensor,
-    dt_bias: &Tensor,
+    consts: &GdnGateConsts,
     dtype: DType,
 ) -> Result<(Tensor, Tensor)> {
     // β and g are tiny per-head ops; computed in pure Candle.
     let beta = candle_nn::ops::sigmoid(b)?;
     let a_f = a.to_dtype(DType::F32)?;
-    let dt_bias_expanded = dt_bias.to_dtype(DType::F32)?.unsqueeze(0)?.unsqueeze(0)?;
-    let g = a_log
-        .to_dtype(DType::F32)?
-        .exp()?
-        .neg()?
-        .unsqueeze(0)?
-        .unsqueeze(0)?
-        .broadcast_mul(&softplus(&a_f.broadcast_add(&dt_bias_expanded)?)?)?
+    let g = consts
+        .neg_exp_a_log
+        .broadcast_mul(&softplus(&a_f.broadcast_add(&consts.dt_bias)?)?)?
         .to_dtype(dtype)?;
     Ok((beta, g))
 }

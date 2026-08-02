@@ -78,6 +78,7 @@ We include:
 ## 🔥 Updates
 
 - **`2026.08.06`**: 🗣️ **Kokoro-82M TTS support** — from-scratch Rust G2P + `candle-onnx` synthesis pipeline, currently English only, wired into `/v1/audio/speech` in crane-serve. Benchmarked against Moonshine-TTS's reference C++ implementation on the same Kokoro-82M ONNX model: **1.6-4.3x faster synthesis** across short/medium/long text.
+- **`2026.08.02`**: ⏱️ Decode is dispatch-bound, not kernel-bound — and now isn't. New `CRANE_PROF=1` forward-pass profiler measures *submission* time against wall-clock time after a device sync, which `rocm-smi`'s busy counter cannot distinguish. It showed the CPU spending **21.8 ms of a 26.9 ms token** merely enqueueing ~2000 kernel launches. Collapsing `Qwen35RmsNorm` and the GDN gated norm into single fused `rms_norm` launches, rewriting the Q/K L2 norm as one (`x/√(Σx²+ε) ≡ rms_norm(x, 1/√K, ε/K)` — an identity, not an approximation), and hoisting `-exp(A_log)`/`dt_bias` to load time cut submission to **6.9 ms**; decode is now GPU-bound. On an RX 7800 XT with Qwen3.5-2B-Q8_0: decode **35.7 → 63.0 t/s** @ depth 0, **31.7 → 55.6** @ 2048, **28.8 → 49.2** @ 4096; prefill **2257 → 2726 t/s**. Gap to llama.cpp: 3.0× → ~1.7×.
 - **`2026.08.01`**: 🔴 AMD ROCm kernels — Crane's own `kernels/cuda/*.cu` now run on AMD too (the ROCm build compiles them with `hipcc` on first use and caches the code object), so the fused GDN recurrence, GPU top-k sampling and `fused_silu_mul` are no longer CUDA-only. The causal Conv1D also became `kernel` shifted multiply-accumulates instead of one windowed reduction per timestep, which helps every backend. Qwen 3.5's GGUF loader also stops forcing F32 side tensors (embeddings, norms, attention scores) on ROCm — F16 like Metal. On an RX 7800 XT with Qwen3.5-2B-Q8_0: prefill **183 → ~1600 t/s**, decode @ depth 2048 **15.4 → 30.6 t/s**, and peak VRAM on a 3800-token prompt drops from 99% to 69% of 16 GB.
 - **`2026.07.03`**: 🗜️ Qwen 3.5 quantization & memory — load community **GGUF** files directly (`--model-path model.gguf`, llama.cpp `qwen35` layout incl. the hybrid GDN blocks, arch auto-detected from the header, tokenizer + chat-template read from GGUF metadata so **no sibling files required**), or quantize a safetensors checkpoint at load time with **`--quant q4k|q8_0|…`** / `CRANE_ISQ` (in-situ quantization via candle `QMatMul`, no conversion step). New **`--dtype f16|bf16|f32`** flag; Qwen 3.5 now defaults to **F16 on Apple Metal**. 🖼️ **Qwen 3.5 vision** — multimodal checkpoints (`Qwen3_5ForConditionalGeneration`) work end-to-end via `--model-type qwen3_5_vl`: smart-resize + ViT + 2×2-spatial-merge + 3D MRoPE on the hybrid decoder, `/v1/chat/completions` accepts OpenAI-style `image_url` content parts (remote URL or `data:image/...;base64,...`). End-to-end example: `cargo run --release --features cuda --example qwen3_5_vl_chat`. Qwen3.5-0.8B on Apple Silicon: ~1.2 GB (Q4_0 GGUF) / ~2.0 GB (F16, new default) / ~3.7 GB (old F32 default).
 - **`2026.06.30`**: 🚀 Qwen 3.5 / Ornith follow-up — K=128 register-resident CUDA recurrence kernel (~5× prefill, ~7.8× recurrence-only on RTX 3090), per-token int8 / int4 K/V cache backends (~2× / ~4× smaller via `CRANE_KV_QUANT`), and Ornith tool-calling support (HF-byte-identical chat template via `AutoTokenizer::apply_chat_template_with_tools`, end-to-end `ornith_tools` example).
@@ -253,9 +254,16 @@ Current limitations:
 - **Dense models are what has been exercised.** candle's ROCm backend has since gained
   the quantized MoE forward paths, but no MoE model has been run through Crane on ROCm,
   so treat it as untested rather than known-good.
-- Decode is still ~3× behind llama.cpp on the same weights. The GPU stays ~93% busy
-  while moving far less than peak bandwidth, so what is left is quantized-matmul and
-  elementwise kernel efficiency in candle's ROCm backend, not launch overhead in Crane.
+- Decode is ~1.7× behind llama.cpp on the same weights, down from ~3×. The earlier
+  reading of that gap — "the GPU stays ~93% busy, so what is left is kernel efficiency,
+  not launch overhead in Crane" — was wrong: `rocm-smi`'s busy counter samples whether a
+  kernel is *resident*, not whether the queue starves between thousands of
+  microsecond-scale launches, so it reads high either way. Measuring submission time
+  directly (`CRANE_PROF=1`) showed the CPU spent 21.8 ms of a 26.9 ms token just
+  enqueueing work. Collapsing the norm op-chains into fused `rms_norm` launches and
+  hoisting per-token-invariant gate constants to load time cut that to 6.9 ms, and decode
+  is now GPU-bound (~45% of the token is submission). What remains really is
+  quantized-matmul efficiency in candle's ROCm backend.
 - Attention still materialises a `[batch, heads, chunk, context]` score matrix. Chunked
   prefill bounds the query dimension, so peak VRAM now grows *linearly* with context
   instead of quadratically, but a fused (flash-style) attention kernel is what would
@@ -449,6 +457,11 @@ decode steps take exactly the single-pass path. Measured on an RX 7800 XT
   or ROCm instead of the fused kernel (cross-check numerics).
 - `CRANE_FULL_RECOMPUTE=1` — force the O(n²) reset-and-reprocess decode
   path (debugging cross-check for the incremental path).
+- `CRANE_PROF=1` — profile the forward pass. Reports, every `CRANE_PROF_EVERY`
+  (64) passes, the time spent *submitting* a pass versus its wall time after a
+  device sync, plus a per-stage breakdown. When the two are close the pass is
+  dispatch-bound and no kernel change will help; `rocm-smi`'s busy counter
+  cannot distinguish the two cases. Output goes to stderr, no `RUST_LOG` needed.
 - `CRANE_TOPK_HOST=1` — force the host sort for top-k sampling on ROCm
   instead of the GPU kernel (A/B the kernel against the path it replaces).
 - `cargo run -p crane-core --release --features cuda --bin gdn_bench`
@@ -530,6 +543,8 @@ above for context):
 | `CRANE_FULL_RECOMPUTE` | unset | Force the O(n²) reset-and-reprocess decode path (debugging cross-check) |
 | `CRANE_GDN_VTILE` | unset | V-column tile size for the fused CUDA/ROCm GDN kernel (advanced tuning) |
 | `CRANE_PREFILL_CHUNK` | `512` | Prefill chunk size in tokens. Prompts longer than this are fed through the KV/GDN caches in chunks, so peak VRAM grows linearly with context instead of quadratically. `0` disables chunking (single-pass prefill) |
+| `CRANE_PROF` | unset | Profile the forward pass: submission time vs. wall time after a device sync, with a per-stage breakdown. Separates dispatch-bound from GPU-bound. Prints to stderr |
+| `CRANE_PROF_EVERY` | `64` | Passes per `CRANE_PROF` summary line |
 
 ## ⚡️ Speed
 
