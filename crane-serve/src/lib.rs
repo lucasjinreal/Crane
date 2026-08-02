@@ -52,12 +52,15 @@ pub struct Args {
     #[arg(long)]
     pub quant: Option<String>,
     /// Compute dtype: f16, bf16 or f32. Defaults per device: BF16 on CUDA,
-    /// F32 on CPU; on Metal F32, except model families validated in F16
-    /// (currently qwen3_5) which default to F16.
+    /// F16 on ROCm, F32 on CPU; on Metal F32, except model families validated
+    /// in F16 (currently qwen3_5) which default to F16.
     #[arg(long)]
     pub dtype: Option<String>,
     #[arg(long, default_value_t = 0)]
     pub max_seq_len: usize,
+    /// GPU memory budget: either a fraction of total VRAM (`0.9`), an absolute
+    /// size (`8G`, `8GB`, `8GiB`, `5120M`, `5120MiB` — all binary units), or a
+    /// plain byte count. Unset or `0` means unlimited.
     #[arg(long)]
     pub gpu_memory_limit: Option<String>,
 }
@@ -118,10 +121,16 @@ pub fn make_error(status: StatusCode, msg: &str) -> (StatusCode, Json<ErrorRespo
 }
 
 pub fn init_logging() {
+    // `fmt()`'s built-in default level is INFO; preserve that when RUST_LOG is
+    // unset so behavior for anyone not setting it is unchanged. When it is set,
+    // honor it fully (e.g. `RUST_LOG=debug` to reach `CRANE_SAMPLE_TRACE` output).
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt()
         .with_target(false)
         .with_file(false)
         .with_line_number(false)
+        .with_env_filter(filter)
         .compact()
         .init();
 }
