@@ -70,11 +70,16 @@ fn enable_thinking() -> Option<bool> {
 }
 
 fn pick_device_dtype() -> (DeviceConfig, DataType) {
+    // Priority order matches crane-serve's device ladder: cuda -> rocm -> metal -> cpu.
     #[cfg(feature = "cuda")]
     {
         return (DeviceConfig::Cuda(0), DataType::F16);
     }
-    #[cfg(all(not(feature = "cuda"), target_os = "macos"))]
+    #[cfg(all(not(feature = "cuda"), feature = "rocm"))]
+    {
+        return (DeviceConfig::Rocm(0), DataType::F16);
+    }
+    #[cfg(all(not(feature = "cuda"), not(feature = "rocm"), target_os = "macos"))]
     {
         return (DeviceConfig::Metal, DataType::F16);
     }

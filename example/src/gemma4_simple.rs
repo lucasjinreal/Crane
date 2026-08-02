@@ -14,6 +14,11 @@ fn main() -> Result<()> {
         .nth(1)
         .unwrap_or_else(|| "model/gemma-4-E2B".to_string());
 
+    // ROCm: only fix device selection. Gemma 4 has known F16/BF16 numerical
+    // issues, so we keep the existing F32 dtype (is_cuda() is false for Rocm).
+    #[cfg(all(not(feature = "cuda"), feature = "rocm"))]
+    let device = crane_core::models::Device::new_rocm(0)?;
+    #[cfg(not(all(not(feature = "cuda"), feature = "rocm")))]
     let device = crane_core::models::Device::cuda_if_available(0)?;
     let dtype = if device.is_cuda() {
         DType::BF16

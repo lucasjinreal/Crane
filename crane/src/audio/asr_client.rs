@@ -24,6 +24,20 @@ impl AsrClient {
                 crane_core::models::Device::cuda_if_available(*gpu_id as usize)
                     .map_err(|e| CraneError::ModelError(e.to_string()))?
             }
+            DeviceConfig::Rocm(_gpu_id) => {
+                #[cfg(feature = "rocm")]
+                {
+                    crane_core::models::Device::new_rocm(*_gpu_id as usize)
+                        .map_err(|e| CraneError::ModelError(e.to_string()))?
+                }
+                #[cfg(not(feature = "rocm"))]
+                {
+                    return Err(CraneError::ConfigError(
+                        "ROCm device requested but crane was built without --features rocm"
+                            .to_string(),
+                    ));
+                }
+            }
             DeviceConfig::Metal => {
                 #[cfg(target_os = "macos")]
                 {

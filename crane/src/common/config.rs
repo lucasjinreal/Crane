@@ -37,6 +37,7 @@ impl Default for CommonConfig {
 pub enum DeviceConfig {
     Cpu,
     Cuda(u32), // GPU ID
+    Rocm(u32), // AMD GPU ID
     Metal,
 }
 
@@ -45,6 +46,7 @@ impl std::fmt::Display for DeviceConfig {
         match self {
             DeviceConfig::Cpu => write!(f, "Cpu"),
             DeviceConfig::Cuda(gpu_id) => write!(f, "Cuda({})", gpu_id),
+            DeviceConfig::Rocm(gpu_id) => write!(f, "Rocm({})", gpu_id),
             DeviceConfig::Metal => write!(f, "Metal"),
         }
     }
@@ -65,5 +67,18 @@ impl std::fmt::Display for DataType {
             DataType::F32 => write!(f, "F32"),
             DataType::BF16 => write!(f, "BF16"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_config_display_formats_each_variant() {
+        assert_eq!(DeviceConfig::Cpu.to_string(), "Cpu");
+        assert_eq!(DeviceConfig::Cuda(2).to_string(), "Cuda(2)");
+        assert_eq!(DeviceConfig::Rocm(1).to_string(), "Rocm(1)");
+        assert_eq!(DeviceConfig::Metal.to_string(), "Metal");
     }
 }

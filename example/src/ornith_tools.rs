@@ -9,9 +9,12 @@
 //!   4. feed the result back as a `tool` turn and let the model answer.
 //!
 //! Build (CUDA): `cargo run --release -p crane-examples --bin ornith_tools --features cuda`
-//! Ornith-9B in bf16 needs ~20 GB of free VRAM; falls back to CPU/f32 otherwise.
-//! Override the model path via `--model-path` or the `MODEL_PATH` env var; defaults
-//! to `checkpoints/Ornith-1.0-9B`.
+//! Build (ROCm): `cargo run --release -p crane-examples --bin ornith_tools --features rocm`
+//! Ornith-9B in fp16 needs ~18 GB of VRAM, which overflows a 16 GB card. Set
+//! `CRANE_ISQ=q4k` to quantize the linears in-situ at load time (~6 GB on GPU);
+//! `Model::new` reads that env var automatically. Falls back to CPU/f32 with no
+//! GPU feature. Override the model path via `--model-path` or the `MODEL_PATH`
+//! env var; defaults to `checkpoints/Ornith-1.0-9B`.
 
 use std::collections::BTreeMap;
 
@@ -132,6 +135,11 @@ fn pick_device() -> Result<(Device, DType)> {
     {
         return Ok((Device::new_metal(0).context("init Metal")?, DType::F16));
     }
+    // ROCm backend: BF16 is still incomplete on the rocm fork, so run in F16.
+    #[cfg(all(not(feature = "cuda"), not(target_os = "macos"), feature = "rocm"))]
+    {
+        return Ok((Device::new_rocm(0).context("init ROCm")?, DType::F16));
+    }
     #[allow(unreachable_code)]
     Ok((Device::Cpu, DType::F32))
 }
@@ -157,7 +165,16 @@ fn generate(model: &mut Model, prompt: &str) -> Result<String> {
 fn main() -> Result<()> {
     let (device, dtype) = pick_device()?;
     let path = model_path();
-    eprintln!("Loading Ornith-1.0-9B ({dtype:?}) from {path} … this needs ~20 GB on GPU.");
+    let isq = std::env::var("CRANE_ISQ").ok().filter(|s| !s.trim().is_empty());
+    match &isq {
+        Some(q) => eprintln!(
+            "Loading Ornith-1.0-9B ({dtype:?}, ISQ={q}) from {path} … ~6 GB on GPU after q4k."
+        ),
+        None => eprintln!(
+            "Loading Ornith-1.0-9B ({dtype:?}) from {path} … ~18 GB unquantized; set \
+             CRANE_ISQ=q4k to fit a 16 GB GPU."
+        ),
+    }
     let mut model = Model::new(&path, &device, &dtype).context("load model")?;
     let tok = AutoTokenizer::from_pretrained(&path, None)
         .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
