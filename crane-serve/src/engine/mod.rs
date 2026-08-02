@@ -26,8 +26,10 @@
 //! | `sequence`      | Per-request lifecycle state                       |
 //! | `backend`       | `ModelBackend` trait + concrete implementations   |
 //! | `model_factory` | Auto-detection and factory creation               |
+//! | `memory`        | GPU memory-limit parsing + usage queries          |
 
 pub mod backend;
+mod memory;
 pub mod model_factory;
 pub mod sampling;
 pub mod scheduler;
@@ -36,6 +38,7 @@ pub mod stats;
 pub mod types;
 
 // Re-export commonly used items for convenience.
+pub use memory::MemoryConfig;
 pub use stats::{EngineStats, StatsSnapshot};
 pub use types::{EngineHandle, EngineRequest, EngineResponse, GenerationParams};
 
@@ -44,157 +47,16 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
-use candle_core::{Device, Tensor};
+use candle_core::Tensor;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use backend::ModelBackend;
 use crane_core::utils::token_output_stream::TokenOutputStream;
+use memory::{format_bytes_engine, query_gpu_memory_usage};
 use sampling::SamplingBuffers;
 use scheduler::{Scheduler, SchedulerOutput};
 use sequence::{Sequence, SequenceStatus};
-
-// ─────────────────────────────────────────────────────────────
-//  Memory configuration
-// ─────────────────────────────────────────────────────────────
-
-/// Configuration for GPU memory limits.
-#[derive(Debug, Clone)]
-pub struct MemoryConfig {
-    /// Maximum tokens per sequence (prompt + completion). 0 = unlimited.
-    pub max_seq_len: usize,
-    /// GPU memory limit in bytes. 0 = unlimited.
-    /// This is an **absolute** limit on total GPU memory usage.
-    pub gpu_memory_limit_bytes: u64,
-    /// Baseline GPU memory recorded after model load + warmup.
-    /// The memory gate compares `(current_used - baseline)` against
-    /// `(gpu_memory_limit_bytes - baseline)` so that the limit represents
-    /// the *total* allowed usage, not just KV-cache growth.
-    pub baseline_gpu_bytes: u64,
-}
-
-impl MemoryConfig {
-    /// Parse memory configuration from CLI arguments.
-    ///
-    /// `gpu_memory_limit` accepts:
-    ///   - Absolute sizes: "5G", "8G", "5120M", "5368709120" (bytes)
-    ///   - Utilization fraction: "0.7" (70% of total GPU memory)
-    #[must_use]
-    pub fn parse(max_seq_len: usize, gpu_memory_limit: Option<&str>, device: &Device) -> Self {
-        let gpu_memory_limit_bytes = match gpu_memory_limit {
-            Some(s) => Self::parse_memory_limit(s, device),
-            None => 0,
-        };
-        Self {
-            max_seq_len,
-            gpu_memory_limit_bytes,
-            baseline_gpu_bytes: 0,
-        }
-    }
-
-    fn parse_memory_limit(s: &str, device: &Device) -> u64 {
-        let s = s.trim();
-        if s.is_empty() || s == "0" {
-            return 0;
-        }
-
-        // Try absolute sizes: "5G", "8G", "5120M", "1024K"
-        let upper = s.to_uppercase();
-        if upper.ends_with('G')
-            && let Ok(n) = upper[..upper.len() - 1].trim().parse::<f64>()
-        {
-            #[allow(
-                clippy::cast_possible_truncation,
-                clippy::cast_sign_loss,
-                clippy::cast_precision_loss
-            )]
-            return (n * (1u64 << 30) as f64) as u64;
-        }
-        if upper.ends_with('M')
-            && let Ok(n) = upper[..upper.len() - 1].trim().parse::<f64>()
-        {
-            #[allow(
-                clippy::cast_possible_truncation,
-                clippy::cast_sign_loss,
-                clippy::cast_precision_loss
-            )]
-            return (n * (1u64 << 20) as f64) as u64;
-        }
-
-        // Try as a fraction (0.0 - 1.0)
-        if let Ok(frac) = s.parse::<f64>() {
-            if (0.0..=1.0).contains(&frac) {
-                let total = Self::query_total_gpu_memory(device);
-                if total > 0 {
-                    #[allow(
-                        clippy::cast_possible_truncation,
-                        clippy::cast_sign_loss,
-                        clippy::cast_precision_loss
-                    )]
-                    return (frac * total as f64) as u64;
-                }
-            }
-            // If > 1.0, treat as bytes
-            if frac > 1.0 {
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                return frac as u64;
-            }
-        }
-
-        tracing::warn!("Could not parse gpu_memory_limit '{s}', ignoring");
-        0
-    }
-
-    /// Record baseline GPU memory (call after model load + warmup).
-    pub fn record_baseline(&mut self, device: &Device) {
-        let (used, _total) = query_gpu_memory_usage(device);
-        self.baseline_gpu_bytes = used;
-    }
-
-    /// Query total GPU memory (bytes). Returns 0 if unavailable.
-    fn query_total_gpu_memory(_device: &Device) -> u64 {
-        #[cfg(feature = "cuda")]
-        {
-            if let Device::Cuda(_) = _device {
-                if let Ok((_free, total)) =
-                    candle_core::cuda_backend::cudarc::driver::result::mem_get_info()
-                {
-                    return total as u64;
-                }
-            }
-        }
-        0
-    }
-}
-
-/// Query current GPU memory usage. Returns (`used_bytes`, `total_bytes`).
-/// Returns (0, 0) if not on CUDA.
-fn query_gpu_memory_usage(_device: &Device) -> (u64, u64) {
-    #[cfg(feature = "cuda")]
-    {
-        if let Device::Cuda(_) = _device {
-            if let Ok((free, total)) =
-                candle_core::cuda_backend::cudarc::driver::result::mem_get_info()
-            {
-                return ((total - free) as u64, total as u64);
-            }
-        }
-    }
-    (0, 0)
-}
-
-/// Format a byte count as a human-readable string (used in engine log messages).
-fn format_bytes_engine(bytes: u64) -> String {
-    if bytes >= 1 << 30 {
-        #[allow(clippy::cast_precision_loss)]
-        return format!("{:.1}G", bytes as f64 / (1u64 << 30) as f64);
-    }
-    if bytes >= 1 << 20 {
-        #[allow(clippy::cast_precision_loss)]
-        return format!("{:.0}M", bytes as f64 / (1u64 << 20) as f64);
-    }
-    format!("{bytes}B")
-}
 
 // ─────────────────────────────────────────────────────────────
 //  InferenceEngine
