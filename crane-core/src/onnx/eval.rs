@@ -666,6 +666,17 @@ fn simple_eval_(
                 let output = ops::layer_norm::layer_norm(node, x, scale, bias)?;
                 values.insert(node.output[0].clone(), output);
             },
+            // Crane Added 20260804: implementation lives in
+            // ops/instance_norm.rs — needed by a fine-tuned Kokoro
+            // backbone's ISTFTNet decoder (F0Ntrain's residual blocks use
+            // InstanceNorm1d).
+            "InstanceNormalization" => {
+                let x = get(&node.input[0])?;
+                let scale = get(&node.input[1])?;
+                let bias = get(&node.input[2])?;
+                let output = ops::instance_norm::instance_normalization(node, x, scale, bias)?;
+                values.insert(node.output[0].clone(), output);
+            },
             "Squeeze" => {
                 let xs = get(&node.input[0])?;
                 let axes = get_opt(1).transpose()?;
