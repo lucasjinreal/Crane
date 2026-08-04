@@ -463,6 +463,15 @@ fn simple_eval_(
                 let output = xs.exp()?;
                 values.insert(node.output[0].clone(), output);
             },
+            // Crane Added 20260804: new op, needed by a fine-tuned Kokoro
+            // backbone's ISTFTNet vocoder — its noise-residual block
+            // computes `1 / alpha` (Snake activation) via `x.__rdiv__`,
+            // which the ONNX exporter lowers to `Reciprocal`.
+            "Reciprocal" => {
+                let xs = get(&node.input[0])?;
+                let output = ops::reciprocal::reciprocal(xs)?;
+                values.insert(node.output[0].clone(), output);
+            },
             "Equal" => {
                 let input0 = get(&node.input[0])?;
                 let input1 = get(&node.input[1])?;

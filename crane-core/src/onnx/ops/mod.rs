@@ -12,6 +12,7 @@ pub(crate) mod nonzero;
 pub(crate) mod pad;
 pub(crate) mod pooling;
 pub(crate) mod random;
+pub(crate) mod reciprocal;
 pub(crate) mod reduce_prod;
 pub(crate) mod reshape;
 pub(crate) mod scatter_elements;
