@@ -70,11 +70,25 @@ pub(crate) fn random_uniform_like(node: &NodeProto, input: &Tensor) -> Result<Te
     Tensor::rand(low, high, input.dims(), input.device())?.to_dtype(dtype)
 }
 
+/// ONNX `RandomNormalLike`:
+/// <https://onnx.ai/onnx/operators/onnx__RandomNormalLike.html>. Needed by a
+/// fine-tuned Kokoro backbone's `ISTFTNet` vocoder — its harmonic-plus-noise
+/// source module adds Gaussian noise via `RandomNormalLike`
+/// (`SourceModuleHnNSF.forward` in istftnet.py). Sources its output shape
+/// from `input`, the same as `random_uniform_like`.
+pub(crate) fn random_normal_like(node: &NodeProto, input: &Tensor) -> Result<Tensor> {
+    let dtype = parse_random_float_dtype(node, "RandomNormalLike", input.dtype())?;
+    reject_random_seed(node, "RandomNormalLike")?;
+    let mean: f32 = get_attr_opt(node, "mean")?.copied().unwrap_or(0.0);
+    let scale: f32 = get_attr_opt(node, "scale")?.copied().unwrap_or(1.0);
+    Tensor::randn(mean, scale, input.dims(), input.device())?.to_dtype(dtype)
+}
+
 #[cfg(test)]
 mod tests {
     use candle_core::{DType, Device, Result, Tensor};
 
-    use super::random_uniform_like;
+    use super::{random_normal_like, random_uniform_like};
     use crate::onnx::proto::attribute_proto::AttributeType;
     use crate::onnx::proto::{AttributeProto, NodeProto};
 
@@ -149,6 +163,44 @@ mod tests {
         let y = random_uniform_like(&node, &x)?;
 
         assert_eq!(y.dtype(), DType::F64);
+        Ok(())
+    }
+
+    #[test]
+    fn random_normal_like_matches_input_shape_and_distribution() -> Result<()> {
+        // Same shape-from-input contract as RandomUniformLike, but for a
+        // Gaussian: checks the sample mean lands near the requested "mean"
+        // (law of large numbers over enough elements) rather than an exact
+        // per-element bound, since a Gaussian is unbounded.
+        let node = NodeProto {
+            op_type: "RandomNormalLike".to_string(),
+            input: vec!["x".to_string()],
+            output: vec!["y".to_string()],
+            attribute: vec![
+                AttributeProto {
+                    name: "mean".to_string(),
+                    r#type: AttributeType::Float as i32,
+                    f: 5.0,
+                    ..Default::default()
+                },
+                AttributeProto {
+                    name: "scale".to_string(),
+                    r#type: AttributeType::Float as i32,
+                    f: 0.5,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let x = Tensor::zeros((4096,), DType::F32, &Device::Cpu)?;
+
+        let y = random_normal_like(&node, &x)?;
+
+        assert_eq!(y.dims(), &[4096]);
+        assert_eq!(y.dtype(), DType::F32);
+        let values = y.to_vec1::<f32>()?;
+        let sample_mean = values.iter().sum::<f32>() / values.len() as f32;
+        assert!((sample_mean - 5.0).abs() < 0.2, "sample mean {sample_mean} far from 5.0");
         Ok(())
     }
 }

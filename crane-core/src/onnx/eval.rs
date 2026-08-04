@@ -1931,6 +1931,11 @@ fn simple_eval_(
                 let output = ops::random::random_uniform_like(node, input)?;
                 values.insert(node.output[0].clone(), output);
             },
+            "RandomNormalLike" => {
+                let input = get(&node.input[0])?;
+                let output = ops::random::random_normal_like(node, input)?;
+                values.insert(node.output[0].clone(), output);
+            },
             "ArgMin" => {
                 let input = get(&node.input[0])?;
                 let axis_i64: i64 = get_attr_opt(node, "axis")?.copied().unwrap_or(0);
