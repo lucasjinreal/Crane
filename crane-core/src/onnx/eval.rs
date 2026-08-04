@@ -1422,51 +1422,8 @@ fn simple_eval_(
                         node.name
                     );
                 }
-                if pads.rank() != 1 {
-                    bail!("Pad expects 'pads' input to be 1D vector: {pads:?}");
-                }
-                if pads.dim(0).unwrap() != 2 * data.rank() {
-                    bail!(
-                        "Pad expects 'pads' input len to be 2 * rank of 'data' input: pads: {}, data rank: {}",
-                        pads,
-                        data.rank()
-                    );
-                }
-
-                let pads = pads.to_vec1::<i64>()?;
-                let (pads_pre, pads_post) = pads.split_at(pads.len() / 2);
-
-                match mode {
-                    "reflect" => {
-                        let mut out = data.clone();
-                        for (i, &dim) in data.dims().iter().enumerate().rev() {
-                            if pads_pre[i] == 0 && pads_post[i] == 0 {
-                                continue;
-                            }
-                            fn zigzag(min: i64, max: i64) -> impl Iterator<Item = i64> {
-                                std::iter::repeat((min..max).chain((min + 1..=max).rev())).flatten()
-                            }
-                            let idx = if dim > 1 {
-                                let cycle_len = dim * 2 - 2;
-                                let skip = cycle_len - ((pads_pre[i] as usize) % cycle_len);
-                                let idx = zigzag(0, (dim - 1) as i64)
-                                    .skip(skip)
-                                    .take((pads_pre[i] as usize) + dim + (pads_post[i] as usize));
-                                Tensor::from_iter(idx, out.device())?
-                            } else {
-                                Tensor::full(0i64, (dim,), out.device())?
-                            };
-
-                            out = out.index_select(&idx, i)?;
-                        }
-
-                        values.insert(node.output[0].clone(), out);
-                    },
-                    _ => bail!(
-                        "unsupported 'mode' value {mode:?} for Pad node {:?}",
-                        node.name
-                    ),
-                }
+                let output = ops::pad::pad(node, data, pads, mode)?;
+                values.insert(node.output[0].clone(), output);
             },
             // https://github.com/onnx/onnx/blob/main/docs/Operators.md#slice
             "Slice" => {

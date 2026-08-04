@@ -9,6 +9,7 @@ pub(crate) mod is_nan;
 pub(crate) mod layer_norm;
 pub(crate) mod modulo;
 pub(crate) mod nonzero;
+pub(crate) mod pad;
 pub(crate) mod pooling;
 pub(crate) mod random;
 pub(crate) mod reduce_prod;
