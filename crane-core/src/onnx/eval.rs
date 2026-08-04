@@ -2,6 +2,7 @@ use super::ops;
 use super::proto::attribute_proto::AttributeType;
 use super::proto::tensor_proto::DataType;
 use super::proto::{self as onnx, GraphProto};
+use super::utils::{collect_all_captures, count_nested_subgraph_captures, release_names_if_done};
 use crate::ops::fused_ops;
 use candle::{DType, Device, IndexOp, Result, Tensor, bail};
 use candle_core as candle;
@@ -379,6 +380,15 @@ fn simple_eval_(
             *remaining_uses.entry(input.as_str()).or_default() += 1;
         }
     }
+    // Crane Added 20260804: also count references a nested subgraph (e.g.
+    // an "If" node's then_branch/else_branch) makes to a name from this
+    // scope. ONNX lets a subgraph reference any name visible in its
+    // enclosing scope without declaring it as an explicit node input, so
+    // the flat scan just above never sees these — without this, a value
+    // could hit a remaining-use count of zero (from its top-level
+    // consumers alone) and be evicted before a later "If" node's
+    // not-yet-evaluated branch gets to use it. See count_nested_subgraph_captures.
+    count_nested_subgraph_captures(graph, &mut remaining_uses);
     // Crane Added 20260804: never evict a value this invocation didn't
     // itself produce. "If" (below) recursively calls simple_eval_ on a
     // branch's subgraph while sharing the same `values` map with the
@@ -1311,12 +1321,12 @@ fn simple_eval_(
             "If" => {
                 // protobuf encodes boolean false as 0 and true as 1
                 let cond = to_scalar_flexible::<u8>(&get(&node.input[0])?.get(0)?)?;
-                let attr_name = if cond != 0 {
-                    "then_branch"
+                let (taken_attr, untaken_attr) = if cond != 0 {
+                    ("then_branch", "else_branch")
                 } else {
-                    "else_branch"
+                    ("else_branch", "then_branch")
                 };
-                let sub_graph = get_attr::<GraphProto>(node, attr_name)?;
+                let sub_graph = get_attr::<GraphProto>(node, taken_attr)?;
                 if sub_graph.output.len() != node.output.len() {
                     bail!(
                         "If node {:?} is malformed: branch outputs ({}) don't match node outputs ({})",
@@ -1330,6 +1340,39 @@ fn simple_eval_(
                     values.insert(
                         out.clone(),
                         branch_out.get(&sub_graph.output[i].name).unwrap().clone(),
+                    );
+                }
+                // Crane Added 20260806: release the taken branch's captured
+                // (outer-scope) references, recursively through any nested
+                // subgraphs it contains (e.g. an inner "If"), now that it
+                // has actually run — matches the up-front over-count in
+                // count_nested_subgraph_captures, which counts both
+                // branches (and nested subgraphs within them) since the
+                // taken one isn't known until here.
+                let mut taken_captures = Vec::new();
+                collect_all_captures(sub_graph, &mut taken_captures);
+                release_names_if_done(
+                    taken_captures,
+                    &mut remaining_uses,
+                    &graph_outputs,
+                    &inherited_values,
+                    values,
+                );
+                // Crane Added 20260806: the untaken branch's captures were
+                // also counted up front (count_nested_subgraph_captures
+                // can't know which branch will be taken) but that branch
+                // never runs, so its counts would otherwise never be
+                // released. The attribute may be absent (an "If" is valid
+                // with only one branch set), hence get_attr_opt.
+                if let Some(untaken_graph) = get_attr_opt::<GraphProto>(node, untaken_attr)? {
+                    let mut untaken_captures = Vec::new();
+                    collect_all_captures(untaken_graph, &mut untaken_captures);
+                    release_names_if_done(
+                        untaken_captures,
+                        &mut remaining_uses,
+                        &graph_outputs,
+                        &inherited_values,
+                        values,
                     );
                 }
             },
@@ -2789,17 +2832,13 @@ fn simple_eval_(
             op_type => bail!("unsupported op_type {op_type} for op {node:?}"),
         }
 
-        for input in node.input.iter().filter(|input| !input.is_empty()) {
-            if let Some(count) = remaining_uses.get_mut(input.as_str()) {
-                *count -= 1;
-                if *count == 0
-                    && !graph_outputs.contains(input.as_str())
-                    && !inherited_values.contains(input.as_str())
-                {
-                    values.remove(input);
-                }
-            }
-        }
+        release_names_if_done(
+            node.input.iter().filter(|input| !input.is_empty()).map(String::as_str),
+            &mut remaining_uses,
+            &graph_outputs,
+            &inherited_values,
+            values,
+        );
     }
     graph
         .output
@@ -2896,9 +2935,11 @@ fn to_vec0_flexible<T: candle::WithDType>(t: &Tensor) -> Result<T> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use candle_core::{Device, Result};
 
-    use super::{Value, simple_eval};
+    use super::{Value, simple_eval, simple_eval_};
     use crate::onnx::proto::attribute_proto::AttributeType;
     use crate::onnx::proto::{AttributeProto, GraphProto, ModelProto, NodeProto, ValueInfoProto};
 
@@ -3109,6 +3150,268 @@ mod tests {
 
         assert_eq!(outputs["if_out"].to_vec1::<f32>()?, vec![1., 2., 3.]);
         assert_eq!(outputs["y2"].to_vec1::<f32>()?, vec![1., 2., 3.]);
+        Ok(())
+    }
+
+    #[test]
+    fn if_branch_capture_survives_an_earlier_top_level_consumer() -> Result<()> {
+        // Regression test for the actual production bug (not just the
+        // inherited_values guard above): a value ("x") produced early, with
+        // exactly one *top-level* consumer, plus an "If" branch that
+        // references it purely by outer-scope capture — never as a direct
+        // input to the "If" node itself, per ONNX subgraph scoping rules.
+        // The flat scan building `remaining_uses` can't see that capture at
+        // all, so without count_nested_subgraph_captures, x's count hits
+        // zero (and gets evicted) right after its one top-level consumer
+        // runs — well before the "If" node, which also needs it, is ever
+        // reached.
+        let then_branch = GraphProto {
+            node: vec![NodeProto {
+                op_type: "Identity".to_string(),
+                input: vec!["x".to_string()],
+                output: vec!["branch_out".to_string()],
+                ..Default::default()
+            }],
+            output: vec![ValueInfoProto { name: "branch_out".to_string(), ..Default::default() }],
+            ..Default::default()
+        };
+
+        let model = ModelProto {
+            graph: Some(GraphProto {
+                input: vec![
+                    ValueInfoProto { name: "raw".to_string(), ..Default::default() },
+                    ValueInfoProto { name: "cond".to_string(), ..Default::default() },
+                ],
+                node: vec![
+                    NodeProto {
+                        op_type: "Identity".to_string(),
+                        input: vec!["raw".to_string()],
+                        output: vec!["x".to_string()],
+                        ..Default::default()
+                    },
+                    // x's only *top-level* consumer — its count would hit
+                    // zero here under the buggy (pre-fix) counting.
+                    NodeProto {
+                        op_type: "Identity".to_string(),
+                        input: vec!["x".to_string()],
+                        output: vec!["discard".to_string()],
+                        ..Default::default()
+                    },
+                    // "x" is never listed as this node's own input — only
+                    // referenced inside then_branch by outer-scope capture.
+                    NodeProto {
+                        op_type: "If".to_string(),
+                        input: vec!["cond".to_string()],
+                        output: vec!["if_out".to_string()],
+                        attribute: vec![AttributeProto {
+                            name: "then_branch".to_string(),
+                            r#type: AttributeType::Graph as i32,
+                            g: Some(then_branch),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                ],
+                output: vec![ValueInfoProto { name: "if_out".to_string(), ..Default::default() }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let raw = Value::new(&[1f32, 2., 3.], &Device::Cpu)?;
+        let cond = Value::new(&[1u8], &Device::Cpu)?;
+        let outputs = simple_eval(
+            &model,
+            [("raw".to_string(), raw), ("cond".to_string(), cond)].into(),
+        )?;
+
+        assert_eq!(outputs["if_out"].to_vec1::<f32>()?, vec![1., 2., 3.]);
+        Ok(())
+    }
+
+    #[test]
+    fn if_branch_releases_capture_shared_by_both_branches() -> Result<()> {
+        // Regression test: count_nested_subgraph_captures deliberately
+        // over-counts a name captured by *both* then_branch and
+        // else_branch, since which one is taken isn't known until
+        // evaluation. The "If" handler must release the untaken branch's
+        // share of that over-count too, not just the taken branch's — else
+        // the count never reaches zero and "x" is retained in `values` for
+        // the rest of evaluation even though nothing needs it anymore.
+        // Calls simple_eval_ directly (rather than the public simple_eval
+        // wrapper) so the shared `values` map can be inspected after the
+        // call to confirm "x" was actually evicted.
+        let then_branch = GraphProto {
+            node: vec![NodeProto {
+                op_type: "Identity".to_string(),
+                input: vec!["x".to_string()],
+                output: vec!["branch_out".to_string()],
+                ..Default::default()
+            }],
+            output: vec![ValueInfoProto { name: "branch_out".to_string(), ..Default::default() }],
+            ..Default::default()
+        };
+        let else_branch = GraphProto {
+            node: vec![NodeProto {
+                op_type: "Identity".to_string(),
+                input: vec!["x".to_string()],
+                output: vec!["branch_out".to_string()],
+                ..Default::default()
+            }],
+            output: vec![ValueInfoProto { name: "branch_out".to_string(), ..Default::default() }],
+            ..Default::default()
+        };
+
+        let graph = GraphProto {
+            input: vec![
+                ValueInfoProto { name: "raw".to_string(), ..Default::default() },
+                ValueInfoProto { name: "cond".to_string(), ..Default::default() },
+            ],
+            node: vec![
+                NodeProto {
+                    op_type: "Identity".to_string(),
+                    input: vec!["raw".to_string()],
+                    output: vec!["x".to_string()],
+                    ..Default::default()
+                },
+                // x's only *top-level* consumer.
+                NodeProto {
+                    op_type: "Identity".to_string(),
+                    input: vec!["x".to_string()],
+                    output: vec!["discard".to_string()],
+                    ..Default::default()
+                },
+                // "x" is never listed as this node's own input — both
+                // branches reference it purely by outer-scope capture.
+                NodeProto {
+                    op_type: "If".to_string(),
+                    input: vec!["cond".to_string()],
+                    output: vec!["if_out".to_string()],
+                    attribute: vec![
+                        AttributeProto {
+                            name: "then_branch".to_string(),
+                            r#type: AttributeType::Graph as i32,
+                            g: Some(then_branch),
+                            ..Default::default()
+                        },
+                        AttributeProto {
+                            name: "else_branch".to_string(),
+                            r#type: AttributeType::Graph as i32,
+                            g: Some(else_branch),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                },
+            ],
+            output: vec![ValueInfoProto { name: "if_out".to_string(), ..Default::default() }],
+            ..Default::default()
+        };
+
+        let mut values: HashMap<String, Value> = HashMap::new();
+        values.insert("raw".to_string(), Value::new(&[1f32, 2., 3.], &Device::Cpu)?);
+        values.insert("cond".to_string(), Value::new(&[1u8], &Device::Cpu)?);
+        let outputs = simple_eval_(&graph, &mut values)?;
+
+        assert_eq!(outputs["if_out"].to_vec1::<f32>()?, vec![1., 2., 3.]);
+        assert!(
+            !values.contains_key("x"),
+            "\"x\" should have been evicted once both branches' over-counted \
+             captures were released"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn if_branch_releases_capture_from_a_nested_if() -> Result<()> {
+        // Regression test: count_nested_subgraph_captures recurses into an
+        // "If" nested inside another "If"'s branch, so a name captured only
+        // by the innermost branch still gets counted at the outermost
+        // scope. The release side must recurse the same way — releasing
+        // only the taken branch's *own* (non-nested) captured_names misses
+        // "x" entirely here, since "x" is never referenced directly inside
+        // the outer branch, only inside the inner branch nested within it.
+        let inner_branch = GraphProto {
+            node: vec![NodeProto {
+                op_type: "Identity".to_string(),
+                input: vec!["x".to_string()],
+                output: vec!["inner_branch_out".to_string()],
+                ..Default::default()
+            }],
+            output: vec![ValueInfoProto {
+                name: "inner_branch_out".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let outer_branch = GraphProto {
+            node: vec![NodeProto {
+                op_type: "If".to_string(),
+                input: vec!["inner_cond".to_string()],
+                output: vec!["outer_branch_out".to_string()],
+                attribute: vec![AttributeProto {
+                    name: "then_branch".to_string(),
+                    r#type: AttributeType::Graph as i32,
+                    g: Some(inner_branch),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            output: vec![ValueInfoProto {
+                name: "outer_branch_out".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let graph = GraphProto {
+            input: vec![
+                ValueInfoProto { name: "raw".to_string(), ..Default::default() },
+                ValueInfoProto { name: "cond".to_string(), ..Default::default() },
+                ValueInfoProto { name: "inner_cond".to_string(), ..Default::default() },
+            ],
+            node: vec![
+                NodeProto {
+                    op_type: "Identity".to_string(),
+                    input: vec!["raw".to_string()],
+                    output: vec!["x".to_string()],
+                    ..Default::default()
+                },
+                // x's only *top-level* consumer.
+                NodeProto {
+                    op_type: "Identity".to_string(),
+                    input: vec!["x".to_string()],
+                    output: vec!["discard".to_string()],
+                    ..Default::default()
+                },
+                NodeProto {
+                    op_type: "If".to_string(),
+                    input: vec!["cond".to_string()],
+                    output: vec!["if_out".to_string()],
+                    attribute: vec![AttributeProto {
+                        name: "then_branch".to_string(),
+                        r#type: AttributeType::Graph as i32,
+                        g: Some(outer_branch),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ],
+            output: vec![ValueInfoProto { name: "if_out".to_string(), ..Default::default() }],
+            ..Default::default()
+        };
+
+        let mut values: HashMap<String, Value> = HashMap::new();
+        values.insert("raw".to_string(), Value::new(&[1f32, 2., 3.], &Device::Cpu)?);
+        values.insert("cond".to_string(), Value::new(&[1u8], &Device::Cpu)?);
+        values.insert("inner_cond".to_string(), Value::new(&[1u8], &Device::Cpu)?);
+        let outputs = simple_eval_(&graph, &mut values)?;
+
+        assert_eq!(outputs["if_out"].to_vec1::<f32>()?, vec![1., 2., 3.]);
+        assert!(
+            !values.contains_key("x"),
+            "\"x\" should have been evicted once the nested If's capture was released"
+        );
         Ok(())
     }
 }

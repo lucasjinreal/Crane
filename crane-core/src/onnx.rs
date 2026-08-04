@@ -24,6 +24,11 @@ pub mod eval;
 #[path = "onnx/session.rs"]
 mod session;
 
+/// Cross-cutting evaluator bookkeeping not tied to any single op (e.g.
+/// "If"-branch value capture/eviction), shared by `eval.rs`'s main loop.
+#[path = "onnx/utils.rs"]
+mod utils;
+
 #[path = "onnx/optimizer/mod.rs"]
 mod optimizer;
 
