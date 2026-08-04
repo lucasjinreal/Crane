@@ -1903,36 +1903,8 @@ fn simple_eval_(
                 values.insert(node.output[0].clone(), output);
             },
             random_type @ ("RandomUniform" | "RandomNormal") => {
-                let dt: i64 = get_attr_opt(node, "dtype")?.copied().unwrap_or(1); // 1 is float
-                // type by
-                // default
-                let dtype = match DataType::try_from(dt as i32) {
-                    Ok(dt) => match dtype(dt) {
-                        Some(DType::U8 | DType::U32 | DType::I64) => {
-                            bail!(
-                                "unsupported 'dtype' value {dt:?}, only floats are allowed, for {random_type} {}",
-                                node.name
-                            )
-                        },
-                        Some(dt) => dt,
-                        None => {
-                            bail!(
-                                "unsupported 'dtype' value {dt:?} for {random_type} {}",
-                                node.name
-                            )
-                        },
-                    },
-                    Err(_) => {
-                        bail!(
-                            "unsupported 'dtype' value {dt:?} for {random_type} {}",
-                            node.name
-                        )
-                    },
-                };
-                let seed: Option<f32> = get_attr_opt(node, "seed")?.copied();
-                if seed.is_some() {
-                    bail!("seed for {random_type} is currently not supported")
-                };
+                let dtype = ops::random::parse_random_float_dtype(node, random_type, DType::F32)?;
+                ops::random::reject_random_seed(node, random_type)?;
                 let shape: Vec<usize> = get_attr::<[i64]>(node, "shape")?
                     .iter()
                     .map(|x| *x as usize)
@@ -1946,6 +1918,11 @@ fn simple_eval_(
                     let scale: f32 = get_attr_opt(node, "scale")?.copied().unwrap_or(1.0);
                     Tensor::randn(mean, scale, shape, &Device::Cpu)?.to_dtype(dtype)?
                 };
+                values.insert(node.output[0].clone(), output);
+            },
+            "RandomUniformLike" => {
+                let input = get(&node.input[0])?;
+                let output = ops::random::random_uniform_like(node, input)?;
                 values.insert(node.output[0].clone(), output);
             },
             "ArgMin" => {
@@ -3482,6 +3459,7 @@ mod tests {
         );
         Ok(())
     }
+
 
     #[test]
     fn var_derived_input_does_not_overflow_a_small_stack_on_drop() {
