@@ -25,7 +25,7 @@ pub fn dtype(dt: DataType) -> Option<DType> {
     }
 }
 
-trait Attr {
+pub(crate) trait Attr {
     const TYPE: AttributeType;
     fn get(attr: &onnx::AttributeProto) -> Result<&Self>;
 }
@@ -154,7 +154,7 @@ fn get_attr<'a, T: Attr + ?Sized>(node: &'a onnx::NodeProto, name: &str) -> Resu
     T::get(attr)
 }
 
-fn get_attr_opt<'a, T: Attr + ?Sized>(
+pub(crate) fn get_attr_opt<'a, T: Attr + ?Sized>(
     node: &'a onnx::NodeProto,
     name: &str,
 ) -> Result<Option<&'a T>> {
@@ -736,6 +736,12 @@ fn simple_eval_(
                 let axis = get_attr_opt::<i64>(node, "axis")?.copied().unwrap_or(0);
                 let axis = xs.normalize_axis(axis)?;
 
+                // Crane Added 20260805: normalize indices to I64 up front.
+                // index_select's CPU backend only accepts U8/U32/I64, but
+                // mid-graph indices (e.g. from Cast/Where/mask ops) can be
+                // I32, which would otherwise fail with UnsupportedDTypeForOp.
+                let indices = &indices.to_dtype(DType::I64)?;
+
                 // index_select does not support negative indices, so normalize them
                 // to positive indices.
                 let indices = &{
@@ -751,25 +757,22 @@ fn simple_eval_(
                 // In Pytorch or Numpy this can be done by indexing the xs tensor using the indices
                 // tensor directly, but candle does not support tensor indexing at the moment, so
                 // some workarounds must be done.
-                let xs = match indices.dims() {
-                    [] => {
-                        let index = indices.to_vec0::<i64>()? as usize;
-                        xs.narrow(axis, index, 1)?.squeeze(axis)?
-                    },
-                    [_] => xs.index_select(indices, axis)?,
-                    [first, _] => {
-                        let mut v = Vec::with_capacity(*first);
-                        for i in 0..*first {
-                            v.push(xs.index_select(&indices.get(i)?, axis)?)
-                        }
-                        Tensor::stack(&v, axis)?
-                    },
-                    _ => {
-                        // TODO: Provide an op to handle the ONNX generalized gather op ideally in a
-                        // differentiable way.
-                        todo!("implement gather for {xs:?} {indices:?} axis {axis}")
-                    },
-                };
+                //
+                // Crane Added 20260804: generalize to a single implementation
+                // that handles any index rank (previously hit `todo!()` for
+                // ranks above 2, needed by a fine-tuned Kokoro backbone that
+                // gathers with a 4-D index tensor). index_select only accepts
+                // a 1-D index tensor, so flatten `indices`, gather along
+                // `axis`, then reshape the result to the ONNX-spec output
+                // shape (`data.shape[:axis] + indices.shape + data.shape[axis+1:]`).
+                // This also subsumes the previous rank-0/1/2 special cases,
+                // which produced identical results through this same path.
+                let flat_indices = indices.flatten_all()?;
+                let gathered = xs.index_select(&flat_indices, axis)?;
+                let mut out_shape = xs.dims()[..axis].to_vec();
+                out_shape.extend(indices.dims());
+                out_shape.extend(&xs.dims()[axis + 1..]);
+                let xs = gathered.reshape(out_shape)?;
                 values.insert(node.output[0].clone(), xs);
             },
             // https://onnx.ai/onnx/operators/onnx__GatherElements.html#gatherelements
@@ -3508,5 +3511,119 @@ mod tests {
             handle.join().is_ok(),
             "dropping a Var-tainted deep op chain overflowed a {CANDLE_DEFAULT_RAYON_STACK}-byte stack"
         );
+    }
+
+    fn gather_model(axis: Option<i64>) -> ModelProto {
+        let attribute = match axis {
+            Some(axis) => vec![AttributeProto {
+                name: "axis".to_string(),
+                r#type: AttributeType::Int as i32,
+                i: axis,
+                ..Default::default()
+            }],
+            None => vec![],
+        };
+        ModelProto {
+            graph: Some(GraphProto {
+                input: vec![
+                    ValueInfoProto { name: "x".to_string(), ..Default::default() },
+                    ValueInfoProto { name: "indices".to_string(), ..Default::default() },
+                ],
+                node: vec![NodeProto {
+                    op_type: "Gather".to_string(),
+                    input: vec!["x".to_string(), "indices".to_string()],
+                    output: vec!["y".to_string()],
+                    attribute,
+                    ..Default::default()
+                }],
+                output: vec![ValueInfoProto { name: "y".to_string(), ..Default::default() }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn gather_supports_rank3_indices() -> Result<()> {
+        // Verifies the generalized N-D Gather path (indices rank > 2, which
+        // previously hit `todo!()`), needed by real ONNX exports that gather
+        // along axis 0 with a higher-rank index tensor built from a mask
+        // (e.g. a fine-tuned Kokoro backbone's PLBERT attention handling).
+        // Per the ONNX Gather spec, output shape is
+        // `data.shape[:axis] + indices.shape + data.shape[axis+1:]`: here
+        // data is [3, 2] u8, indices is [1, 1, 2] i64, axis defaults to 0,
+        // so the output is [1, 1, 2, 2] gathering rows 0 and 2.
+        let model = gather_model(None);
+        let x = Value::new(&[[10u8, 11], [20, 21], [30, 31]], &Device::Cpu)?;
+        let indices = Value::new(&[[[0i64, 2]]], &Device::Cpu)?;
+        let outputs = simple_eval(
+            &model,
+            [("x".to_string(), x), ("indices".to_string(), indices)].into(),
+        )?;
+
+        let y = &outputs["y"];
+        assert_eq!(y.dims(), &[1, 1, 2, 2]);
+        assert_eq!(y.flatten_all()?.to_vec1::<u8>()?, vec![10, 11, 30, 31]);
+        Ok(())
+    }
+
+    #[test]
+    fn gather_scalar_indices() -> Result<()> {
+        // Verifies the rank-0 (scalar) indices case still works now that
+        // the dedicated narrow+squeeze arm was folded into the single
+        // generalized flatten/index_select/reshape path: a scalar index
+        // removes the `axis` dimension entirely from the output, per the
+        // ONNX Gather spec's `data.shape[:axis] + indices.shape +
+        // data.shape[axis+1:]` with `indices.shape == []`.
+        let model = gather_model(None);
+        let x = Value::new(&[[10u8, 11], [20, 21], [30, 31]], &Device::Cpu)?;
+        let indices = Value::new(1i64, &Device::Cpu)?;
+        let outputs = simple_eval(
+            &model,
+            [("x".to_string(), x), ("indices".to_string(), indices)].into(),
+        )?;
+
+        let y = &outputs["y"];
+        assert_eq!(y.dims(), &[2]);
+        assert_eq!(y.to_vec1::<u8>()?, vec![20, 21]);
+        Ok(())
+    }
+
+    #[test]
+    fn gather_nonzero_axis() -> Result<()> {
+        // Verifies the generalized path's `xs.dims()[..axis]` /
+        // `xs.dims()[axis+1..]` output-shape slicing when `axis != 0`,
+        // which the rank-3-indices/axis-0 test above doesn't exercise.
+        let model = gather_model(Some(1));
+        let x = Value::new(&[[10u8, 11, 12], [20, 21, 22]], &Device::Cpu)?;
+        let indices = Value::new(&[[[0i64, 2]]], &Device::Cpu)?;
+        let outputs = simple_eval(
+            &model,
+            [("x".to_string(), x), ("indices".to_string(), indices)].into(),
+        )?;
+
+        let y = &outputs["y"];
+        assert_eq!(y.dims(), &[2, 1, 1, 2]);
+        assert_eq!(y.flatten_all()?.to_vec1::<u8>()?, vec![10, 12, 20, 22]);
+        Ok(())
+    }
+
+    #[test]
+    fn gather_negative_indices_rank3() -> Result<()> {
+        // Verifies negative-index normalization composes correctly with
+        // the generalized reshape for indices rank > 2 (the earlier
+        // rank-3 test only used non-negative indices).
+        let model = gather_model(None);
+        let x = Value::new(&[[10u8, 11], [20, 21], [30, 31]], &Device::Cpu)?;
+        let indices = Value::new(&[[[-1i64, 0]]], &Device::Cpu)?;
+        let outputs = simple_eval(
+            &model,
+            [("x".to_string(), x), ("indices".to_string(), indices)].into(),
+        )?;
+
+        let y = &outputs["y"];
+        assert_eq!(y.dims(), &[1, 1, 2, 2]);
+        assert_eq!(y.flatten_all()?.to_vec1::<u8>()?, vec![30, 31, 10, 11]);
+        Ok(())
     }
 }
