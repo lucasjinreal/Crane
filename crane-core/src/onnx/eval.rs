@@ -1817,6 +1817,12 @@ fn simple_eval_(
                 }
                 values.insert(node.output[0].clone(), result);
             },
+            "ReduceProd" => {
+                let input = get(&node.input[0])?;
+                let axes = get_opt(1).and_then(Result::ok);
+                let output = ops::reduce_prod::reduce_prod(node, input, axes)?;
+                values.insert(node.output[0].clone(), output);
+            },
             //https://github.com/onnx/onnx/blob/main/docs/Operators.md#ReduceSum
             // Version 13 impl
             "ReduceSum" => {
@@ -2981,7 +2987,7 @@ fn to_vec0_flexible<T: candle::WithDType>(t: &Tensor) -> Result<T> {
 mod tests {
     use std::collections::HashMap;
 
-    use candle_core::{Device, Result};
+    use candle_core::{DType, Device, Result};
 
     use super::{Value, simple_eval, simple_eval_};
     use crate::onnx::proto::attribute_proto::AttributeType;
