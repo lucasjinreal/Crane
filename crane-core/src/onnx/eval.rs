@@ -734,6 +734,15 @@ fn simple_eval_(
                 };
                 values.insert(node.output[0].clone(), xs);
             },
+            "TopK" => {
+                let xs = get(&node.input[0])?;
+                let k = get(&node.input[1])?;
+                let (out_values, out_indices) = ops::topk::top_k(node, xs, k)?;
+                values.insert(node.output[0].clone(), out_values);
+                if let Some(indices_name) = node.output.get(1).filter(|s| !s.is_empty()) {
+                    values.insert(indices_name.clone(), out_indices);
+                }
+            },
             "Gather" => {
                 // https://github.com/onnx/onnx/blob/main/docs/Operators.md#Gather
                 let xs = get(&node.input[0])?;
@@ -2951,7 +2960,7 @@ fn broadcast_shape_from_many(shapes: &[&[usize]]) -> Result<Vec<usize>> {
 /// Extract scalar from tensors that may be wrapped in extra dimensions.
 /// Some ONNX exports use shape [1] or [1,1] where scalars are expected.
 /// Only accepts single-element tensors; multi-element tensors still fail.
-fn to_scalar_flexible<T: candle::WithDType>(t: &Tensor) -> Result<T> {
+pub(crate) fn to_scalar_flexible<T: candle::WithDType>(t: &Tensor) -> Result<T> {
     if t.rank() > 0 && t.elem_count() == 1 {
         t.flatten_all()?.i(0)?.to_scalar::<T>()
     } else {

@@ -11,3 +11,4 @@ pub(crate) mod pooling;
 pub(crate) mod reshape;
 pub(crate) mod squeeze;
 pub(crate) mod stft;
+pub(crate) mod topk;
