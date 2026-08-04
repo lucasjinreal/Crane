@@ -2708,6 +2708,13 @@ fn simple_eval_(
 
                 values.insert(node.output[0].clone(), output);
             },
+            "ScatterElements" => {
+                let data = get(&node.input[0])?;
+                let indices = get(&node.input[1])?;
+                let updates = get(&node.input[2])?;
+                let output = ops::scatter_elements::scatter_elements(node, data, indices, updates)?;
+                values.insert(node.output[0].clone(), output);
+            },
             "ScatterND" => {
                 let data = get(&node.input[0])?;
 
