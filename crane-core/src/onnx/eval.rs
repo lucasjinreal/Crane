@@ -474,6 +474,11 @@ fn simple_eval_(
                 let xs = xs.eq(&xs.zeros_like()?)?;
                 values.insert(node.output[0].clone(), xs);
             },
+            "IsNaN" => {
+                let xs = get(&node.input[0])?;
+                let output = ops::is_nan::is_nan(xs)?;
+                values.insert(node.output[0].clone(), output);
+            },
             // Crane Added 20260731: implementation lives in ops/nonzero.rs.
             "NonZero" => {
                 let input = get(&node.input[0])?;
