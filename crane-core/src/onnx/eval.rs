@@ -379,6 +379,15 @@ fn simple_eval_(
             *remaining_uses.entry(input.as_str()).or_default() += 1;
         }
     }
+    // Crane Added 20260804: never evict a value this invocation didn't
+    // itself produce. "If" (below) recursively calls simple_eval_ on a
+    // branch's subgraph while sharing the same `values` map with the
+    // enclosing graph. That recursive call's own last-use bookkeeping is
+    // scoped only to the branch's own node list, so without this guard it
+    // would free an outer-scope value the moment the branch's *local* view
+    // of its uses hits zero — even though the outer graph still needs that
+    // value after the "If" node returns.
+    let inherited_values: HashSet<String> = values.keys().cloned().collect();
 
     // The nodes are topologically sorted so we can just process them in order.
     for node in graph.node.iter() {
@@ -2783,7 +2792,10 @@ fn simple_eval_(
         for input in node.input.iter().filter(|input| !input.is_empty()) {
             if let Some(count) = remaining_uses.get_mut(input.as_str()) {
                 *count -= 1;
-                if *count == 0 && !graph_outputs.contains(input.as_str()) {
+                if *count == 0
+                    && !graph_outputs.contains(input.as_str())
+                    && !inherited_values.contains(input.as_str())
+                {
                     values.remove(input);
                 }
             }
@@ -3029,6 +3041,74 @@ mod tests {
         )?;
 
         assert_eq!(outputs["y"].dims(), &[1, 1, 4]);
+        Ok(())
+    }
+
+    #[test]
+    fn if_branch_does_not_evict_value_outer_graph_still_needs() -> Result<()> {
+        // Regression test: an "If" branch recursively calls simple_eval_
+        // sharing the same `values` map as the enclosing graph. Its own
+        // last-use cleanup is scoped only to the branch's own node list, so
+        // without the inherited_values guard it would free an outer-scope
+        // value ("x") the moment the branch's *local* view of its uses hits
+        // zero — even though a node after the "If" still needs it.
+        let then_branch = GraphProto {
+            node: vec![NodeProto {
+                op_type: "Identity".to_string(),
+                input: vec!["x".to_string()],
+                output: vec!["branch_out".to_string()],
+                ..Default::default()
+            }],
+            output: vec![ValueInfoProto { name: "branch_out".to_string(), ..Default::default() }],
+            ..Default::default()
+        };
+
+        let model = ModelProto {
+            graph: Some(GraphProto {
+                input: vec![
+                    ValueInfoProto { name: "x".to_string(), ..Default::default() },
+                    ValueInfoProto { name: "cond".to_string(), ..Default::default() },
+                ],
+                node: vec![
+                    NodeProto {
+                        op_type: "If".to_string(),
+                        input: vec!["cond".to_string()],
+                        output: vec!["if_out".to_string()],
+                        attribute: vec![AttributeProto {
+                            name: "then_branch".to_string(),
+                            r#type: AttributeType::Graph as i32,
+                            g: Some(then_branch),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                    // Runs after the "If" node and needs "x" again — this is
+                    // exactly what the buggy version evicted out from under.
+                    NodeProto {
+                        op_type: "Identity".to_string(),
+                        input: vec!["x".to_string()],
+                        output: vec!["y2".to_string()],
+                        ..Default::default()
+                    },
+                ],
+                output: vec![
+                    ValueInfoProto { name: "if_out".to_string(), ..Default::default() },
+                    ValueInfoProto { name: "y2".to_string(), ..Default::default() },
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let x = Value::new(&[1f32, 2., 3.], &Device::Cpu)?;
+        let cond = Value::new(&[1u8], &Device::Cpu)?;
+        let outputs = simple_eval(
+            &model,
+            [("x".to_string(), x), ("cond".to_string(), cond)].into(),
+        )?;
+
+        assert_eq!(outputs["if_out"].to_vec1::<f32>()?, vec![1., 2., 3.]);
+        assert_eq!(outputs["y2"].to_vec1::<f32>()?, vec![1., 2., 3.]);
         Ok(())
     }
 }
