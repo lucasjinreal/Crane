@@ -1313,6 +1313,12 @@ fn simple_eval_(
                 let output = input.to_dtype(dtype)?;
                 values.insert(node.output[0].clone(), output);
             },
+            "CastLike" => {
+                let input = get(&node.input[0])?;
+                let target_type = get(&node.input[1])?;
+                let output = ops::cast_like::cast_like(input, target_type)?;
+                values.insert(node.output[0].clone(), output);
+            },
             // https://github.com/onnx/onnx/blob/main/docs/Operators.md#CumSum
             "CumSum" => {
                 let exclusive = get_attr_opt::<i64>(node, "exclusive")?
