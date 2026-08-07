@@ -2832,6 +2832,33 @@ fn simple_eval_(
             op_type => bail!("unsupported op_type {op_type} for op {node:?}"),
         }
 
+        // Crane Added 20260807: detach every output this node just produced
+        // from its computation graph. `simple_eval_` is a forward-only
+        // evaluator that never calls `Tensor::backward()`, but candle's
+        // `Tensor::track_op()` is `is_variable || op.is_some()` and
+        // `BackpropOp::new1/2/3` check it transitively on their operands —
+        // so once any tensor anywhere upstream is a `Var` (the "LSTM" op
+        // above wraps its weights in one, since `candle_nn::rnn::lstm()`
+        // requires a `VarBuilder`), the taint propagates forward forever:
+        // every tensor computed from it, and everything computed from
+        // those, keeps retaining full backward-provenance for the rest of
+        // the graph. On a model whose LSTM feeds into a large downstream
+        // network (e.g. a TTS vocoder), that produces a real, deep
+        // computation graph, and dropping the final output recurses through
+        // the whole thing in one native call-stack frame per node —
+        // confirmed via gdb backtrace to overflow the stack on Kokoro
+        // synthesis. Detaching per node keeps every tensor's `Drop` O(1)
+        // regardless of what fed into it, and as a side effect lets
+        // `release_names_if_done` below actually free memory — previously
+        // an evicted name's storage could still be kept alive by a later
+        // tensor's retained op chain even after its `values` entry was
+        // removed.
+        for output_name in node.output.iter().filter(|name| !name.is_empty()) {
+            if let Some(value) = values.get_mut(output_name.as_str()) {
+                *value = value.detach();
+            }
+        }
+
         release_names_if_done(
             node.input.iter().filter(|input| !input.is_empty()).map(String::as_str),
             &mut remaining_uses,
@@ -3413,5 +3440,73 @@ mod tests {
             "\"x\" should have been evicted once the nested If's capture was released"
         );
         Ok(())
+    }
+
+    #[test]
+    fn var_derived_input_does_not_overflow_a_small_stack_on_drop() {
+        // Regression test for the per-node `.detach()` above. The real bug:
+        // the "LSTM" op wraps its weights in a `candle::Var` (via
+        // `VarBuilder`, which `candle_nn::rnn::lstm()` requires), and
+        // candle's `Tensor::track_op()` (`is_variable || op.is_some()`) is
+        // checked transitively by `BackpropOp::new1/2/3` on their operands —
+        // so once *any* tensor upstream is Var-derived, every node from
+        // there to the end of the graph keeps building a real, retained
+        // backward-provenance chain, even though `simple_eval_` never calls
+        // `.backward()`. A plain (non-`Var`) input never triggers this
+        // (`track_op()` stays false throughout, confirmed by the fact that
+        // this same test setup without the `Var` below does not overflow
+        // even a far deeper chain), so the `Var` origin here is essential,
+        // not incidental. Runs eval and the resulting drop on a thread with
+        // the same stack size candle's CPU rayon pool actually uses, so a
+        // regression here fails the way it does in production.
+        const CHAIN_LEN: usize = 200_000;
+        const CANDLE_DEFAULT_RAYON_STACK: usize = 2 * 1024 * 1024;
+
+        let mut nodes = Vec::with_capacity(CHAIN_LEN);
+        let mut prev = "x".to_string();
+        for i in 0..CHAIN_LEN {
+            let out = format!("y{i}");
+            nodes.push(NodeProto {
+                op_type: "Add".to_string(),
+                input: vec![prev, "x_leaf".to_string()],
+                output: vec![out.clone()],
+                ..Default::default()
+            });
+            prev = out;
+        }
+        let model = ModelProto {
+            graph: Some(GraphProto {
+                input: vec![
+                    ValueInfoProto { name: "x".to_string(), ..Default::default() },
+                    ValueInfoProto { name: "x_leaf".to_string(), ..Default::default() },
+                ],
+                node: nodes,
+                output: vec![ValueInfoProto { name: prev, ..Default::default() }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let handle = std::thread::Builder::new()
+            .stack_size(CANDLE_DEFAULT_RAYON_STACK)
+            .spawn(move || {
+                // The only Var in this graph — this is what seeds the taint
+                // that then propagates through all 200,000 Add nodes.
+                let x_var = candle_core::Var::from_tensor(
+                    &Value::new(&[1.0f32], &Device::Cpu).expect("build var tensor"),
+                )
+                .expect("build var");
+                let x_leaf = Value::new(&[1.0f32], &Device::Cpu).expect("build leaf tensor");
+                let inputs =
+                    [("x".to_string(), x_var.as_tensor().clone()), ("x_leaf".to_string(), x_leaf)]
+                        .into();
+                let outputs = simple_eval(&model, inputs).expect("eval deep chain");
+                drop(outputs);
+            })
+            .expect("failed to spawn test thread");
+        assert!(
+            handle.join().is_ok(),
+            "dropping a Var-tainted deep op chain overflowed a {CANDLE_DEFAULT_RAYON_STACK}-byte stack"
+        );
     }
 }
