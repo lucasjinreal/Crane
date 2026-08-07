@@ -49,7 +49,9 @@
 //!   axes either.** `eval.rs`'s `CumSum` is a matmul-based, float-only
 //!   implementation, and (like `ReduceSum`) never normalizes a negative
 //!   `axis` input. [`fix_int_cumsum`] wraps `data` in a `Double` round-trip
-//!   cast and normalizes `axis` dynamically.
+//!   cast (cast back via `CastLike` against `data` itself, so the original
+//!   dtype never needs to be statically known) and normalizes `axis`
+//!   dynamically.
 //! - **`LSTM` only implements `direction == "forward"`.** `eval.rs` bails
 //!   immediately on `"bidirectional"`. [`expand_bidirectional_lstm`] splits
 //!   a bidirectional `LSTM` into two independent forward-direction `LSTM`
@@ -99,7 +101,7 @@ pub(super) fn rewrite_unsupported_ops(graph: &mut GraphProto) -> Result<()> {
                     new_nodes.push(node.clone());
                 }
             },
-            "CumSum" => fix_int_cumsum(node, graph, &mut new_nodes),
+            "CumSum" => fix_int_cumsum(node, &mut new_nodes),
             "LSTM" if is_bidirectional(node) => {
                 if let Rewritten::No = expand_bidirectional_lstm(node, &mut new_nodes) {
                     new_nodes.push(node.clone());
@@ -427,12 +429,19 @@ fn fix_reduce_mean_axes_input(
 ///
 /// - `candle_core::Tensor::cumsum` is a matmul-based implementation that
 ///   only supports floating-point dtypes, so an int64 `data` input fails
-///   outright. Wrapping `data` in `Cast(to=Double)` before, and back to
-///   its original declared dtype (or `Double`, if undeclared) after,
-///   routes every dtype through the same working float path. `Double` (not
-///   `Float`) matches the precision the dropped `ops/cumsum.rs`
-///   implementation used, since `Float`/f32 loses exactness above 2^24 —
-///   plausible for cumulative sums longer than a couple thousand terms.
+///   outright. Wrapping `data` in `Cast(to=Double)` before, and back to its
+///   original dtype after, routes every dtype through the same working
+///   float path. `Double` (not `Float`) matches the precision the dropped
+///   `ops/cumsum.rs` implementation used, since `Float`/f32 loses exactness
+///   above 2^24 — plausible for cumulative sums longer than a couple
+///   thousand terms. The "back to its original dtype" cast uses
+///   `CastLike(cumsum_out, data)` (`eval.rs`'s `CastLike`), not a static
+///   `Cast(to=...)` resolved from `graph.value_info`: a real-world export
+///   (e.g. `torch.onnx.export(dynamo=False)`) can leave `value_info`
+///   completely empty, and a rewrite that guessed the dtype from it used to
+///   silently leave the output at `Double` when the guess failed —
+///   `CastLike` reads `data`'s actual runtime dtype instead, so there's
+///   nothing to guess.
 /// - `axis` is an `eval.rs` *input* (not an attribute), cast via
 ///   `to_dtype(DType::U32)` then to `usize` with no negative-axis
 ///   normalization at all — the same wraparound bug
@@ -443,7 +452,7 @@ fn fix_reduce_mean_axes_input(
 ///
 /// `exclusive`/`reverse` attributes, if present, are preserved verbatim on
 /// the rewritten node — this rewrite only touches `data` and `axis`.
-fn fix_int_cumsum(node: &NodeProto, graph: &GraphProto, new_nodes: &mut Vec<NodeProto>) {
+fn fix_int_cumsum(node: &NodeProto, new_nodes: &mut Vec<NodeProto>) {
     let data = &node.input[0];
     let axis = &node.input[1];
     let output = &node.output[0];
@@ -459,10 +468,7 @@ fn fix_int_cumsum(node: &NodeProto, graph: &GraphProto, new_nodes: &mut Vec<Node
     rewritten.output = vec![cumsum_out_name.clone()];
     new_nodes.push(rewritten);
 
-    let back_dtype = declared_dtype(graph, data)
-        .and_then(|dt| DataType::try_from(dt).ok())
-        .unwrap_or(DataType::Double);
-    new_nodes.push(cast_node(&cumsum_out_name, output, back_dtype));
+    new_nodes.push(binary_node("CastLike", &cumsum_out_name, data, output));
 }
 
 /// Whether `node` (an `LSTM`) declares `direction == "bidirectional"`.
@@ -1296,6 +1302,38 @@ mod tests {
         let mut graph = GraphProto {
             node: vec![cumsum_node("data", "axis", "out", None, None)],
             value_info: vec![declare_tensor_type("data", DataType::Float)],
+            output: vec![ValueInfoProto {
+                name: "out".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        rewrite_unsupported_ops(&mut graph).unwrap();
+
+        let data =
+            Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], (2, 3), &Device::Cpu).unwrap();
+        let mut inputs = HashMap::new();
+        inputs.insert("data".to_string(), data);
+        inputs.insert("axis".to_string(), Tensor::new(1i64, &Device::Cpu).unwrap());
+
+        let values = run_graph(graph, inputs);
+        let out = values.get("out").unwrap();
+        assert_eq!(out.dtype(), candle_core::DType::F32);
+        assert_eq!(out.to_vec2::<f32>().unwrap(), vec![vec![1.0, 3.0, 6.0], vec![
+            4.0, 9.0, 15.0
+        ]]);
+    }
+
+    // Real-world exports (e.g. `torch.onnx.export(dynamo=False)`) can leave
+    // `graph.value_info` completely empty, so `data`'s dtype is never
+    // statically declared anywhere. The old `declared_dtype`-guessing
+    // rewrite silently left `out` as `Double` in exactly this case; the
+    // `CastLike`-based rewrite must still recover the correct `F32` output
+    // dtype from `data`'s actual runtime value.
+    #[test]
+    fn cumsum_float_data_without_declared_dtype_still_casts_back_to_f32() {
+        let mut graph = GraphProto {
+            node: vec![cumsum_node("data", "axis", "out", None, None)],
             output: vec![ValueInfoProto {
                 name: "out".to_string(),
                 ..Default::default()
