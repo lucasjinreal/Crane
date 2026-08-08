@@ -6,10 +6,15 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
-# CUDA-only micro-benchmark for the fused GDN recurrence kernel.
+# Micro-benchmark for the fused GDN recurrence kernel. No `required-features`:
+# it needs `cuda` OR `rocm`, and that field is an AND — the binary itself
+# refuses to run when neither is on.
 [[bin]]
 name = "gdn_bench"
-required-features = ["cuda"]
+
+# Micro-benchmark for the GPU top-k kernel. Same `required-features` caveat.
+[[bin]]
+name = "topk_bench"
 
 # G2P hot-path performance benchmark (text_to_ipa, IpaNormalizer::normalize).
 [[bench]]
@@ -77,6 +82,13 @@ cuda = [
     "dep:bindgen_cuda",
 ]
 cudnn = ["candle-core/cudnn"]
+# AMD ROCm/HIP backend (experimental). Deliberately does NOT enable `cuda` or pull
+# `bindgen_cuda`; Crane's portable (non-cuda) op fallbacks then apply automatically.
+rocm = [
+    "candle-core/rocm",
+    "candle-nn/rocm",
+    "candle-transformers/rocm",
+]
 mkl = [
     "dep:intel-mkl-src",
     "candle-core/mkl",

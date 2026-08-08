@@ -1,15 +1,20 @@
-//! Fused CUDA kernels for Crane transformer inference.
+//! Fused GPU kernels for Crane transformer inference.
 //!
-//! When the `cuda` feature is enabled, this module provides:
+//! On a GPU build this module provides:
 //! - `fused_silu_mul` — Fused SiLU(gate) * up in one pass
-//! - `fused_add_rmsnorm` — Fused residual_add + RMSNorm
 //! - `gpu_argmax` — GPU-side argmax for greedy sampling
 //! - `topk_indices` — GPU top-k on 1D f32 tensors
-//! - `copy_from_slice_u32` — HtoD: create a new CUDA U32 tensor from a host slice
-//! - `copy_from_tensor_f32` — contiguous copy of a CUDA f32 tensor
+//! - `copy_from_slice_u32` — HtoD: create a new U32 tensor from a host slice
+//! - `copy_from_tensor_f32` — contiguous copy of a device f32 tensor
 //!
 //! Each operation eliminates multiple kernel launches and intermediate
 //! GMEM round-trips compared to the equivalent candle op chain.
+//!
+//! Three implementations, picked at compile time from the backend features:
+//! `cuda_impl` (PTX built by `build.rs`), `rocm_impl` (the same `.cu` sources,
+//! compiled by `hipcc` on first use) and [`portable`], which needs no kernels
+//! at all. `cuda` and `rocm` are mutually exclusive in a working build —
+//! candle-core cannot link both backends — so `cuda` wins if both are on.
 //!
 //! Reusable elementwise ops with their own CPU/CUDA dispatch (not gated by
 //! the `cuda` feature at the module level — each op's `CustomOp2` handles
@@ -23,56 +28,27 @@ pub mod snake;
 #[cfg(feature = "cuda")]
 mod cuda_impl;
 
+// Top-k has its own module on both GPU backends, matching its own kernel
+// source: it shares nothing with the fused elementwise kernels.
+#[cfg(feature = "cuda")]
+mod cuda_topk;
+
 #[cfg(feature = "cuda")]
 pub use cuda_impl::*;
 
-// ── Non-CUDA fallbacks ──────────────────────────────────────────────
+#[cfg(feature = "cuda")]
+pub use cuda_topk::topk_indices;
 
-#[cfg(not(feature = "cuda"))]
-mod fallback {
-    use candle_core::{Result, Tensor};
+#[cfg(all(feature = "rocm", not(feature = "cuda")))]
+mod rocm_impl;
 
-    pub fn gpu_argmax(logits: &Tensor) -> Result<u32> {
-        let logits = logits.flatten_all()?;
-        logits.argmax(0)?.to_scalar::<u32>()
-    }
+#[cfg(all(feature = "rocm", not(feature = "cuda")))]
+pub use rocm_impl::*;
 
-    pub fn topk_indices(logits: &Tensor, k: usize) -> Result<Tensor> {
-        if logits.rank() != 1 {
-            candle_core::bail!("topk_indices expects a 1D tensor");
-        }
-        let n = logits.dims1()?;
-        if k == 0 || k > n {
-            candle_core::bail!("topk_indices: invalid k");
-        }
-        let vals = logits.to_vec1::<f32>()?;
-        let mut pairs: Vec<(f32, u32)> = vals
-            .into_iter()
-            .enumerate()
-            .map(|(i, v)| (v, i as u32))
-            .collect();
-        let kth = k.saturating_sub(1);
-        pairs.select_nth_unstable_by(kth, |a, b| {
-            b.0.partial_cmp(&a.0)
-                .unwrap_or(std::cmp::Ordering::Greater)
-        });
-        pairs.truncate(k);
-        pairs.sort_by(|a, b| {
-            b.0.partial_cmp(&a.0)
-                .unwrap_or(std::cmp::Ordering::Greater)
-        });
-        let out: Vec<u32> = pairs.into_iter().map(|(_, i)| i).collect();
-        Tensor::new(out.as_slice(), logits.device())
-    }
+// Always compiled: it needs no backend, the GPU entry points fall back to it
+// (off a GPU device, and above the top-k kernel's maximum `k`), and the kernel
+// cross-check tests compare against it.
+pub mod portable;
 
-    pub fn copy_from_slice_u32(src: &[u32], device: &candle_core::Device) -> Result<Tensor> {
-        Tensor::new(src, device)
-    }
-
-    pub fn copy_from_tensor_f32(src: &Tensor) -> Result<Tensor> {
-        src.contiguous()
-    }
-}
-
-#[cfg(not(feature = "cuda"))]
-pub use fallback::*;
+#[cfg(not(any(feature = "cuda", feature = "rocm")))]
+pub use portable::*;

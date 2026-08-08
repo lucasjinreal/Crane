@@ -9,14 +9,16 @@ use crane::prelude::*;
 fn main() -> CraneResult<()> {
     // Create a simple chat configuration.
     //
-    // Qwen 3.5 (hybrid Gated Delta Net + attention) runs on CPU/CUDA/Metal.
+    // Qwen 3.5 (hybrid Gated Delta Net + attention) runs on CPU/CUDA/ROCm/Metal.
     // Picks the best available target: CUDA (F16) when built `--features cuda`,
-    // Metal (F16) on macOS, otherwise CPU (F32).
+    // ROCm (F16) when built `--features rocm`, Metal (F16) on macOS, otherwise CPU (F32).
     #[cfg(feature = "cuda")]
     let (device, dtype) = (DeviceConfig::Cuda(0), DataType::F16);
-    #[cfg(all(not(feature = "cuda"), target_os = "macos"))]
+    #[cfg(all(not(feature = "cuda"), feature = "rocm"))]
+    let (device, dtype) = (DeviceConfig::Rocm(0), DataType::F16);
+    #[cfg(all(not(feature = "cuda"), not(feature = "rocm"), target_os = "macos"))]
     let (device, dtype) = (DeviceConfig::Metal, DataType::F16);
-    #[cfg(all(not(feature = "cuda"), not(target_os = "macos")))]
+    #[cfg(all(not(feature = "cuda"), not(feature = "rocm"), not(target_os = "macos")))]
     let (device, dtype) = (DeviceConfig::Cpu, DataType::F32);
 
     let config = ChatConfig {

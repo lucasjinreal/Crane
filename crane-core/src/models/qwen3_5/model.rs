@@ -15,7 +15,7 @@ use tokenizers::Tokenizer;
 
 use super::config::{load_config, Config, HiddenAct, LayerType, RopeParameters, TextConfig};
 use super::kv_cache::{KvCache, KvCacheKind};
-use super::modeling::{DecoderLayer, MRotaryEmbedding, Qwen35RmsNorm};
+use super::modeling::{DecoderLayer, MRotaryEmbedding, Qwen35RmsNorm, RopeSlice};
 use crate::generation::based::ModelForCausalLM;
 use crate::generation::GenerationConfig;
 use crate::models::hunyuan_dense::modeling::Gguf;
@@ -154,7 +154,7 @@ impl Qwen3_5TextModel {
         // ~1 GB at Qwen3.5's 248k vocab), F32 on CPU.
         let dtype = if device.is_cuda() {
             DType::BF16
-        } else if device.is_metal() {
+        } else if device.is_metal() || device.is_rocm() {
             DType::F16
         } else {
             DType::F32
@@ -357,18 +357,43 @@ impl Qwen3_5TextModel {
     /// absolute position of the first token (used for rotary slicing).
     /// `attention_mask` is broadcastable to `[B, 1, S, S_total]` (or `None`).
     ///
-    /// Returns logits of shape `[B, S, vocab_size]`.
+    /// Returns next-token logits of shape `[B, vocab_size]` — only the last
+    /// position is projected through `lm_head`.
+    ///
+    /// Long prompts are prefilled in chunks; see [`super::prefill`].
     pub fn forward(
         &mut self,
         input_ids: &Tensor,
         start_pos: usize,
         attention_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
-        let (_b, seq_len) = input_ids.dims2()?;
-        let is_decode_step = seq_len == 1;
+        super::prefill::forward(self, input_ids, start_pos, attention_mask)
+    }
 
-        let xs = self.embed_tokens.forward(input_ids)?;
-        self.forward_through_layers(xs, start_pos, attention_mask, is_decode_step, None)
+    /// Embed `input_ids` `[B, S]` and run every decoder layer, returning the
+    /// pre-final-norm hidden states `[B, S, hidden_size]`.
+    ///
+    /// `start_pos` is the absolute position of the first token: RoPE and the
+    /// causal mask are indexed from it, so a prefill chunk starting mid-prompt
+    /// sees its true positions rather than chunk-relative ones.
+    pub(super) fn forward_layers(
+        &mut self,
+        input_ids: &Tensor,
+        start_pos: usize,
+        attention_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        use crate::ops::prof::{timed, Span};
+
+        let seq_len = input_ids.dim(1)?;
+        let xs = timed(Span::Embed, || self.embed_tokens.forward(input_ids))?;
+
+        let (cos, sin) = self.rotary.cos_sin(start_pos, seq_len)?;
+        let rope = RopeSlice {
+            cos: &cos,
+            sin: &sin,
+            rot_dim: self.rotary.rot_dim(),
+        };
+        self.run_layers(xs, rope, attention_mask)
     }
 
     /// Forward pass with **pre-computed hidden states** (vision path).
@@ -395,95 +420,60 @@ impl Qwen3_5TextModel {
     ) -> Result<Tensor> {
         let (_b, seq_len, _h) = hidden_states.dims3()?;
         let is_decode_step = seq_len == 1;
-        let xs = hidden_states.clone();
 
         let mask = match attention_mask {
             Some(m) => Some(m.clone()),
-            None if !is_decode_step => {
-                let total = start_pos + seq_len;
-                Some(build_causal_mask(seq_len, total, xs.device(), xs.dtype())?)
-            }
+            None if !is_decode_step => Some(super::prefill::causal_mask(
+                seq_len,
+                start_pos,
+                hidden_states.device(),
+                hidden_states.dtype(),
+            )?),
             None => None,
         };
-        let mask_ref = mask.as_ref();
 
         let (cos, sin) = self.rotary.cos_sin_with_position_ids(position_ids)?;
-        let rot_dim = self.rotary.rot_dim();
+        let rope = RopeSlice {
+            cos: &cos,
+            sin: &sin,
+            rot_dim: self.rotary.rot_dim(),
+        };
 
-        let mut xs = xs;
-        for i in 0..self.layers.len() {
-            let layer = &self.layers[i];
-            let gdn_slot = self.gdn_caches[i].as_mut();
-            let attn_slot = self.attn_caches[i].as_mut();
-            xs = layer.forward(
-                &xs,
-                &cos,
-                &sin,
-                rot_dim,
-                mask_ref,
-                gdn_slot,
-                attn_slot,
-                is_decode_step,
-            )?;
-        }
-
-        let xs = self.norm.forward(&xs)?;
-        let (b, s, _) = xs.dims3()?;
-        let last = xs.narrow(1, s - 1, 1)?.reshape((b, ()))?;
-        let logits = self.lm_head.forward(&last)?;
-        Ok(logits)
+        let xs = self.run_layers(hidden_states.clone(), rope, mask.as_ref())?;
+        let s = xs.dim(1)?;
+        let last = xs.narrow(1, s - 1, 1)?.contiguous()?;
+        self.head(&last)
     }
 
-    /// Shared body of `forward` and `forward_embeds`: run the decoder stack
-    /// + norm + lm_head projection on the last position.
-    fn forward_through_layers(
+    /// Run every decoder layer over already-embedded hidden states `xs`,
+    /// returning the pre-final-norm hidden states.
+    fn run_layers(
         &mut self,
         mut xs: Tensor,
-        start_pos: usize,
+        rope: RopeSlice<'_>,
         attention_mask: Option<&Tensor>,
-        is_decode_step: bool,
-        position_ids: Option<&Tensor>,
     ) -> Result<Tensor> {
-        let seq_len = xs.dim(1)?;
-        let mask = match attention_mask {
-            Some(m) => Some(m.clone()),
-            None if !is_decode_step => {
-                let total = start_pos + seq_len;
-                Some(build_causal_mask(seq_len, total, xs.device(), xs.dtype())?)
-            }
-            None => None,
-        };
-        let mask_ref = mask.as_ref();
-
-        // Path 1 (text-only): cos/sin from a 1D position slice.
-        // Path 2 (vision): cos/sin from per-token 3D positions.
-        let (cos, sin) = match position_ids {
-            Some(p) => self.rotary.cos_sin_with_position_ids(p)?,
-            None => self.rotary.cos_sin(start_pos, seq_len)?,
-        };
-        let rot_dim = self.rotary.rot_dim();
-
         for i in 0..self.layers.len() {
             let layer = &self.layers[i];
             let gdn_slot = self.gdn_caches[i].as_mut();
             let attn_slot = self.attn_caches[i].as_mut();
-            xs = layer.forward(
-                &xs,
-                &cos,
-                &sin,
-                rot_dim,
-                mask_ref,
-                gdn_slot,
-                attn_slot,
-                is_decode_step,
-            )?;
+            xs = layer.forward(&xs, rope, attention_mask, gdn_slot, attn_slot)?;
         }
+        Ok(xs)
+    }
 
-        let xs = self.norm.forward(&xs)?;
-        let (b, s, _) = xs.dims3()?;
-        let last = xs.narrow(1, s - 1, 1)?.reshape((b, ()))?;
-        let logits = self.lm_head.forward(&last)?;
-        Ok(logits)
+    /// Final norm + `lm_head` over a single position `[B, 1, hidden_size]`,
+    /// returning `[B, vocab_size]`.
+    ///
+    /// Prefill only ever needs the last position, and at Qwen 3.5's 248k vocab
+    /// running the head over the whole prompt would put the quadratic memory
+    /// term straight back after chunking removed it from attention.
+    pub(super) fn head(&self, hidden: &Tensor) -> Result<Tensor> {
+        crate::ops::prof::timed(crate::ops::prof::Span::Head, || {
+            let (b, _s, _h) = hidden.dims3()?;
+            let xs = self.norm.forward(hidden)?.reshape((b, ()))?;
+            Ok(self.lm_head.forward(&xs)?)
+        })
     }
 }
 
@@ -513,25 +503,6 @@ fn build_layer_caches(
         }
     }
     Ok((gdn_caches, attn_caches))
-}
-
-/// Build a causal mask of shape `[1, 1, S_q, S_k]` where row `i` has `-inf`
-/// for columns `j > start_pos + i` (future tokens). Returned as f32 cast to
-/// the model's dtype.
-fn build_causal_mask(
-    seq_q: usize,
-    total_k: usize,
-    device: &candle_core::Device,
-    dtype: candle_core::DType,
-) -> candle_core::Result<candle_core::Tensor> {
-    let mut data: Vec<f32> = Vec::with_capacity(total_k * total_k);
-    for q in 0..total_k {
-        for k in 0..total_k {
-            data.push(if k > q { f32::NEG_INFINITY } else { 0.0 });
-        }
-    }
-    let full = candle_core::Tensor::from_vec(data, (total_k, total_k), device)?.to_dtype(dtype)?;
-    Ok(full.narrow(0, 0, seq_q)?.unsqueeze(0)?.unsqueeze(0)?)
 }
 
 /// Read EOS token id(s) from `generation_config.json` (preferred) then
@@ -781,10 +752,10 @@ impl Model {
         Ok(input_ids)
     }
 
-    /// Run a single forward step, returning raw logits `[1, S, vocab]`.
+    /// Run a single forward step, returning next-token logits `[1, vocab]`.
     pub fn forward_step(&mut self, input_ids: &[u32], start_pos: usize) -> Result<Tensor> {
         let input = Tensor::new(input_ids, &self.device)?.unsqueeze(0)?;
-        Ok(self.inner.forward(&input, start_pos, None)?)
+        self.inner.forward(&input, start_pos, None)
     }
 
     /// Reset all per-layer GDN caches (between unrelated requests).
@@ -897,10 +868,10 @@ impl ModelForCausalLM for Model {
             }
         }
 
-        if !finalized {
-            if let Some(ref mut s) = streamer {
-                s.finalize()?;
-            }
+        if !finalized
+            && let Some(ref mut s) = streamer
+        {
+            s.finalize()?;
         }
 
         let dt = start_gen.elapsed();

@@ -5,7 +5,8 @@ use candle_core::quantized::GgmlDType;
 use candle_core::{Module, Result, Tensor};
 use candle_nn::VarBuilder;
 
-use super::backend::{apply_recurrence, causal_conv1d, compute_beta_g, l2_norm};
+use super::backend::{apply_recurrence, compute_beta_g, l2_alpha, l2_norm_fused, GdnGateConsts};
+use super::conv::causal_conv1d;
 use super::cache::GdnLayerCache;
 use super::config::{GdnConfig, GdnDims, VHeadOrder};
 use super::norm::RmsNormGated;
@@ -23,6 +24,18 @@ pub struct GatedDeltaNet {
     pub a_log: Tensor,
     pub norm: RmsNormGated,
     pub out_proj: LinearLayer,
+    /// Per-token-invariant values derived from `a_log` / `dt_bias` / the head
+    /// dim. Built by [`GatedDeltaNet::with_derived`]; kept out of the public
+    /// constructors' argument lists because they are pure functions of fields
+    /// that are already there.
+    derived: GdnDerived,
+}
+
+/// Constants the forward pass would otherwise rebuild on every token.
+struct GdnDerived {
+    gates: GdnGateConsts,
+    /// The `[head_k_dim]` scale vector for the fused Q/K L2 norm.
+    l2_alpha: Tensor,
 }
 
 impl GatedDeltaNet {
@@ -52,6 +65,33 @@ pub fn load(
         let norm = RmsNormGated::new(dims.head_v_dim, cfg.rms_norm_eps(), vb_la.pp("norm"))?;
         let out_proj = linear_layer(dims.value_dim, dims.hidden_size, vb_la.pp("out_proj"), quant)?;
 
+        Self::with_derived(input_proj, conv1d_weight, dt_bias, a_log, norm, out_proj, &dims)
+    }
+
+    /// Assemble from already-loaded parts, deriving the per-token constants.
+    ///
+    /// This rather than a struct literal: `derived` has to stay consistent with
+    /// `a_log` and `dt_bias`, and a literal would let a caller forget.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_derived(
+        input_proj: GdnInputProjection,
+        conv1d_weight: Tensor,
+        dt_bias: Tensor,
+        a_log: Tensor,
+        norm: RmsNormGated,
+        out_proj: LinearLayer,
+        dims: &GdnDims,
+    ) -> Result<Self> {
+        // `conv1d_weight` is the dtype/device witness: it is always present and
+        // always carries the model's compute dtype on both load paths.
+        let derived = GdnDerived {
+            gates: GdnGateConsts::new(&a_log, &dt_bias)?,
+            l2_alpha: l2_alpha(
+                dims.head_k_dim,
+                conv1d_weight.dtype(),
+                conv1d_weight.device(),
+            )?,
+        };
         Ok(Self {
             input_proj,
             conv1d_weight,
@@ -59,55 +99,61 @@ pub fn load(
             a_log,
             norm,
             out_proj,
+            derived,
         })
     }
 
-    /// Forward pass over a sequence (prefill or single decode step).
+    /// Forward pass over a sequence: a whole prompt, one prefill chunk, or a
+    /// single decode step — all continue from `cache`, which is updated in
+    /// place.
     ///
-    /// `x: [B, S, hidden_size]`. `cache` is updated in place. Returns
-    /// `[B, S, hidden_size]`.
+    /// `x: [B, S, hidden_size]`. Returns `[B, S, hidden_size]`.
     pub fn forward(
         &self,
         x: &Tensor,
         dims: &GdnDims,
         cache: &mut GdnLayerCache,
-        is_decode_step: bool,
     ) -> Result<Tensor> {
+        use crate::ops::prof::{timed, Span};
+
         let (batch_size, seq_len, _) = x.dims3()?;
         let dtype = x.dtype();
 
         // 1. Input projections → Q, K, V, Z, B, A.
-        let projected = self.input_proj.forward(x, dims, batch_size, seq_len)?;
+        let projected = timed(Span::GdnProj, || {
+            self.input_proj.forward(x, dims, batch_size, seq_len)
+        })?;
 
         // 2. Causal Conv1D over [Q|K|V].
-        let mixed_qkv = projected.conv_input(dims, batch_size, seq_len)?;
-        let mixed_qkv = causal_conv1d(
-            &mixed_qkv,
-            &self.conv1d_weight,
-            dims,
-            cache,
-            is_decode_step,
-        )?;
+        let mixed_qkv = timed(Span::GdnConv, || {
+            let mixed_qkv = projected.conv_input(dims, batch_size, seq_len)?;
+            causal_conv1d(&mixed_qkv, &self.conv1d_weight, dims, cache)
+        })?;
 
-        // 3. Split → per-head Q, K, V; expand K from num_k_heads → num_v_heads.
-        let (q, k, v) = split_qkv(&mixed_qkv, dims, batch_size, seq_len)?;
-        let (q, k) = repeat_kv_heads(&q, &k, dims)?;
-
-        // 4. L2-normalize Q and K (Qwen 3.5 uses QK-norm = L2).
-        let q = l2_norm(&q, 1e-6)?;
-        let k = l2_norm(&k, 1e-6)?;
-
-        // 5. Compute β (write strength) and g (decay) from B, A, A_log, dt_bias.
-        let (beta, g) =
-            compute_beta_g(&projected.b, &projected.a, &self.a_log, &self.dt_bias, dtype)?;
+        // 3-5. Per-head split, QK L2-norm, and the β/g gates.
+        let (q, k, v, beta, g) = timed(Span::GdnQkv, || -> Result<_> {
+            // Split → per-head Q, K, V; expand K from num_k_heads → num_v_heads.
+            let (q, k, v) = split_qkv(&mixed_qkv, dims, batch_size, seq_len)?;
+            let (q, k) = repeat_kv_heads(&q, &k, dims)?;
+            // L2-normalize Q and K (Qwen 3.5 uses QK-norm = L2).
+            let q = l2_norm_fused(&q, &self.derived.l2_alpha, 1e-6)?;
+            let k = l2_norm_fused(&k, &self.derived.l2_alpha, 1e-6)?;
+            // β (write strength) and g (decay) from B, A, and the gate consts.
+            let (beta, g) = compute_beta_g(&projected.b, &projected.a, &self.derived.gates, dtype)?;
+            Ok((q, k, v, beta, g))
+        })?;
 
         // 6. Run the gated delta rule recurrence.
-        let y = apply_recurrence(
-            &q, &k, &v, &g, &beta, dims, batch_size, seq_len, cache, dtype,
-        )?;
+        let y = timed(Span::GdnRecur, || {
+            apply_recurrence(
+                &q, &k, &v, &g, &beta, dims, batch_size, seq_len, cache, dtype,
+            )
+        })?;
 
         // 7. Gated RMSNorm + output projection.
-        self.finish_forward(y, projected.z, batch_size, seq_len)
+        timed(Span::GdnFinish, || {
+            self.finish_forward(y, projected.z, batch_size, seq_len)
+        })
     }
 
     fn finish_forward(

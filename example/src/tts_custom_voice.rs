@@ -21,13 +21,18 @@ fn main() -> anyhow::Result<()> {
         { Device::new_cuda(0).unwrap_or(Device::Cpu) }
         #[cfg(all(target_os = "macos", not(feature = "cuda")))]
         { Device::new_metal(0).unwrap_or(Device::Cpu) }
-        #[cfg(all(not(target_os = "macos"), not(feature = "cuda")))]
+        #[cfg(all(not(feature = "cuda"), not(target_os = "macos"), feature = "rocm"))]
+        { Device::new_rocm(0).unwrap_or(Device::Cpu) }
+        #[cfg(all(not(target_os = "macos"), not(feature = "cuda"), not(feature = "rocm")))]
         { Device::Cpu }
     };
     let dtype = {
         #[cfg(feature = "cuda")]
         { DType::BF16 }
-        #[cfg(not(feature = "cuda"))]
+        // ROCm defaults to F16: BF16 is still incomplete on the rocm backend.
+        #[cfg(all(not(feature = "cuda"), feature = "rocm"))]
+        { DType::F16 }
+        #[cfg(all(not(feature = "cuda"), not(feature = "rocm")))]
         { DType::F32 }
     };
 
