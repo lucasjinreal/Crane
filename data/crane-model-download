@@ -98,10 +98,8 @@ MODELS = {
         "repo_id": "moonshine-ai/moonshine",
         "dirname": "moonshine-g2p/en_us",
         "kind": "g2p",
-        "source": "github",
-        "github_repo": "moonshine-ai/moonshine",
-        "github_ref": "main",
-        "github_base": "core/moonshine-tts/data/en_us",
+        "source": "url",
+        "base_url": "https://download.moonshine.ai/tts/en_us",
         "files": {
             "dict_filtered_heteronyms.tsv": "dict_filtered_heteronyms.tsv",
             "g2p-config.json": "g2p-config.json",
@@ -114,10 +112,8 @@ MODELS = {
         "repo_id": "moonshine-ai/moonshine",
         "dirname": "moonshine-g2p/de",
         "kind": "g2p",
-        "source": "github",
-        "github_repo": "moonshine-ai/moonshine",
-        "github_ref": "main",
-        "github_base": "core/moonshine-tts/data/de",
+        "source": "url",
+        "base_url": "https://download.moonshine.ai/tts/de",
         "files": {
             "dict.tsv": "dict.tsv",
         },
@@ -152,22 +148,18 @@ def list_models():
         print(f"  {key:<{width}}  [{kind}]  {info['description']}")
 
 
-def download_github_files(info, local_dir):
-    repo = info["github_repo"]
-    ref = info["github_ref"]
-    base = info.get("github_base", "")
-    for repo_path, local_name in info["files"].items():
-        full_repo_path = f"{base}/{repo_path}" if base else repo_path
-        # Git LFS-tracked files (the .tsv and .onnx here) are stored as
-        # pointer text on raw.githubusercontent.com; media.githubusercontent.com
-        # resolves the actual LFS object content for both LFS and non-LFS
-        # files alike.
-        url = f"https://media.githubusercontent.com/media/{repo}/{ref}/{full_repo_path}"
+def download_url_files(info, local_dir):
+    base = info["base_url"]
+    for rel_path, local_name in info["files"].items():
+        url = f"{base}/{rel_path}"
         target = os.path.join(local_dir, local_name)
         os.makedirs(os.path.dirname(target), exist_ok=True)
         print(f"  {url}")
+        # download.moonshine.ai's CDN returns 403 for the default
+        # Python-urllib/x.y User-Agent; send a browser-like one instead.
+        request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         try:
-            with urllib.request.urlopen(url) as response, open(target, "wb") as f:
+            with urllib.request.urlopen(request) as response, open(target, "wb") as f:
                 shutil.copyfileobj(response, f)
         except urllib.error.HTTPError as e:
             print(f"error: download failed for {url}: {e}", file=sys.stderr)
@@ -178,10 +170,10 @@ def download_model(model_key, path, token, quant):
     info = MODELS[model_key]
     local_dir = os.path.join(os.path.expanduser(path), info["kind"], info["dirname"])
 
-    if info.get("source") == "github":
-        print(f"Downloading {info['repo_id']} (GitHub) to {local_dir} ...")
+    if info.get("source") == "url":
+        print(f"Downloading {info['repo_id']} ({info['base_url']}) to {local_dir} ...")
         os.makedirs(local_dir, exist_ok=True)
-        download_github_files(info, local_dir)
+        download_url_files(info, local_dir)
         print(f"\nDone. Use with: crane-serve --model-path {local_dir}")
         return
 

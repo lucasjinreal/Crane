@@ -118,7 +118,10 @@ pub fn make_error(status: StatusCode, msg: &str) -> (StatusCode, Json<ErrorRespo
 }
 
 pub fn init_logging() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt()
+        .with_env_filter(filter)
         .with_target(false)
         .with_file(false)
         .with_line_number(false)
@@ -136,16 +139,20 @@ fn encode_tts_audio(
     audio_info: &crane::audio::AudioInfo,
     format: &openai_api::AudioResponseFormat,
 ) -> Result<handlers::tts::TtsResult, String> {
+    tracing::debug!("TTS encode: converting output tensor {:?} to f32", audio.dims());
     let audio_f32 = audio
         .to_dtype(candle_core::DType::F32)
         .map_err(|e| e.to_string())?
         .flatten_all()
         .map_err(|e| e.to_string())?;
+    tracing::debug!("TTS encode: copying {} samples out of the tensor", audio_f32.elem_count());
     let samples = audio_f32.to_vec1::<f32>().map_err(|e| e.to_string())?;
     tracing::info!("TTS writing {} samples", samples.len());
     match format {
         openai_api::AudioResponseFormat::Wav => {
+            tracing::debug!("TTS encode: building WAV container");
             let wav_bytes = crane::audio::encode_wav(&samples, audio_info).map_err(|e| e.to_string())?;
+            tracing::debug!("TTS encode: WAV container built ({} bytes)", wav_bytes.len());
             Ok(handlers::tts::TtsResult {
                 audio_bytes: wav_bytes,
                 content_type: "audio/wav",
@@ -154,7 +161,9 @@ fn encode_tts_audio(
             })
         }
         openai_api::AudioResponseFormat::Pcm => {
+            tracing::debug!("TTS encode: converting samples to PCM16");
             let pcm = crane::audio::pcm_f32_to_i16(&samples);
+            tracing::debug!("TTS encode: PCM16 built ({} bytes)", pcm.len());
             Ok(handlers::tts::TtsResult {
                 audio_bytes: pcm,
                 content_type: "audio/pcm",
@@ -189,11 +198,34 @@ fn generate_audio(
             ref_audio_path,
             ref_text.len()
         );
-        tts.generate_voice_clone(&req.input, &req.language, ref_audio_path, ref_text, &opts)
-            .map_err(|e| e.to_string())
+        let started = std::time::Instant::now();
+        let result = tts
+            .generate_voice_clone(&req.input, &req.language, ref_audio_path, ref_text, &opts)
+            .map_err(|e| e.to_string());
+        log_generate_result(&result, started.elapsed());
+        result
     } else {
-        tts.generate_speech(&req.input, &req.language, req.voice.as_deref(), &opts)
-            .map_err(|e| e.to_string())
+        let started = std::time::Instant::now();
+        let result = tts
+            .generate_speech(&req.input, &req.language, req.voice.as_deref(), &opts)
+            .map_err(|e| e.to_string());
+        log_generate_result(&result, started.elapsed());
+        result
+    }
+}
+
+/// Logs the shape/dtype of a successful [`generate_audio`] result (or the
+/// fact that it errored) plus how long the model call took, so a crash that
+/// aborts the process before a response is ever sent still leaves a trace of
+/// whether the model call itself returned before things went wrong.
+fn log_generate_result(result: &Result<candle_core::Tensor, String>, elapsed: std::time::Duration) {
+    match result {
+        Ok(tensor) => tracing::debug!(
+            "TTS model call returned {:?} ({:?}) in {elapsed:?}",
+            tensor.dims(),
+            tensor.dtype(),
+        ),
+        Err(e) => tracing::debug!("TTS model call failed in {elapsed:?}: {e}"),
     }
 }
 
@@ -205,8 +237,20 @@ fn run_tts_loop(
     info!("{model_name} engine thread started");
     let audio_info = tts.audio_info();
     while let Some(req) = tts_rx.blocking_recv() {
-        let result = generate_audio(tts, model_name, &req)
-            .and_then(|audio| encode_tts_audio(&audio, &audio_info, &req.response_format));
+        tracing::debug!(
+            "TTS request received: language={}, voice={:?}, input_len={}",
+            req.language,
+            req.voice,
+            req.input.chars().count()
+        );
+        let result = generate_audio(tts, model_name, &req).and_then(|audio| {
+            let encoded = encode_tts_audio(&audio, &audio_info, &req.response_format);
+            tracing::debug!("TTS: dropping output tensor {:?}", audio.dims());
+            drop(audio);
+            tracing::debug!("TTS: output tensor dropped");
+            encoded
+        });
+        tracing::debug!("TTS: result ready ({}), sending to client", result.is_ok());
         if let Err(ref e) = result {
             tracing::error!(
                 "TTS generation failed: {e} (language={}, voice={:?}, input_len={})",
@@ -216,6 +260,7 @@ fn run_tts_loop(
             );
         }
         let _ = req.tx.send(result);
+        tracing::debug!("TTS: result sent to client, waiting for next request");
     }
 }
 
