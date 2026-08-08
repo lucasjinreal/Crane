@@ -10,6 +10,7 @@ mod tts_client;
 #[cfg(feature = "onnx")]
 mod tts_kokoro;
 mod tts_qwen3;
+mod tts_voxcpm2;
 mod tts_voxtral;
 
 pub use asr::{Asr, AsrStream, TranscribeOptions, Transcript};

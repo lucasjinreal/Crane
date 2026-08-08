@@ -39,6 +39,9 @@ pub async fn chat_completions(
     if state.qwen3_5_vlm_tx.is_some() {
         return vlm::qwen3_5_vlm_chat_completions(state, req).await;
     }
+    if state.minicpm_v_vlm_tx.is_some() {
+        return vlm::minicpm_v_vlm_chat_completions(state, req).await;
+    }
     if state.gemma4_vlm_tx.is_some() {
         return vlm::gemma4_vlm_chat_completions(state, req).await;
     }

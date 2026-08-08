@@ -719,6 +719,9 @@ pub struct Qwen3Model {
     rotary_emb: RotaryEmbedding,
     config: Config,
     dtype: DType,
+    /// Full-sequence post-norm hidden states from the most recent forward
+    /// call — see [`Self::last_hidden_states`].
+    last_hidden_states: Option<Tensor>,
 }
 
 impl Qwen3Model {
@@ -794,6 +797,7 @@ impl Qwen3Model {
             rotary_emb,
             config: config.clone(),
             dtype,
+            last_hidden_states: None,
         })
     }
 
@@ -915,6 +919,7 @@ impl Qwen3Model {
             rotary_emb,
             config,
             dtype,
+            last_hidden_states: None,
         })
     }
 
@@ -1007,10 +1012,26 @@ impl Qwen3Model {
         }
 
         let hidden_states = self.norm.forward(&hidden_states)?;
+        // Cheap to stash: Tensor is Arc-backed, so this is a refcount bump,
+        // not a data copy. Lets callers that need the full-sequence
+        // post-norm hidden states (e.g. MiniCPM-o's TTS conditioning, which
+        // needs every generated position's hidden state, not just the
+        // last) get them via `last_hidden_states()` without changing this
+        // method's return type for every other caller.
+        self.last_hidden_states = Some(hidden_states.clone());
         let logits = self
             .lm_head
             .forward(&hidden_states.narrow(1, seq_len - 1, 1)?)?;
         Ok(logits)
+    }
+
+    /// Full-sequence post-norm hidden states (`[B, S, H]`, pre-`lm_head`)
+    /// from the most recent [`Self::forward`]/[`Self::forward_embeds`] call.
+    /// See the field doc on why this exists instead of widening every
+    /// caller's return type.
+    #[must_use]
+    pub fn last_hidden_states(&self) -> Option<&Tensor> {
+        self.last_hidden_states.as_ref()
     }
 
     /// The token embedding table, exposed for callers that need to embed
@@ -1032,6 +1053,17 @@ impl Qwen3Model {
     #[must_use]
     pub fn num_layers(&self) -> usize {
         self.layers.len()
+    }
+
+    /// Number of tokens currently held in the KV cache (0 before the first
+    /// forward pass, or right after `clear_kv_cache`). Needed by callers
+    /// that evict from the middle of the cache (e.g. MiniCPM-o's duplex
+    /// sliding window) and must keep `start_pos` in later `forward`/
+    /// `forward_embeds` calls in sync with the cache's *actual* length
+    /// rather than a separately-tracked running position counter.
+    #[must_use]
+    pub fn kv_cache_len(&self) -> usize {
+        self.layers.first().map_or(0, |l| l.self_attn.cache_seq_len)
     }
 
     /// Total bytes held by the model's KV caches (no GPU copies).

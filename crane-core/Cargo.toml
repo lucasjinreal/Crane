@@ -93,6 +93,7 @@ onnx = ["dep:prost", "dep:prost-build", "dep:lru", "dep:aho-corasick", "dep:unic
 [dev-dependencies]
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
+hound = "3"
 
 [build-dependencies]
 bindgen_cuda = { version = "0.1.6", optional = true }

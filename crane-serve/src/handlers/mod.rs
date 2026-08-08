@@ -7,9 +7,11 @@
 //! | `sglang` | `/generate`, `/model_info`, `/server_info`, etc.|
 //! | `tts`    | `/v1/audio/speech`                              |
 //! | `asr`    | `/v1/audio/transcriptions`                      |
+//! | `duplex` | `/v1/audio/duplex` (WebSocket)                  |
 
 pub mod asr;
 pub mod common;
+pub mod duplex;
 pub mod openai;
 pub mod sglang;
 pub mod sse;

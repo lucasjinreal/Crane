@@ -39,6 +39,7 @@ fn model_type() -> LlmModelType {
         Some("qwen25") => LlmModelType::Qwen25,
         Some("qwen3") => LlmModelType::Qwen3,
         Some("hunyuan") => LlmModelType::HunyuanDense,
+        Some("minicpm5") => LlmModelType::Minicpm5,
         _ => LlmModelType::Qwen35,
     }
 }

@@ -7,17 +7,32 @@ This directory contains simple, user-friendly examples showing how to use the Cr
 ### Chat Examples
 - `chat_simple.rs`: Basic chat functionality — send a message and get a response
 - `chat_streaming.rs`: Chat with real-time streaming responses — token-by-token output
-- `hunyuan_simple.rs`: Hunyuan Dense model inference 
+- `chat_cli.rs`: Interactive multi-turn chat REPL — `--model-type` selects the backend (`qwen25`, `qwen3`, `qwen35` (default), `hunyuan`, `minicpm5`)
+- `hunyuan_simple.rs`: Hunyuan Dense model inference
+- `ornith_tools.rs`: Ornith (Qwen3.5-arch) tool-calling demo — chat-template `tool_call`/`tool` turns
 
 ### Audio Examples
 - `asr_simple.rs`: Automatic Speech Recognition — transcribe audio to text (requires ONNX feature)
 - `tts_simple.rs`: TTS unified entry — auto-detects Base vs CustomVoice model
 - `tts_custom_voice.rs`: TTS with predefined speakers (CustomVoice model)
 - `tts_voice_clone.rs`: TTS voice cloning from reference audio (Base model)
+- `voxtral_tts_simple.rs`: Voxtral TTS inference
+- `voxcpm2_simple.rs`: VoxCPM2 zero-shot TTS (text in, audio out; no voice cloning yet — see `AGENTS.md`)
 
 ### Vision Examples
 - `vision_simple.rs`: Vision capabilities — image analysis and OCR
 - `ocr_simple.rs`: PaddleOCR VL — document OCR
+- `qwen3_5_vl_simple.rs`: Qwen3.5-VL multimodal inference (image + text)
+
+### MiniCPM / MiniCPM-o Examples
+
+MiniCPM comes in several forms in this codebase; not all of them have a dedicated example binary yet:
+
+- **MiniCPM5-1B** (plain dense chat model): use `chat_cli.rs` with `--model-type minicpm5` (see below) — no separate binary. Both safetensors and GGUF checkpoints work (`-m` auto-detects by file extension) — a bare `.gguf` with no sibling files loads fine, since the tokenizer/chat-template are read straight from GGUF metadata. See `AGENTS.md`'s "MiniCPM5-1B" section.
+- **MiniCPM-o-4.5** (full omni: vision + audio understanding, speech-token TTS, full-duplex live audio chat): `minicpmo_duplex_simple.rs` is the live full-duplex demo — connects to `crane-serve`'s `/v1/audio/duplex` WebSocket, streams mic (or `--wav` file) audio in, prints listen/speak arbitration state, plays back and saves any spoken response. It talks to a running server, so start `crane-serve --model-type minicpmo` first (see below). Turn-based (non-duplex) vision/audio understanding and TTS generation are implemented in `crane-core` but not yet exposed through a dedicated `example/` binary or the `crane` SDK traits — see `AGENTS.md`'s "MiniCPM-o-4.5 (full omni)" section for the current API surface (`MiniCpmOVlModel`, `MiniCpmTts`, `Token2Wav`, direct Rust API only).
+- **MiniCPM-V-4.6** (vision-language chat): served via `crane-serve`'s OpenAI-compatible `/v1/chat/completions` with multimodal `image_url` content parts (`--model-type minicpmv4_6` or auto-detected from `config.json`) — no `example/` binary yet either.
+
+**MiniCPM-o-4.5 GGUF options**: `crane-serve --model-type minicpmo` can load any of the four towers (LLM, audio, vision\*, TTS) from standalone GGUF files instead of the checkpoint's safetensors, via `--llm-gguf <path>` (currently the only tower exposed as a server CLI flag — audio/TTS GGUF loaders exist in `crane-core` but aren't wired to `crane-serve`'s CLI yet). The upstream LLM GGUF (e.g. `MiniCPM-o-4_5-Q8_0.gguf`) is genuinely quantized and meaningfully cuts VRAM (~19.8GB → ~11.2GB total); the audio/vision/TTS GGUF releases are F16/F32-only re-exports with no memory benefit, useful only for pure-GGUF deployment convenience. See `AGENTS.md` for full detail.
 
 ## Running Examples
 
@@ -48,6 +63,17 @@ cargo run --bin tts_voice_clone --release -- vendor/Qwen3-TTS-12Hz-0.6B-Base
 
 # TTS — Auto-detect model type
 cargo run --bin tts_simple --release -- vendor/Qwen3-TTS-12Hz-0.6B-CustomVoice
+
+# MiniCPM5-1B chat (interactive REPL) — safetensors dir or a bare .gguf file both work
+cargo run --bin chat_cli --release -- -m /path/to/MiniCPM5-1B --model-type minicpm5
+cargo run --bin chat_cli --release -- -m /path/to/MiniCPM5-1B-Q8_0.gguf --model-type minicpm5
+
+# MiniCPM-o-4.5 full-duplex live audio chat — start the server first...
+cargo run -p crane-serve --features cuda --release --bin crane-serve -- -m /path/to/MiniCPM-o-4_5 --model-type minicpmo
+# ...then, in another terminal, either talk live via the mic:
+cargo run --bin minicpmo_duplex_simple --release
+# ...or feed a WAV file headlessly:
+cargo run --bin minicpmo_duplex_simple --release -- --wav path/to/clip.wav --no-playback --output-wav /tmp/response.wav
 ```
 
 TTS examples write generated audio to `data/audio/output`.

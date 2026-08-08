@@ -196,9 +196,16 @@ impl MRotaryEmbedding {
         //
         // Note this is a no-op when T == H == W (the text-only case): all three
         // gathers are identical, so the result reduces to the plain rope table.
+        // `mrope_section_doubled` is empty for configs with no `mrope_section`
+        // (e.g. MiniCPM-V-4.6's `qwen3_5_text` backbone, which drives this
+        // path with T==H==W and no interleaving at all) — `.get(dim)` instead
+        // of `[dim]` avoids an out-of-bounds panic; `unwrap_or(0)` makes
+        // `limit` collapse to 0 below, so the H/W reassignment loop never
+        // runs and every column stays on the T axis, which is exactly
+        // correct when T==H==W.
         let mut axis_of = vec![0usize; half_rot];
         for (dim, offset) in [(1usize, 1usize), (2usize, 2usize)] {
-            let section = self.mrope_section_doubled[dim] / 2;
+            let section = self.mrope_section_doubled.get(dim).copied().unwrap_or(0) / 2;
             let limit = (section * 3).min(half_rot);
             let mut i = offset;
             while i < limit {

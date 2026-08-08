@@ -23,7 +23,7 @@ use engine::model_factory::{ModelFormat, ModelType};
 use engine::{EngineHandle, InferenceEngine, MemoryConfig};
 use handlers::asr::AsrTranscribeRequest;
 use handlers::tts::TtsGenerateRequest;
-use handlers::vlm::{Gemma4VlmRequest, Qwen3_5VlmRequest, VlmRequest};
+use handlers::vlm::{Gemma4VlmRequest, MinicpmVVlmRequest, Qwen3_5VlmRequest, VlmRequest};
 use openai_api::ErrorResponse;
 
 #[derive(Parser, Debug, Clone)]
@@ -60,6 +60,16 @@ pub struct Args {
     pub max_seq_len: usize,
     #[arg(long)]
     pub gpu_memory_limit: Option<String>,
+    /// MiniCPM-o duplex only: load the LLM tower from a standalone
+    /// quantized GGUF file (e.g. a llama.cpp-style Qwen3 conversion like
+    /// `MiniCPM-o-4_5-Q8_0.gguf`) instead of the checkpoint's own bf16
+    /// safetensors weights, cutting the LLM's VRAM footprint roughly in
+    /// half — the other five towers still load from `-m`'s checkpoint
+    /// directory as usual. `-m` must still point at a real checkpoint
+    /// directory (tokenizer/config and the other towers are read from
+    /// there regardless).
+    #[arg(long)]
+    pub llm_gguf: Option<String>,
 }
 
 pub struct AppState {
@@ -72,9 +82,18 @@ pub struct AppState {
     pub vlm_tx: Option<tokio::sync::mpsc::UnboundedSender<VlmRequest>>,
     pub gemma4_vlm_tx: Option<tokio::sync::mpsc::UnboundedSender<Gemma4VlmRequest>>,
     pub qwen3_5_vlm_tx: Option<tokio::sync::mpsc::UnboundedSender<Qwen3_5VlmRequest>>,
+    pub minicpm_v_vlm_tx: Option<tokio::sync::mpsc::UnboundedSender<MinicpmVVlmRequest>>,
     pub tts_tx: Option<tokio::sync::mpsc::UnboundedSender<TtsGenerateRequest>>,
     /// Channel to the ASR engine thread; `None` unless an ASR model is loaded.
     pub asr_tx: Option<tokio::sync::mpsc::UnboundedSender<AsrTranscribeRequest>>,
+    /// Channel to the duplex engine thread; `None` unless a MiniCPM-o
+    /// duplex model is loaded.
+    pub duplex_tx: Option<tokio::sync::mpsc::UnboundedSender<handlers::duplex::DuplexRequest>>,
+    /// Exclusivity guard for `/v1/audio/duplex` — only one live session at
+    /// a time (see `handlers::duplex`'s module doc). Always constructed
+    /// (even when no duplex model is loaded), just never contended in that
+    /// case.
+    pub duplex_lock: Arc<tokio::sync::Mutex<()>>,
     pub model_path: String,
     pub model_type_name: String,
     pub dtype_name: String,
@@ -248,6 +267,56 @@ fn run_asr_loop(
     }
 }
 
+/// Base64 of 16-bit little-endian PCM, matching this crate's other audio
+/// encodings (`crane::audio::pcm_f32_to_i16`) and the wire format
+/// documented in `handlers::duplex`'s module doc.
+fn encode_pcm16_base64(samples: &[f32]) -> String {
+    use base64::Engine as _;
+    let mut bytes = Vec::with_capacity(samples.len() * 2);
+    for &s in samples {
+        let clamped = s.clamp(-1.0, 1.0);
+        bytes.extend_from_slice(&(clamped * i16::MAX as f32).to_le_bytes());
+    }
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+fn run_duplex_loop(
+    mut duplex_rx: tokio::sync::mpsc::UnboundedReceiver<handlers::duplex::DuplexRequest>,
+    session: &mut crane_core::models::minicpmo::DuplexSession,
+) {
+    use handlers::duplex::{DuplexChunkEvent, DuplexRequest};
+
+    info!("MiniCPM-o duplex engine thread started");
+    let mut chunk_seed: u64 = 0;
+    while let Some(req) = duplex_rx.blocking_recv() {
+        match req {
+            DuplexRequest::Prepare { system_prompt, tx } => {
+                let result = session.prepare(system_prompt.as_deref()).map_err(|e| e.to_string());
+                if let Err(ref e) = result {
+                    tracing::error!("Duplex prepare failed: {e}");
+                }
+                let _ = tx.send(result);
+            }
+            DuplexRequest::Chunk { samples, tx } => {
+                let result = (|| -> Result<DuplexChunkEvent, String> {
+                    session.streaming_prefill(&samples).map_err(|e| e.to_string())?;
+                    chunk_seed = chunk_seed.wrapping_add(1);
+                    let out = session.streaming_generate(chunk_seed).map_err(|e| e.to_string())?;
+                    let (audio_base64, audio_sample_rate) = match out.audio_waveform {
+                        Some(waveform) => (Some(encode_pcm16_base64(&waveform)), Some(24_000)),
+                        None => (None, None),
+                    };
+                    Ok(DuplexChunkEvent { is_listen: out.is_listen, text: out.text, end_of_turn: out.end_of_turn, audio_base64, audio_sample_rate })
+                })();
+                if let Err(ref e) = result {
+                    tracing::error!("Duplex chunk processing failed: {e}");
+                }
+                let _ = tx.send(result);
+            }
+        }
+    }
+}
+
 /// Resolve the compute dtype. An explicit `--dtype` always wins; otherwise
 /// BF16 on CUDA and F32 elsewhere — except model families validated in F16 on
 /// Metal (currently qwen3_5), which default to F16 there (halves weight,
@@ -329,6 +398,7 @@ pub async fn run(args: Args) -> Result<()> {
     let is_vlm = resolved_type.is_vlm();
     let is_tts = resolved_type.is_tts();
     let is_asr = resolved_type.is_asr();
+    let is_duplex = resolved_type.is_duplex();
 
     let (
         engine_handle,
@@ -338,8 +408,10 @@ pub async fn run(args: Args) -> Result<()> {
         vlm_tx_opt,
         gemma4_vlm_tx_opt,
         qwen3_5_vlm_tx_opt,
+        minicpm_v_vlm_tx_opt,
         tts_tx_opt,
         asr_tx_opt,
+        duplex_tx_opt,
     ): (
         Option<EngineHandle>,
         tokenizers::Tokenizer,
@@ -348,8 +420,10 @@ pub async fn run(args: Args) -> Result<()> {
         Option<tokio::sync::mpsc::UnboundedSender<VlmRequest>>,
         Option<tokio::sync::mpsc::UnboundedSender<Gemma4VlmRequest>>,
         Option<tokio::sync::mpsc::UnboundedSender<Qwen3_5VlmRequest>>,
+        Option<tokio::sync::mpsc::UnboundedSender<MinicpmVVlmRequest>>,
         Option<tokio::sync::mpsc::UnboundedSender<TtsGenerateRequest>>,
         Option<tokio::sync::mpsc::UnboundedSender<AsrTranscribeRequest>>,
+        Option<tokio::sync::mpsc::UnboundedSender<handlers::duplex::DuplexRequest>>,
     ) = if is_tts {
         info!("Loading TTS model ({:?}) from: {}", resolved_type, args.model_path);
         let model_path_clone = args.model_path.clone();
@@ -396,7 +470,7 @@ pub async fn run(args: Args) -> Result<()> {
             });
         let eos_id = tokenizer.token_to_id("<|im_end|>").or_else(|| tokenizer.token_to_id("<|endoftext|>")).unwrap_or(2);
         let chat_template = engine::model_factory::create_chat_template(model_type, &args.model_path);
-        (None, tokenizer, vec![eos_id], chat_template, None, None, None, Some(tts_tx), None)
+        (None, tokenizer, vec![eos_id], chat_template, None, None, None, None, Some(tts_tx), None, None)
     } else if is_asr {
         info!("Loading ASR model ({:?}) from: {}", resolved_type, args.model_path);
         let model_path_clone = args.model_path.clone();
@@ -443,7 +517,7 @@ pub async fn run(args: Args) -> Result<()> {
             });
         let eos_id = tokenizer.token_to_id("<|im_end|>").or_else(|| tokenizer.token_to_id("<|endoftext|>")).unwrap_or(2);
         let chat_template = engine::model_factory::create_chat_template(model_type, &args.model_path);
-        (None, tokenizer, vec![eos_id], chat_template, None, None, None, None, Some(asr_tx))
+        (None, tokenizer, vec![eos_id], chat_template, None, None, None, None, None, Some(asr_tx), None)
     } else if is_vlm {
         let use_cpu = args.cpu || {
             #[cfg(feature = "cuda")]
@@ -465,7 +539,44 @@ pub async fn run(args: Args) -> Result<()> {
         let mut vlm_tx_opt_inner: Option<tokio::sync::mpsc::UnboundedSender<VlmRequest>> = None;
         let mut gemma4_vlm_tx_opt_inner: Option<tokio::sync::mpsc::UnboundedSender<Gemma4VlmRequest>> = None;
         let mut qwen3_5_vlm_tx_opt_inner: Option<tokio::sync::mpsc::UnboundedSender<Qwen3_5VlmRequest>> = None;
-        if resolved_type == engine::model_factory::ModelType::Qwen3_5VL {
+        let mut minicpm_v_vlm_tx_opt_inner: Option<tokio::sync::mpsc::UnboundedSender<MinicpmVVlmRequest>> = None;
+        if resolved_type == engine::model_factory::ModelType::MinicpmV46 {
+            info!("Loading MiniCPM-V-4.6 model from: {}", args.model_path);
+            let model_path_clone = args.model_path.clone();
+            let device_clone = device.clone();
+            let dtype_clone = dtype;
+            let (mcpv_tx, mut mcpv_rx) = tokio::sync::mpsc::unbounded_channel::<MinicpmVVlmRequest>();
+            std::thread::Builder::new().name("minicpm-v-vlm-engine".into()).spawn(move || {
+                use crane_core::models::minicpm_v::{MinicpmV46VLModel, VlGenerationConfig};
+                let mut vlm = match MinicpmV46VLModel::new(&model_path_clone, &device_clone, &dtype_clone) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::error!("Failed to load MiniCPM-V-4.6 model: {e}");
+                        return;
+                    }
+                };
+                info!("MiniCPM-V-4.6 engine thread started");
+                while let Some(req) = mcpv_rx.blocking_recv() {
+                    let MinicpmVVlmRequest { img_path, text_prompt, max_tokens, tx } = req;
+                    let res = (|| -> anyhow::Result<String> {
+                        let img = image::open(&img_path)?;
+                        let cfg = VlGenerationConfig {
+                            max_new_tokens: max_tokens,
+                            ..Default::default()
+                        };
+                        let started = std::time::Instant::now();
+                        let out = vlm.generate(Some(&img), &text_prompt, &cfg, |_| {})?;
+                        tracing::info!("MiniCPM-V-4.6 request completed in {:?}", started.elapsed());
+                        Ok(out)
+                    })();
+                    if let Err(ref e) = res {
+                        tracing::error!("MiniCPM-V-4.6 request failed: {e}");
+                    }
+                    let _ = tx.send(res.map_err(|e| e.to_string()));
+                }
+            }).expect("Failed to spawn MiniCPM-V-4.6 thread");
+            minicpm_v_vlm_tx_opt_inner = Some(mcpv_tx);
+        } else if resolved_type == engine::model_factory::ModelType::Qwen3_5VL {
             info!("Loading Qwen 3.5 VL model from: {}", args.model_path);
             let model_path_clone = args.model_path.clone();
             let device_clone = device.clone();
@@ -597,7 +708,67 @@ pub async fn run(args: Args) -> Result<()> {
         }
         info!("VLM model routing established (type: {:?})", resolved_type);
         let eos_id = tokenizer.token_to_id("</s>").or_else(|| tokenizer.token_to_id("<end_of_turn>")) .or_else(|| tokenizer.token_to_id("<|end_of_sentence|>")) .unwrap_or(1);
-        (None, tokenizer, vec![eos_id], chat_template, vlm_tx_opt_inner, gemma4_vlm_tx_opt_inner, qwen3_5_vlm_tx_opt_inner, None, None)
+        (None, tokenizer, vec![eos_id], chat_template, vlm_tx_opt_inner, gemma4_vlm_tx_opt_inner, qwen3_5_vlm_tx_opt_inner, minicpm_v_vlm_tx_opt_inner, None, None, None)
+    } else if is_duplex {
+        info!("Loading MiniCPM-o duplex model from: {}", args.model_path);
+        let model_path_clone = args.model_path.clone();
+        let use_cpu = args.cpu || {
+            #[cfg(feature = "cuda")]
+            {
+                !candle_core::utils::cuda_is_available()
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                true
+            }
+        };
+        let duplex_device = if use_cpu { crane_core::models::Device::Cpu } else { device.clone() };
+        let duplex_dtype = dtype;
+        let llm_gguf_clone = args.llm_gguf.clone();
+        if let Some(ref gguf) = llm_gguf_clone {
+            info!("MiniCPM-o duplex: loading LLM tower from GGUF: {gguf}");
+        }
+        let (duplex_tx, duplex_rx) = tokio::sync::mpsc::unbounded_channel::<handlers::duplex::DuplexRequest>();
+        std::thread::Builder::new()
+            .name("duplex-engine".into())
+            .spawn(move || {
+                let session_result = if let Some(gguf) = llm_gguf_clone {
+                    crane_core::models::minicpmo::DuplexSession::new_with_llm_gguf(
+                        &model_path_clone,
+                        &gguf,
+                        &duplex_device,
+                        duplex_dtype,
+                        crane_core::models::minicpmo::DuplexConfig::default(),
+                    )
+                } else {
+                    crane_core::models::minicpmo::DuplexSession::new(
+                        &model_path_clone,
+                        &duplex_device,
+                        duplex_dtype,
+                        crane_core::models::minicpmo::DuplexConfig::default(),
+                    )
+                };
+                let mut session = match session_result {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!("Failed to load MiniCPM-o duplex session: {e}");
+                        return;
+                    }
+                };
+                duplex_device.with_context(|| {
+                    run_duplex_loop(duplex_rx, &mut session);
+                });
+            })
+            .expect("Failed to spawn duplex thread");
+        info!("MiniCPM-o duplex model routing established");
+        let tokenizer = crane_core::utils::tokenizer_utils::load_tokenizer_from_model_dir(&args.model_path)
+            .unwrap_or_else(|e| {
+                tracing::warn!("Failed to load HF tokenizer: {e}; creating stub for duplex-only mode");
+                tokenizers::Tokenizer::new(tokenizers::models::bpe::BPE::default())
+            });
+        let eos_id = tokenizer.token_to_id("<|im_end|>").or_else(|| tokenizer.token_to_id("<|endoftext|>")).unwrap_or(2);
+        let chat_template = engine::model_factory::create_chat_template(model_type, &args.model_path);
+        (None, tokenizer, vec![eos_id], chat_template, None, None, None, None, None, None, Some(duplex_tx))
     } else {
         // Only one of the TTS/ASR/VLM/LLM branches runs per process, so each is
         // the sole long-lived consumer of candle's process-wide rayon pool.
@@ -616,7 +787,7 @@ pub async fn run(args: Args) -> Result<()> {
         let (engine, handle) = InferenceEngine::new(backend, args.max_concurrent, args.decode_tokens_per_seq, memory_config);
         std::thread::Builder::new().name("inference-engine".into()).spawn(move || engine.run()).expect("Failed to spawn engine thread");
         info!("Inference engine started (max_concurrent={}, decode_tokens_per_seq={})", args.max_concurrent, args.decode_tokens_per_seq);
-        (Some(handle), tokenizer, eos_token_id, chat_template, None, None, None, None, None)
+        (Some(handle), tokenizer, eos_token_id, chat_template, None, None, None, None, None, None, None)
     };
 
     let model_name = args.model_name.clone().unwrap_or_else(|| {
@@ -636,8 +807,11 @@ pub async fn run(args: Args) -> Result<()> {
         vlm_tx: vlm_tx_opt,
         gemma4_vlm_tx: gemma4_vlm_tx_opt,
         qwen3_5_vlm_tx: qwen3_5_vlm_tx_opt,
+        minicpm_v_vlm_tx: minicpm_v_vlm_tx_opt,
         tts_tx: tts_tx_opt,
         asr_tx: asr_tx_opt,
+        duplex_tx: duplex_tx_opt,
+        duplex_lock: Arc::new(tokio::sync::Mutex::new(())),
         model_path: args.model_path.clone(),
         model_type_name: resolved_type.display_name().to_string(),
         dtype_name,
@@ -661,6 +835,9 @@ pub async fn run(args: Args) -> Result<()> {
         info!("mode: tts");
     } else if is_asr {
         info!("mode: asr");
+    } else if is_duplex {
+        info!("mode: duplex");
+        info!(duplex_ws = %format!("ws://{local_addr}/v1/audio/duplex"), "duplex endpoint");
     } else {
         info!(max_concurrent = args.max_concurrent, decode_tokens_per_seq = args.decode_tokens_per_seq, "scheduler configured");
         if args.max_seq_len > 0 || state.gpu_memory_limit != "unlimited" {
@@ -689,6 +866,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/chat/completions", post(handlers::openai::chat_completions))
         .route("/v1/completions", post(handlers::openai::completions))
         .route("/v1/audio/speech", post(handlers::tts::speech))
+        .route("/v1/audio/duplex", get(handlers::duplex::duplex_ws))
         .merge(transcriptions_router)
         .route("/v1/models", get(handlers::openai::list_models))
         .route("/v1/models/{model_id}", get(handlers::openai::retrieve_model))

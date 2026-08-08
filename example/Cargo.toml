@@ -10,6 +10,14 @@ anyhow = "1.0.100"
 image = "0.25.9"
 rustyline = "14.0.0"
 serde_json = "1.0.140"
+serde = { version = "1", features = ["derive"] }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.30"
+futures-util = "0.3"
+base64 = "0.22"
+hound = "3"
+cpal = "0.18"
 
 [[bin]]
 name = "chat_simple"
@@ -72,8 +80,16 @@ name = "hunyuan_simple"
 path = "src/hunyuan_simple.rs"
 
 [[bin]]
+name = "voxcpm2_simple"
+path = "src/voxcpm2_simple.rs"
+
+[[bin]]
 name = "onnx_probe"
 path = "src/onnx_probe.rs"
+
+[[bin]]
+name = "minicpmo_duplex_simple"
+path = "src/minicpmo_duplex_simple.rs"
 
 [features]
 default = []

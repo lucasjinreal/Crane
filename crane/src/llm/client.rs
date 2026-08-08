@@ -22,6 +22,10 @@ enum LoadedModel {
     HunyuanDense {
         model: crane_core::models::hunyuan_dense::Model,
     },
+    Minicpm5 {
+        model: crane_core::models::minicpm5::Model,
+        tokenizer: crane_core::autotokenizer::AutoTokenizer,
+    },
 }
 
 /// LLM client for various language models
@@ -73,6 +77,19 @@ impl LlmClient {
                         .map_err(|e| CraneError::ModelError(e.to_string()))?;
                 model.warmup();
                 LoadedModel::Qwen25 { model, tokenizer }
+            }
+            LlmModelType::Minicpm5 => {
+                let tokenizer = crane_core::autotokenizer::AutoTokenizer::from_pretrained(
+                    &config.model_path,
+                    None,
+                )
+                .map_err(|e| CraneError::TokenizationError(e.to_string()))?;
+
+                let mut model =
+                    crane_core::models::minicpm5::Model::new(&config.model_path, &device, &dtype)
+                        .map_err(|e| CraneError::ModelError(e.to_string()))?;
+                model.warmup();
+                LoadedModel::Minicpm5 { model, tokenizer }
             }
             LlmModelType::HunyuanDense => {
                 let mut model = crane_core::models::hunyuan_dense::Model::new(
@@ -265,6 +282,29 @@ impl LlmClient {
                     .map_err(|e| CraneError::TokenizationError(e.to_string()))?;
                 Ok(result)
             }
+            LoadedModel::Minicpm5 { model, tokenizer } => {
+                let prompt = tokenizer
+                    .apply_chat_template_with_options(
+                        messages,
+                        Option::<&serde_json::Value>::None,
+                        true,
+                        config.enable_thinking,
+                    )
+                    .map_err(|e| CraneError::TokenizationError(e.to_string()))?;
+                let input_ids = model
+                    .prepare_inputs(&prompt)
+                    .map_err(|e| CraneError::ModelError(e.to_string()))?;
+
+                let output_ids = model
+                    .generate(&input_ids, &gen_config, None)
+                    .map_err(|e| CraneError::ModelError(e.to_string()))?;
+
+                let generated_ids = output_ids.get(input_ids.len()..).unwrap_or(&[]);
+                let result = tokenizer
+                    .decode(generated_ids, true)
+                    .map_err(|e| CraneError::TokenizationError(e.to_string()))?;
+                Ok(result)
+            }
         }
     }
 
@@ -344,6 +384,20 @@ impl LlmClient {
                     StreamTokenizer::Tokenizer(model.tokenizer.tokenizer.clone()),
                 )
             }
+            LoadedModel::Minicpm5 { tokenizer, model } => {
+                let prompt = tokenizer
+                    .apply_chat_template_with_options(
+                        messages,
+                        Option::<&serde_json::Value>::None,
+                        true,
+                        config.enable_thinking,
+                    )
+                    .map_err(|e| CraneError::TokenizationError(e.to_string()))?;
+                let input_ids = model
+                    .prepare_inputs(&prompt)
+                    .map_err(|e| CraneError::ModelError(e.to_string()))?;
+                (input_ids, StreamTokenizer::Auto(tokenizer.clone()))
+            }
         };
 
         let (mut streamer, receiver) = match tokenizer_for_stream {
@@ -364,6 +418,9 @@ impl LlmClient {
                     model.generate(&input_ids, &gen_config, Some(&mut streamer))
                 }
                 LoadedModel::HunyuanDense { model } => {
+                    model.generate(&input_ids, &gen_config, Some(&mut streamer))
+                }
+                LoadedModel::Minicpm5 { model, .. } => {
                     model.generate(&input_ids, &gen_config, Some(&mut streamer))
                 }
             });

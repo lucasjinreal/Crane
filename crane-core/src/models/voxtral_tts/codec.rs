@@ -43,7 +43,13 @@ const SPECIAL_TOKEN_OFFSET: f64 = 2.0;
 /// ```
 ///
 /// Computation is performed in `f32` and converted back to the original dtype.
-fn reconstruct_weight_norm(weight_v: &Tensor, weight_g: &Tensor) -> Result<Tensor> {
+///
+/// `pub(crate)`: also reused by `voxcpm2::audio_vae` — the math is
+/// independent of which tensor names a checkpoint stores `weight_g`/
+/// `weight_v` under (this one happens to read `original0`/`original1`,
+/// VoxCPM2's AudioVAE reads `weight_g`/`weight_v` — the reconstruction
+/// itself is identical either way).
+pub(crate) fn reconstruct_weight_norm(weight_v: &Tensor, weight_g: &Tensor) -> Result<Tensor> {
     let original_dtype = weight_v.dtype();
     let v = weight_v.to_dtype(DType::F32)?;
     let g = weight_g.to_dtype(DType::F32)?.flatten_all()?;

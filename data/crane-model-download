@@ -129,9 +129,69 @@ MODELS = {
         "kind": "tts",
         "description": "Kokoro 82M, ONNX, 55 voices / 10 languages (Apache-2.0)",
     },
+    "minicpm5-1b": {
+        "repo_id": "openbmb/MiniCPM5-1B",
+        "dirname": "MiniCPM5-1B",
+        "kind": "llm",
+        "description": "MiniCPM5 1B, plain dense chat model (Apache-2.0)",
+    },
+    "minicpm5-1b-gguf": {
+        "repo_id": "openbmb/MiniCPM5-1B-GGUF",
+        "dirname": "MiniCPM5-1B-GGUF",
+        "kind": "llm",
+        "quant_template": "MiniCPM5-1B-{quant}.gguf",
+        "description": "MiniCPM5 1B, GGUF quant with embedded tokenizer (Apache-2.0)",
+    },
+    "minicpm-v-4.6": {
+        "repo_id": "openbmb/MiniCPM-V-4.6",
+        "dirname": "MiniCPM-V-4.6",
+        "kind": "vlm",
+        "description": "MiniCPM-V 4.6, vision-language chat (Apache-2.0)",
+    },
+    "minicpm-o-4.5": {
+        "repo_id": "openbmb/MiniCPM-o-4_5",
+        "dirname": "MiniCPM-o-4_5",
+        "kind": "omni",
+        "description": "MiniCPM-o 4.5, full omni: vision + audio understanding, speech-token TTS, full-duplex live audio chat (Apache-2.0)",
+    },
+    "minicpm-o-4.5-llm-gguf": {
+        "repo_id": "openbmb/MiniCPM-o-4_5-gguf",
+        "dirname": "MiniCPM-o-4_5-gguf",
+        "kind": "omni",
+        "quant_template": "MiniCPM-o-4_5-{quant}.gguf",
+        "description": "MiniCPM-o 4.5 standalone LLM-tower GGUF, for --llm-gguf (genuinely quantized, cuts VRAM ~19.8GB to ~11.2GB at Q8_0) (Apache-2.0)",
+    },
+    "minicpm-o-4.5-other-ggufs": {
+        "repo_id": "openbmb/MiniCPM-o-4_5-gguf",
+        "dirname": "MiniCPM-o-4_5-gguf",
+        "kind": "omni",
+        "files": {
+            "audio/MiniCPM-o-4_5-audio-F16.gguf": "MiniCPM-o-4_5-audio-F16.gguf",
+            "vision/MiniCPM-o-4_5-vision-F16.gguf": "MiniCPM-o-4_5-vision-F16.gguf",
+            "tts/MiniCPM-o-4_5-tts-F16.gguf": "MiniCPM-o-4_5-tts-F16.gguf",
+        },
+        "description": "MiniCPM-o 4.5 audio/vision/tts tower GGUFs (F16 only, no VRAM savings -- pure-GGUF deployment convenience) (Apache-2.0)",
+    },
+    "voxcpm2": {
+        "repo_id": "openbmb/VoxCPM2",
+        "dirname": "VoxCPM2",
+        "kind": "tts",
+        # `openbmb/VoxCPM2` only ships `audiovae.pth` (a PyTorch pickle);
+        # candle has no pickle reader, so Crane needs `audiovae.safetensors`
+        # instead. Rather than making every user run the one-time conversion
+        # themselves, `extra_files` pulls an already-converted copy (same
+        # weights, straight `torch.load` -> `safetensors.torch.save_file`,
+        # nothing else changed) from a second repo into the same directory.
+        "extra_files": {
+            "hahihula/VoxCPM2-audiovae-safetensors": {
+                "audiovae.safetensors": "audiovae.safetensors",
+            },
+        },
+        "description": "VoxCPM2, tokenizer-free diffusion TTS, voice cloning + prompt cache (Apache-2.0)",
+    },
 }
 
-_VALID_KINDS = ("tts", "asr", "vad", "llm", "g2p")
+_VALID_KINDS = ("tts", "asr", "vad", "llm", "g2p", "vlm", "omni")
 _REQUIRED_KEYS = ("repo_id", "dirname", "kind", "description")
 for _key, _info in MODELS.items():
     _missing = [k for k in _REQUIRED_KEYS if k not in _info]
@@ -226,6 +286,21 @@ def download_model(model_key, path, token, quant):
                 snapshot_download(
                     repo_id=info["repo_id"], local_dir=local_dir, token=token
                 )
+
+        # Additional files pulled from a *different* repo into the same
+        # local_dir (e.g. a pre-converted weight file the primary repo
+        # doesn't ship) — downloaded after the primary content above so a
+        # failure here doesn't leave the main download half-finished.
+        extra_files = info.get("extra_files")
+        if extra_files:
+            os.makedirs(local_dir, exist_ok=True)
+            for extra_repo_id, repo_files in extra_files.items():
+                for repo_path, local_name in repo_files.items():
+                    print(f"Downloading {extra_repo_id}:{repo_path} ...")
+                    cached = hf_hub_download(
+                        repo_id=extra_repo_id, filename=repo_path, token=token
+                    )
+                    shutil.copy2(cached, os.path.join(local_dir, local_name))
     except HfHubHTTPError as e:
         status = e.response.status_code if e.response is not None else None
         print(f"error: download failed: {e}", file=sys.stderr)

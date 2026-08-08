@@ -509,6 +509,75 @@ pub async fn qwen3_5_vlm_chat_completions(
     Ok(Json(response).into_response())
 }
 
+// ─────────────────────────────────────────────────────────────
+//  MiniCPM-V-4.6 VLM
+// ─────────────────────────────────────────────────────────────
+
+pub struct MinicpmVVlmRequest {
+    pub img_path: std::path::PathBuf,
+    pub text_prompt: String,
+    pub max_tokens: usize,
+    pub tx: tokio::sync::oneshot::Sender<Result<String, String>>,
+}
+
+/// MiniCPM-V-4.6 chat completions handler. Mirrors
+/// [`qwen3_5_vlm_chat_completions`] — same request/response shape, same
+/// single-image-per-turn extraction via [`extract_image_and_text`].
+pub async fn minicpm_v_vlm_chat_completions(
+    state: Arc<AppState>,
+    req: ChatCompletionRequest,
+) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    let mcpv_tx = state.minicpm_v_vlm_tx.as_ref().ok_or_else(|| {
+        make_error(StatusCode::INTERNAL_SERVER_ERROR, "MiniCPM-V-4.6 model not loaded")
+    })?;
+
+    let (image_url, text_prompt) = extract_image_and_text(&req.messages, "MiniCPM-V-4.6")?;
+    let (_temp_dir, img_path) = download_image(&image_url)
+        .await
+        .map_err(|e| make_error(StatusCode::BAD_REQUEST, &e))?;
+
+    let max_tokens = req.max_tokens;
+    let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if mcpv_tx
+        .send(MinicpmVVlmRequest { img_path, text_prompt, max_tokens, tx })
+        .is_err()
+    {
+        return Err(make_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "MiniCPM-V-4.6 engine thread crashed",
+        ));
+    }
+
+    let result = rx
+        .await
+        .map_err(|_| make_error(StatusCode::INTERNAL_SERVER_ERROR, "channel closed"))?;
+
+    let text = result.map_err(|e| make_error(StatusCode::INTERNAL_SERVER_ERROR, &e))?;
+
+    let response = ChatCompletionResponse {
+        id: request_id,
+        object: "chat.completion".into(),
+        created: now_epoch(),
+        model: state.model_name.clone(),
+        choices: vec![ChatChoice {
+            index: 0,
+            message: ChatMessage {
+                role: "assistant".into(),
+                content: ChatMessageContent::Text(text),
+            },
+            finish_reason: Some("stop".into()),
+        }],
+        usage: Usage {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+        },
+    };
+    Ok(Json(response).into_response())
+}
+
 /// Gemma4VL chat completions handler.
 pub async fn gemma4_vlm_chat_completions(
     state: Arc<AppState>,

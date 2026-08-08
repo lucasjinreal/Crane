@@ -90,6 +90,18 @@ pub enum Token {
     TokenObj(TokenObj),
 }
 
+/// HF `tokenizer_config.json` commonly sets `model_max_length` to a
+/// `1e30`-scale "no limit" sentinel (e.g. `1000000000000000019884624838656`,
+/// seen in MiniCPM5-1B's config) that overflows `usize` on deserialization.
+/// Clamp instead of hard-failing.
+fn deserialize_model_max_length<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(value.as_u64().map_or(usize::MAX, |v| v as usize))
+}
+
 #[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
 pub struct AutoTokenizerConfig {
     pub add_bos_token: Option<bool>,
@@ -97,6 +109,7 @@ pub struct AutoTokenizerConfig {
     pub clean_up_tokenization_spaces: bool,
     pub legacy: Option<bool>,
     pub tokenizer_class: String,
+    #[serde(deserialize_with = "deserialize_model_max_length")]
     pub model_max_length: usize,
     pub bos_token: Option<Token>,
     pub eos_token: Option<Token>,

@@ -414,6 +414,81 @@ impl ModelBackend for Qwen25Backend {
 }
 
 // ─────────────────────────────────────────────────────────────
+//  MiniCPM5 Backend
+// ─────────────────────────────────────────────────────────────
+
+/// Engine wrapper around `crane_core::models::minicpm5::Model`.
+///
+/// Only single-sequence forward is supported (no KV swap, no batch decode) —
+/// same tier as [`Qwen25Backend`].
+pub struct Minicpm5Backend {
+    pub model: crane_core::models::minicpm5::Model,
+    dtype: DType,
+}
+
+impl Minicpm5Backend {
+    /// # Errors
+    ///
+    /// Returns an error if the model fails to load from `model_path`.
+    pub fn new(
+        model_path: &str,
+        device: &Device,
+        dtype: &DType,
+        format: crane_core::models::minicpm5::ModelFormat,
+    ) -> Result<Self> {
+        let model =
+            crane_core::models::minicpm5::Model::new_with_format(model_path, device, dtype, format)?;
+        Ok(Self {
+            model,
+            dtype: *dtype,
+        })
+    }
+}
+
+impl ModelBackend for Minicpm5Backend {
+    fn forward_step(&mut self, input_ids: &[u32], start_pos: usize) -> Result<Tensor> {
+        self.model
+            .forward_step(input_ids, start_pos)
+            .map_err(Into::into)
+    }
+
+    fn clear_kv_cache(&mut self) {
+        self.model.clear_kv_cache();
+    }
+
+    fn num_layers(&self) -> usize {
+        0 // KV swap not supported; vector is unused
+    }
+
+    fn device(&self) -> &Device {
+        &self.model.device
+    }
+
+    fn dtype(&self) -> DType {
+        self.dtype
+    }
+
+    fn tokenizer(&self) -> &tokenizers::Tokenizer {
+        &self.model.tokenizer.tokenizer
+    }
+
+    fn eos_token_id(&self) -> Vec<u32> {
+        let ids = self.model.eos_token_ids();
+        if !ids.is_empty() {
+            return ids.to_vec();
+        }
+        let tok = &self.model.tokenizer.tokenizer;
+        tok.token_to_id("<|im_end|>")
+            .or_else(|| tok.token_to_id("<|endoftext|>"))
+            .map_or_else(|| vec![1], |id| vec![id])
+    }
+
+    fn warmup(&mut self) {
+        self.model.warmup();
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
 //  Qwen 3.5 Backend
 // ─────────────────────────────────────────────────────────────
 

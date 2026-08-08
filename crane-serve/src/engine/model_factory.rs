@@ -11,7 +11,8 @@ use serde::Deserialize;
 use std::path::Path;
 
 use super::backend::{
-    Gemma4Backend, HunyuanBackend, ModelBackend, Qwen25Backend, Qwen3Backend, Qwen3_5Backend,
+    Gemma4Backend, HunyuanBackend, Minicpm5Backend, ModelBackend, Qwen25Backend, Qwen3Backend,
+    Qwen3_5Backend,
 };
 use crate::chat_template::{AutoChatTemplate, ChatTemplateProcessor, HunyuanChatTemplate};
 
@@ -26,6 +27,9 @@ pub enum ModelType {
     Gemma4,
     Gemma4VL,
     HunyuanDense,
+    Minicpm5,
+    MinicpmV46,
+    MiniCpmODuplex,
     Qwen25,
     Qwen3,
     Qwen3_5,
@@ -33,6 +37,7 @@ pub enum ModelType {
     Qwen3TTS,
     VoxtralTTS,
     Kokoro,
+    VoxCpm2,
     PaddleOcrVl,
     Qwen3ASR,
 }
@@ -47,6 +52,12 @@ impl ModelType {
             "gemma4" | "gemma-4" | "gemma4_e2b" => Self::Gemma4,
             "gemma4_vl" | "gemma4-vl" | "gemma4vl" => Self::Gemma4VL,
             "hunyuan" | "hunyuan_dense" | "hunyuandense" => Self::HunyuanDense,
+            // Bare "minicpm" is aliased to MiniCPM5 for now, since it's the
+            // only OpenBMB family member Crane supports; re-scope this once
+            // MiniCPM-o/MiniCPM-V land as their own `ModelType`s.
+            "minicpmv46" | "minicpmv4.6" | "minicpmv4_6" | "minicpm-v4.6" | "minicpm-v-4.6" | "minicpmv" => Self::MinicpmV46,
+            "minicpmo" | "minicpm-o" | "minicpm_o" | "minicpmoduplex" | "minicpm-o-duplex" | "minicpm_o_duplex" => Self::MiniCpmODuplex,
+            "minicpm5" | "minicpm-5" | "minicpm_5" | "minicpm" => Self::Minicpm5,
             "qwen25" | "qwen2.5" | "qwen2" => Self::Qwen25,
             "qwen3" => Self::Qwen3,
             "qwen3_5" | "qwen3.5" | "qwen35" | "qwen3_5_dense" => Self::Qwen3_5,
@@ -56,6 +67,7 @@ impl ModelType {
             "qwen3_tts" | "qwen3tts" | "qwen3-tts" | "tts" => Self::Qwen3TTS,
             "voxtral_tts" | "voxtral-tts" | "voxtral" | "voxtral_4b" => Self::VoxtralTTS,
             "kokoro" | "kokoro_tts" | "kokoro-tts" | "kokoro-82m" => Self::Kokoro,
+            "voxcpm2" | "voxcpm-2" | "voxcpm_2" | "voxcpm" => Self::VoxCpm2,
             "paddleocr_vl" | "paddleocrv" | "paddleocr" | "paddle_ocr_vl" | "paddleocrvl" => Self::PaddleOcrVl,
             "qwen3_asr" | "qwen3asr" | "qwen3-asr" | "asr" => Self::Qwen3ASR,
             _ => Self::Auto,
@@ -69,6 +81,9 @@ impl ModelType {
             Self::Gemma4 => "gemma4",
             Self::Gemma4VL => "gemma4_vl",
             Self::HunyuanDense => "hunyuan",
+            Self::Minicpm5 => "minicpm5",
+            Self::MinicpmV46 => "minicpmv4_6",
+            Self::MiniCpmODuplex => "minicpmo_duplex",
             Self::Qwen25 => "qwen25",
             Self::Qwen3 => "qwen3",
             Self::Qwen3_5 => "qwen3_5",
@@ -76,6 +91,7 @@ impl ModelType {
             Self::Qwen3TTS => "qwen3_tts",
             Self::VoxtralTTS => "voxtral_tts",
             Self::Kokoro => "kokoro_tts",
+            Self::VoxCpm2 => "voxcpm2",
             Self::PaddleOcrVl => "paddleocr_vl",
             Self::Qwen3ASR => "qwen3_asr",
         }
@@ -84,19 +100,26 @@ impl ModelType {
     /// Whether this model type is a vision-language model.
     #[must_use]
     pub fn is_vlm(&self) -> bool {
-        matches!(self, Self::PaddleOcrVl | Self::Gemma4VL | Self::Qwen3_5VL)
+        matches!(self, Self::PaddleOcrVl | Self::Gemma4VL | Self::Qwen3_5VL | Self::MinicpmV46)
     }
 
     /// Whether this model type is a TTS model.
     #[must_use]
     pub fn is_tts(&self) -> bool {
-        matches!(self, Self::Qwen3TTS | Self::VoxtralTTS | Self::Kokoro)
+        matches!(self, Self::Qwen3TTS | Self::VoxtralTTS | Self::Kokoro | Self::VoxCpm2)
     }
 
     /// Whether this model type is an ASR model.
     #[must_use]
     pub fn is_asr(&self) -> bool {
         matches!(self, Self::Qwen3ASR)
+    }
+
+    /// Whether this model type is a full-duplex live audio session
+    /// (served over a WebSocket, not a one-shot HTTP request/response).
+    #[must_use]
+    pub fn is_duplex(&self) -> bool {
+        matches!(self, Self::MiniCpmODuplex)
     }
 }
 
@@ -132,6 +155,10 @@ struct HfConfig {
     model_type: Option<String>,
     architectures: Option<Vec<String>>,
     vision_config: Option<serde_json::Value>,
+    /// VoxCPM2's `config.json` uses a **singular** `"architecture"` string
+    /// field (not the plural HF-style `"architectures"` list) — genuinely
+    /// distinctive, checked separately in `detect_model_type`.
+    architecture: Option<String>,
 }
 
 /// Minimal subset of Mistral `params.json` for architecture detection.
@@ -155,6 +182,14 @@ pub fn detect_model_type(model_path: &str) -> ModelType {
         && let Ok(data) = std::fs::read(&config_path)
         && let Ok(config) = serde_json::from_slice::<HfConfig>(&data)
     {
+        // 0. Check the singular `architecture` field (VoxCPM2's schema —
+        // no `model_type`, no plural `architectures`, so this must be
+        // checked separately or it's silently invisible to the branches
+        // below).
+        if config.architecture.as_deref().map(str::to_lowercase).as_deref() == Some("voxcpm2") {
+            return ModelType::VoxCpm2;
+        }
+
         // 1. Check `model_type` field
         if let Some(ref mt) = config.model_type {
             match mt.to_lowercase().as_str() {
@@ -174,6 +209,8 @@ pub fn detect_model_type(model_path: &str) -> ModelType {
                         ModelType::Qwen3_5
                     };
                 }
+                "minicpmv4_6" | "minicpmv4.6" => return ModelType::MinicpmV46,
+                "minicpmo" => return ModelType::MiniCpmODuplex,
                 "qwen3_tts" | "qwen3tts" => return ModelType::Qwen3TTS,
                 "qwen3_asr" | "qwen3asr" => return ModelType::Qwen3ASR,
                 "style_text_to_speech_2" => return ModelType::Kokoro,
@@ -195,6 +232,15 @@ pub fn detect_model_type(model_path: &str) -> ModelType {
                 }
                 if a.contains("gemma4") {
                     return ModelType::Gemma4;
+                }
+                if a.contains("minicpmv4_6") {
+                    return ModelType::MinicpmV46;
+                }
+                // Checked before any bare "minicpm" fallback would exist —
+                // "MiniCPMO" is architecturally distinctive (real HF
+                // architectures value on the checkpoint).
+                if a.contains("minicpmo") {
+                    return ModelType::MiniCpmODuplex;
                 }
                 if a.contains("qwen3ttsforconditional") || a.contains("qwen3_tts") {
                     return ModelType::Qwen3TTS;
@@ -247,12 +293,29 @@ pub fn detect_model_type(model_path: &str) -> ModelType {
         ModelType::VoxtralTTS
     } else if path_lower.contains("kokoro") {
         ModelType::Kokoro
+    } else if path_lower.contains("voxcpm") {
+        ModelType::VoxCpm2
     } else if path_lower.contains("paddleocr") {
         ModelType::PaddleOcrVl
     } else if path_lower.contains("gemma4") || path_lower.contains("gemma-4") {
         ModelType::Gemma4
     } else if path_lower.contains("hunyuan") {
         ModelType::HunyuanDense
+    } else if path_lower.contains("minicpm-v") || path_lower.contains("minicpmv") {
+        // Checked before the bare "minicpm" branch below — "MiniCPM-V-4.6"
+        // contains "minicpm" too, and would otherwise be mis-claimed by the
+        // Minicpm5 fallback.
+        ModelType::MinicpmV46
+    } else if path_lower.contains("minicpm-o") || path_lower.contains("minicpmo") {
+        // Same reasoning as MiniCPM-V-4.6 above — checked before the bare
+        // "minicpm" fallback.
+        ModelType::MiniCpmODuplex
+    } else if path_lower.contains("minicpm") {
+        // MiniCPM5's config.json is a plain `LlamaForCausalLM`
+        // (model_type/architectures give no distinctive signal), so this
+        // path-name heuristic is the only auto-detect route; use
+        // `--model-type minicpm5` explicitly for renamed directories.
+        ModelType::Minicpm5
     } else if path_lower.contains("qwen3-tts") || path_lower.contains("qwen3_tts") || path_lower.contains("qwen3tts") {
         ModelType::Qwen3TTS
     } else if path_lower.contains("qwen3-asr") || path_lower.contains("qwen3_asr") || path_lower.contains("qwen3asr") {
@@ -295,6 +358,11 @@ fn detect_from_gguf_header(path: &Path) -> Option<ModelType> {
         "qwen3" | "qwen3moe" => Some(ModelType::Qwen3),
         "qwen2" => Some(ModelType::Qwen25),
         a if a.starts_with("hunyuan") => Some(ModelType::HunyuanDense),
+        // Deliberately specific (not bare "llama") — MiniCPM5 GGUF
+        // conversions may use "llama" as `general.architecture` since the
+        // checkpoint itself is architecturally plain Llama, in which case
+        // this won't fire and `--model-type minicpm5` is required instead.
+        a if a.starts_with("minicpm") => Some(ModelType::Minicpm5),
         a if a.starts_with("gemma") => Some(ModelType::Gemma4),
         other => {
             tracing::warn!("Unrecognized GGUF architecture '{other}'");
@@ -355,6 +423,14 @@ pub fn create_backend(
             };
             Ok(Box::new(Gemma4Backend::new(model_path, device, dtype, g4_fmt)?))
         }
+        ModelType::Minicpm5 => {
+            let mc_fmt = match format {
+                ModelFormat::Safetensors => crane_core::models::minicpm5::ModelFormat::Safetensors,
+                ModelFormat::Gguf => crane_core::models::minicpm5::ModelFormat::Gguf,
+                ModelFormat::Auto => crane_core::models::minicpm5::ModelFormat::Auto,
+            };
+            Ok(Box::new(Minicpm5Backend::new(model_path, device, dtype, mc_fmt)?))
+        }
         ModelType::Qwen25 => Ok(Box::new(Qwen25Backend::new(model_path, device, dtype)?)),
         ModelType::Qwen3 => Ok(Box::new(Qwen3Backend::new(model_path, device, dtype)?)),
         ModelType::Qwen3_5 => {
@@ -379,6 +455,9 @@ pub fn create_backend(
         ModelType::Qwen3_5VL => {
             anyhow::bail!("Qwen3_5-VL is a VLM model — use the Qwen3_5-VL endpoint instead of create_backend()")
         }
+        ModelType::MinicpmV46 => {
+            anyhow::bail!("MiniCPM-V-4.6 is a VLM model — use the MiniCPM-V-4.6 endpoint instead of create_backend()")
+        }
         ModelType::Qwen3TTS => {
             anyhow::bail!("Qwen3-TTS is a TTS model — use create_tts() instead of create_backend()")
         }
@@ -388,8 +467,14 @@ pub fn create_backend(
         ModelType::Kokoro => {
             anyhow::bail!("Kokoro is a TTS model — use create_tts() instead of create_backend()")
         }
+        ModelType::VoxCpm2 => {
+            anyhow::bail!("VoxCPM2 is a TTS model — use create_tts() instead of create_backend()")
+        }
         ModelType::Qwen3ASR => {
             anyhow::bail!("Qwen3-ASR is an ASR model — use create_asr() instead of create_backend()")
+        }
+        ModelType::MiniCpmODuplex => {
+            anyhow::bail!("MiniCPM-o is a full-duplex model — use the duplex WebSocket endpoint instead of create_backend()")
         }
         ModelType::Auto => unreachable!(),
     }
@@ -485,6 +570,10 @@ pub fn create_tts(
         ModelType::Kokoro => create_kokoro_tts(model_path, device, dtype),
         #[cfg(not(feature = "onnx"))]
         ModelType::Kokoro => anyhow::bail!("Kokoro TTS requires the 'onnx' feature"),
+        ModelType::VoxCpm2 => {
+            let model = crane_core::models::voxcpm2::VoxCpm2Model::new(model_path, device, dtype)?;
+            Ok(Box::new(model))
+        }
         other => anyhow::bail!("{other:?} is not a TTS model type"),
     }
 }
@@ -571,6 +660,93 @@ mod tests {
     }
 
     #[test]
+    fn model_type_from_str_minicpm5_variants() {
+        assert_eq!(ModelType::from_str("minicpm5"), ModelType::Minicpm5);
+        assert_eq!(ModelType::from_str("minicpm-5"), ModelType::Minicpm5);
+        assert_eq!(ModelType::from_str("minicpm_5"), ModelType::Minicpm5);
+        assert_eq!(ModelType::from_str("minicpm"), ModelType::Minicpm5);
+        assert_eq!(ModelType::from_str("MINICPM5"), ModelType::Minicpm5);
+    }
+
+    #[test]
+    fn model_type_from_str_minicpm_v46_variants() {
+        assert_eq!(ModelType::from_str("minicpmv46"), ModelType::MinicpmV46);
+        assert_eq!(ModelType::from_str("minicpmv4.6"), ModelType::MinicpmV46);
+        assert_eq!(ModelType::from_str("minicpmv4_6"), ModelType::MinicpmV46);
+        assert_eq!(ModelType::from_str("minicpm-v4.6"), ModelType::MinicpmV46);
+        assert_eq!(ModelType::from_str("MINICPMV4_6"), ModelType::MinicpmV46);
+    }
+
+    #[test]
+    fn model_type_is_vlm_includes_minicpm_v46() {
+        assert!(ModelType::MinicpmV46.is_vlm());
+        assert!(!ModelType::Minicpm5.is_vlm());
+    }
+
+    #[test]
+    fn detect_from_config_json_model_type_minicpmv4_6() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.json");
+        std::fs::write(&config, r#"{"model_type": "minicpmv4_6"}"#).unwrap();
+        let result = detect_model_type(dir.path().to_str().unwrap());
+        assert_eq!(result, ModelType::MinicpmV46);
+    }
+
+    #[test]
+    fn detect_from_config_json_architectures_minicpmv4_6() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.json");
+        std::fs::write(&config, r#"{"architectures": ["MiniCPMV4_6ForConditionalGeneration"]}"#).unwrap();
+        let result = detect_model_type(dir.path().to_str().unwrap());
+        assert_eq!(result, ModelType::MinicpmV46);
+    }
+
+    #[test]
+    fn detect_path_heuristic_minicpm_v46_not_claimed_by_minicpm5() {
+        let result = detect_model_type("/models/MiniCPM-V-4.6");
+        assert_eq!(result, ModelType::MinicpmV46);
+    }
+
+    #[test]
+    fn model_type_from_str_minicpmo_variants() {
+        assert_eq!(ModelType::from_str("minicpmo"), ModelType::MiniCpmODuplex);
+        assert_eq!(ModelType::from_str("minicpm-o"), ModelType::MiniCpmODuplex);
+        assert_eq!(ModelType::from_str("minicpm_o_duplex"), ModelType::MiniCpmODuplex);
+        assert_eq!(ModelType::from_str("MINICPMO"), ModelType::MiniCpmODuplex);
+    }
+
+    #[test]
+    fn model_type_is_duplex_includes_minicpmo() {
+        assert!(ModelType::MiniCpmODuplex.is_duplex());
+        assert!(!ModelType::MinicpmV46.is_duplex());
+        assert!(!ModelType::Minicpm5.is_duplex());
+    }
+
+    #[test]
+    fn detect_from_config_json_model_type_minicpmo() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.json");
+        std::fs::write(&config, r#"{"model_type": "minicpmo"}"#).unwrap();
+        let result = detect_model_type(dir.path().to_str().unwrap());
+        assert_eq!(result, ModelType::MiniCpmODuplex);
+    }
+
+    #[test]
+    fn detect_from_config_json_architectures_minicpmo() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.json");
+        std::fs::write(&config, r#"{"architectures": ["MiniCPMO"]}"#).unwrap();
+        let result = detect_model_type(dir.path().to_str().unwrap());
+        assert_eq!(result, ModelType::MiniCpmODuplex);
+    }
+
+    #[test]
+    fn detect_path_heuristic_minicpmo_not_claimed_by_minicpm5() {
+        let result = detect_model_type("/models/MiniCPM-o-4_5");
+        assert_eq!(result, ModelType::MiniCpmODuplex);
+    }
+
+    #[test]
     fn model_type_from_str_voxtral_variants() {
         assert_eq!(ModelType::from_str("voxtral_tts"), ModelType::VoxtralTTS);
         assert_eq!(ModelType::from_str("voxtral-tts"), ModelType::VoxtralTTS);
@@ -586,6 +762,35 @@ mod tests {
         assert_eq!(ModelType::from_str("kokoro-tts"), ModelType::Kokoro);
         assert_eq!(ModelType::from_str("kokoro-82m"), ModelType::Kokoro);
         assert_eq!(ModelType::from_str("KOKORO"), ModelType::Kokoro);
+    }
+
+    #[test]
+    fn model_type_from_str_voxcpm2_variants() {
+        assert_eq!(ModelType::from_str("voxcpm2"), ModelType::VoxCpm2);
+        assert_eq!(ModelType::from_str("voxcpm-2"), ModelType::VoxCpm2);
+        assert_eq!(ModelType::from_str("voxcpm_2"), ModelType::VoxCpm2);
+        assert_eq!(ModelType::from_str("voxcpm"), ModelType::VoxCpm2);
+        assert_eq!(ModelType::from_str("VOXCPM2"), ModelType::VoxCpm2);
+    }
+
+    #[test]
+    fn model_type_is_tts_includes_voxcpm2() {
+        assert!(ModelType::VoxCpm2.is_tts());
+    }
+
+    #[test]
+    fn detect_from_config_json_singular_architecture_voxcpm2() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.json");
+        std::fs::write(&config, r#"{"architecture": "voxcpm2"}"#).unwrap();
+        let result = detect_model_type(dir.path().to_str().unwrap());
+        assert_eq!(result, ModelType::VoxCpm2);
+    }
+
+    #[test]
+    fn detect_path_heuristic_voxcpm2() {
+        let result = detect_model_type("/models/VoxCPM2");
+        assert_eq!(result, ModelType::VoxCpm2);
     }
 
     #[test]
@@ -623,6 +828,9 @@ mod tests {
     fn model_type_display_name() {
         assert_eq!(ModelType::Auto.display_name(), "auto");
         assert_eq!(ModelType::HunyuanDense.display_name(), "hunyuan");
+        assert_eq!(ModelType::Minicpm5.display_name(), "minicpm5");
+        assert_eq!(ModelType::MinicpmV46.display_name(), "minicpmv4_6");
+        assert_eq!(ModelType::MiniCpmODuplex.display_name(), "minicpmo_duplex");
         assert_eq!(ModelType::Qwen25.display_name(), "qwen25");
         assert_eq!(ModelType::Qwen3.display_name(), "qwen3");
         assert_eq!(ModelType::Qwen3ASR.display_name(), "qwen3_asr");
@@ -730,6 +938,29 @@ mod tests {
     fn detect_path_heuristic_hunyuan() {
         let result = detect_model_type("/models/Hunyuan-Dense-7B");
         assert_eq!(result, ModelType::HunyuanDense);
+    }
+
+    #[test]
+    fn detect_path_heuristic_minicpm5() {
+        let result = detect_model_type("/models/MiniCPM5-1B");
+        assert_eq!(result, ModelType::Minicpm5);
+    }
+
+    #[test]
+    fn detect_from_config_json_llama_architecture_is_not_minicpm5() {
+        // MiniCPM5's own config.json is a plain LlamaForCausalLM — verify
+        // that alone does NOT get claimed by Minicpm5 (would misfire on
+        // real Llama checkpoints). Falls through to the Qwen25 default
+        // since there's no path-name signal in this temp dir.
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.json");
+        std::fs::write(
+            &config,
+            r#"{"model_type": "llama", "architectures": ["LlamaForCausalLM"]}"#,
+        )
+        .unwrap();
+        let result = detect_model_type(dir.path().to_str().unwrap());
+        assert_ne!(result, ModelType::Minicpm5);
     }
 
     #[test]

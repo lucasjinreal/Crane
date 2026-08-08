@@ -420,7 +420,11 @@ fn strip_thinking(text: &str) -> String {
 /// Replace positions where `input_ids == image_token_id` with the corresponding
 /// row of `image_embeds`. Both `hidden_states` and `image_embeds` share the
 /// last dim (text hidden size).
-fn splice_image_features(
+///
+/// `pub(crate)`: also reused by `minicpm_v::vlm` — the splice-at-placeholder
+/// operation is model-agnostic (Qwen 3.5-VL and MiniCPM-V-4.6 both use a
+/// single repeated placeholder token id).
+pub(crate) fn splice_image_features(
     input_ids: &Tensor,
     hidden_states: &Tensor,
     image_embeds: &Tensor,
