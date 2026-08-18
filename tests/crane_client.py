@@ -16,6 +16,7 @@ def speech(
     voice: str | None = None,
     language: str | None = None,
     server_url: str = "http://localhost:8000",
+    timeout: float = 180,
     **opts,
 ) -> bytes:
     """POST to /v1/audio/speech and return the raw audio response bytes."""
@@ -34,7 +35,7 @@ def speech(
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.read()
     except urllib.error.HTTPError as e:
         message = e.read().decode("utf-8", errors="replace")
@@ -57,6 +58,7 @@ def chat(
     top_p: float | None = None,
     top_k: int | None = None,
     repetition_penalty: float | None = None,
+    timeout: float = 180,
     **opts,
 ) -> str:
     """POST to /v1/chat/completions and return the assistant's reply text."""
@@ -84,7 +86,7 @@ def chat(
     )
     try:
         # Long prompts and long generations can take minutes on CPU/small GPUs.
-        with urllib.request.urlopen(req, timeout=300) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             response_body = resp.read().decode("utf-8")
     except urllib.error.HTTPError as e:
         err_message = e.read().decode("utf-8", errors="replace")
@@ -111,6 +113,7 @@ def transcribe(
     wav_path: str,
     language: str | None = None,
     server_url: str = "http://localhost:8000",
+    timeout: float = 180,
     **opts,
 ) -> str:
     """POST a WAV file to /v1/audio/transcriptions and return the transcript text."""
@@ -130,7 +133,7 @@ def transcribe(
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             response_body = resp.read().decode("utf-8")
     except urllib.error.HTTPError as e:
         message = e.read().decode("utf-8", errors="replace")
@@ -150,6 +153,14 @@ def transcribe(
     if "text" not in response:
         raise RuntimeError(f"transcribe response missing 'text' field: {response}")
     return response["text"]
+
+
+def _positive_float(value: str) -> float:
+    """Parse a CLI argument as a strictly positive float, for use as an argparse type."""
+    parsed = float(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(f"must be a positive number, got {value!r}")
+    return parsed
 
 
 def _escape_header_value(value: str) -> str:
@@ -194,6 +205,7 @@ def _cmd_speech(args):
         voice=args.voice,
         language=args.language,
         server_url=args.url,
+        timeout=args.timeout,
     )
     if args.output:
         with open(args.output, "wb") as f:
@@ -207,18 +219,21 @@ _SPEECH_EXAMPLES = """examples:
   crane_client.py speech "hello world" -o out.wav
   crane_client.py speech "hello world" | pw-play -
   crane_client.py speech "hello world" --voice ash --language en | pw-play -
-  crane_client.py speech "hello world" -u http://localhost:9000 | pw-play -"""
+  crane_client.py speech "hello world" -u http://localhost:9000 | pw-play -
+  crane_client.py speech "hello world" -t 120 -o out.wav"""
 
 _TRANSCRIBE_EXAMPLES = """examples:
   crane_client.py transcribe speech.wav
   crane_client.py transcribe speech.wav --language en
-  crane_client.py transcribe speech.wav -u http://localhost:9000"""
+  crane_client.py transcribe speech.wav -u http://localhost:9000
+  crane_client.py transcribe speech.wav -t 120"""
 
 _CHAT_EXAMPLES = """examples:
   crane_client.py chat "what model is suggested for Qwen3 on a 16GB VRAM GPU?"
   crane_client.py chat "summarize this" --file long_prompt.txt
   crane_client.py chat "hi" --system "You are terse." --max-tokens 64
-  crane_client.py chat "hi" -u http://localhost:9000"""
+  crane_client.py chat "hi" -u http://localhost:9000
+  crane_client.py chat "hi" -t 600"""
 
 
 def _cmd_chat(args):
@@ -242,6 +257,7 @@ def _cmd_chat(args):
         top_p=args.top_p,
         top_k=args.top_k,
         repetition_penalty=args.repetition_penalty,
+        timeout=args.timeout,
     )
     print(text)
 
@@ -252,6 +268,7 @@ def _cmd_transcribe(args):
         args.wav_path,
         language=args.language,
         server_url=args.url,
+        timeout=args.timeout,
     )
     print(text)
 
@@ -282,6 +299,13 @@ def main():
     speech_parser.add_argument(
         "--output", "-o", default=None, help="write audio to this file instead of stdout"
     )
+    speech_parser.add_argument(
+        "--timeout",
+        "-t",
+        type=_positive_float,
+        default=180,
+        help="request timeout in seconds (default: 180; large models can take longer)",
+    )
     speech_parser.set_defaults(func=_cmd_speech)
 
     transcribe_parser = subparsers.add_parser(
@@ -293,6 +317,13 @@ def main():
     )
     transcribe_parser.add_argument("wav_path", help="path to the WAV file to transcribe")
     transcribe_parser.add_argument("--language", default=None, help="language hint")
+    transcribe_parser.add_argument(
+        "--timeout",
+        "-t",
+        type=_positive_float,
+        default=180,
+        help="request timeout in seconds (default: 180)",
+    )
     transcribe_parser.set_defaults(func=_cmd_transcribe)
 
     chat_parser = subparsers.add_parser(
@@ -313,6 +344,13 @@ def main():
     chat_parser.add_argument("--top-p", type=float, default=None)
     chat_parser.add_argument("--top-k", type=int, default=None)
     chat_parser.add_argument("--repetition-penalty", type=float, default=None)
+    chat_parser.add_argument(
+        "--timeout",
+        "-t",
+        type=_positive_float,
+        default=180,
+        help="request timeout in seconds (default: 180; long prompts/generations can take minutes)",
+    )
     chat_parser.set_defaults(func=_cmd_chat)
 
     args = parser.parse_args()
