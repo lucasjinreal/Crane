@@ -56,3 +56,67 @@ pub fn repeat_kv(xs: Tensor, n_rep: usize) -> Result<Tensor> {
         Tensor::cat(&vec![&xs; n_rep], 2)?.reshape((b_sz, n_kv_head * n_rep, seq_len, head_dim))
     }
 }
+
+/// Drains candle's Metal staging-buffer pool; call periodically while
+/// loading to avoid quadratic allocation cost on large checkpoints.
+/// No-op on non-Metal devices.
+pub fn release_load_staging(device: &Device) {
+    if device.is_metal() {
+        let _ = device.synchronize();
+    }
+}
+
+/// This process's physical memory footprint in bytes (macOS's
+/// `ri_phys_footprint`), excluding reclaimable file-backed pages like a
+/// mmaped checkpoint. Returns `None` off macOS or on syscall failure.
+pub fn phys_footprint_bytes() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        // struct rusage_info_v2 from <sys/resource.h>, truncated to the
+        // fields we need plus padding for the kernel to fill.
+        #[repr(C)]
+        #[derive(Default)]
+        struct RUsageInfoV2 {
+            ri_uuid: [u8; 16],
+            ri_user_time: u64,
+            ri_system_time: u64,
+            ri_pkg_idle_wkups: u64,
+            ri_interrupt_wkups: u64,
+            ri_pageins: u64,
+            ri_wired_size: u64,
+            ri_resident_size: u64,
+            ri_phys_footprint: u64,
+            ri_proc_start_abstime: u64,
+            ri_proc_exit_abstime: u64,
+            ri_child_user_time: u64,
+            ri_child_system_time: u64,
+            ri_child_pkg_idle_wkups: u64,
+            ri_child_interrupt_wkups: u64,
+            ri_child_pageins: u64,
+            ri_child_elapsed_abstime: u64,
+            ri_diskio_bytesread: u64,
+            ri_diskio_byteswritten: u64,
+        }
+
+        unsafe extern "C" {
+            fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut core::ffi::c_void) -> i32;
+        }
+
+        const RUSAGE_INFO_V2: i32 = 2;
+        let mut info = RUsageInfoV2::default();
+        let pid = std::process::id() as i32;
+        // SAFETY: `info` matches the RUSAGE_INFO_V2 flavor passed below.
+        let rc = unsafe {
+            proc_pid_rusage(
+                pid,
+                RUSAGE_INFO_V2,
+                std::ptr::from_mut(&mut info).cast::<core::ffi::c_void>(),
+            )
+        };
+        (rc == 0).then_some(info.ri_phys_footprint)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}

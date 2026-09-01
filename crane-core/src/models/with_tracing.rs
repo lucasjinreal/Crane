@@ -119,7 +119,7 @@ impl QMatMul {
     pub fn new(
         out_dim: usize,
         in_dim: usize,
-        vb: crate::models::quantized_var_builder::VarBuilder,
+        vb: crate::utils::quantized_var_builder::VarBuilder,
     ) -> Result<Self> {
         let ws = vb.get((in_dim, out_dim), "weight")?;
         let inner = candle_core::quantized::QMatMul::from_arc(ws)?;

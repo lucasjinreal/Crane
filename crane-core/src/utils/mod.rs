@@ -1,4 +1,6 @@
+pub mod cast_var_builder;
 pub mod image_utils;
+pub mod quantized_var_builder;
 pub mod token_output_stream;
 pub mod tokenizer_utils;
 pub mod utils;

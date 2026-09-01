@@ -175,34 +175,87 @@ fn resolve_audiovae_safetensors(model_path: &str) -> Result<std::path::PathBuf> 
 
 impl VoxCpm2Model {
     pub fn new(model_path: &str, device: &Device, dtype: &DType) -> Result<Self> {
+        let timing = std::env::var_os("CRANE_VOXCPM2_TIMING").is_some();
+        /// `phys_footprint` in GiB, for the load-phase log lines.
+        fn footprint_gib() -> f64 {
+            crate::models::utils::phys_footprint_bytes().unwrap_or(0) as f64
+                / (1024.0 * 1024.0 * 1024.0)
+        }
+        macro_rules! load_phase {
+            ($label:expr, $e:expr) => {{
+                let __t = std::time::Instant::now();
+                let __v = $e;
+                crate::models::utils::release_load_staging(device);
+                if timing {
+                    eprintln!(
+                        "[voxcpm2] load/{}: {:?} (footprint {:.2} GiB)",
+                        $label,
+                        __t.elapsed(),
+                        footprint_gib()
+                    );
+                }
+                __v
+            }};
+        }
+        if timing {
+            // Baseline before any weight is touched (process + Metal init).
+            eprintln!(
+                "[voxcpm2] load/baseline (pre-load): footprint {:.2} GiB",
+                footprint_gib()
+            );
+        }
         let cfg = load_config(&format!("{model_path}/config.json"))
             .map_err(|e| anyhow::anyhow!("{e}"))
             .context("load VoxCPM2 config.json")?;
 
         let tokenizer_path = format!("{model_path}/tokenizer.json");
         let tokenizer = VoxCpm2Tokenizer::from_file(&tokenizer_path)?;
+        if timing {
+            eprintln!(
+                "[voxcpm2] load/tokenizer: footprint {:.2} GiB",
+                footprint_gib()
+            );
+        }
 
+        // Cast dtype on the CPU rather than on-device; see `cast_var_builder`.
         let weights_path = format!("{model_path}/model.safetensors");
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], *dtype, device) }
-            .context("mmap model.safetensors")?;
+        let vb = unsafe {
+            crate::utils::cast_var_builder::from_mmaped_safetensors_cpu_cast(
+                &[weights_path],
+                *dtype,
+                device,
+            )
+        }
+        .context("mmap model.safetensors")?;
 
         let table_len = cfg.max_length;
-        let base_lm = MiniCpm4Model::new(&cfg.lm_config, table_len, vb.pp("base_lm"))?;
+        let base_lm = load_phase!(
+            "base_lm",
+            MiniCpm4Model::new(&cfg.lm_config, table_len, vb.pp("base_lm"))
+        )?;
         let residual_cfg = cfg
             .lm_config
             .derive_residual_lm(cfg.residual_lm_num_layers, cfg.residual_lm_no_rope);
-        let residual_lm = MiniCpm4Model::new(&residual_cfg, table_len, vb.pp("residual_lm"))?;
+        let residual_lm = load_phase!(
+            "residual_lm",
+            MiniCpm4Model::new(&residual_cfg, table_len, vb.pp("residual_lm"))
+        )?;
 
         let encoder_cfg = cfg.lm_config.derive(&cfg.encoder_config);
-        let feat_encoder =
-            VoxCpmLocEnc::new(&encoder_cfg, cfg.feat_dim, table_len, vb.pp("feat_encoder"))?;
+        let feat_encoder = load_phase!(
+            "feat_encoder",
+            VoxCpmLocEnc::new(&encoder_cfg, cfg.feat_dim, table_len, vb.pp("feat_encoder"))
+        )?;
 
         let dit_cfg = cfg.lm_config.derive(&cfg.dit_config.shape);
-        let estimator = VoxCpmLocDit::new(
-            &dit_cfg,
-            cfg.feat_dim,
-            table_len,
-            vb.pp("feat_decoder").pp("estimator"),
+        let estimator = load_phase!(
+            "dit",
+            VoxCpmLocDit::new(
+                &dit_cfg,
+                cfg.feat_dim,
+                table_len,
+                vb.pp("feat_decoder").pp("estimator"),
+            )
         )?;
         let feat_decoder = UnifiedCfm::new(estimator, cfg.dit_config.mean_mode);
 
@@ -240,20 +293,37 @@ impl VoxCpm2Model {
             VarBuilder::from_mmaped_safetensors(&[&vae_weights_path], DType::F32, device)
         }
         .with_context(|| format!("mmap AudioVAE weights ({})", vae_weights_path.display()))?;
-        let audio_vae = AudioVaeDecoder::new(
-            avc.latent_dim,
-            avc.decoder_dim,
-            &avc.decoder_rates,
-            avc.sr_bin_boundaries,
-            avc.out_sample_rate,
-            vae_vb.pp("decoder"),
+        let audio_vae = load_phase!(
+            "audio_vae_decoder",
+            AudioVaeDecoder::new(
+                avc.latent_dim,
+                avc.decoder_dim,
+                &avc.decoder_rates,
+                avc.sr_bin_boundaries,
+                avc.out_sample_rate,
+                vae_vb.pp("decoder"),
+            )
         )?;
-        let audio_vae_encoder = AudioVaeEncoder::new(
-            avc.encoder_dim,
-            avc.latent_dim,
-            &avc.encoder_rates,
-            vae_vb.pp("encoder"),
+        let audio_vae_encoder = load_phase!(
+            "audio_vae_encoder",
+            AudioVaeEncoder::new(
+                avc.encoder_dim,
+                avc.latent_dim,
+                &avc.encoder_rates,
+                vae_vb.pp("encoder"),
+            )
         )?;
+
+        // Unmap both checkpoints now rather than at end of scope, so warmup
+        // doesn't run with several GiB of redundant mapping still established.
+        drop(vb);
+        drop(vae_vb);
+        if timing {
+            eprintln!(
+                "[voxcpm2] load/done (checkpoints unmapped): footprint {:.2} GiB",
+                footprint_gib()
+            );
+        }
 
         let mut model = Self {
             tokenizer,

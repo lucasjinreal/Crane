@@ -34,6 +34,5 @@ pub use candle_core;
 pub use candle_core::Tensor;
 pub use candle_core::{DType, Device};
 
-pub mod quantized_var_builder;
 pub mod utils;
 pub mod with_tracing;

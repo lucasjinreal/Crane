@@ -17,6 +17,7 @@ use candle_nn::{Activation, Embedding, RmsNorm, VarBuilder, embedding, rms_norm}
 use super::config::MiniCpm4Config;
 use crate::models::modules::attention::{AttentionConfig, GqaAttention, RopeMode};
 use crate::models::modules::ffn::SwiGluFfn;
+use crate::models::utils::release_load_staging;
 
 // ── LongRoPE ─────────────────────────────────────────────────────────────
 
@@ -206,6 +207,7 @@ impl MiniCpm4Model {
         let vb_layers = vb.pp("layers");
         for i in 0..cfg.num_hidden_layers {
             layers.push(DecoderLayer::new(cfg, vb_layers.pp(i))?);
+            release_load_staging(vb.device());
         }
 
         let norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("norm"))?;

@@ -34,12 +34,35 @@ use crate::models::voxtral_tts::codec::reconstruct_weight_norm;
 
 // ── Weight-normed causal convs (zero-padding) ───────────────────────────
 
+/// Depthwise (`groups == channels`) conv1d evaluated as shift/multiply/
+/// accumulate over the `k` kernel taps instead of via [`Conv1d`], which runs
+/// one GPU conv per channel for depthwise groups. Only valid for `stride ==
+/// 1`; [`CausalConv1d::load`] falls back to [`Conv1d`] otherwise.
+struct DepthwiseConv1d {
+    taps: Vec<Tensor>,
+    bias: Tensor,
+    dilation: usize,
+}
+
+impl DepthwiseConv1d {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let l_out = x.dim(2)? - self.dilation * (self.taps.len() - 1);
+        let mut acc = x.narrow(2, 0, l_out)?.broadcast_mul(&self.taps[0])?;
+        for (k, tap) in self.taps.iter().enumerate().skip(1) {
+            acc = (acc + x.narrow(2, k * self.dilation, l_out)?.broadcast_mul(tap)?)?;
+        }
+        acc.broadcast_add(&self.bias)
+    }
+}
+
 /// Weight-normed `Conv1d`, manually zero-left-padded by `2*padding -
 /// output_padding` before an otherwise-unpadded conv — matches
 /// `CausalConv1d.forward`'s `F.pad(x, (padding*2 - output_padding, 0))`.
 struct CausalConv1d {
     conv: Conv1d,
     left_pad: usize,
+    /// Set for true depthwise convs; takes the cheaper path instead of `conv`.
+    depthwise: Option<DepthwiseConv1d>,
 }
 
 impl CausalConv1d {
@@ -66,10 +89,29 @@ impl CausalConv1d {
             groups,
             cudnn_fwd_algo: None,
         };
+        // True depthwise and unstrided — take the cheap DepthwiseConv1d path.
+        let depthwise = if groups > 1 && groups == in_ch && groups == out_ch && stride == 1 {
+            let taps = (0..kernel)
+                .map(|k| {
+                    weight
+                        .narrow(2, k, 1)?
+                        .reshape((1, out_ch, 1))?
+                        .contiguous()
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Some(DepthwiseConv1d {
+                taps,
+                bias: bias.reshape((1, out_ch, 1))?,
+                dilation,
+            })
+        } else {
+            None
+        };
         let conv = candle_nn::Conv1d::new(weight, Some(bias), cfg);
         Ok(Self {
             conv,
             left_pad: padding * 2 - output_padding,
+            depthwise,
         })
     }
 
@@ -79,7 +121,10 @@ impl CausalConv1d {
         } else {
             x.clone()
         };
-        self.conv.forward(&x)
+        match &self.depthwise {
+            Some(dw) => dw.forward(&x),
+            None => self.conv.forward(&x),
+        }
     }
 }
 
@@ -137,20 +182,21 @@ impl CausalConvTranspose1d {
 /// broadcasts over batch/time). Port of `Snake1d`/`snake`.
 struct Snake1d {
     alpha: Tensor,
+    /// `(alpha + 1e-9).recip()`, precomputed since `alpha` is a frozen weight.
+    alpha_recip: Tensor,
 }
 
 impl Snake1d {
     fn load(channels: usize, vb: VarBuilder) -> Result<Self> {
-        Ok(Self {
-            alpha: vb.get((1, channels, 1), "alpha")?,
-        })
+        let alpha = vb.get((1, channels, 1), "alpha")?;
+        let alpha_recip = (&alpha + 1e-9)?.recip()?;
+        Ok(Self { alpha, alpha_recip })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let sin = x.broadcast_mul(&self.alpha)?.sin()?;
         let sin2 = sin.sqr()?;
-        let recip = (&self.alpha + 1e-9)?.recip()?;
-        x + sin2.broadcast_mul(&recip)?
+        x + sin2.broadcast_mul(&self.alpha_recip)?
     }
 }
 
@@ -519,6 +565,80 @@ impl AudioVaeEncoder {
             x = block.forward(&x)?;
         }
         self.fc_mu.forward(&x)
+    }
+}
+
+#[cfg(test)]
+mod depthwise_tests {
+    use super::*;
+    use candle_core::Device;
+
+    /// [`DepthwiseConv1d`] must agree with the `Conv1d` path it replaces.
+    #[test]
+    fn depthwise_matches_grouped_conv1d() {
+        let dev = Device::Cpu;
+        let (c, k, l) = (5usize, 7usize, 80usize);
+
+        for dilation in [1usize, 3, 9] {
+            let w: Vec<f32> = (0..c * k)
+                .map(|i| ((i * 37 % 19) as f32 - 9.0) / 7.0)
+                .collect();
+            let b: Vec<f32> = (0..c).map(|i| (i as f32) * 0.25 - 0.5).collect();
+            let x: Vec<f32> = (0..c * l)
+                .map(|i| ((i * 53 % 31) as f32 - 15.0) / 11.0)
+                .collect();
+
+            let weight = Tensor::from_vec(w, (c, 1, k), &dev).unwrap();
+            let bias = Tensor::from_vec(b, c, &dev).unwrap();
+            let xs = Tensor::from_vec(x, (1, c, l), &dev).unwrap();
+
+            let reference = Conv1d::new(
+                weight.clone(),
+                Some(bias.clone()),
+                Conv1dConfig {
+                    padding: 0,
+                    stride: 1,
+                    dilation,
+                    groups: c,
+                    cudnn_fwd_algo: None,
+                },
+            )
+            .forward(&xs)
+            .unwrap();
+
+            let taps = (0..k)
+                .map(|i| {
+                    weight
+                        .narrow(2, i, 1)
+                        .unwrap()
+                        .reshape((1, c, 1))
+                        .unwrap()
+                        .contiguous()
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let got = DepthwiseConv1d {
+                taps,
+                bias: bias.reshape((1, c, 1)).unwrap(),
+                dilation,
+            }
+            .forward(&xs)
+            .unwrap();
+
+            assert_eq!(
+                got.dims(),
+                reference.dims(),
+                "shape mismatch at dilation {dilation}"
+            );
+            let got: Vec<f32> = got.flatten_all().unwrap().to_vec1().unwrap();
+            let reference: Vec<f32> = reference.flatten_all().unwrap().to_vec1().unwrap();
+            for (i, (g, r)) in got.iter().zip(&reference).enumerate() {
+                assert!(
+                    (g - r).abs() < 1e-5,
+                    "dilation {dilation}, element {i}: got {g}, expected {r}"
+                );
+            }
+        }
     }
 }
 
