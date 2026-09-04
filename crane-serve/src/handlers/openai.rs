@@ -100,7 +100,7 @@ pub async fn chat_completions(
             request_id.clone(),
             input_ids,
             GenerationParams {
-                max_tokens: req.max_tokens,
+                max_tokens: req.max_completion_tokens.unwrap_or(req.max_tokens),
                 temperature: req.temperature.or(Some(0.8)),
                 top_p: req.top_p.or(Some(0.95)),
                 top_k: req.top_k.or(Some(40)),
@@ -108,6 +108,7 @@ pub async fn chat_completions(
                 frequency_penalty: req.frequency_penalty.unwrap_or(0.0),
                 presence_penalty: req.presence_penalty.unwrap_or(0.0),
                 eos_token_id: state.eos_token_id.clone(),
+                stop: req.stop.map_or_else(Vec::new, StringOrArray::into_vec),
             },
         )
         .map_err(|e| make_error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()))?;
@@ -203,7 +204,7 @@ pub async fn completions(
             request_id.clone(),
             input_ids,
             GenerationParams {
-                max_tokens: req.max_tokens,
+                max_tokens: req.max_completion_tokens.unwrap_or(req.max_tokens),
                 temperature: req.temperature.or(Some(0.8)),
                 top_p: req.top_p.or(Some(0.95)),
                 top_k: req.top_k.or(Some(40)),
@@ -211,6 +212,7 @@ pub async fn completions(
                 frequency_penalty: req.frequency_penalty.unwrap_or(0.0),
                 presence_penalty: req.presence_penalty.unwrap_or(0.0),
                 eos_token_id: state.eos_token_id.clone(),
+                stop: req.stop.map_or_else(Vec::new, StringOrArray::into_vec),
             },
         )
         .map_err(|e| make_error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()))?;

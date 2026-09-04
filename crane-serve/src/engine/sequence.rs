@@ -58,6 +58,15 @@ pub struct Sequence {
     pub presence_penalty: f32,
     pub repeat_last_n: usize,
 
+    // ── stop sequences ──
+    /// String sequences that terminate generation when produced.
+    pub stop_sequences: Vec<String>,
+    /// Decoded text accumulated since the last successful `take_safe_text`
+    /// call. Used both to detect stop-sequence matches and, via
+    /// `take_safe_text`, to withhold text that could still extend into a
+    /// stop sequence from being streamed to the client.
+    pub unsent_text: String,
+
     // ── response channel ──
     /// Sends `EngineResponse` chunks back to the API handler.
     pub response_tx: mpsc::UnboundedSender<super::EngineResponse>,
@@ -81,7 +90,68 @@ impl Sequence {
         {
             return true;
         }
-        false
+        self.stop_sequence_match().is_some()
+    }
+
+    /// The first stop sequence that `unsent_text` currently ends with, if any.
+    #[must_use]
+    pub fn stop_sequence_match(&self) -> Option<&str> {
+        self.stop_sequences
+            .iter()
+            .find(|s| !s.is_empty() && self.unsent_text.ends_with(s.as_str()))
+            .map(String::as_str)
+    }
+
+    /// Longest suffix of `unsent_text` that is also a prefix of some stop
+    /// sequence. This much text must be withheld from streaming, since a
+    /// later token could still extend it into a full stop-sequence match.
+    fn stop_prefix_overlap(&self) -> usize {
+        let text = self.unsent_text.as_str();
+        let mut max_overlap = 0usize;
+        for stop in &self.stop_sequences {
+            if stop.is_empty() {
+                continue;
+            }
+            let mut boundaries: Vec<usize> = stop.char_indices().map(|(i, _)| i).collect();
+            boundaries.push(stop.len());
+            for k in boundaries {
+                if k == 0 || k > text.len() {
+                    continue;
+                }
+                if text.ends_with(&stop[..k]) {
+                    max_overlap = max_overlap.max(k);
+                }
+            }
+        }
+        max_overlap
+    }
+
+    /// Drains and returns the prefix of `unsent_text` that is safe to stream
+    /// now, withholding any tail that could still extend into a stop
+    /// sequence. Returns `None` if nothing new is safe to send.
+    #[must_use]
+    pub fn take_safe_text(&mut self) -> Option<String> {
+        if self.stop_sequences.is_empty() {
+            return (!self.unsent_text.is_empty()).then(|| std::mem::take(&mut self.unsent_text));
+        }
+        let safe_len = self.unsent_text.len() - self.stop_prefix_overlap();
+        if safe_len == 0 {
+            return None;
+        }
+        Some(self.unsent_text.drain(..safe_len).collect())
+    }
+
+    /// Drains and returns any text preceding a fully-matched stop sequence
+    /// that hasn't been streamed yet. Only meaningful once `should_stop` has
+    /// returned `true` because of a stop-sequence match.
+    #[must_use]
+    pub fn take_pre_stop_text(&mut self) -> Option<String> {
+        let stop_len = self.stop_sequence_match()?.len();
+        let pre_len = self.unsent_text.len() - stop_len;
+        if pre_len == 0 {
+            return None;
+        }
+        Some(self.unsent_text.drain(..pre_len).collect())
     }
 
     /// The KV cache covers tokens `0..start_pos` when we do the next forward.
@@ -120,6 +190,9 @@ impl Sequence {
         {
             return "stop";
         }
+        if self.stop_sequence_match().is_some() {
+            return "stop";
+        }
         "length"
     }
 }
@@ -152,6 +225,8 @@ mod tests {
             top_k: Some(40),
             max_tokens,
             eos_token_id: vec![eos_token_id],
+            stop_sequences: vec![],
+            unsent_text: String::new(),
             repetition_penalty: 1.0,
             frequency_penalty: 0.0,
             presence_penalty: 0.0,
@@ -252,5 +327,131 @@ mod tests {
         assert_eq!(SequenceStatus::Waiting, SequenceStatus::Waiting);
         assert_ne!(SequenceStatus::Waiting, SequenceStatus::Running);
         assert_ne!(SequenceStatus::Running, SequenceStatus::Finished);
+    }
+
+    /// Helper: build a Sequence with stop sequences and accumulated unsent text.
+    fn make_seq_with_stop(stop_sequences: &[&str], unsent_text: &str) -> Sequence {
+        let mut seq = make_seq(&[1, 2], &[10, 11], 100, 999, SequenceStatus::Running);
+        seq.stop_sequences = stop_sequences.iter().map(|s| (*s).to_string()).collect();
+        seq.unsent_text = unsent_text.to_string();
+        seq
+    }
+
+    #[test]
+    fn should_stop_on_stop_sequence() {
+        let seq = make_seq_with_stop(&["```"], "print('hi')\n```");
+        assert!(seq.should_stop());
+    }
+
+    #[test]
+    fn should_not_stop_partial_stop_sequence() {
+        let seq = make_seq_with_stop(&["```"], "print('hi')\n``");
+        assert!(!seq.should_stop());
+    }
+
+    #[test]
+    fn stop_sequence_match_returns_match() {
+        let seq = make_seq_with_stop(&["END", "```"], "some text```");
+        assert_eq!(seq.stop_sequence_match(), Some("```"));
+    }
+
+    #[test]
+    fn stop_sequence_match_none_when_no_match() {
+        let seq = make_seq_with_stop(&["END", "```"], "some text");
+        assert_eq!(seq.stop_sequence_match(), None);
+    }
+
+    #[test]
+    fn finish_reason_stop_sequence() {
+        let seq = make_seq_with_stop(&["```"], "hello```");
+        assert_eq!(seq.finish_reason(), "stop");
+    }
+
+    #[test]
+    fn multiple_stop_sequences_first_match_wins() {
+        let seq = make_seq_with_stop(&["lo", "hello"], "hello");
+        assert_eq!(seq.stop_sequence_match(), Some("lo"));
+    }
+
+    #[test]
+    fn take_safe_text_returns_everything_when_no_stop_sequences() {
+        let mut seq = make_seq_with_stop(&[], "hello world");
+        assert_eq!(seq.take_safe_text(), Some("hello world".to_string()));
+        assert_eq!(seq.unsent_text, "");
+    }
+
+    #[test]
+    fn take_safe_text_withholds_stop_prefix_tail() {
+        // "``" is a proper prefix of "```", so it must be withheld: a later
+        // token could turn it into a full match.
+        let mut seq = make_seq_with_stop(&["```"], "print('hi')\n``");
+        assert_eq!(seq.take_safe_text(), Some("print('hi')\n".to_string()));
+        assert_eq!(seq.unsent_text, "``");
+    }
+
+    #[test]
+    fn take_safe_text_releases_withheld_tail_once_it_cannot_match() {
+        let mut seq = make_seq_with_stop(&["```"], "print('hi')\n``");
+        seq.take_safe_text();
+        // The next token proves the withheld "``" is not becoming a stop
+        // sequence — appending non-matching text should release it all.
+        seq.unsent_text.push_str("x");
+        assert_eq!(seq.take_safe_text(), Some("``x".to_string()));
+    }
+
+    #[test]
+    fn take_safe_text_none_when_everything_withheld() {
+        let mut seq = make_seq_with_stop(&["```"], "``");
+        assert_eq!(seq.take_safe_text(), None);
+        assert_eq!(seq.unsent_text, "``");
+    }
+
+    #[test]
+    fn take_safe_text_ignores_empty_stop_sequence() {
+        let mut seq = make_seq_with_stop(&[""], "hello");
+        assert_eq!(seq.take_safe_text(), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn take_safe_text_handles_utf8_char_boundary() {
+        // Stop sequence contains a multi-byte character; the withheld tail
+        // must land on a valid UTF-8 boundary.
+        let mut seq = make_seq_with_stop(&["→END"], "hello →");
+        assert_eq!(seq.take_safe_text(), Some("hello ".to_string()));
+        assert_eq!(seq.unsent_text, "→");
+    }
+
+    #[test]
+    fn take_pre_stop_text_returns_text_before_match() {
+        let mut seq = make_seq_with_stop(&["```"], "print('hi')\n```");
+        assert_eq!(seq.take_pre_stop_text(), Some("print('hi')\n".to_string()));
+        assert_eq!(seq.unsent_text, "```");
+    }
+
+    #[test]
+    fn take_pre_stop_text_none_when_match_is_whole_text() {
+        let mut seq = make_seq_with_stop(&["```"], "```");
+        assert_eq!(seq.take_pre_stop_text(), None);
+    }
+
+    #[test]
+    fn multi_token_stop_sequence_accumulation() {
+        // Simulate tokens arriving one at a time until the stop sequence
+        // completes across several `take_safe_text` calls.
+        let mut seq = make_seq_with_stop(&["```"], "");
+        let mut streamed = String::new();
+
+        for chunk in ["hi", "\n", "`", "`", "`"] {
+            seq.unsent_text.push_str(chunk);
+            if seq.stop_sequence_match().is_some() {
+                break;
+            }
+            if let Some(text) = seq.take_safe_text() {
+                streamed.push_str(&text);
+            }
+        }
+
+        assert_eq!(streamed, "hi\n");
+        assert_eq!(seq.take_pre_stop_text(), None);
     }
 }

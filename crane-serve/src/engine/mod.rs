@@ -585,6 +585,8 @@ impl InferenceEngine {
             frequency_penalty: req.frequency_penalty,
             presence_penalty: req.presence_penalty,
             repeat_last_n: 64,
+            stop_sequences: req.stop,
+            unsent_text: String::new(),
             response_tx: req.response_tx,
         };
 
@@ -720,11 +722,12 @@ impl InferenceEngine {
             "Prefill complete, first token generated",
         );
 
-        self.send_token(&seq_id, next_token);
+        self.accumulate_token(&seq_id, next_token);
 
         if self.sequences.get(&seq_id).unwrap().should_stop() {
             self.finish_sequence(&seq_id);
         } else {
+            self.flush_pending_text(&seq_id);
             self.scheduler.promote_to_running(seq_id);
         }
     }
@@ -992,7 +995,7 @@ impl InferenceEngine {
                     .total_decode_steps
                     .fetch_add(1, Ordering::Relaxed);
 
-                self.send_token(seq_id, next_token);
+                self.accumulate_token(seq_id, next_token);
 
                 if self.sequences.get(seq_id).is_none_or(Sequence::should_stop) {
                     alive[i] = false;
@@ -1005,6 +1008,8 @@ impl InferenceEngine {
                     warn!(id = %seq_id, "Client disconnected mid-batch-decode");
                     alive[i] = false;
                     pending_cancel.push(seq_id.clone());
+                } else {
+                    self.flush_pending_text(seq_id);
                 }
             }
 
@@ -1116,7 +1121,7 @@ impl InferenceEngine {
                     .total_decode_steps
                     .fetch_add(1, Ordering::Relaxed);
 
-                self.send_token(seq_id, next_token);
+                self.accumulate_token(seq_id, next_token);
 
                 if self.sequences.get(seq_id).is_none_or(Sequence::should_stop) {
                     self.finish_sequence(seq_id);
@@ -1135,6 +1140,8 @@ impl InferenceEngine {
                     self.cleanup_sequence(seq_id);
                     break;
                 }
+
+                self.flush_pending_text(seq_id);
             }
 
             self.swap_out(seq_id);
@@ -1229,7 +1236,11 @@ impl InferenceEngine {
     //  Response sending
     // ─────────────────────────────────────────────────────────
 
-    fn send_token(&mut self, seq_id: &str, token_id: u32) {
+    /// Decodes a newly sampled token and buffers its text on the sequence's
+    /// `unsent_text`, without streaming it yet. Streaming happens separately
+    /// via `flush_pending_text`, once it's confirmed the buffered text isn't
+    /// part of a stop-sequence match still in progress.
+    fn accumulate_token(&mut self, seq_id: &str, token_id: u32) {
         let text = if let Some(stream) = self.token_streams.get_mut(seq_id) {
             match stream.next_token(token_id) {
                 Ok(Some(t)) => t,
@@ -1243,10 +1254,29 @@ impl InferenceEngine {
             return;
         };
 
+        if let Some(seq) = self.sequences.get_mut(seq_id) {
+            seq.unsent_text.push_str(&text);
+        }
+    }
+
+    /// Streams whatever text is currently safe to send for a sequence that
+    /// did not just stop — i.e. any buffered text not withheld as a possible
+    /// stop-sequence prefix. Must only be called after confirming
+    /// `should_stop()` is false, otherwise a completed stop sequence could
+    /// be streamed before `finish_sequence` truncates it.
+    fn flush_pending_text(&mut self, seq_id: &str) {
+        let Some(text) = self
+            .sequences
+            .get_mut(seq_id)
+            .and_then(Sequence::take_safe_text)
+        else {
+            return;
+        };
+
         if let Some(seq) = self.sequences.get(seq_id)
             && seq
                 .response_tx
-                .send(EngineResponse::Token { text, token_id })
+                .send(EngineResponse::Token { text, token_id: 0 })
                 .is_err()
         {
             debug!(id = %seq_id, "Response channel closed (client disconnected)");
@@ -1263,11 +1293,37 @@ impl InferenceEngine {
     }
 
     fn finish_sequence(&mut self, seq_id: &str) {
-        let remaining = self
-            .token_streams
-            .get_mut(seq_id)
-            .and_then(|s| s.decode_rest().ok().flatten())
-            .unwrap_or_default();
+        // A stop sequence has already been produced, so flushing the
+        // tokenizer's remaining buffered text would stream part of the stop
+        // sequence itself to the client. Only the text preceding the match
+        // (already withheld from streaming) is still owed to the client.
+        let stopped_by_stop_sequence = self
+            .sequences
+            .get(seq_id)
+            .is_some_and(|s| s.stop_sequence_match().is_some());
+
+        let remaining = if stopped_by_stop_sequence {
+            self.sequences
+                .get_mut(seq_id)
+                .and_then(Sequence::take_pre_stop_text)
+                .unwrap_or_default()
+        } else {
+            // Flush the text buffered by the token that just triggered
+            // EOS/max-tokens, followed by the tokenizer's withheld UTF-8 tail.
+            let mut remaining = self
+                .sequences
+                .get_mut(seq_id)
+                .map(|s| std::mem::take(&mut s.unsent_text))
+                .unwrap_or_default();
+            if let Some(rest) = self
+                .token_streams
+                .get_mut(seq_id)
+                .and_then(|s| s.decode_rest().ok().flatten())
+            {
+                remaining.push_str(&rest);
+            }
+            remaining
+        };
 
         if !remaining.is_empty()
             && let Some(seq) = self.sequences.get(seq_id)
@@ -1281,11 +1337,23 @@ impl InferenceEngine {
         if let Some(seq) = self.sequences.get(seq_id) {
             let generated_ids = &seq.tokens[seq.prompt_len..];
             let completion_tokens = seq.num_generated();
-            let full_text = self
+            let mut full_text = self
                 .model
                 .tokenizer()
                 .decode(generated_ids, true)
                 .unwrap_or_default();
+
+            if let Some(stop_seq) = seq.stop_sequence_match() {
+                if let Some(pos) = full_text.rfind(stop_seq) {
+                    full_text.truncate(pos);
+                } else {
+                    warn!(
+                        id = %seq_id,
+                        "Stop sequence matched but not found in final decoded text; \
+                         returning untruncated text",
+                    );
+                }
+            }
 
             let finish_reason = seq.finish_reason().to_string();
 

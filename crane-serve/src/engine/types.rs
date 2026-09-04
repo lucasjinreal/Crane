@@ -19,6 +19,8 @@ pub struct EngineRequest {
     pub frequency_penalty: f32,
     pub presence_penalty: f32,
     pub eos_token_id: Vec<u32>,
+    /// String sequences that terminate generation when produced.
+    pub stop: Vec<String>,
     pub response_tx: mpsc::UnboundedSender<EngineResponse>,
 }
 
@@ -46,6 +48,8 @@ pub struct GenerationParams {
     pub presence_penalty: f32,
     /// Token IDs that terminate generation when produced.
     pub eos_token_id: Vec<u32>,
+    /// String sequences that terminate generation when produced.
+    pub stop: Vec<String>,
 }
 
 /// A response chunk from the engine to an API handler.
@@ -96,6 +100,7 @@ impl EngineHandle {
                 frequency_penalty: params.frequency_penalty,
                 presence_penalty: params.presence_penalty,
                 eos_token_id: params.eos_token_id,
+                stop: params.stop,
                 response_tx,
             })
             .map_err(|_| anyhow::anyhow!("Engine thread has shut down"))?;
@@ -141,6 +146,7 @@ mod tests {
                 frequency_penalty: 0.0,
                 presence_penalty: 0.0,
                 eos_token_id: vec![0],
+                stop: vec![],
             },
         );
         assert!(rx.is_ok());
@@ -166,6 +172,7 @@ mod tests {
                 frequency_penalty: 0.0,
                 presence_penalty: 0.0,
                 eos_token_id: vec![0],
+                stop: vec![],
             },
         );
         assert!(result.is_err());
@@ -251,6 +258,7 @@ mod tests {
                     frequency_penalty: 0.3,
                     presence_penalty: 0.2,
                     eos_token_id: vec![2],
+                    stop: vec![],
                 },
             )
             .unwrap();

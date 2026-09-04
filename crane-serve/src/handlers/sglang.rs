@@ -74,6 +74,11 @@ pub async fn generate(
         )
     })?;
 
+    let mut eos_token_id = state.eos_token_id.clone();
+    if let Some(stop_token_ids) = &sp.stop_token_ids {
+        eos_token_id.extend(stop_token_ids);
+    }
+
     let response_rx = engine
         .submit(
             request_id.clone(),
@@ -86,7 +91,11 @@ pub async fn generate(
                 repetition_penalty: sp.repetition_penalty,
                 frequency_penalty: sp.frequency_penalty.unwrap_or(0.0),
                 presence_penalty: sp.presence_penalty.unwrap_or(0.0),
-                eos_token_id: state.eos_token_id.clone(),
+                eos_token_id,
+                stop: sp
+                    .stop
+                    .clone()
+                    .map_or_else(Vec::new, StringOrList::into_vec),
             },
         )
         .map_err(|e| make_error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()))?;
@@ -214,6 +223,7 @@ pub async fn health_generate(
                 frequency_penalty: 0.0,
                 presence_penalty: 0.0,
                 eos_token_id: state.eos_token_id.clone(),
+                stop: vec![],
             },
         )
         .map_err(|e| {

@@ -34,6 +34,8 @@ pub struct ChatCompletionRequest {
     pub messages: Vec<ChatMessage>,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: usize,
+    /// OpenAI's newer alias for `max_tokens`; takes precedence when present.
+    pub max_completion_tokens: Option<usize>,
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
     pub top_k: Option<usize>,
@@ -42,7 +44,7 @@ pub struct ChatCompletionRequest {
     pub stream: bool,
     #[serde(default)]
     pub stream_options: Option<StreamOptions>,
-    pub stop: Option<Vec<String>>,
+    pub stop: Option<StringOrArray>,
     pub frequency_penalty: Option<f32>,
     pub presence_penalty: Option<f32>,
     pub seed: Option<u64>,
@@ -371,6 +373,8 @@ pub struct CompletionRequest {
     pub prompt: StringOrArray,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: usize,
+    /// OpenAI's newer alias for `max_tokens`; takes precedence when present.
+    pub max_completion_tokens: Option<usize>,
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
     pub top_k: Option<usize>,
@@ -379,7 +383,7 @@ pub struct CompletionRequest {
     pub stream: bool,
     #[serde(default)]
     pub stream_options: Option<StreamOptions>,
-    pub stop: Option<Vec<String>>,
+    pub stop: Option<StringOrArray>,
     pub suffix: Option<String>,
     pub echo: Option<bool>,
     pub frequency_penalty: Option<f32>,
@@ -400,6 +404,13 @@ impl StringOrArray {
         match self {
             Self::Single(s) => s.clone(),
             Self::Array(arr) => arr.join(""),
+        }
+    }
+
+    pub fn into_vec(self) -> Vec<String> {
+        match self {
+            Self::Single(s) => vec![s],
+            Self::Array(arr) => arr,
         }
     }
 }
