@@ -49,6 +49,8 @@ mod norm;
 mod projection;
 #[cfg(all(feature = "rocm", not(feature = "cuda")))]
 mod rocm_backend;
+#[cfg(all(feature = "sycl", not(feature = "cuda"), not(feature = "rocm")))]
+mod sycl_backend;
 
 pub use backend::{
     GdnGateConsts, apply_recurrence, compute_beta_g, gated_delta_rule_recurrence, l2_alpha,
@@ -64,3 +66,5 @@ pub use norm::RmsNormGated;
 pub use projection::{GdnInputProjection, GdnInputProjectionKind, GdnProjection};
 #[cfg(all(feature = "rocm", not(feature = "cuda")))]
 pub use rocm_backend::gdn_recurrence_rocm;
+#[cfg(all(feature = "sycl", not(feature = "cuda"), not(feature = "rocm")))]
+pub use sycl_backend::gdn_recurrence_sycl;

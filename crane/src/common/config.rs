@@ -38,6 +38,7 @@ pub enum DeviceConfig {
     Cpu,
     Cuda(u32), // GPU ID
     Rocm(u32), // AMD GPU ID
+    Sycl(u32), // Intel GPU ID (oneAPI / SYCL)
     Metal,
 }
 
@@ -47,6 +48,7 @@ impl std::fmt::Display for DeviceConfig {
             DeviceConfig::Cpu => write!(f, "Cpu"),
             DeviceConfig::Cuda(gpu_id) => write!(f, "Cuda({})", gpu_id),
             DeviceConfig::Rocm(gpu_id) => write!(f, "Rocm({})", gpu_id),
+            DeviceConfig::Sycl(gpu_id) => write!(f, "Sycl({})", gpu_id),
             DeviceConfig::Metal => write!(f, "Metal"),
         }
     }
@@ -79,6 +81,7 @@ mod tests {
         assert_eq!(DeviceConfig::Cpu.to_string(), "Cpu");
         assert_eq!(DeviceConfig::Cuda(2).to_string(), "Cuda(2)");
         assert_eq!(DeviceConfig::Rocm(1).to_string(), "Rocm(1)");
+        assert_eq!(DeviceConfig::Sycl(0).to_string(), "Sycl(0)");
         assert_eq!(DeviceConfig::Metal.to_string(), "Metal");
     }
 }

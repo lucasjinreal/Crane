@@ -85,6 +85,13 @@ cudnn = ["candle-core/cudnn"]
 # AMD ROCm/HIP backend (experimental). candle 0.11 on crates.io has no `rocm`
 # feature, so this can't forward to `candle-core/rocm` yet.
 rocm = []
+# Intel SYCL / oneAPI backend (proof-of-concept). Forwards to the `sycl` feature
+# of the candle fork wired in via `[patch.crates-io]` in the root Cargo.toml.
+sycl = [
+    "candle-core/sycl",
+    "candle-nn/sycl",
+    "candle-transformers/sycl",
+]
 mkl = [
     "dep:intel-mkl-src",
     "candle-core/mkl",

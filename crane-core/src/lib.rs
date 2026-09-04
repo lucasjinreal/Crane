@@ -24,6 +24,7 @@
 //! | `cuda` | Enable CUDA device and custom PTX kernels (requires CUDA toolkit) |
 //! | `accelerate` | Link against Apple Accelerate for CPU BLAS |
 //! | `mkl` | Link against Intel MKL for CPU BLAS |
+//! | `sycl` | Enable the Intel oneAPI / SYCL backend (POC; needs a candle fork, see README) |
 
 pub mod generation;
 pub mod models;

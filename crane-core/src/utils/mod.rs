@@ -17,6 +17,12 @@ pub fn select_device(force_cpu: bool) -> Result<Device> {
     } else if metal_is_available() {
         Ok(Device::new_metal(0)?)
     } else {
+        // Intel oneAPI / SYCL (proof-of-concept). Only reachable when built
+        // `--features sycl` against the candle fork that provides the backend.
+        #[cfg(feature = "sycl")]
+        if candle_core::utils::sycl_is_available() {
+            return Ok(Device::new_sycl(0)?);
+        }
         Ok(Device::Cpu)
     }
 }

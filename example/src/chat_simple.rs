@@ -16,9 +16,21 @@ fn main() -> CraneResult<()> {
     let (device, dtype) = (DeviceConfig::Cuda(0), DataType::F16);
     #[cfg(all(not(feature = "cuda"), feature = "rocm"))]
     let (device, dtype) = (DeviceConfig::Rocm(0), DataType::F16);
-    #[cfg(all(not(feature = "cuda"), not(feature = "rocm"), target_os = "macos"))]
+    #[cfg(all(not(feature = "cuda"), not(feature = "rocm"), feature = "sycl"))]
+    let (device, dtype) = (DeviceConfig::Sycl(0), DataType::F16);
+    #[cfg(all(
+        not(feature = "cuda"),
+        not(feature = "rocm"),
+        not(feature = "sycl"),
+        target_os = "macos"
+    ))]
     let (device, dtype) = (DeviceConfig::Metal, DataType::F16);
-    #[cfg(all(not(feature = "cuda"), not(feature = "rocm"), not(target_os = "macos")))]
+    #[cfg(all(
+        not(feature = "cuda"),
+        not(feature = "rocm"),
+        not(feature = "sycl"),
+        not(target_os = "macos")
+    ))]
     let (device, dtype) = (DeviceConfig::Cpu, DataType::F32);
 
     let config = ChatConfig {

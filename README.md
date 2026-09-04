@@ -288,6 +288,43 @@ Current limitations:
   prompt lengths from one process makes exhaustion likelier, because the caching allocator
   retains a bucket set per shape it has seen.
 
+#### Intel GPU / SYCL (proof-of-concept)
+
+SYCL/oneAPI support targets Intel GPUs. candle 0.11 on crates.io has no `sycl`
+feature, so the root `Cargo.toml` `[patch.crates-io]` points
+`candle-core`/`candle-nn`/`candle-transformers` at
+[`Hahihula/candle`](https://github.com/Hahihula/candle) — candle 0.11.0 plus an
+**off-by-default** `sycl` feature (native rms_norm / softmax / rope / sigmoid
+kernels + a small `pub` launch surface). With `sycl` off that fork is stock
+candle, so CPU/CUDA/Metal builds are unchanged. POC only, not for `main`.
+
+Needs the Intel oneAPI toolchain (`icpx`, oneMKL) and the Level-Zero GPU runtime;
+the `intel/oneapi-basekit` image bundles both, and `--device /dev/dri` exposes an
+Intel GPU (`sycl-ls` should list a `level_zero:gpu` entry). `--features sycl`
+selects `DeviceConfig::Sycl(0)` in the examples / `crane-serve` device ladder
+(`Device::new_sycl`) and builds `crane-core/kernels/sycl/gdn.cpp` into
+`libcrane_gdn_sycl.so` — a **fused Gated Delta Net recurrence** kernel, the SYCL
+counterpart of `kernels/cuda/gdn.cu`.
+
+```bash
+source /opt/intel/oneapi/setvars.sh          # skip inside the oneAPI container
+cargo build --release --features sycl
+cargo run  --release --features sycl -p crane-examples --bin chat_cli -- \
+    -m /path/to/Qwen3.5-0.8B
+```
+
+`libcandle_sycl.so` / `libcrane_gdn_sycl.so` are linked by rpath into an rlib and
+that rpath doesn't reach the final binary, so add their `OUT_DIR`s to
+`LD_LIBRARY_PATH` when running (do not clobber the image's oneAPI paths). A
+one-shot containerised build/run/test recipe that handles all of this lives in
+[`contrib/sycl/`](contrib/sycl/).
+
+Verified on an Intel Arc iGPU (Meteor Lake): `Qwen3-0.6B` (dense) and
+**`Qwen3.5-0.8B`** (hybrid GDN + attention) generate coherent text. The fused GDN
+kernel matches the portable reference (`cos = 1.0`, `--test sycl_kernels`) and is
+~15% faster at decode (3.8 → 4.4 tok/s); `CRANE_GDN_PORTABLE=1` forces the
+op-by-op path. It's a naive v0 (no shared-memory staging), so there is headroom.
+
 ### OpenAI API Server
 
 Start a server compatible with OpenAI SDK and SGLang client:

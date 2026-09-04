@@ -38,6 +38,20 @@ impl AsrClient {
                     ));
                 }
             },
+            DeviceConfig::Sycl(_gpu_id) => {
+                #[cfg(feature = "sycl")]
+                {
+                    crane_core::models::Device::new_sycl(*_gpu_id as usize)
+                        .map_err(|e| CraneError::ModelError(e.to_string()))?
+                }
+                #[cfg(not(feature = "sycl"))]
+                {
+                    return Err(CraneError::ConfigError(
+                        "SYCL device requested but crane was built without --features sycl"
+                            .to_string(),
+                    ));
+                }
+            },
             DeviceConfig::Metal => {
                 #[cfg(target_os = "macos")]
                 {
