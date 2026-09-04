@@ -6,8 +6,9 @@ pub mod streamer;
 pub struct SpeechOptions {
     /// Maximum number of codec frames to generate before stopping.
     pub max_new_tokens: usize,
-    /// Sampling temperature; higher values increase randomness.
-    pub temperature: f64,
+    /// Sampling temperature; higher values increase randomness. `None` lets
+    /// each model apply its own default.
+    pub temperature: Option<f64>,
     /// Nucleus sampling threshold; `None` disables top-p filtering.
     pub top_p: Option<f64>,
     /// Repetition penalty applied to previously generated tokens; `1.0` means no penalty.
@@ -26,7 +27,7 @@ impl Default for SpeechOptions {
     fn default() -> Self {
         Self {
             max_new_tokens: 8192,
-            temperature: 0.9,
+            temperature: None,
             top_p: None,
             repetition_penalty: 1.05,
             cfm_steps: None,

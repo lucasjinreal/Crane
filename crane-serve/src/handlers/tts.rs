@@ -27,7 +27,8 @@ pub struct TtsGenerateRequest {
     pub language: String,
     pub instructions: Option<String>,
     pub response_format: AudioResponseFormat,
-    pub temperature: f64,
+    /// `None` lets the model apply its own default.
+    pub temperature: Option<f64>,
     pub top_p: Option<f64>,
     pub repetition_penalty: f32,
     pub max_tokens: usize,
@@ -102,7 +103,6 @@ pub async fn speech(
         },
     }
 
-    let temperature = req.temperature.unwrap_or(0.9);
     let repetition_penalty = req.repetition_penalty.unwrap_or(1.05);
     let language = req.language.clone().unwrap_or_else(|| "auto".to_string());
 
@@ -177,7 +177,7 @@ pub async fn speech(
             language,
             instructions: req.instructions,
             response_format: req.response_format,
-            temperature,
+            temperature: req.temperature,
             top_p: req.top_p,
             repetition_penalty,
             max_tokens: req.max_tokens,
@@ -255,7 +255,7 @@ pub async fn speech(
         language,
         instructions: req.instructions,
         response_format: req.response_format,
-        temperature,
+        temperature: req.temperature,
         top_p: req.top_p,
         repetition_penalty,
         max_tokens: req.max_tokens,

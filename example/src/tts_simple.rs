@@ -119,7 +119,7 @@ fn run_voice_clone(
         let output_path = format!("{output_dir}/{filename}");
         let opts = crane_core::generation::SpeechOptions {
             max_new_tokens: 2048,
-            temperature: 0.9,
+            temperature: Some(0.9),
             top_p: Some(1.0),
             repetition_penalty: 1.05,
             ..Default::default()
@@ -175,7 +175,7 @@ fn run_custom_voice(
         let output_path = format!("{output_dir}/{filename}");
         let opts = crane_core::generation::SpeechOptions {
             max_new_tokens: 2048,
-            temperature: 0.9,
+            temperature: Some(0.9),
             top_p: Some(1.0),
             repetition_penalty: 1.05,
             ..Default::default()

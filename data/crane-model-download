@@ -212,6 +212,18 @@ MODELS = {
         },
         "description": "VoxCPM2, tokenizer-free diffusion TTS, voice cloning + prompt cache (Apache-2.0)",
     },
+    "audio8-tts-0.1b-onnx-int8": {
+        "repo_id": "Audio8/audio8-TTS-0.1B-ONNX-INT8",
+        "dirname": "Audio8-TTS-0.1B-ONNX-INT8",
+        "kind": "tts",
+        "description": "Audio8-TTS 0.1B ONNX INT8, CPU-friendly zero-shot voice cloning (Apache-2.0)",
+    },
+    "audio8-tts-0.6b-onnx-int4": {
+        "repo_id": "Audio8/Audio8-TTS-Preview-0.6B-ONNX-INT4",
+        "dirname": "Audio8-TTS-Preview-0.6B-ONNX-INT4",
+        "kind": "tts",
+        "description": "Audio8-TTS 0.6B ONNX INT4, CPU-friendly zero-shot voice cloning (Apache-2.0)",
+    },
     "muscriptor-small": {
         "repo_id": "MuScriptor/muscriptor-small",
         "dirname": "muscriptor-small",
