@@ -14,6 +14,7 @@ Examples:
     ./crane-model-download --model qwen3.5-9b-gguf --path ~/models --quant Q8_0
     ./crane-model-download --model g2p-lexicons --path ~/models
     ./crane-model-download --model kokoro --path ~/models
+    ./crane-model-download --model kugelaudio --path ~/models
 
 Run directly (uv picks up the inline metadata above and manages the
 `huggingface_hub` dependency in an ephemeral venv, no setup needed):
@@ -230,6 +231,30 @@ MODELS = {
         "kind": "amt",
         "description": "MuScriptor large (~1.3B), audio-to-MIDI transcription, best quality (CC-BY-NC-4.0, gated)",
     },
+    "kugelaudio": {
+        "repo_id": "kugelaudio/kugelaudio-0-open",
+        "dirname": "kugelaudio-0-open",
+        "kind": "tts",
+        # The checkpoint ships no tokenizer of its own (its processor loads
+        # a Qwen2-VL-family tokenizer by default -- plain Qwen2.5's doesn't
+        # define the <|vision_start/end/pad|> ids this port hardcodes as
+        # speech control tokens). Pulled from a second repo into the same
+        # directory so `--tokenizer <dirname>/tokenizer.json` just works.
+        # See crane_core::models::kugelaudio::prompt's doc comment.
+        "extra_files": {
+            "Qwen/Qwen2-VL-2B-Instruct": {
+                "tokenizer.json": "tokenizer.json",
+            },
+        },
+        # Not wired into crane-serve yet (no ModelType::KugelAudio /
+        # model_factory / tts_tx routing) -- only the standalone example
+        # binary can run it so far.
+        "usage_hint": (
+            "cargo run -p crane-examples --release --features cuda "
+            "--bin kugelaudio_simple -- {target} --tokenizer {target}/tokenizer.json"
+        ),
+        "description": "KugelAudio, Qwen2-backbone AR + diffusion-head TTS, voice cloning via reference audio (MIT)",
+    },
 }
 
 _VALID_KINDS = ("tts", "asr", "vad", "llm", "g2p", "vlm", "omni", "amt")
@@ -272,7 +297,9 @@ def download_url_files(info, local_dir):
 
 
 def print_done(info, target):
-    if info["kind"] == "amt":
+    if "usage_hint" in info:
+        print(f"\nDone. Use with: {info['usage_hint'].format(target=target)}")
+    elif info["kind"] == "amt":
         # MuScriptor isn't served through crane-serve — it's a standalone
         # CLI, so the generic crane-serve hint below would be actively
         # wrong here rather than just imprecise.
@@ -399,7 +426,8 @@ def main():
         "  crane-model-download --model qwen3.5-9b-gguf --path ~/models --quant Q8_0\n"
         "  crane-model-download --model g2p-lexicons --path ~/models\n"
         "  crane-model-download --model g2p-oov-en-us --path ~/models\n"
-        "  crane-model-download --model kokoro --path ~/models\n",
+        "  crane-model-download --model kokoro --path ~/models\n"
+        "  crane-model-download --model kugelaudio --path ~/models\n",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     group = parser.add_mutually_exclusive_group(required=True)

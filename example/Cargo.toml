@@ -19,6 +19,7 @@ futures-util = "0.3"
 base64 = "0.22"
 hound = "3"
 cpal = "0.18"
+tokenizers = { workspace = true }
 
 [[bin]]
 name = "chat_simple"
@@ -103,6 +104,10 @@ path = "src/minicpmo_duplex_simple.rs"
 [[bin]]
 name = "muscriptor_transcribe"
 path = "src/muscriptor_transcribe.rs"
+
+[[bin]]
+name = "kugelaudio_simple"
+path = "src/kugelaudio_simple.rs"
 
 [features]
 default = []
