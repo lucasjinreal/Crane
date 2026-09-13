@@ -4,6 +4,7 @@ mod compat;
 mod constant_fold;
 mod eliminate;
 pub(crate) mod fuse_atan2;
+pub(crate) mod fuse_quantized_linear;
 pub(crate) mod fuse_snake;
 
 use std::collections::{HashMap, HashSet};
@@ -44,6 +45,9 @@ pub struct OptimizationReport {
     pub fused_atan2_nodes: usize,
     /// Number of decomposed `Snake` activation patterns fused into single nodes.
     pub fused_snake_nodes: usize,
+    /// Number of `DynamicQuantizeLinear`/`MatMulInteger`/`DequantizeLinear`
+    /// patterns erased in favor of a pre-dequantized `Gather`/`MatMul`.
+    pub dequantized_int8_nodes: usize,
     /// DCE is skipped when graph-valued attributes may capture outer values.
     pub skipped_dce_for_subgraphs: bool,
 }
@@ -64,6 +68,13 @@ pub(crate) fn optimize(
     compat::rewrite_unsupported_ops(graph)
         .map_err(|err| candle_core::Error::Msg(err.to_string()))?;
 
+    // Also unconditional: without this, `eval.rs`'s missing
+    // `DynamicQuantizeLinear`/`MatMulInteger`/`DequantizeLinear` support
+    // would make INT8-quantized graphs (e.g. Audio8-TTS) fail to evaluate
+    // at all, optimizations disabled or not.
+    report.dequantized_int8_nodes +=
+        fuse_quantized_linear::fuse_quantized_linear(graph, constants)?;
+
     if !options.optimize {
         report.final_nodes = graph.node.len();
         return Ok(report);
@@ -76,9 +87,15 @@ pub(crate) fn optimize(
     for _ in 0..options.max_optimization_passes {
         let folded = constant_fold::fold_constants(graph, constants, options.max_folded_elements)?;
         let aliases = eliminate::eliminate_alias_nodes(graph);
+        // Re-run: constant folding/alias elimination can turn an
+        // indirection (Identity/Transpose/Cast) between a static
+        // initializer and a quantized op into a direct reference, which
+        // this pass otherwise only sees on its first, pre-fold pass.
+        let dequantized = fuse_quantized_linear::fuse_quantized_linear(graph, constants)?;
         report.folded_nodes += folded;
         report.removed_alias_nodes += aliases;
-        if folded == 0 && aliases == 0 {
+        report.dequantized_int8_nodes += dequantized;
+        if folded == 0 && aliases == 0 && dequantized == 0 {
             break;
         }
     }

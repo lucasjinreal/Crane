@@ -4,6 +4,11 @@
 //! Kokoro backbone's `ISTFTNet` vocoder, which pads its overlap-add
 //! reconstruction window edges by replicating the border sample instead of
 //! reflecting.
+//!
+//! Crane Added 20260827: `mode="constant"` (the ONNX default), needed by
+//! Audio8-TTS's codec decoder, whose upsampling depthwise convolutions pad
+//! with a constant (defaulting to `0`, per spec, when `constant_value` is
+//! omitted).
 
 use candle_core::{Result, Tensor, bail};
 
@@ -15,13 +20,48 @@ fn zigzag(min: i64, max: i64) -> impl Iterator<Item = i64> {
     std::iter::repeat((min..max).chain((min + 1..=max).rev())).flatten()
 }
 
+/// Validates and reshapes `mode="constant"`'s optional `constant_value`
+/// input into a 0-D scalar, checking it's a single element matching `data`'s
+/// dtype (per the ONNX spec) rather than silently reshaping/casting it.
+fn constant_fill_value(
+    node: &NodeProto,
+    data: &Tensor,
+    constant_value: Option<&Tensor>,
+) -> Result<Option<Tensor>> {
+    let Some(v) = constant_value else {
+        return Ok(None);
+    };
+    if v.elem_count() != 1 {
+        bail!(
+            "Pad mode=\"constant\" expects 'constant_value' to be a scalar, got shape {:?} for Pad node {:?}",
+            v.dims(),
+            node.name
+        );
+    }
+    if v.dtype() != data.dtype() {
+        bail!(
+            "Pad mode=\"constant\" expects 'constant_value' dtype to match 'data' dtype {:?}, got {:?} for Pad node {:?}",
+            data.dtype(),
+            v.dtype(),
+            node.name
+        );
+    }
+    Ok(Some(v.reshape(())?))
+}
+
 /// ONNX `Pad`: <https://onnx.ai/onnx/operators/onnx__Pad.html>.
 ///
-/// Only `mode="reflect"` and `mode="edge"` are implemented; any other mode
-/// (including the ONNX default, `"constant"`) is rejected. Negative `pads`
-/// values (cropping) are also rejected rather than silently computing a
-/// bogus output length.
-pub(crate) fn pad(node: &NodeProto, data: &Tensor, pads: &Tensor, mode: &str) -> Result<Tensor> {
+/// `mode="constant"` (using `constant_value` if given, else `0`),
+/// `mode="reflect"`, and `mode="edge"` are implemented; any other mode is
+/// rejected. Negative `pads` values (cropping) are also rejected rather than
+/// silently computing a bogus output length.
+pub(crate) fn pad(
+    node: &NodeProto,
+    data: &Tensor,
+    pads: &Tensor,
+    mode: &str,
+    constant_value: Option<&Tensor>,
+) -> Result<Tensor> {
     if pads.rank() != 1 {
         bail!("Pad expects 'pads' input to be 1D vector: {pads:?}");
     }
@@ -40,6 +80,42 @@ pub(crate) fn pad(node: &NodeProto, data: &Tensor, pads: &Tensor, mode: &str) ->
     let (pads_pre, pads_post) = pads.split_at(pads.len() / 2);
 
     match mode {
+        "constant" => {
+            let fill = constant_fill_value(node, data, constant_value)?;
+            let filler = |dims: Vec<usize>| -> Result<Tensor> {
+                match &fill {
+                    Some(fill) => {
+                        Tensor::ones(dims, data.dtype(), data.device())?.broadcast_mul(fill)
+                    },
+                    None => Tensor::zeros(dims, data.dtype(), data.device()),
+                }
+            };
+            let mut out = data.clone();
+            for (i, _) in data.dims().iter().enumerate().rev() {
+                if pads_pre[i] == 0 && pads_post[i] == 0 {
+                    continue;
+                }
+                // `pads_pre`/`pads_post` were already checked non-negative
+                // above, so these i64->usize casts never lose the sign;
+                // pad counts stay far below either type's range.
+                #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                let (pre_count, post_count) = (pads_pre[i] as usize, pads_post[i] as usize);
+                let mut pieces = Vec::with_capacity(3);
+                if pre_count > 0 {
+                    let mut dims = out.dims().to_vec();
+                    dims[i] = pre_count;
+                    pieces.push(filler(dims)?);
+                }
+                pieces.push(out.clone());
+                if post_count > 0 {
+                    let mut dims = out.dims().to_vec();
+                    dims[i] = post_count;
+                    pieces.push(filler(dims)?);
+                }
+                out = Tensor::cat(&pieces, i)?;
+            }
+            Ok(out)
+        },
         "reflect" => {
             let mut out = data.clone();
             for (i, &dim) in data.dims().iter().enumerate().rev() {
@@ -130,7 +206,7 @@ mod tests {
         let x = Tensor::new(&[1.0f32, 2.0, 3.0], &Device::Cpu)?;
         let pads = Tensor::new(&[2i64, 1], &Device::Cpu)?;
 
-        let y = pad(&node, &x, &pads, "edge")?;
+        let y = pad(&node, &x, &pads, "edge", None)?;
 
         assert_eq!(y.to_vec1::<f32>()?, vec![1.0, 1.0, 1.0, 2.0, 3.0, 3.0]);
         Ok(())
@@ -145,7 +221,7 @@ mod tests {
         // pads = [pre_axis0, pre_axis1, post_axis0, post_axis1]
         let pads = Tensor::new(&[1i64, 0, 0, 1], &Device::Cpu)?;
 
-        let y = pad(&node, &x, &pads, "edge")?;
+        let y = pad(&node, &x, &pads, "edge", None)?;
 
         assert_eq!(
             y.to_vec2::<f32>()?,
@@ -166,7 +242,7 @@ mod tests {
         let x = Tensor::zeros((0,), DType::F32, &Device::Cpu)?;
         let pads = Tensor::new(&[1i64, 1], &Device::Cpu)?;
 
-        assert!(pad(&node, &x, &pads, "edge").is_err());
+        assert!(pad(&node, &x, &pads, "edge", None).is_err());
         Ok(())
     }
 
@@ -179,7 +255,68 @@ mod tests {
         let x = Tensor::new(&[1.0f32, 2.0, 3.0], &Device::Cpu)?;
         let pads = Tensor::new(&[-1i64, 0], &Device::Cpu)?;
 
-        assert!(pad(&node, &x, &pads, "edge").is_err());
+        assert!(pad(&node, &x, &pads, "edge", None).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn pad_constant_mode_defaults_to_zero() -> Result<()> {
+        // With no `constant_value` given, ONNX defaults the fill to 0.
+        let node = pad_node();
+        let x = Tensor::new(&[1.0f32, 2.0, 3.0], &Device::Cpu)?;
+        let pads = Tensor::new(&[2i64, 1], &Device::Cpu)?;
+
+        let y = pad(&node, &x, &pads, "constant", None)?;
+
+        assert_eq!(y.to_vec1::<f32>()?, vec![0.0, 0.0, 1.0, 2.0, 3.0, 0.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn pad_constant_mode_uses_given_value() -> Result<()> {
+        // An explicit `constant_value` fills the padded region instead of 0.
+        let node = pad_node();
+        let x = Tensor::new(&[[1.0f32, 2.0], [3.0, 4.0]], &Device::Cpu)?;
+        // pads = [pre_axis0, pre_axis1, post_axis0, post_axis1]
+        let pads = Tensor::new(&[1i64, 0, 0, 1], &Device::Cpu)?;
+        let fill = Tensor::new(-1.0f32, &Device::Cpu)?;
+
+        let y = pad(&node, &x, &pads, "constant", Some(&fill))?;
+
+        assert_eq!(
+            y.to_vec2::<f32>()?,
+            vec![
+                vec![-1.0, -1.0, -1.0],
+                vec![1.0, 2.0, -1.0],
+                vec![3.0, 4.0, -1.0],
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pad_constant_mode_dtype_mismatch_errors() -> Result<()> {
+        // `constant_value` must share `data`'s dtype per the ONNX spec; a
+        // mismatch must error rather than silently coerce.
+        let node = pad_node();
+        let x = Tensor::new(&[1.0f32, 2.0, 3.0], &Device::Cpu)?;
+        let pads = Tensor::new(&[1i64, 0], &Device::Cpu)?;
+        let fill = Tensor::new(1i64, &Device::Cpu)?;
+
+        assert!(pad(&node, &x, &pads, "constant", Some(&fill)).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn pad_constant_mode_non_scalar_value_errors() -> Result<()> {
+        // `constant_value` must be a scalar; a multi-element tensor must
+        // error rather than panic in `reshape`.
+        let node = pad_node();
+        let x = Tensor::new(&[1.0f32, 2.0, 3.0], &Device::Cpu)?;
+        let pads = Tensor::new(&[1i64, 0], &Device::Cpu)?;
+        let fill = Tensor::new(&[1.0f32, 2.0], &Device::Cpu)?;
+
+        assert!(pad(&node, &x, &pads, "constant", Some(&fill)).is_err());
         Ok(())
     }
 }

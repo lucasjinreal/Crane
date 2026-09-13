@@ -56,6 +56,7 @@ rustfft = "6"
 image = "0.25"
 half = "2"
 prost = { version = "0.14.3", optional = true }
+memmap2 = { version = "0.9", optional = true }
 
 # candle-core = { workspace = true, features = ["accelerate"] }
 
@@ -97,7 +98,7 @@ accelerate = [
     "candle-nn/accelerate",
     "candle-transformers/accelerate",
 ]
-onnx = ["dep:prost", "dep:prost-build", "dep:lru", "dep:aho-corasick", "dep:unicode-normalization"]
+onnx = ["dep:prost", "dep:prost-build", "dep:lru", "dep:aho-corasick", "dep:unicode-normalization", "dep:memmap2"]
 [dev-dependencies]
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }

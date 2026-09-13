@@ -1457,13 +1457,14 @@ impl Qwen3TTSModel {
             .forward_embeds(&prefill_embeds, Some(&causal_mask), 0)?;
 
         let eos_token_id = self.config.talker_config.codec_eos_token_id as u32;
+        let temperature = opts.temperature.unwrap_or(0.9);
         let mut all_codes = Vec::new();
         let mut logits_processor = candle_transformers::generation::LogitsProcessor::from_sampling(
             42,
             candle_transformers::generation::Sampling::TopKThenTopP {
                 k: 50,
                 p: opts.top_p.unwrap_or(1.0),
-                temperature: opts.temperature,
+                temperature,
             },
         );
 
@@ -1530,7 +1531,7 @@ impl Qwen3TTSModel {
                 first_code,
                 &self.talker.codec_embedding,
                 &self.device,
-                opts.temperature,
+                temperature,
                 opts.top_p,
             )?;
 
@@ -1575,7 +1576,7 @@ impl Qwen3TTSModel {
                 opts.max_new_tokens,
                 trailing_len,
                 opts.top_p.unwrap_or(1.0),
-                opts.temperature,
+                temperature,
                 opts.repetition_penalty,
             );
             if let Some(first_frame) = all_codes.first() {
@@ -1623,12 +1624,13 @@ impl Qwen3TTSModel {
             .forward_embeds(&prefill_embeds, Some(&causal_mask), 0)?;
 
         let eos_token_id = self.config.talker_config.codec_eos_token_id as u32;
+        let temperature = opts.temperature.unwrap_or(0.9);
         let logits_processor = LogitsProcessor::from_sampling(
             42,
             candle_transformers::generation::Sampling::TopKThenTopP {
                 k: 50,
                 p: opts.top_p.unwrap_or(1.0),
-                temperature: opts.temperature,
+                temperature,
             },
         );
 
@@ -1661,7 +1663,7 @@ impl Qwen3TTSModel {
             trailing_len,
             tts_pad_embed,
             repetition_penalty: opts.repetition_penalty,
-            temperature: opts.temperature,
+            temperature,
             top_p: opts.top_p,
         })
     }
@@ -1863,13 +1865,14 @@ impl Qwen3TTSModel {
 
         // ── Phase 3: Autoregressive generation ─────────────────────────
         let eos_token_id = self.config.talker_config.codec_eos_token_id as u32;
+        let temperature = opts.temperature.unwrap_or(0.9);
         let mut all_codes = Vec::new();
         let mut logits_processor = candle_transformers::generation::LogitsProcessor::from_sampling(
             42,
             candle_transformers::generation::Sampling::TopKThenTopP {
                 k: 50,
                 p: opts.top_p.unwrap_or(1.0),
-                temperature: opts.temperature,
+                temperature,
             },
         );
 
@@ -1987,7 +1990,7 @@ impl Qwen3TTSModel {
                 first_code,
                 &self.talker.codec_embedding,
                 &self.device,
-                opts.temperature,
+                temperature,
                 opts.top_p,
             )?;
 

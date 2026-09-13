@@ -1,4 +1,6 @@
 #[cfg(feature = "onnx")]
+pub mod audio8_tts;
+#[cfg(feature = "onnx")]
 pub mod g2p;
 #[cfg(feature = "onnx")]
 pub mod kokoro_tts;
