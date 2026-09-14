@@ -56,7 +56,10 @@ mod tests {
         };
         t.insert("fc1.weight".into(), fill(&[output_dim, input_dim]));
         t.insert("fc1.bias".into(), fill(&[output_dim]));
-        t.insert("norm.weight".into(), Tensor::ones(output_dim, DType::F32, &device).unwrap());
+        t.insert(
+            "norm.weight".into(),
+            Tensor::ones(output_dim, DType::F32, &device).unwrap(),
+        );
         t.insert("fc2.weight".into(), fill(&[output_dim, output_dim]));
         t.insert("fc2.bias".into(), fill(&[output_dim]));
         let vb = VarBuilder::from_tensors(t, DType::F32, &device);

@@ -43,7 +43,9 @@ fn timestep_embedding(t: &Tensor, dim: usize, device: &candle_core::Device) -> R
     let freqs = Tensor::from_vec(freqs, half, device)?;
     let t = t.to_dtype(candle_core::DType::F32)?;
     let n = t.dim(0)?;
-    let args = t.reshape((n, 1))?.broadcast_mul(&freqs.reshape((1, half))?)?;
+    let args = t
+        .reshape((n, 1))?
+        .broadcast_mul(&freqs.reshape((1, half))?)?;
     Tensor::cat(&[args.cos()?, args.sin()?], D::Minus1)
 }
 
@@ -62,7 +64,8 @@ impl TimestepEmbedder {
     }
 
     fn forward(&self, t: &Tensor, device: &candle_core::Device) -> Result<Tensor> {
-        let t_freq = timestep_embedding(t, FREQUENCY_EMBEDDING_SIZE, device)?.to_dtype(self.mlp0.weight().dtype())?;
+        let t_freq = timestep_embedding(t, FREQUENCY_EMBEDDING_SIZE, device)?
+            .to_dtype(self.mlp0.weight().dtype())?;
         let h = self.mlp0.forward(&t_freq)?.silu()?;
         self.mlp2.forward(&h)
     }
@@ -101,7 +104,13 @@ struct HeadLayer {
 }
 
 impl HeadLayer {
-    fn load(embed_dim: usize, ffn_dim: usize, cond_dim: usize, norm_eps: f64, vb: VarBuilder) -> Result<Self> {
+    fn load(
+        embed_dim: usize,
+        ffn_dim: usize,
+        cond_dim: usize,
+        norm_eps: f64,
+        vb: VarBuilder,
+    ) -> Result<Self> {
         Ok(Self {
             ffn: FeedForwardNetwork::load(embed_dim, ffn_dim, vb.pp("ffn"))?,
             norm: RmsNorm::new(embed_dim, norm_eps, vb.pp("norm"))?,
@@ -135,7 +144,13 @@ struct FinalLayer {
 }
 
 impl FinalLayer {
-    fn load(hidden_size: usize, output_size: usize, cond_size: usize, norm_eps: f64, vb: VarBuilder) -> Result<Self> {
+    fn load(
+        hidden_size: usize,
+        output_size: usize,
+        cond_size: usize,
+        norm_eps: f64,
+        vb: VarBuilder,
+    ) -> Result<Self> {
         Ok(Self {
             norm_eps,
             hidden_size,
@@ -176,7 +191,8 @@ impl DiffusionHead {
     pub fn load(cfg: &DiffusionHeadConfig, vb: VarBuilder) -> Result<Self> {
         let cond_dim = cfg.hidden_size;
         let ffn_dim = (cfg.hidden_size as f64 * cfg.head_ffn_ratio).round() as usize;
-        let noisy_images_proj = linear_no_bias(cfg.latent_size, cfg.hidden_size, vb.pp("noisy_images_proj"))?;
+        let noisy_images_proj =
+            linear_no_bias(cfg.latent_size, cfg.hidden_size, vb.pp("noisy_images_proj"))?;
         let cond_proj = linear_no_bias(cfg.hidden_size, cond_dim, vb.pp("cond_proj"))?;
         let t_embedder = TimestepEmbedder::load(cond_dim, vb.pp("t_embedder"))?;
         let vb_layers = vb.pp("layers");
@@ -212,7 +228,12 @@ impl DiffusionHead {
     /// latent's generating position. Returns `[N, latent_size]` — the
     /// predicted noise/velocity (interpretation depends on
     /// `diffusion_head_config.prediction_type`; see `dpm_solver.rs`).
-    pub fn forward(&self, noisy_latents: &Tensor, timesteps: &Tensor, condition: &Tensor) -> Result<Tensor> {
+    pub fn forward(
+        &self,
+        noisy_latents: &Tensor,
+        timesteps: &Tensor,
+        condition: &Tensor,
+    ) -> Result<Tensor> {
         let x = self.noisy_images_proj.forward(noisy_latents)?;
         let t = self.t_embedder.forward(timesteps, x.device())?;
         let cond = self.cond_proj.forward(condition)?;
@@ -272,7 +293,10 @@ mod tests {
             t.insert(format!("{p}.adaLN_modulation.1.weight"), fill(&[3 * h, h]));
         }
         t.insert("final_layer.linear.weight".into(), fill(&[l, h]));
-        t.insert("final_layer.adaLN_modulation.1.weight".into(), fill(&[2 * h, h]));
+        t.insert(
+            "final_layer.adaLN_modulation.1.weight".into(),
+            fill(&[2 * h, h]),
+        );
 
         VarBuilder::from_tensors(t, DType::F32, device)
     }
@@ -286,7 +310,42 @@ mod tests {
 
         let n = 5usize;
         let noisy = Tensor::rand(-1f32, 1f32, (n, cfg.latent_size), &device).unwrap();
-        let t = Tensor::from_vec((0..n).map(|i| i as f32 * 50.0).collect::<Vec<_>>(), n, &device).unwrap();
+        let t = Tensor::from_vec(
+            (0..n).map(|i| i as f32 * 50.0).collect::<Vec<_>>(),
+            n,
+            &device,
+        )
+        .unwrap();
+        let cond = Tensor::rand(-1f32, 1f32, (n, cfg.hidden_size), &device).unwrap();
+
+        let out = head.forward(&noisy, &t, &cond).expect("forward");
+        assert_eq!(out.dims(), &[n, cfg.latent_size]);
+        let max_abs: f32 = out.abs().unwrap().max_all().unwrap().to_scalar().unwrap();
+        assert!(max_abs.is_finite());
+    }
+
+    /// Same forward pass on Metal (skipped where Metal isn't available,
+    /// e.g. non-macOS CI) — the adaLN modulation/SiLU/RMSNorm ops here have
+    /// no CUDA-only equivalent, but this is the one place that actually
+    /// exercises them on the Metal backend rather than just Cpu.
+    #[test]
+    fn forward_shape_and_finite_on_metal() {
+        if !candle_core::utils::metal_is_available() {
+            return;
+        }
+        let device = Device::new_metal(0).expect("metal device");
+        let cfg = small_cfg();
+        let vb = make_vb(&cfg, &device);
+        let head = DiffusionHead::load(&cfg, vb).expect("load");
+
+        let n = 5usize;
+        let noisy = Tensor::rand(-1f32, 1f32, (n, cfg.latent_size), &device).unwrap();
+        let t = Tensor::from_vec(
+            (0..n).map(|i| i as f32 * 50.0).collect::<Vec<_>>(),
+            n,
+            &device,
+        )
+        .unwrap();
         let cond = Tensor::rand(-1f32, 1f32, (n, cfg.hidden_size), &device).unwrap();
 
         let out = head.forward(&noisy, &t, &cond).expect("forward");

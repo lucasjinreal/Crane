@@ -62,7 +62,11 @@ fn betas_cosine(num_train_timesteps: usize) -> Vec<f64> {
 fn round_half_even(x: f64) -> f64 {
     let floor = x.floor();
     if (x - floor - 0.5).abs() < 1e-9 {
-        if (floor as i64).rem_euclid(2) == 0 { floor } else { floor + 1.0 }
+        if (floor as i64).rem_euclid(2) == 0 {
+            floor
+        } else {
+            floor + 1.0
+        }
     } else {
         x.round()
     }
@@ -132,7 +136,10 @@ impl DpmSolverScheduler {
             acc *= 1.0 - b;
             alphas_cumprod.push(acc);
         }
-        let sigmas_full = alphas_cumprod.iter().map(|ac| ((1.0 - ac) / ac).sqrt()).collect();
+        let sigmas_full = alphas_cumprod
+            .iter()
+            .map(|ac| ((1.0 - ac) / ac).sqrt())
+            .collect();
         Ok(Self {
             sigmas_full,
             num_train_timesteps,
@@ -257,7 +264,12 @@ impl DpmSolverScheduler {
         prev_sample.to_dtype(orig_dtype)
     }
 
-    fn first_order_update(&self, model_output: &Tensor, sample: &Tensor, noise: &Tensor) -> Result<Tensor> {
+    fn first_order_update(
+        &self,
+        model_output: &Tensor,
+        sample: &Tensor,
+        noise: &Tensor,
+    ) -> Result<Tensor> {
         let current_index = self.step_index.min(self.sigmas.len() - 1);
         let next_index = (self.step_index + 1).min(self.sigmas.len() - 1);
         let (alpha_t, sigma_t) = sigma_to_alpha_sigma_t(self.sigmas[next_index]);
@@ -358,7 +370,10 @@ mod tests {
         s.set_timesteps(20);
         let ts = s.timesteps();
         assert_eq!(ts.len(), 20);
-        assert!(ts.windows(2).all(|w| w[0] > w[1]), "timesteps must be strictly descending: {ts:?}");
+        assert!(
+            ts.windows(2).all(|w| w[0] > w[1]),
+            "timesteps must be strictly descending: {ts:?}"
+        );
         assert!(ts.iter().all(|&t| (0..1000).contains(&t)));
         // linspace(0, 999, 21) round-trip: first (highest) timestep should be
         // very close to 999, matching diffusers' behavior for this config.
@@ -401,7 +416,44 @@ mod tests {
             sample = s.step(&fake_model_output, &sample).expect("step");
             assert_eq!(sample.dims(), &[1, latent_size]);
         }
-        let max_abs: f32 = sample.abs().unwrap().max_all().unwrap().to_scalar().unwrap();
+        let max_abs: f32 = sample
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar()
+            .unwrap();
+        assert!(max_abs.is_finite());
+    }
+
+    /// Same denoising loop on Metal (skipped where Metal isn't available) —
+    /// `step`'s scalar-coefficient `cos`/`sin`/`exp` math is plain candle
+    /// tensor ops with no CUDA-only path, but this is the only place that
+    /// actually runs the scheduler on the Metal backend.
+    #[test]
+    fn full_denoise_loop_produces_finite_output_of_correct_shape_on_metal() {
+        if !candle_core::utils::metal_is_available() {
+            return;
+        }
+        let device = Device::new_metal(0).expect("metal device");
+        let mut s = DpmSolverScheduler::new(&cfg()).expect("new");
+        s.set_timesteps(20);
+
+        let latent_size = 8usize;
+        let mut sample = Tensor::rand(-1f32, 1f32, (1, latent_size), &device).unwrap();
+        let steps = s.timesteps().len();
+        for _ in 0..steps {
+            let fake_model_output = scale(&sample, 0.1).unwrap();
+            sample = s.step(&fake_model_output, &sample).expect("step");
+            assert_eq!(sample.dims(), &[1, latent_size]);
+        }
+        let max_abs: f32 = sample
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar()
+            .unwrap();
         assert!(max_abs.is_finite());
     }
 

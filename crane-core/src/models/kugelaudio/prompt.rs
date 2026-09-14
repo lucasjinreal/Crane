@@ -63,7 +63,11 @@ fn encode(tokenizer: &Tokenizer, text: &str) -> Result<Vec<u32>> {
 /// `KugelAudioProcessor.__call__` appending it, immediately followed by
 /// `generate()`'s per-step loop treating it as the first "already generated"
 /// token).
-pub fn build_prompt(tokenizer: &Tokenizer, text: &str, voice_audio_num_samples: Option<usize>) -> Result<PromptResult> {
+pub fn build_prompt(
+    tokenizer: &Tokenizer,
+    text: &str,
+    voice_audio_num_samples: Option<usize>,
+) -> Result<PromptResult> {
     const SYSTEM_PROMPT: &str = " Transform the text provided by various speakers into speech output, utilizing the distinct voice of each respective speaker.\n";
 
     let formatted_text = if text.trim_start().starts_with("Speaker") {
@@ -131,9 +135,18 @@ mod tests {
              utilizing distinct voice of each respective speaker. Voice input: Text Speech"
             .split_whitespace()
             .enumerate()
-            .map(|(i, w)| (w.trim_matches(|c: char| ".,:".contains(c)).to_string(), i as u32))
+            .map(|(i, w)| {
+                (
+                    w.trim_matches(|c: char| ".,:".contains(c)).to_string(),
+                    i as u32,
+                )
+            })
             .collect();
-        let model = WordLevel::builder().vocab(vocab).unk_token("<unk>".into()).build().unwrap();
+        let model = WordLevel::builder()
+            .vocab(vocab)
+            .unk_token("<unk>".into())
+            .build()
+            .unwrap();
         let mut tok = Tokenizer::new(model);
         tok.with_pre_tokenizer(Some(Whitespace {}));
         tok
@@ -158,7 +171,11 @@ mod tests {
         assert_eq!(true_count, 5);
         // The true run must be contiguous.
         let first_true = result.speech_input_mask.iter().position(|&b| b).unwrap();
-        assert!(result.speech_input_mask[first_true..first_true + 5].iter().all(|&b| b));
+        assert!(
+            result.speech_input_mask[first_true..first_true + 5]
+                .iter()
+                .all(|&b| b)
+        );
     }
 
     #[test]

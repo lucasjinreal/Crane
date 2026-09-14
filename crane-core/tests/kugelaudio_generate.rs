@@ -16,11 +16,14 @@ fn kugelaudio_generate_is_well_formed() {
     use crane_core::models::kugelaudio::model::special_tokens::{
         EOS_TOKEN_ID, SPEECH_DIFFUSION_ID, SPEECH_END_ID, SPEECH_START_ID,
     };
-    use crane_core::models::kugelaudio::{KugelAudioGenerationConfig, KugelAudioModel, build_prompt};
+    use crane_core::models::kugelaudio::{
+        KugelAudioGenerationConfig, KugelAudioModel, build_prompt,
+    };
     use tokenizers::Tokenizer;
 
     let dir = std::env::var("CRANE_KUGELAUDIO_DIR").expect("set CRANE_KUGELAUDIO_DIR");
-    let tokenizer_path = std::env::var("CRANE_KUGELAUDIO_TOKENIZER").expect("set CRANE_KUGELAUDIO_TOKENIZER");
+    let tokenizer_path =
+        std::env::var("CRANE_KUGELAUDIO_TOKENIZER").expect("set CRANE_KUGELAUDIO_TOKENIZER");
 
     // CUDA → CUDA BF16 (the checkpoint's native `torch_dtype`); macOS →
     // Metal F16; everything else → CPU F32. Same pattern as
@@ -37,10 +40,12 @@ fn kugelaudio_generate_is_well_formed() {
     let (device, dtype) = (Device::Cpu, DType::F32);
 
     let tokenizer = Tokenizer::from_file(&tokenizer_path).expect("load tokenizer.json");
-    let prompt = build_prompt(&tokenizer, "Hello there, this is a short test.", None).expect("build_prompt");
+    let prompt =
+        build_prompt(&tokenizer, "Hello there, this is a short test.", None).expect("build_prompt");
     assert!(prompt.speech_input_mask.iter().all(|&b| !b));
 
-    let mut model = KugelAudioModel::from_pretrained(&dir, &device, dtype).expect("from_pretrained");
+    let mut model =
+        KugelAudioModel::from_pretrained(&dir, &device, dtype).expect("from_pretrained");
 
     let gen_cfg = KugelAudioGenerationConfig {
         cfg_scale: 1.0, // no CFG for this first smoke run — see module doc comment
@@ -57,9 +62,17 @@ fn kugelaudio_generate_is_well_formed() {
     );
 
     assert_eq!(out.token_ids[0], SPEECH_START_ID);
-    let valid = [SPEECH_START_ID, SPEECH_END_ID, SPEECH_DIFFUSION_ID, EOS_TOKEN_ID];
+    let valid = [
+        SPEECH_START_ID,
+        SPEECH_END_ID,
+        SPEECH_DIFFUSION_ID,
+        EOS_TOKEN_ID,
+    ];
     for &id in &out.token_ids {
-        assert!(valid.contains(&id), "generated token {id} outside the constrained set {valid:?}");
+        assert!(
+            valid.contains(&id),
+            "generated token {id} outside the constrained set {valid:?}"
+        );
     }
 
     if !out.audio.is_empty() {

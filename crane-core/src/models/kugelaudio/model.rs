@@ -118,10 +118,12 @@ impl KugelAudioModel {
         .context("kugelaudio: load lm_head")?;
 
         let vb_acoustic = vb_model.pp("acoustic_tokenizer");
-        let acoustic_encoder = load_encoder(&config.acoustic_tokenizer_config, vb_acoustic.pp("encoder"))
-            .context("kugelaudio: load acoustic_tokenizer.encoder")?;
-        let acoustic_decoder = load_decoder(&config.acoustic_tokenizer_config, vb_acoustic.pp("decoder"))
-            .context("kugelaudio: load acoustic_tokenizer.decoder")?;
+        let acoustic_encoder =
+            load_encoder(&config.acoustic_tokenizer_config, vb_acoustic.pp("encoder"))
+                .context("kugelaudio: load acoustic_tokenizer.encoder")?;
+        let acoustic_decoder =
+            load_decoder(&config.acoustic_tokenizer_config, vb_acoustic.pp("decoder"))
+                .context("kugelaudio: load acoustic_tokenizer.decoder")?;
 
         let semantic_encoder = load_encoder(
             &config.semantic_tokenizer_config,
@@ -142,8 +144,11 @@ impl KugelAudioModel {
         )
         .context("kugelaudio: load semantic_connector")?;
 
-        let diffusion_head = DiffusionHead::load(&config.diffusion_head_config, vb_model.pp("prediction_head"))
-            .context("kugelaudio: load prediction_head")?;
+        let diffusion_head = DiffusionHead::load(
+            &config.diffusion_head_config,
+            vb_model.pp("prediction_head"),
+        )
+        .context("kugelaudio: load prediction_head")?;
 
         let speech_scaling_factor: f64 = vb_model
             .get((), "speech_scaling_factor")
@@ -212,13 +217,15 @@ impl KugelAudioModel {
     /// `config.rs`'s `TokenizerConfig::std_dist_type` doc comment).
     /// `[batch, vae_dim, T]`.
     pub fn encode_acoustic(&self, waveform: &Tensor) -> candle_core::Result<Tensor> {
-        self.acoustic_encoder.encode(&waveform.to_dtype(self.dtype)?)
+        self.acoustic_encoder
+            .encode(&waveform.to_dtype(self.dtype)?)
     }
 
     /// Encode a raw waveform through the semantic tokenizer.
     /// `[batch, semantic_vae_dim, T]`.
     pub fn encode_semantic(&self, waveform: &Tensor) -> candle_core::Result<Tensor> {
-        self.semantic_encoder.encode(&waveform.to_dtype(self.dtype)?)
+        self.semantic_encoder
+            .encode(&waveform.to_dtype(self.dtype)?)
     }
 
     /// Decode acoustic latents (`[batch, vae_dim, T]`, **already** run
@@ -232,7 +239,10 @@ impl KugelAudioModel {
     /// encoder output before the acoustic connector projects it into the
     /// decoder's embedding space (voice-prompt conditioning path).
     pub fn scale_acoustic_latent(&self, latent: &Tensor) -> candle_core::Result<Tensor> {
-        latent.affine(self.speech_scaling_factor, self.speech_bias_factor * self.speech_scaling_factor)
+        latent.affine(
+            self.speech_scaling_factor,
+            self.speech_bias_factor * self.speech_scaling_factor,
+        )
     }
 
     /// `latent / speech_scaling_factor - speech_bias_factor` — inverts
@@ -267,8 +277,10 @@ impl KugelAudioModel {
     /// callers must apply [`Self::unscale_acoustic_latent`] before decoding
     /// to audio.
     pub fn sample_speech_latents(&self, condition: &Tensor) -> candle_core::Result<Tensor> {
-        let mut scheduler = DpmSolverScheduler::new(&self.config.diffusion_head_config)
-            .map_err(|e| candle_core::Error::Msg(format!("kugelaudio: build DPM scheduler: {e}")))?;
+        let mut scheduler =
+            DpmSolverScheduler::new(&self.config.diffusion_head_config).map_err(|e| {
+                candle_core::Error::Msg(format!("kugelaudio: build DPM scheduler: {e}"))
+            })?;
         scheduler.set_timesteps(self.config.diffusion_head_config.ddpm_num_inference_steps);
 
         let n = condition.dim(0)?;
@@ -278,7 +290,9 @@ impl KugelAudioModel {
 
         for &t in scheduler.timesteps().to_vec().iter() {
             let timesteps = Tensor::full(t as f32, n, condition.device())?;
-            let eps = self.diffusion_head.forward(&sample, &timesteps, condition)?;
+            let eps = self
+                .diffusion_head
+                .forward(&sample, &timesteps, condition)?;
             sample = scheduler.step(&eps, &sample)?;
         }
         Ok(sample)
@@ -305,8 +319,10 @@ impl KugelAudioModel {
         neg_condition: &Tensor,
         cfg_scale: f64,
     ) -> candle_core::Result<Tensor> {
-        let mut scheduler = DpmSolverScheduler::new(&self.config.diffusion_head_config)
-            .map_err(|e| candle_core::Error::Msg(format!("kugelaudio: build DPM scheduler: {e}")))?;
+        let mut scheduler =
+            DpmSolverScheduler::new(&self.config.diffusion_head_config).map_err(|e| {
+                candle_core::Error::Msg(format!("kugelaudio: build DPM scheduler: {e}"))
+            })?;
         scheduler.set_timesteps(self.config.diffusion_head_config.ddpm_num_inference_steps);
 
         let latent_size = self.config.diffusion_head_config.latent_size;
@@ -317,7 +333,9 @@ impl KugelAudioModel {
         for &t in scheduler.timesteps().to_vec().iter() {
             let combined_sample = Tensor::cat(&[&sample, &sample], 0)?; // [2, latent]
             let timesteps = Tensor::full(t as f32, 2, condition.device())?;
-            let eps = self.diffusion_head.forward(&combined_sample, &timesteps, &combined_condition)?; // [2, latent]
+            let eps =
+                self.diffusion_head
+                    .forward(&combined_sample, &timesteps, &combined_condition)?; // [2, latent]
             let cond_eps = eps.narrow(0, 0, 1)?;
             let uncond_eps = eps.narrow(0, 1, 1)?;
             let half_eps = (&uncond_eps + ((&cond_eps - &uncond_eps)? * cfg_scale)?)?;
@@ -331,7 +349,11 @@ impl KugelAudioModel {
     /// positions in `mask` (length `N`) — `build_prompt`'s voice-prompt
     /// placeholder run. No-op (returns `embeds` unchanged) if `mask` is all
     /// `false`.
-    fn splice_speech_embeds(embeds: &Tensor, mask: &[bool], replacement: &Tensor) -> candle_core::Result<Tensor> {
+    fn splice_speech_embeds(
+        embeds: &Tensor,
+        mask: &[bool],
+        replacement: &Tensor,
+    ) -> candle_core::Result<Tensor> {
         let Some(start) = mask.iter().position(|&b| b) else {
             return Ok(embeds.clone());
         };
@@ -407,14 +429,23 @@ impl KugelAudioModel {
         if prompt.voice_frame_count > 0 {
             let waveform = voice_waveform
                 .context("kugelaudio generate: prompt has voice-prompt frames but no voice_waveform was given")?;
-            let acoustic = self.encode_acoustic(waveform)?.transpose(1, 2)?.contiguous()?; // [1, T, vae_dim]
+            let acoustic = self
+                .encode_acoustic(waveform)?
+                .transpose(1, 2)?
+                .contiguous()?; // [1, T, vae_dim]
             let acoustic_scaled = self.scale_acoustic_latent(&acoustic)?;
-            let semantic = self.encode_semantic(waveform)?.transpose(1, 2)?.contiguous()?; // [1, T_sem, sem_dim]
+            let semantic = self
+                .encode_semantic(waveform)?
+                .transpose(1, 2)?
+                .contiguous()?; // [1, T_sem, sem_dim]
             let semantic = Self::align_time_len(&semantic, acoustic_scaled.dim(1)?)?;
-            let acoustic_embed = self.acoustic_connector.forward(&acoustic_scaled.squeeze(0)?)?;
+            let acoustic_embed = self
+                .acoustic_connector
+                .forward(&acoustic_scaled.squeeze(0)?)?;
             let semantic_embed = self.semantic_connector.forward(&semantic.squeeze(0)?)?;
             let combined = (acoustic_embed + semantic_embed)?; // [T, hidden]
-            text_embeds = Self::splice_speech_embeds(&text_embeds, &prompt.speech_input_mask, &combined)?;
+            text_embeds =
+                Self::splice_speech_embeds(&text_embeds, &prompt.speech_input_mask, &combined)?;
         }
 
         let embed_one = |model: &Self, id: u32| -> candle_core::Result<Tensor> {
@@ -433,31 +464,46 @@ impl KugelAudioModel {
         let mut neg_last_embed = speech_start_embed;
         let mut neg_seqlen = 0usize;
 
-        let mut logits_processor = LogitsProcessor::new(
-            42,
-            cfg.do_sample.then_some(cfg.temperature),
-            None,
-        );
+        let mut logits_processor =
+            LogitsProcessor::new(42, cfg.do_sample.then_some(cfg.temperature), None);
 
-        let candidate_ids = [SPEECH_START_ID, SPEECH_END_ID, SPEECH_DIFFUSION_ID, EOS_TOKEN_ID];
-        let vocab_size = self.config.decoder_config.vocab_size;
+        let candidate_ids = [
+            SPEECH_START_ID,
+            SPEECH_END_ID,
+            SPEECH_DIFFUSION_ID,
+            EOS_TOKEN_ID,
+        ];
 
         let mut all_latents: Vec<Tensor> = Vec::new();
         let mut audio_samples: Vec<f32> = Vec::new();
         let mut prev_audio_len = 0usize;
 
+        // CRANE_KUGELAUDIO_PROFILE=1: per-component wall-clock breakdown to
+        // stderr, printed once at the end (same convention as
+        // CRANE_TTS_DEBUG / CRANE_SAMPLE_TRACE elsewhere in this crate).
+        let profile = std::env::var("CRANE_KUGELAUDIO_PROFILE").is_ok();
+        let mut t_decoder_main = std::time::Duration::ZERO;
+        let mut t_decoder_neg = std::time::Duration::ZERO;
+        let mut t_diffusion = std::time::Duration::ZERO;
+        let mut t_decode_acoustic = std::time::Duration::ZERO;
+        let mut t_encode_semantic = std::time::Duration::ZERO;
+        let mut n_diffusion_steps = 0usize;
+
         for _step in 0..cfg.max_new_tokens {
             let last_logits = logits.narrow(1, logits.dim(1)? - 1, 1)?.flatten_all()?;
             let candidate_values: Vec<f32> = candidate_ids
                 .iter()
-                .map(|&id| last_logits.narrow(0, id as usize, 1)?.to_dtype(DType::F32)?.to_vec1::<f32>().map(|v| v[0]))
+                .map(|&id| {
+                    last_logits
+                        .narrow(0, id as usize, 1)?
+                        .to_dtype(DType::F32)?
+                        .to_vec1::<f32>()
+                        .map(|v| v[0])
+                })
                 .collect::<candle_core::Result<_>>()?;
-            let mut masked = vec![f32::NEG_INFINITY; vocab_size];
-            for (id, &v) in candidate_ids.iter().zip(candidate_values.iter()) {
-                masked[*id as usize] = v;
-            }
-            let masked_logits = Tensor::from_vec(masked, vocab_size, &device)?;
-            let next_token = logits_processor.sample(&masked_logits)?;
+            let candidate_logits =
+                Tensor::from_vec(candidate_values, candidate_ids.len(), &device)?;
+            let next_token = candidate_ids[logits_processor.sample(&candidate_logits)? as usize];
 
             generated_ids.push(next_token);
             if next_token == EOS_TOKEN_ID || next_token == SPEECH_END_ID {
@@ -468,25 +514,59 @@ impl KugelAudioModel {
                 let condition = hidden.narrow(1, hidden.dim(1)? - 1, 1)?.squeeze(1)?; // [1, hidden]
 
                 let speech_latent_scaled = if use_cfg {
+                    let t0 = std::time::Instant::now();
                     let neg_hidden = neg_decoder.forward_embeds(&neg_last_embed, neg_seqlen)?;
+                    if profile {
+                        self.device.synchronize()?;
+                        t_decoder_neg += t0.elapsed();
+                    }
                     neg_seqlen += 1;
-                    let neg_condition = neg_hidden.narrow(1, neg_hidden.dim(1)? - 1, 1)?.squeeze(1)?;
-                    self.sample_speech_latents_cfg(&condition, &neg_condition, cfg.cfg_scale)?
+                    let neg_condition = neg_hidden
+                        .narrow(1, neg_hidden.dim(1)? - 1, 1)?
+                        .squeeze(1)?;
+                    let t0 = std::time::Instant::now();
+                    let out =
+                        self.sample_speech_latents_cfg(&condition, &neg_condition, cfg.cfg_scale)?;
+                    if profile {
+                        self.device.synchronize()?;
+                        t_diffusion += t0.elapsed();
+                    }
+                    out
                 } else {
-                    self.sample_speech_latents(&condition)?
+                    let t0 = std::time::Instant::now();
+                    let out = self.sample_speech_latents(&condition)?;
+                    if profile {
+                        self.device.synchronize()?;
+                        t_diffusion += t0.elapsed();
+                    }
+                    out
                 };
+                n_diffusion_steps += 1;
                 let speech_latent = self.unscale_acoustic_latent(&speech_latent_scaled)?;
                 all_latents.push(speech_latent);
 
-                let latents_bct = Tensor::stack(&all_latents, 1)?.transpose(1, 2)?.contiguous()?; // [1, vae_dim, T]
+                let latents_bct = Tensor::stack(&all_latents, 1)?
+                    .transpose(1, 2)?
+                    .contiguous()?; // [1, vae_dim, T]
+                let t0 = std::time::Instant::now();
                 let full_audio = self.decode_acoustic(&latents_bct)?; // [1, 1, num_samples]
+                if profile {
+                    self.device.synchronize()?;
+                    t_decode_acoustic += t0.elapsed();
+                }
                 let num_samples = full_audio.dim(2)?;
-                let new_chunk = full_audio.narrow(D::Minus1, prev_audio_len, num_samples - prev_audio_len)?;
+                let new_chunk =
+                    full_audio.narrow(D::Minus1, prev_audio_len, num_samples - prev_audio_len)?;
                 let chunk: Vec<f32> = new_chunk.flatten_all()?.to_dtype(DType::F32)?.to_vec1()?;
                 audio_samples.extend(chunk);
                 prev_audio_len = num_samples;
 
+                let t0 = std::time::Instant::now();
                 let full_semantic = self.encode_semantic(&full_audio)?; // [1, sem_dim, T_sem]
+                if profile {
+                    self.device.synchronize()?;
+                    t_encode_semantic += t0.elapsed();
+                }
                 let t_sem = full_semantic.dim(2)?;
                 let last_semantic = full_semantic
                     .narrow(D::Minus1, t_sem - 1, 1)?
@@ -501,7 +581,12 @@ impl KugelAudioModel {
                 embed_one(self, next_token)?
             };
 
+            let t0 = std::time::Instant::now();
             let (h, l) = self.forward(&next_embed, pos_seqlen)?;
+            if profile {
+                self.device.synchronize()?;
+                t_decoder_main += t0.elapsed();
+            }
             hidden = h;
             logits = l;
             pos_seqlen += 1;
@@ -509,6 +594,15 @@ impl KugelAudioModel {
             if use_cfg && next_token == SPEECH_DIFFUSION_ID {
                 neg_last_embed = next_embed;
             }
+        }
+
+        if profile {
+            eprintln!(
+                "kugelaudio profile ({n_diffusion_steps} diffusion frames): \
+                 decoder_main={t_decoder_main:.2?} decoder_neg={t_decoder_neg:.2?} \
+                 diffusion_sampling={t_diffusion:.2?} decode_acoustic={t_decode_acoustic:.2?} \
+                 encode_semantic={t_encode_semantic:.2?}"
+            );
         }
 
         Ok(KugelAudioGenerationOutput {

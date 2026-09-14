@@ -34,8 +34,8 @@ fn kugelaudio_loads_and_runs_forward_and_tokenizer_roundtrip() {
     #[cfg(all(not(target_os = "macos"), not(feature = "cuda")))]
     let (device, dtype) = (Device::Cpu, DType::F32);
 
-    let mut model =
-        KugelAudioModel::from_pretrained(&dir, &device, dtype).expect("KugelAudioModel::from_pretrained");
+    let mut model = KugelAudioModel::from_pretrained(&dir, &device, dtype)
+        .expect("KugelAudioModel::from_pretrained");
 
     let hidden_size = model.config.decoder_config.hidden_size;
     let vocab_size = model.config.decoder_config.vocab_size;
@@ -45,14 +45,27 @@ fn kugelaudio_loads_and_runs_forward_and_tokenizer_roundtrip() {
     // A tiny fake "prompt": a handful of token ids run through the real
     // embedding table and decoder stack.
     let input_ids = Tensor::from_vec(vec![100u32, 200, 300, 400], (1, 4), &device).unwrap();
-    let embeds = model.embed_text_tokens(&input_ids).expect("embed_text_tokens");
+    let embeds = model
+        .embed_text_tokens(&input_ids)
+        .expect("embed_text_tokens");
     assert_eq!(embeds.dims(), &[1, 4, hidden_size]);
 
     let (hidden, logits) = model.forward(&embeds, 0).expect("forward");
     assert_eq!(hidden.dims(), &[1, 4, hidden_size]);
     assert_eq!(logits.dims(), &[1, 4, vocab_size]);
-    let max_abs: f32 = logits.abs().unwrap().max_all().unwrap().to_dtype(DType::F32).unwrap().to_scalar().unwrap();
-    assert!(max_abs.is_finite(), "logits must be finite, got max_abs={max_abs}");
+    let max_abs: f32 = logits
+        .abs()
+        .unwrap()
+        .max_all()
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_scalar()
+        .unwrap();
+    assert!(
+        max_abs.is_finite(),
+        "logits must be finite, got max_abs={max_abs}"
+    );
 
     // Decode-step shape check: single-token continuation with seqlen_offset.
     model.clear_kv_cache();
@@ -67,13 +80,29 @@ fn kugelaudio_loads_and_runs_forward_and_tokenizer_roundtrip() {
     let latents = model.encode_acoustic(&waveform).expect("encode_acoustic");
     assert_eq!(latents.dim(0).unwrap(), 1);
     assert_eq!(latents.dim(1).unwrap(), model.config.acoustic_vae_dim);
-    let latent_max: f32 = latents.abs().unwrap().max_all().unwrap().to_dtype(DType::F32).unwrap().to_scalar().unwrap();
+    let latent_max: f32 = latents
+        .abs()
+        .unwrap()
+        .max_all()
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_scalar()
+        .unwrap();
     assert!(latent_max.is_finite());
 
     let recon = model.decode_acoustic(&latents).expect("decode_acoustic");
     assert_eq!(recon.dim(0).unwrap(), 1);
     assert_eq!(recon.dim(1).unwrap(), 1);
-    let recon_max: f32 = recon.abs().unwrap().max_all().unwrap().to_dtype(DType::F32).unwrap().to_scalar().unwrap();
+    let recon_max: f32 = recon
+        .abs()
+        .unwrap()
+        .max_all()
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_scalar()
+        .unwrap();
     assert!(recon_max.is_finite());
 
     // Semantic tokenizer encode.
@@ -83,8 +112,21 @@ fn kugelaudio_loads_and_runs_forward_and_tokenizer_roundtrip() {
     // One diffusion-sampling call (no CFG — see `sample_speech_latents`'s
     // doc comment) using a real decoder hidden state as condition.
     let condition = hidden.narrow(1, 3, 1).unwrap().squeeze(1).unwrap(); // [1, hidden_size]
-    let speech_latent = model.sample_speech_latents(&condition).expect("sample_speech_latents");
-    assert_eq!(speech_latent.dims(), &[1, model.config.diffusion_head_config.latent_size]);
-    let sl_max: f32 = speech_latent.abs().unwrap().max_all().unwrap().to_dtype(DType::F32).unwrap().to_scalar().unwrap();
+    let speech_latent = model
+        .sample_speech_latents(&condition)
+        .expect("sample_speech_latents");
+    assert_eq!(
+        speech_latent.dims(),
+        &[1, model.config.diffusion_head_config.latent_size]
+    );
+    let sl_max: f32 = speech_latent
+        .abs()
+        .unwrap()
+        .max_all()
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_scalar()
+        .unwrap();
     assert!(sl_max.is_finite());
 }

@@ -57,9 +57,16 @@ impl ConvRmsNorm {
 /// length matches PyTorch's `ceil`-based length formula (candle's `Conv1d`
 /// follows the `floor` convention like PyTorch's raw op; this recovers the
 /// same "round up" framing the Python's manual padding relies on).
-fn extra_padding_for_conv1d(length: usize, kernel_size: usize, stride: usize, padding_total: usize) -> usize {
-    let n_frames = (length as f64 - kernel_size as f64 + padding_total as f64) / stride as f64 + 1.0;
-    let ideal_length = ((n_frames.ceil() as i64 - 1) * stride as i64) + (kernel_size as i64 - padding_total as i64);
+fn extra_padding_for_conv1d(
+    length: usize,
+    kernel_size: usize,
+    stride: usize,
+    padding_total: usize,
+) -> usize {
+    let n_frames =
+        (length as f64 - kernel_size as f64 + padding_total as f64) / stride as f64 + 1.0;
+    let ideal_length = ((n_frames.ceil() as i64 - 1) * stride as i64)
+        + (kernel_size as i64 - padding_total as i64);
     (ideal_length - length as i64).max(0) as usize
 }
 
@@ -72,6 +79,33 @@ struct SConv1d {
     kernel_size: usize,
     stride: usize,
     padding_total: usize,
+    /// True depthwise conv (`groups == in_ch == out_ch`, `stride == 1`,
+    /// `dilation == 1`): use the closed-form fast path instead of candle's
+    /// generic grouped-conv fallback.
+    depthwise_fast_path: bool,
+}
+
+/// `groups == in_ch == out_ch` depthwise conv, `stride == 1`, `dilation ==
+/// 1`, on an already-padded `x: [B, C, T_padded]` with `weight: [C, 1, K]`.
+fn depthwise_conv1d_stride1(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
+    let (c, _one, k) = weight.dims3()?;
+    let t_out = x.dim(D::Minus1)? - k + 1;
+    let w = weight.reshape((1, c, k))?; // [1, C, K]
+    let mut acc: Option<Tensor> = None;
+    for i in 0..k {
+        let x_i = x.narrow(D::Minus1, i, t_out)?; // [B, C, T_out]
+        let w_i = w.narrow(D::Minus1, i, 1)?; // [1, C, 1]
+        let term = x_i.broadcast_mul(&w_i)?;
+        acc = Some(match acc {
+            Some(a) => (a + term)?,
+            None => term,
+        });
+    }
+    let out = acc.expect("kernel_size > 0");
+    match bias {
+        Some(b) => out.broadcast_add(&b.reshape((1, c, 1))?),
+        None => Ok(out),
+    }
 }
 
 impl SConv1d {
@@ -104,21 +138,35 @@ impl SConv1d {
             cudnn_fwd_algo: None,
         };
         let padding_total = (kernel_size - 1) * dilation - (stride - 1);
+        // CRANE_KUGELAUDIO_PORTABLE_CONV: force candle's generic grouped-conv
+        // path instead, for cross-checking against the fast path (same
+        // convention as CRANE_GDN_PORTABLE elsewhere in this crate).
+        let depthwise_fast_path = groups == in_ch
+            && in_ch == out_ch
+            && stride == 1
+            && dilation == 1
+            && std::env::var("CRANE_KUGELAUDIO_PORTABLE_CONV").is_err();
         Ok(Self {
             conv: Conv1d::new(weight, bias, cfg),
             kernel_size,
             stride,
             padding_total,
+            depthwise_fast_path,
         })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let length = x.dim(D::Minus1)?;
-        let extra = extra_padding_for_conv1d(length, self.kernel_size, self.stride, self.padding_total);
+        let extra =
+            extra_padding_for_conv1d(length, self.kernel_size, self.stride, self.padding_total);
         // Causal + `pad_mode == "constant"`: left-pad by `padding_total`,
         // right-pad by `extra` (both zero).
         let x = x.pad_with_zeros(D::Minus1, self.padding_total, extra)?;
-        self.conv.forward(&x)
+        if self.depthwise_fast_path {
+            depthwise_conv1d_stride1(&x, self.conv.weight(), self.conv.bias())
+        } else {
+            self.conv.forward(&x)
+        }
     }
 }
 
@@ -235,10 +283,7 @@ impl Block1D {
         )?;
         let ffn = ConvFfn::load(dim, FFN_EXPANSION * dim, cfg.conv_bias, vb.pp("ffn"))?;
         let (gamma, ffn_gamma) = if cfg.layer_scale_init_value > 0.0 {
-            (
-                Some(vb.get(dim, "gamma")?),
-                Some(vb.get(dim, "ffn_gamma")?),
-            )
+            (Some(vb.get(dim, "gamma")?), Some(vb.get(dim, "ffn_gamma")?))
         } else {
             (None, None)
         };
@@ -345,7 +390,11 @@ impl TokenizerEncoder {
         let final_norm = if cfg.disable_last_norm {
             None
         } else {
-            Some(ConvRmsNorm::load(last_ch, cfg.layernorm_eps, vb.pp("norm"))?)
+            Some(ConvRmsNorm::load(
+                last_ch,
+                cfg.layernorm_eps,
+                vb.pp("norm"),
+            )?)
         };
         let head = SConv1d::load(
             last_ch,
@@ -417,9 +466,9 @@ impl TokenizerDecoder {
             .decoder_ratios
             .clone()
             .ok_or_else(|| candle_core::Error::Msg("kugelaudio: decoder_ratios missing".into()))?;
-        let n_filters = cfg
-            .decoder_n_filters
-            .ok_or_else(|| candle_core::Error::Msg("kugelaudio: decoder_n_filters missing".into()))?;
+        let n_filters = cfg.decoder_n_filters.ok_or_else(|| {
+            candle_core::Error::Msg("kugelaudio: decoder_n_filters missing".into())
+        })?;
         let n_stages = depths.len();
 
         let vb_up = vb.pp("upsample_layers");
@@ -465,7 +514,11 @@ impl TokenizerDecoder {
         let final_norm = if cfg.disable_last_norm {
             None
         } else {
-            Some(ConvRmsNorm::load(last_ch, cfg.layernorm_eps, vb.pp("norm"))?)
+            Some(ConvRmsNorm::load(
+                last_ch,
+                cfg.layernorm_eps,
+                vb.pp("norm"),
+            )?)
         };
         let head = SConv1d::load(
             last_ch,
@@ -567,7 +620,8 @@ mod tests {
         let mut t: HashMap<String, Tensor> = HashMap::new();
         let fill = |shape: &[usize]| -> Tensor {
             let n: usize = shape.iter().product();
-            let data: Vec<f32> = (0..n).map(|i| 0.01 * (i as f32 + 1.0)).collect();
+            // Bounded regardless of tensor size, so it stays usable at real-checkpoint channel counts.
+            let data: Vec<f32> = (0..n).map(|i| 0.02 * ((i % 13) as f32 - 6.0)).collect();
             Tensor::from_vec(data, shape, device).unwrap()
         };
         let ones = |n: usize| Tensor::ones(n, DType::F32, device).unwrap();
@@ -610,9 +664,15 @@ mod tests {
                     fill(&[ch, 1, BLOCK1D_KERNEL_SIZE]),
                 );
                 t.insert(format!("{p}.mixer.conv.conv.conv.bias"), fill(&[ch]));
-                t.insert(format!("{p}.ffn.linear1.weight"), fill(&[FFN_EXPANSION * ch, ch]));
+                t.insert(
+                    format!("{p}.ffn.linear1.weight"),
+                    fill(&[FFN_EXPANSION * ch, ch]),
+                );
                 t.insert(format!("{p}.ffn.linear1.bias"), fill(&[FFN_EXPANSION * ch]));
-                t.insert(format!("{p}.ffn.linear2.weight"), fill(&[ch, FFN_EXPANSION * ch]));
+                t.insert(
+                    format!("{p}.ffn.linear2.weight"),
+                    fill(&[ch, FFN_EXPANSION * ch]),
+                );
                 t.insert(format!("{p}.ffn.linear2.bias"), fill(&[ch]));
                 t.insert(format!("{p}.gamma"), ones(ch));
                 t.insert(format!("{p}.ffn_gamma"), ones(ch));
@@ -662,9 +722,15 @@ mod tests {
                         fill(&[ch, 1, BLOCK1D_KERNEL_SIZE]),
                     );
                     t.insert(format!("{p}.mixer.conv.conv.conv.bias"), fill(&[ch]));
-                    t.insert(format!("{p}.ffn.linear1.weight"), fill(&[FFN_EXPANSION * ch, ch]));
+                    t.insert(
+                        format!("{p}.ffn.linear1.weight"),
+                        fill(&[FFN_EXPANSION * ch, ch]),
+                    );
                     t.insert(format!("{p}.ffn.linear1.bias"), fill(&[FFN_EXPANSION * ch]));
-                    t.insert(format!("{p}.ffn.linear2.weight"), fill(&[ch, FFN_EXPANSION * ch]));
+                    t.insert(
+                        format!("{p}.ffn.linear2.weight"),
+                        fill(&[ch, FFN_EXPANSION * ch]),
+                    );
                     t.insert(format!("{p}.ffn.linear2.bias"), fill(&[ch]));
                     t.insert(format!("{p}.gamma"), ones(ch));
                     t.insert(format!("{p}.ffn_gamma"), ones(ch));
@@ -730,5 +796,145 @@ mod tests {
         let max_abs: f32 = y.abs().unwrap().max_all().unwrap().to_scalar().unwrap();
         assert!(max_abs.is_finite());
         assert!(max_abs > 0.0);
+    }
+
+    /// Real checkpoint's channel/depth/ratio config (32 filters, 7 stages,
+    /// deepest stage 2048 channels) — big enough to actually exercise the
+    /// `groups` count [`SConv1d::depthwise_fast_path`] targets, unlike
+    /// `small_cfg`'s 4/8-channel toy sizes. Sequence length stays tiny
+    /// (this only needs to stress channel/group count, not real audio
+    /// lengths) so the CPU F32 forward pass here stays fast.
+    fn real_scale_cfg() -> TokenizerConfig {
+        TokenizerConfig {
+            channels: 1,
+            vae_dim: 64,
+            encoder_n_filters: 32,
+            encoder_ratios: vec![8, 5, 5, 4, 2, 2],
+            encoder_depths: "3-3-3-3-3-3-8".to_string(),
+            decoder_n_filters: Some(32),
+            decoder_ratios: Some(vec![8, 5, 5, 4, 2, 2]),
+            decoder_depths: None,
+            causal: true,
+            conv_bias: true,
+            conv_norm: "none".to_string(),
+            pad_mode: "constant".to_string(),
+            layernorm: "RMSNorm".to_string(),
+            layernorm_eps: 1e-5,
+            layernorm_elementwise_affine: true,
+            mixer_layer: "depthwise_conv".to_string(),
+            layer_scale_init_value: 1e-6,
+            disable_last_norm: true,
+            fix_std: 0.5,
+            std_dist_type: "gaussian".to_string(),
+        }
+    }
+
+    /// Cross-checks the depthwise fast path against the portable conv path
+    /// at real channel/group scale.
+    #[test]
+    fn depthwise_fast_path_matches_portable_conv_at_real_scale() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let device = Device::Cpu;
+        let cfg = real_scale_cfg();
+        let vb = make_vb(&cfg, &device);
+        let t_in = 6400usize; // 2 full hops (3200 each) so every downsample stage sees nonzero length
+        let x = Tensor::rand(-1f32, 1f32, (1, cfg.channels, t_in), &device).unwrap();
+
+        unsafe {
+            std::env::remove_var("CRANE_KUGELAUDIO_PORTABLE_CONV");
+        }
+        let encoder_fast = load_encoder(&cfg, vb.pp("encoder")).expect("load encoder (fast)");
+        let fast = encoder_fast.encode(&x).expect("encode (fast)");
+
+        unsafe {
+            std::env::set_var("CRANE_KUGELAUDIO_PORTABLE_CONV", "1");
+        }
+        let encoder_portable =
+            load_encoder(&cfg, vb.pp("encoder")).expect("load encoder (portable)");
+        let portable = encoder_portable.encode(&x).expect("encode (portable)");
+        unsafe {
+            std::env::remove_var("CRANE_KUGELAUDIO_PORTABLE_CONV");
+        }
+
+        assert_eq!(fast.dims(), portable.dims());
+        let max_diff: f32 = (&fast - &portable)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar()
+            .unwrap();
+        let max_mag: f32 = portable
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar()
+            .unwrap();
+        assert!(
+            max_diff < 1e-3 * max_mag.max(1.0),
+            "fast path diverges from portable conv: max_diff={max_diff} max_mag={max_mag}"
+        );
+    }
+
+    /// Same cross-check on Metal (skipped where Metal isn't available, e.g.
+    /// non-macOS CI). The depthwise fast path
+    /// ([`depthwise_conv1d_stride1`]) added by the CUDA speedup commit is
+    /// plain `narrow`/`broadcast_mul`/`add` — no CUDA-only kernel — but this
+    /// is the only place that actually exercises it against candle's
+    /// generic grouped-conv fallback on the Metal backend.
+    #[test]
+    fn depthwise_fast_path_matches_portable_conv_at_real_scale_on_metal() {
+        if !candle_core::utils::metal_is_available() {
+            return;
+        }
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let device = Device::new_metal(0).expect("metal device");
+        let cfg = real_scale_cfg();
+        let vb = make_vb(&cfg, &device);
+        let t_in = 6400usize;
+        let x = Tensor::rand(-1f32, 1f32, (1, cfg.channels, t_in), &device).unwrap();
+
+        unsafe {
+            std::env::remove_var("CRANE_KUGELAUDIO_PORTABLE_CONV");
+        }
+        let encoder_fast = load_encoder(&cfg, vb.pp("encoder")).expect("load encoder (fast)");
+        let fast = encoder_fast.encode(&x).expect("encode (fast)");
+
+        unsafe {
+            std::env::set_var("CRANE_KUGELAUDIO_PORTABLE_CONV", "1");
+        }
+        let encoder_portable =
+            load_encoder(&cfg, vb.pp("encoder")).expect("load encoder (portable)");
+        let portable = encoder_portable.encode(&x).expect("encode (portable)");
+        unsafe {
+            std::env::remove_var("CRANE_KUGELAUDIO_PORTABLE_CONV");
+        }
+
+        assert_eq!(fast.dims(), portable.dims());
+        let max_diff: f32 = (&fast - &portable)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar()
+            .unwrap();
+        let max_mag: f32 = portable
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar()
+            .unwrap();
+        assert!(
+            max_diff < 1e-3 * max_mag.max(1.0),
+            "fast path diverges from portable conv on metal: max_diff={max_diff} max_mag={max_mag}"
+        );
     }
 }

@@ -256,6 +256,9 @@ mod tests {
         assert_eq!(cfg.diffusion_head_config.head_layers, 4);
         assert!((cfg.diffusion_head_config.head_ffn_ratio - 3.0).abs() < 1e-9);
         assert_eq!(cfg.diffusion_head_config.prediction_type, "v_prediction");
-        assert_eq!(cfg.diffusion_head_config.ddpm_algorithm_type, "sde-dpmsolver++");
+        assert_eq!(
+            cfg.diffusion_head_config.ddpm_algorithm_type,
+            "sde-dpmsolver++"
+        );
     }
 }

@@ -80,7 +80,9 @@ const SAMPLE_RATE: u32 = 24_000;
 
 fn main() -> anyhow::Result<()> {
     use candle_core::{DType, Device, Tensor};
-    use crane_core::models::kugelaudio::{KugelAudioGenerationConfig, KugelAudioModel, build_prompt};
+    use crane_core::models::kugelaudio::{
+        KugelAudioGenerationConfig, KugelAudioModel, build_prompt,
+    };
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokenizers::Tokenizer;
 
@@ -126,7 +128,10 @@ fn main() -> anyhow::Result<()> {
         // be identical on every launch without this. CPU's RNG is already
         // OS-entropy-seeded per run and errors if you try to reseed it.
         let seed = args.seed.unwrap_or_else(|| {
-            let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64;
             nanos ^ (std::process::id() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
         });
         println!("Seed: {seed}");
@@ -138,7 +143,8 @@ fn main() -> anyhow::Result<()> {
     let mut model = KugelAudioModel::from_pretrained(&args.model_path, &device, dtype)?;
 
     println!("Loading tokenizer from: {tokenizer_path}");
-    let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|e| anyhow::anyhow!("load tokenizer.json: {e}"))?;
+    let tokenizer = Tokenizer::from_file(&tokenizer_path)
+        .map_err(|e| anyhow::anyhow!("load tokenizer.json: {e}"))?;
 
     let voice_waveform = args
         .ref_wav
@@ -151,10 +157,21 @@ fn main() -> anyhow::Result<()> {
         })
         .transpose()?;
 
-    println!("Mode: {}", if voice_waveform.is_some() { "voice cloning (--ref-wav)" } else { "zero-shot" });
+    println!(
+        "Mode: {}",
+        if voice_waveform.is_some() {
+            "voice cloning (--ref-wav)"
+        } else {
+            "zero-shot"
+        }
+    );
     println!("Text: {}", args.text);
 
-    let prompt = build_prompt(&tokenizer, &args.text, voice_waveform.as_ref().map(|(_, n)| *n))?;
+    let prompt = build_prompt(
+        &tokenizer,
+        &args.text,
+        voice_waveform.as_ref().map(|(_, n)| *n),
+    )?;
 
     let gen_cfg = KugelAudioGenerationConfig {
         cfg_scale: args.cfg_scale,
@@ -173,7 +190,9 @@ fn main() -> anyhow::Result<()> {
     );
 
     if out.audio.is_empty() {
-        anyhow::bail!("generation produced no audio (model emitted speech_end/eos before any diffusion token)");
+        anyhow::bail!(
+            "generation produced no audio (model emitted speech_end/eos before any diffusion token)"
+        );
     }
 
     std::fs::create_dir_all(&args.output_dir)?;
