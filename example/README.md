@@ -18,6 +18,7 @@ This directory contains simple, user-friendly examples showing how to use the Cr
 - `tts_voice_clone.rs`: TTS voice cloning from reference audio (Base model)
 - `voxtral_tts_simple.rs`: Voxtral TTS inference
 - `voxcpm2_simple.rs`: VoxCPM2 tokenizer-free TTS — zero-shot, all three reference-audio conditioning modes (transcript-free "Controllable Cloning" via `--ref-wav`, "Ultimate Cloning" via `--prompt-wav`/`--prompt-text`, and the combined mode), and `--stream` for incremental generation with time-to-first-chunk reporting
+- `kugelaudio_simple.rs`: KugelAudio TTS (Qwen2 backbone + diffusion head, a post-trained VibeVoice fine-tune) — zero-shot or voice cloning from a reference clip via `--ref-wav`. Not wired into `crane-serve` yet, so this is the only way to run it. Needs an external Qwen2-VL-family `tokenizer.json` (the checkpoint ships none) — `crane-model-download --model kugelaudio` fetches both
 
 ### Vision Examples
 - `vision_simple.rs`: Vision capabilities — image analysis and OCR
@@ -79,6 +80,26 @@ cargo run --bin voxcpm2_simple --release -- checkpoints/VoxCPM2 "Text to speak" 
 cargo run --bin voxcpm2_simple --release -- checkpoints/VoxCPM2 "Text to speak" \
     --prompt-wav ref.wav --prompt-text "What the reference clip says"
 
+# KugelAudio — zero-shot. Needs a Qwen2-VL-family tokenizer.json (the
+# checkpoint ships none); `crane-model-download --model kugelaudio` fetches
+# both the checkpoint and a matching tokenizer.json into the same dir.
+# GPU strongly recommended.
+cargo run --bin kugelaudio_simple --release --features cuda -- \
+    checkpoints/kugelaudio-0-open --tokenizer checkpoints/kugelaudio-0-open/tokenizer.json \
+    "Text to synthesize"
+
+# KugelAudio — voice cloning from a reference clip (no transcript needed)
+cargo run --bin kugelaudio_simple --release --features cuda -- \
+    checkpoints/kugelaudio-0-open --tokenizer checkpoints/kugelaudio-0-open/tokenizer.json \
+    "Text to speak" --ref-wav ref.wav
+
+# KugelAudio — pin the seed for reproducible output (default: a fresh
+# random seed every launch, since candle's CUDA/Metal RNGs otherwise start
+# from the same fixed seed and every run would sound identical)
+cargo run --bin kugelaudio_simple --release --features cuda -- \
+    checkpoints/kugelaudio-0-open --tokenizer checkpoints/kugelaudio-0-open/tokenizer.json \
+    "Text to speak" --seed 777
+
 # MiniCPM5-1B chat (interactive REPL) — safetensors dir or a bare .gguf file both work
 cargo run --bin chat_cli --release -- -m /path/to/MiniCPM5-1B --model-type minicpm5
 cargo run --bin chat_cli --release -- -m /path/to/MiniCPM5-1B-Q8_0.gguf --model-type minicpm5
@@ -92,8 +113,9 @@ cargo run --bin minicpmo_duplex_simple --release -- --wav path/to/clip.wav --no-
 ```
 
 TTS examples write generated audio to `data/audio/output`. `voxcpm2_simple`
-writes to `--output-dir` (default `data/audio/output`) and, with `--stream`,
-still saves the full concatenated waveform once the stream completes.
+and `kugelaudio_simple` write to `--output-dir` (default `data/audio/output`);
+`voxcpm2_simple` with `--stream` still saves the full concatenated waveform
+once the stream completes.
 
 VoxCPM2 also streams over HTTP: `crane-serve --model-type voxcpm2` then
 `POST /v1/audio/speech` with `"stream": true` and `"response_format": "pcm"`

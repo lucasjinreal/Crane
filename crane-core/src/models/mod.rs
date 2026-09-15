@@ -19,6 +19,7 @@ pub mod qwen3_tts;
 // pub mod qwen3_vl;
 pub mod gemma4;
 pub mod hunyuan_dense;
+pub mod kugelaudio;
 pub mod minicpm5;
 pub mod minicpm_v;
 pub mod minicpmo;
