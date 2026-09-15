@@ -109,6 +109,9 @@ pub async fn chat_completions(
                 presence_penalty: req.presence_penalty.unwrap_or(0.0),
                 eos_token_id: state.eos_token_id.clone(),
                 stop: req.stop.map_or_else(Vec::new, StringOrArray::into_vec),
+                tool_names: tools.map_or_else(Vec::new, |tools| {
+                    tools.iter().map(|t| t.function.name.clone()).collect()
+                }),
             },
         )
         .map_err(|e| make_error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()))?;
@@ -213,6 +216,9 @@ pub async fn completions(
                 presence_penalty: req.presence_penalty.unwrap_or(0.0),
                 eos_token_id: state.eos_token_id.clone(),
                 stop: req.stop.map_or_else(Vec::new, StringOrArray::into_vec),
+                // `/v1/completions` is raw text completion with no chat
+                // template or tool concept.
+                tool_names: Vec::new(),
             },
         )
         .map_err(|e| make_error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()))?;
@@ -363,6 +369,7 @@ async fn collect_response(
                 prompt_tokens: pt,
                 completion_tokens: ct,
                 finish_reason: fr,
+                ..
             } => {
                 full_text = ft;
                 prompt_tokens = pt;

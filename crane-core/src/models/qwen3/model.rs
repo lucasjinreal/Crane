@@ -12,12 +12,16 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 // TODO(candle-transformers-removal): Generation helpers only; see CANDLE_TRANSFORMERS.md.
 use candle_transformers::generation::LogitsProcessor;
+use ribo::utils::log;
 use tokenizers::Tokenizer;
 
 use super::modeling::{BatchKvCache, Config, Qwen3Model};
+use crate::device::{DeviceAssignment, GpuBudget};
 use crate::generation::GenerationConfig;
 use crate::generation::based::ModelForCausalLM;
+use crate::models::modules::quant_kv_cache::{KvCacheKind, KvCacheState};
 use crate::utils::token_output_stream::TokenOutputStream;
+use crate::utils::tokenizer_utils;
 use crate::utils::utils;
 
 /// Format of model weights on disk.
@@ -35,25 +39,69 @@ pub struct Model {
     pub tokenizer: TokenOutputStream,
     pub device: Device,
     pub dtype: DType,
+    /// From `GpuBudget::max_concurrent` at load time; used by
+    /// [`Self::kv_bytes_per_token`] to decide whether quantized KV pricing
+    /// is safe (see its doc comment).
+    max_concurrent: Option<usize>,
     inner: Qwen3Model,
 }
 
 impl Model {
+    /// `gpu_budget` constrains `MoE` expert placement; only consumed once
+    /// the checkpoint is `MoE` (see [`crate::device::GpuBudget`]).
+    ///
     /// # Errors
     ///
     /// Returns an error if the model files cannot be found or loaded.
-    pub fn new(model_path: &str, device: &Device, dtype: &DType) -> Result<Self> {
-        Self::new_with_format(model_path, device, dtype, ModelFormat::Auto)
+    pub fn new(
+        model_path: &str,
+        devices: &DeviceAssignment,
+        dtype: &DType,
+        gpu_budget: &GpuBudget,
+    ) -> Result<Self> {
+        Self::new_with_format(model_path, devices, dtype, ModelFormat::Auto, gpu_budget)
     }
 
+    /// `devices.main` holds every weight but `MoE` experts; `devices.expert`
+    /// holds `MoE` expert weights, if the checkpoint is `MoE`. Applies to
+    /// both GGUF and safetensors checkpoints. `gpu_budget` constrains `MoE`
+    /// expert placement; only consumed once the checkpoint is `MoE` (see
+    /// [`crate::device::GpuBudget`]).
+    ///
     /// # Errors
     ///
     /// Returns an error if the model files cannot be found or loaded.
     pub fn new_with_format(
         model_path: &str,
-        device: &Device,
+        devices: &DeviceAssignment,
         dtype: &DType,
         format: ModelFormat,
+        gpu_budget: &GpuBudget,
+    ) -> Result<Self> {
+        Self::new_with_options(
+            model_path,
+            devices,
+            dtype,
+            format,
+            gpu_budget,
+            KvCacheKind::from_env(),
+        )
+    }
+
+    /// Like [`Self::new_with_format`], but takes an explicit `kv_kind`
+    /// (e.g. from a `--kv-quant` CLI flag) instead of reading
+    /// `CRANE_KV_QUANT`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the model files cannot be found or loaded.
+    pub fn new_with_options(
+        model_path: &str,
+        devices: &DeviceAssignment,
+        dtype: &DType,
+        format: ModelFormat,
+        gpu_budget: &GpuBudget,
+        kv_kind: KvCacheKind,
     ) -> Result<Self> {
         let format = match format {
             ModelFormat::Auto => {
@@ -68,8 +116,12 @@ impl Model {
         };
 
         match format {
-            ModelFormat::Gguf | ModelFormat::Auto => Self::from_gguf(model_path, device),
-            ModelFormat::Safetensors => Self::from_pretrained(model_path, device, *dtype),
+            ModelFormat::Gguf | ModelFormat::Auto => {
+                Self::from_gguf(model_path, devices, gpu_budget, kv_kind)
+            },
+            ModelFormat::Safetensors => {
+                Self::from_pretrained(model_path, devices, *dtype, gpu_budget, kv_kind)
+            },
         }
     }
 
@@ -81,7 +133,41 @@ impl Model {
         self.inner.clear_kv_cache();
     }
 
-    fn from_pretrained(model_path: &str, device: &Device, dtype: DType) -> Result<Model> {
+    /// Bytes of KV cache one sequence consumes per generated token. See
+    /// [`Config::kv_bytes_per_token`]/[`Config::quantized_kv_bytes_per_token`].
+    ///
+    /// Prices at the smaller quantized storage size only when the fused
+    /// dequantize-in-attention kernel (`crate::ops::fused_ops::quant_attn`)
+    /// covers the sequence's entire lifetime: CUDA/ROCm, `max_concurrent ==
+    /// 1` so batch decode's `to_fp_pair()`/`from_fp_pair()` round-trip
+    /// (which always dequantizes to the compute dtype) never applies, and
+    /// `CRANE_QUANT_ATTN_FUSED` isn't `0` (which forces every append onto
+    /// the unfused path). Otherwise prices at the compute dtype's size,
+    /// since KV-swap/preemption and any unfused decode/prefill step fully
+    /// dequantize `Int8`/`Int4` caches, and a reservation based on the
+    /// smaller quantized size would under-claim VRAM against that worst
+    /// case (see git history for why that matters here).
+    pub fn kv_bytes_per_token(&self) -> u64 {
+        let config = self.inner.config();
+        let fused_covers_full_lifetime = (self.device.is_cuda() || self.device.is_rocm())
+            && self.max_concurrent == Some(1)
+            && !crate::ops::fused_ops::quant_attn::fused_disabled();
+        self.inner.kv_kind().effective_kv_bytes_per_token(
+            fused_covers_full_lifetime,
+            config.num_hidden_layers,
+            config.num_key_value_heads,
+            config.head_dim(),
+            self.dtype.size_in_bytes(),
+        )
+    }
+
+    fn from_pretrained(
+        model_path: &str,
+        devices: &DeviceAssignment,
+        dtype: DType,
+        gpu_budget: &GpuBudget,
+        kv_kind: KvCacheKind,
+    ) -> Result<Model> {
         let tokenizer_path = std::path::Path::new(model_path).join("tokenizer.json");
         if !tokenizer_path.exists() {
             anyhow::bail!("Tokenizer not found at {}", tokenizer_path.display());
@@ -89,69 +175,54 @@ impl Model {
         let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(E::msg)?;
 
         let filenames = utils::get_safetensors_files(model_path)?;
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, device) }?;
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, &devices.main) }?;
 
         let config_file = std::path::Path::new(model_path).join("config.json");
         let config_data = std::fs::read(config_file)?;
         let config: Config = serde_json::from_slice(&config_data)?;
 
-        let inner = Qwen3Model::new(&config, vb)?;
+        let inner =
+            Qwen3Model::new_with_kv_kind(&config, vb, &devices.expert, gpu_budget, kv_kind)?;
 
         Ok(Self {
             tokenizer: TokenOutputStream::new(tokenizer),
-            device: device.clone(),
+            device: devices.main.clone(),
             dtype,
+            max_concurrent: gpu_budget.max_concurrent,
             inner,
         })
     }
 
     /// Load a GGUF quantized model file.
-    fn from_gguf(model_path: &str, device: &Device) -> Result<Model> {
+    fn from_gguf(
+        model_path: &str,
+        devices: &DeviceAssignment,
+        gpu_budget: &GpuBudget,
+        kv_kind: KvCacheKind,
+    ) -> Result<Model> {
         let gguf_path = std::path::Path::new(model_path);
-
-        let tokenizer_path = {
-            let same_dir = gguf_path
-                .parent()
-                .unwrap_or(gguf_path)
-                .join("tokenizer.json");
-            if same_dir.exists() {
-                same_dir
-            } else {
-                let parent = gguf_path
-                    .parent()
-                    .and_then(|p| p.parent())
-                    .unwrap_or(gguf_path)
-                    .join("tokenizer.json");
-                if parent.exists() {
-                    parent
-                } else {
-                    anyhow::bail!(
-                        "Cannot find tokenizer.json near {}. \
-                         Place tokenizer.json in the same directory as the GGUF file.",
-                        gguf_path.display()
-                    );
-                }
-            }
-        };
-        let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(E::msg)?;
 
         let mmap = crate::quantized::gguf_file::mmap_gguf_file(gguf_path)?;
         let mut cursor = std::io::Cursor::new(mmap.as_ref());
         let ct = candle_core::quantized::gguf_file::Content::read(&mut cursor)?;
 
-        eprintln!(
-            "GGUF loaded: {} tensors, {} metadata entries",
+        log::info!(
+            "GGUF header parsed: {} tensors, {} metadata entries",
             ct.tensor_infos.len(),
             ct.metadata.len(),
         );
 
-        let inner = Qwen3Model::from_gguf(ct, &mut cursor, device)?;
+        let tokenizer = tokenizer_utils::resolve_gguf_tokenizer(&ct, gguf_path)?;
+
+        let inner =
+            Qwen3Model::from_gguf_with_kv_kind(ct, &mut cursor, devices, gpu_budget, kv_kind)?;
         let dtype = inner.model_dtype();
 
         Ok(Self {
             tokenizer: TokenOutputStream::new(tokenizer),
-            device: device.clone(),
+            device: devices.main.clone(),
             dtype,
+            max_concurrent: gpu_budget.max_concurrent,
             inner,
         })
     }
@@ -190,11 +261,11 @@ impl Model {
         self.inner.num_layers()
     }
 
-    pub fn get_kv_caches(&self) -> Vec<Option<(Tensor, Tensor)>> {
+    pub fn get_kv_caches(&self) -> Vec<Option<KvCacheState>> {
         self.inner.get_kv_caches()
     }
 
-    pub fn set_kv_caches(&mut self, caches: Vec<Option<(Tensor, Tensor)>>) {
+    pub fn set_kv_caches(&mut self, caches: Vec<Option<KvCacheState>>) {
         self.inner.set_kv_caches(caches);
     }
 
@@ -210,7 +281,7 @@ impl Model {
     /// Returns an error if the batch decode setup fails.
     pub fn setup_batch_decode(
         &mut self,
-        seq_kv_caches: &[Vec<Option<(Tensor, Tensor)>>],
+        seq_kv_caches: &[Vec<Option<KvCacheState>>],
         extra_room: usize,
     ) -> candle_core::Result<(Vec<usize>, usize)> {
         self.inner.setup_batch_decode(seq_kv_caches, extra_room)

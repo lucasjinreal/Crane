@@ -12,6 +12,7 @@
 use candle_core::Result;
 use serde::Deserialize;
 
+use crate::models::modules::quant_kv_cache;
 use crate::ops::gdn::{GdnConfig, defaults};
 
 /// Whether a transformer block at layer index `i` is full (softmax) attention
@@ -257,6 +258,48 @@ impl TextConfig {
             .collect()
     }
 
+    /// Number of layers that carry a full-attention K/V cache — every
+    /// `full_attention_interval`-th layer (see [`Self::layer_types`]). The
+    /// rest are `GDN` linear-attention layers with recurrent state instead
+    /// of a growing K/V cache.
+    #[must_use]
+    pub fn num_full_attention_layers(&self) -> usize {
+        self.num_hidden_layers / self.full_attention_interval
+    }
+
+    /// Bytes of K/V cache one sequence consumes per generated token, at the
+    /// compute dtype. Only counts full-attention layers ([`Self::num_full_attention_layers`]) —
+    /// `GDN` layers don't grow a per-token K/V cache.
+    #[must_use]
+    pub fn kv_bytes_per_token(&self, dtype_bytes: usize) -> u64 {
+        2 * self.num_full_attention_layers() as u64
+            * self.num_key_value_heads as u64
+            * self.head_dim as u64
+            * dtype_bytes as u64
+    }
+
+    /// Bytes of K/V cache one sequence consumes per generated token when K/V
+    /// are stored as `bits`-wide (4 or 8) quantized codes plus a per-token
+    /// f32 scale per head, instead of the compute dtype (see
+    /// [`crate::models::modules::quant_kv_cache::QuantKvCache`]). Only an
+    /// accurate estimate when the fused dequantize-in-attention kernel
+    /// (`crate::ops::fused_ops::quant_attn`) covers the sequence's entire
+    /// lifetime — see [`Self::kv_bytes_per_token`]'s doc for why plain
+    /// compute-dtype pricing is required otherwise.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `bits` is neither 4 nor 8.
+    #[must_use]
+    pub fn quantized_kv_bytes_per_token(&self, bits: u32) -> u64 {
+        quant_kv_cache::quantized_kv_bytes_per_token(
+            bits,
+            self.num_full_attention_layers(),
+            self.num_key_value_heads,
+            self.head_dim,
+        )
+    }
+
     #[must_use]
     pub fn linear_key_dim(&self) -> usize {
         self.linear_num_key_heads * self.linear_key_head_dim
@@ -408,5 +451,52 @@ mod tests {
         cfg.output_gate_type = Some("sigmoid".into());
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("output_gate_type"), "unexpected error: {err}");
+    }
+
+    // 16 of 64 layers are full attention (matches layer_types()'s count above).
+    #[test]
+    fn num_full_attention_layers_counts_only_full_attention() {
+        assert_eq!(qwen3_8().num_full_attention_layers(), 16);
+    }
+
+    // f16: 2 * 16 full-attn layers * 4 kv_heads * 256 head_dim * 2 bytes =
+    // 65,536 bytes/token — must not scale with the 64 total (incl. GDN) layers.
+    #[test]
+    fn kv_bytes_per_token_counts_only_full_attention_layers() {
+        assert_eq!(qwen3_8().kv_bytes_per_token(2), 2 * 16 * 4 * 256 * 2);
+    }
+
+    // int8: 1 byte/code + 4 byte f32 scale per head -> 2*16*4*(256+4) bytes/token.
+    #[test]
+    fn quantized_kv_bytes_per_token_int8_matches_qwen3_8_27b() {
+        assert_eq!(
+            qwen3_8().quantized_kv_bytes_per_token(8),
+            2 * 16 * 4 * (256 + 4)
+        );
+    }
+
+    // int4: nibble-packed codes (head_dim/2 bytes) + 4 byte f32 scale per head.
+    #[test]
+    fn quantized_kv_bytes_per_token_int4_matches_qwen3_8_27b() {
+        assert_eq!(
+            qwen3_8().quantized_kv_bytes_per_token(4),
+            2 * 16 * 4 * (128 + 4)
+        );
+    }
+
+    // Both quantized bit widths must cost strictly less than compute-dtype
+    // (f16) pricing for the same geometry.
+    #[test]
+    fn quantized_kv_bytes_per_token_smaller_than_fp16() {
+        let cfg = qwen3_8();
+        let fp16_bytes = cfg.kv_bytes_per_token(2);
+        assert!(cfg.quantized_kv_bytes_per_token(8) < fp16_bytes);
+        assert!(cfg.quantized_kv_bytes_per_token(4) < fp16_bytes);
+    }
+
+    #[test]
+    #[should_panic(expected = "bits must be 4 or 8")]
+    fn quantized_kv_bytes_per_token_rejects_invalid_bits() {
+        let _ = qwen3_8().quantized_kv_bytes_per_token(16);
     }
 }

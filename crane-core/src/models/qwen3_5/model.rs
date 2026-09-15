@@ -15,11 +15,11 @@ use candle_transformers::generation::LogitsProcessor;
 use tokenizers::Tokenizer;
 
 use super::config::{Config, HiddenAct, LayerType, RopeParameters, TextConfig, load_config};
-use super::kv_cache::{KvCache, KvCacheKind};
 use super::modeling::{DecoderLayer, MRotaryEmbedding, Qwen35RmsNorm, RopeSlice};
 use crate::generation::GenerationConfig;
 use crate::generation::based::ModelForCausalLM;
 use crate::models::modules::embedding::EmbeddingLayer;
+use crate::models::modules::quant_kv_cache::{KvCache, KvCacheKind};
 use crate::quantized::gguf_file::Gguf;
 use crate::utils::token_output_stream::TokenOutputStream;
 use crate::utils::utils;
@@ -41,6 +41,10 @@ pub struct Qwen3_5TextModel {
     attn_caches: Vec<Option<KvCache>>,
     device: Device,
     dtype: DType,
+    /// KV cache representation in use, read from `CRANE_KV_QUANT` at
+    /// construction (see [`build_layer_caches`]). Needed by
+    /// [`Self::kv_kind`] for VRAM pricing.
+    kv_kind: KvCacheKind,
 }
 
 impl Qwen3_5TextModel {
@@ -131,12 +135,25 @@ impl Qwen3_5TextModel {
         // overhead. Quantize only a dedicated (untied) output projection.
         let lm_head = match quant {
             Some(dt) if !is_tied => quantize_linear(Linear::new(lm_head_raw, None), dt)?,
-            _ => LinearLayer::Standard(Linear::new(lm_head_raw, None)),
+            _ => {
+                // Pre-store in F32 only when the compute dtype is F16: at
+                // this model's 248k vocab, raw logits overflow F16's 65504
+                // max even more readily than smaller-vocab models (see
+                // `forward_logits`). BF16/F32 stay native.
+                let w = if dtype == DType::F16 {
+                    lm_head_raw.to_dtype(DType::F32)?
+                } else {
+                    lm_head_raw
+                };
+                LinearLayer::Standard(Linear::new(w, None))
+            },
         };
 
         let rotary = MRotaryEmbedding::new(&text_cfg, device)?;
 
-        let (gdn_caches, attn_caches) = build_layer_caches(&layers, &text_cfg, dtype, device)?;
+        let kv_kind = KvCacheKind::from_env();
+        let (gdn_caches, attn_caches) =
+            build_layer_caches(&layers, &text_cfg, dtype, device, kv_kind)?;
 
         Ok(Self {
             cfg: text_cfg,
@@ -149,6 +166,7 @@ impl Qwen3_5TextModel {
             attn_caches,
             device: device.clone(),
             dtype,
+            kv_kind,
         })
     }
 
@@ -320,13 +338,25 @@ impl Qwen3_5TextModel {
         let lm_head = if tie_word_embeddings {
             // Tied: the output projection is this very table, so it reuses the
             // same buffer rather than materializing a dense copy.
-            embed_tokens.tied_output()?
+            let tied = embed_tokens.tied_output()?;
+            // Pre-store a `Standard` tied head as F32 only for F16, same
+            // overflow reasoning as the safetensors path above. A
+            // `Quantized` table already computes in F32 internally via
+            // QMatMul, so it needs no change.
+            match tied {
+                LinearLayer::Standard(l) if dtype == DType::F16 => {
+                    LinearLayer::Standard(Linear::new(l.weight().to_dtype(DType::F32)?, None))
+                },
+                other => other,
+            }
         } else {
             gg.linear("output.weight")?
         };
 
         let rotary = MRotaryEmbedding::new(&text_cfg, device)?;
-        let (gdn_caches, attn_caches) = build_layer_caches(&layers, &text_cfg, dtype, device)?;
+        let kv_kind = KvCacheKind::from_env();
+        let (gdn_caches, attn_caches) =
+            build_layer_caches(&layers, &text_cfg, dtype, device, kv_kind)?;
 
         Ok(Self {
             cfg: text_cfg,
@@ -339,12 +369,20 @@ impl Qwen3_5TextModel {
             attn_caches,
             device: device.clone(),
             dtype,
+            kv_kind,
         })
     }
 
     #[must_use]
     pub fn config(&self) -> &TextConfig {
         &self.cfg
+    }
+
+    /// KV cache representation in use, selected at construction from
+    /// `CRANE_KV_QUANT` (see [`KvCacheKind::from_env`]).
+    #[must_use]
+    pub fn kv_kind(&self) -> KvCacheKind {
+        self.kv_kind
     }
 
     #[must_use]
@@ -547,7 +585,7 @@ impl Qwen3_5TextModel {
         crate::ops::prof::timed(crate::ops::prof::Span::Head, || {
             let (b, _s, _h) = hidden.dims3()?;
             let xs = self.norm.forward(hidden)?.reshape((b, ()))?;
-            Ok(self.lm_head.forward(&xs)?)
+            Ok(self.lm_head.forward_logits(&xs)?)
         })
     }
 }
@@ -561,11 +599,11 @@ fn build_layer_caches(
     cfg: &TextConfig,
     dtype: DType,
     device: &Device,
+    kv_kind: KvCacheKind,
 ) -> Result<(
     Vec<Option<crate::ops::gdn::GdnLayerCache>>,
     Vec<Option<KvCache>>,
 )> {
-    let kv_kind = KvCacheKind::from_env();
     let mut gdn_caches = Vec::with_capacity(layers.len());
     let mut attn_caches = Vec::with_capacity(layers.len());
     for layer in layers {
@@ -742,9 +780,7 @@ impl Model {
     /// a sibling `tokenizer.json` is only consulted if the GGUF lacks the
     /// embedded metadata (older / third-party quantizers).
     fn from_gguf_file(model_path: &str, device: &Device) -> Result<Self> {
-        use crate::utils::tokenizer_utils::{
-            build_tokenizer_from_gguf_path, gguf_has_embedded_tokenizer,
-        };
+        use crate::utils::tokenizer_utils::resolve_gguf_tokenizer;
 
         let gguf_path = std::path::Path::new(model_path);
         let parent = gguf_path.parent().unwrap_or(gguf_path);
@@ -759,28 +795,7 @@ impl Model {
             ct.metadata.len()
         );
 
-        // Prefer the embedded tokenizer; fall back to a sibling tokenizer.json
-        // only when the GGUF lacks the necessary metadata.
-        let tokenizer = if gguf_has_embedded_tokenizer(&ct) {
-            build_tokenizer_from_gguf_path(gguf_path)?.ok_or_else(|| {
-                anyhow::anyhow!("GGUF reports embedded tokenizer but build returned None")
-            })?
-        } else {
-            let tokenizer_path = parent.join("tokenizer.json");
-            if !tokenizer_path.exists() {
-                anyhow::bail!(
-                    "GGUF lacks `tokenizer.ggml.tokens`/`merges` metadata and no sibling \
-                     tokenizer.json was found at {}. Re-export the model with a current \
-                     llama.cpp to get the embedded tokenizer.",
-                    tokenizer_path.display()
-                );
-            }
-            eprintln!(
-                "[qwen3_5] GGUF has no embedded tokenizer; falling back to {}",
-                tokenizer_path.display()
-            );
-            Tokenizer::from_file(&tokenizer_path).map_err(E::msg)?
-        };
+        let tokenizer = resolve_gguf_tokenizer(&ct, gguf_path)?;
 
         // EOS: sibling generation_config.json wins (may hold the full multi-id
         // set); fall back to the single id in GGUF metadata, then fill in any
@@ -902,6 +917,30 @@ impl Model {
     /// Total bytes held by the full-attention K/V caches (context-scaling term).
     pub fn attn_cache_bytes(&self) -> usize {
         self.inner.attn_cache_bytes()
+    }
+
+    /// Bytes of KV cache one sequence consumes per generated token. See
+    /// [`TextConfig::kv_bytes_per_token`]/[`TextConfig::quantized_kv_bytes_per_token`].
+    ///
+    /// Batch decode isn't implemented for this hybrid architecture
+    /// (`Qwen3_5Backend` never sets `supports_kv_swap`, so the engine caps
+    /// `max_concurrent` to 1 — see the cross-referencing comment on its
+    /// `ModelBackend` impl in `crane-serve/src/engine/backend.rs`), so the
+    /// only conditions gating the fused dequantize-in-attention kernel's
+    /// full-lifetime coverage are CUDA/ROCm and `CRANE_QUANT_ATTN_FUSED` not
+    /// being `0`. Otherwise prices at the compute dtype's size, for the same
+    /// reasoning as `qwen3::Model::kv_bytes_per_token`.
+    pub fn kv_bytes_per_token(&self) -> u64 {
+        let config = self.inner.config();
+        let fused_covers_full_lifetime = (self.device.is_cuda() || self.device.is_rocm())
+            && !crate::ops::fused_ops::quant_attn::fused_disabled();
+        self.inner.kv_kind().effective_kv_bytes_per_token(
+            fused_covers_full_lifetime,
+            config.num_full_attention_layers(),
+            config.num_key_value_heads,
+            config.head_dim,
+            self.dtype.size_in_bytes(),
+        )
     }
 
     /// Warm up the model with a small forward pass.

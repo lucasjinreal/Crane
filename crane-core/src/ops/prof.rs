@@ -28,11 +28,12 @@ use candle_core::Device;
 
 /// One measured region of the forward pass.
 ///
-/// The variants form three non-overlapping tiers: [`Span::Embed`]..=[`Span::Head`]
+/// The variants form four non-overlapping tiers: [`Span::Embed`]..=[`Span::Head`]
 /// partition the whole pass, [`Span::GdnProj`]..=[`Span::GdnFinish`] partition
-/// [`Span::Gdn`], and [`Span::GdnPrep`]..=[`Span::GdnPost`] partition
-/// [`Span::GdnRecur`]. Each tier is reported on its own line and should sum to
-/// its parent.
+/// [`Span::Gdn`], [`Span::GdnPrep`]..=[`Span::GdnPost`] partition
+/// [`Span::GdnRecur`], and [`Span::MoeRouter`]..=[`Span::MoeExpert`] partition
+/// [`Span::Mlp`] for `MoE` layers. Each tier is reported on its own line and
+/// should sum to its parent.
 #[derive(Clone, Copy)]
 pub enum Span {
     // Tier 1 — the whole pass.
@@ -53,17 +54,23 @@ pub enum Span {
     GdnPrep,
     GdnLaunch,
     GdnPost,
+    // Tier 2b — inside `Mlp` (MoE layers only).
+    MoeRouter,
+    MoeToDevice,
+    MoeExpert,
 }
 
-const NUM_SPANS: usize = 15;
+const NUM_SPANS: usize = 18;
 const TIER1: std::ops::Range<usize> = 0..7;
 const TIER2: std::ops::Range<usize> = 7..12;
 const TIER3: std::ops::Range<usize> = 12..15;
+const TIER2_MOE: std::ops::Range<usize> = 15..18;
 
 const NAMES: [&str; NUM_SPANS] = [
     "embed", "norm", "attn", "gdn", "mlp", "resid", "head", //
     "proj", "conv", "qkv", "recur", "finish", //
-    "prep", "launch", "post",
+    "prep", "launch", "post", //
+    "router", "to_dev", "expert",
 ];
 
 static SPAN_NS: [AtomicU64; NUM_SPANS] = [const { AtomicU64::new(0) }; NUM_SPANS];
@@ -240,6 +247,11 @@ fn report(kind: usize, t: &Totals) {
         line(TIER3),
         sum(TIER3)
     );
+    eprintln!(
+        "[crane-prof]   moe:   {} | sum {:.2} ms",
+        line(TIER2_MOE),
+        sum(TIER2_MOE)
+    );
 }
 
 #[cfg(test)]
@@ -259,14 +271,15 @@ mod tests {
         assert_eq!(SPAN_NS[Span::Embed as usize].load(Ordering::Relaxed), 0);
     }
 
-    /// The three tiers must partition the span list exactly — a span left out
+    /// The four tiers must partition the span list exactly — a span left out
     /// of every tier would be recorded and never reported.
     #[test]
     fn tiers_cover_every_span() {
         assert_eq!(TIER1.start, 0);
         assert_eq!(TIER1.end, TIER2.start);
         assert_eq!(TIER2.end, TIER3.start);
-        assert_eq!(TIER3.end, NUM_SPANS);
+        assert_eq!(TIER3.end, TIER2_MOE.start);
+        assert_eq!(TIER2_MOE.end, NUM_SPANS);
         assert_eq!(NAMES.len(), NUM_SPANS);
     }
 }

@@ -21,6 +21,10 @@ pub struct EngineRequest {
     pub eos_token_id: Vec<u32>,
     /// String sequences that terminate generation when produced.
     pub stop: Vec<String>,
+    /// Tool function names offered in the request, used to build a
+    /// grammar constraint on the tool-call XML skeleton. Empty when no
+    /// tools were offered.
+    pub tool_names: Vec<String>,
     pub response_tx: mpsc::UnboundedSender<EngineResponse>,
 }
 
@@ -50,6 +54,10 @@ pub struct GenerationParams {
     pub eos_token_id: Vec<u32>,
     /// String sequences that terminate generation when produced.
     pub stop: Vec<String>,
+    /// Tool function names offered in the request, used to build a
+    /// grammar constraint on the tool-call XML skeleton. Empty when no
+    /// tools were offered.
+    pub tool_names: Vec<String>,
 }
 
 /// A response chunk from the engine to an API handler.
@@ -63,6 +71,12 @@ pub enum EngineResponse {
         prompt_tokens: usize,
         completion_tokens: usize,
         finish_reason: String,
+        /// Time-to-first-token in milliseconds. `None` if no token was ever
+        /// sent (e.g. the request failed before producing output).
+        ttft_ms: Option<u64>,
+        /// Decode-phase token rate for this request. See
+        /// [`super::sequence::Sequence::decode_tokens_per_sec`].
+        decode_tokens_per_sec: f64,
     },
     /// An error occurred.
     Error(String),
@@ -80,13 +94,19 @@ impl EngineHandle {
     ///
     /// # Errors
     ///
-    /// Returns an error if the engine thread has shut down.
+    /// Returns an error if the engine thread has shut down, or if the engine
+    /// has recorded a fatal GPU error and is no longer accepting requests.
     pub fn submit(
         &self,
         id: String,
         tokens: Vec<u32>,
         params: GenerationParams,
     ) -> anyhow::Result<mpsc::UnboundedReceiver<EngineResponse>> {
+        if let Some(err) = self.stats.get_fatal_error() {
+            return Err(anyhow::anyhow!(
+                "Engine is unavailable due to a fatal GPU error: {err}"
+            ));
+        }
         let (response_tx, response_rx) = mpsc::unbounded_channel();
         self.request_tx
             .send(EngineRequest {
@@ -101,6 +121,7 @@ impl EngineHandle {
                 presence_penalty: params.presence_penalty,
                 eos_token_id: params.eos_token_id,
                 stop: params.stop,
+                tool_names: params.tool_names,
                 response_tx,
             })
             .map_err(|_| anyhow::anyhow!("Engine thread has shut down"))?;
@@ -147,6 +168,7 @@ mod tests {
                 presence_penalty: 0.0,
                 eos_token_id: vec![0],
                 stop: vec![],
+                tool_names: vec![],
             },
         );
         assert!(rx.is_ok());
@@ -173,10 +195,37 @@ mod tests {
                 presence_penalty: 0.0,
                 eos_token_id: vec![0],
                 stop: vec![],
+                tool_names: vec![],
             },
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("shut down"));
+    }
+
+    #[test]
+    fn submit_rejects_after_fatal_error() {
+        let (handle, _rx) = make_handle();
+        handle
+            .stats
+            .set_fatal_error("CUDA error: an illegal memory access was encountered");
+        let result = handle.submit(
+            "test-3".into(),
+            vec![1],
+            GenerationParams {
+                max_tokens: 10,
+                temperature: None,
+                top_p: None,
+                top_k: None,
+                repetition_penalty: 1.0,
+                frequency_penalty: 0.0,
+                presence_penalty: 0.0,
+                eos_token_id: vec![0],
+                stop: vec![],
+                tool_names: vec![],
+            },
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("fatal GPU error"));
     }
 
     #[test]
@@ -207,6 +256,8 @@ mod tests {
             prompt_tokens: 5,
             completion_tokens: 2,
             finish_reason: "stop".into(),
+            ttft_ms: Some(42),
+            decode_tokens_per_sec: 12.5,
         };
         if let EngineResponse::Finished {
             prompt_tokens,
@@ -259,6 +310,7 @@ mod tests {
                     presence_penalty: 0.2,
                     eos_token_id: vec![2],
                     stop: vec![],
+                    tool_names: vec![],
                 },
             )
             .unwrap();

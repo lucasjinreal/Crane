@@ -13,7 +13,6 @@
 
 mod config;
 mod conv3d_temporal_2;
-mod kv_cache;
 mod model;
 mod modeling;
 mod prefill;
@@ -21,8 +20,8 @@ pub mod processor;
 pub mod vision;
 pub mod vlm;
 
+pub use crate::models::modules::quant_kv_cache::{KvCache, KvCacheBackend, KvCacheKind};
 pub use config::{Config, LayerType, TextConfig, VisionConfig, load_config};
-pub use kv_cache::{KvCache, KvCacheBackend, KvCacheKind};
 pub use model::{Model, ModelFormat, Qwen3_5TextModel};
 pub use modeling::{
     DecoderLayer, FullAttention, MRotaryEmbedding, Mlp, Qwen35RmsNorm, RopeSlice, apply_mrope,

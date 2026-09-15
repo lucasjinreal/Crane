@@ -19,6 +19,7 @@ use candle_core::{D, DType, Device, Module, Result, Tensor};
 use candle_nn::VarBuilder;
 use std::io::{Read, Seek};
 
+use crate::ops::fused_ops::quant_attn;
 use crate::ops::linear::{LinearLayer, linear_layer};
 use crate::quantized::gguf_file::Gguf;
 
@@ -83,7 +84,7 @@ impl Module for Qwen35RmsNorm {
 }
 
 use super::config::{LayerType, TextConfig};
-use super::kv_cache::KvCache;
+use crate::models::modules::quant_kv_cache::KvCache;
 use crate::ops::gdn::{
     GatedDeltaNet, GdnDims, GdnInputProjection, GdnInputProjectionKind, GdnLayerCache,
     RmsNormGated, VHeadOrder,
@@ -455,12 +456,18 @@ impl FullAttention {
     // batch, heads, seq_len, head_dim), matching the terminology used
     // throughout this function's comments.
     #[allow(clippy::many_single_char_names)]
+    // This function's length comes from three densely-commented attention
+    // paths (fused quantized decode, GQA-grouped SDPA decode, standard
+    // SDPA); splitting it up further would scatter that rationale across
+    // several small functions without simplifying the control flow itself —
+    // same rationale as `qwen3::modeling::Attention::forward`'s own allow.
+    #[allow(clippy::too_many_lines)]
     pub fn forward(
         &self,
         x: &Tensor,
         rope: RopeSlice<'_>,
         attention_mask: Option<&Tensor>,
-        kv_cache: Option<&mut KvCache>,
+        mut kv_cache: Option<&mut KvCache>,
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _) = x.dims3()?;
 
@@ -512,6 +519,27 @@ impl FullAttention {
         let q = apply_mrope(&q, rope.cos, rope.sin, rope.rot_dim)?;
         let k = apply_mrope(&k, rope.cos, rope.sin, rope.rot_dim)?;
 
+        let n_rep = self.num_heads / self.num_kv_heads;
+        #[allow(clippy::cast_precision_loss)] // head_dim is small (<=512 in practice)
+        let scale = 1.0 / (self.head_dim as f64).sqrt();
+
+        if !legacy_attn_expand()
+            && let Some(y) = self.try_fused_attn(
+                &q,
+                &k,
+                &v,
+                b_sz,
+                seq_len,
+                n_rep,
+                scale,
+                gate.as_ref(),
+                attention_mask,
+                kv_cache.as_deref_mut(),
+            )?
+        {
+            return Ok(y);
+        }
+
         // Append this step's K/V to the cache (post-RoPE, pre-GQA-expand) and
         // continue with the full cached K/V. During incremental decode this is
         // what lets the attention see the whole context from a single token.
@@ -519,10 +547,6 @@ impl FullAttention {
             Some(cache) => cache.append(&k, &v)?,
             None => (k, v),
         };
-
-        let n_rep = self.num_heads / self.num_kv_heads;
-        #[allow(clippy::cast_precision_loss)] // head_dim is small (<=512 in practice)
-        let scale = 1.0 / (self.head_dim as f64).sqrt();
 
         if n_rep > 1 && seq_len == 1 && !legacy_attn_expand() {
             // ── GQA-grouped SDPA for decode ──
@@ -607,6 +631,82 @@ impl FullAttention {
         };
 
         self.o_proj.forward(&y)
+    }
+
+    /// Fused dequantize-in-attention (Phase 5): GPU + quantized cache only.
+    /// Reads int8/int4 codes + scales directly instead of a
+    /// fully-dequantized K/V from `QuantKvCache`'s scratch buffer, covering
+    /// both decode (`seq_len == 1`) and prefill (`seq_len > 1`). Returns
+    /// `Ok(None)` when the fused path doesn't apply — no cache, an `Fp`
+    /// cache, a CPU/Metal device, or `CRANE_QUANT_ATTN_FUSED=0` — so the
+    /// caller falls back to the regular append + GQA-grouped/standard SDPA
+    /// path below.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying tensor operations fail.
+    // q/k/v/y/g are standard ML tensor-shape notation (query, key, value,
+    // output, gate), matching [`Self::forward`]'s own allow for the same.
+    #[allow(clippy::many_single_char_names)]
+    #[allow(clippy::too_many_arguments)]
+    fn try_fused_attn(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        b_sz: usize,
+        seq_len: usize,
+        n_rep: usize,
+        scale: f64,
+        gate: Option<&Tensor>,
+        attention_mask: Option<&Tensor>,
+        kv_cache: Option<&mut KvCache>,
+    ) -> Result<Option<Tensor>> {
+        let Some(cache) = kv_cache else {
+            return Ok(None);
+        };
+        let Some(kv_ref) = cache.try_quantized_append(k, v)? else {
+            return Ok(None);
+        };
+
+        // q is [B, num_heads, seq_len, D]; fold (n_rep, seq_len) into a
+        // single R axis per kv head (rep-major, position-minor) — see
+        // `qwen3::modeling::Attention::forward`'s identical fold for the
+        // full derivation.
+        let q_g = (q.reshape((b_sz, self.num_kv_heads, n_rep * seq_len, self.head_dim))? * scale)?;
+        let attn_weights = quant_attn::quant_qk_dot(&q_g, &kv_ref)?;
+        let total_kv = attn_weights.dim(D::Minus1)?;
+        // The mask varies per query position, not per rep, so unfold R back
+        // into (n_rep, seq_len) merged with kv_heads into num_heads before
+        // adding it — the exact inverse of the q_g fold above.
+        let attn_weights = attn_weights.reshape((b_sz, self.num_heads, seq_len, total_kv))?;
+        let attn_weights = match attention_mask {
+            Some(mask) => attn_weights.broadcast_add(mask)?,
+            None => attn_weights,
+        };
+        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?.reshape((
+            b_sz,
+            self.num_kv_heads,
+            n_rep * seq_len,
+            total_kv,
+        ))?;
+        let y = quant_attn::quant_sv_dot(&attn_weights, &kv_ref)?;
+        let y = y
+            .reshape((b_sz, self.num_heads, seq_len, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((b_sz, seq_len, ()))?;
+
+        // Qwen 3.5 gates the attention output before `o_proj` — same
+        // adaptation the unfused GQA path below needs.
+        let y = match gate {
+            Some(g) => {
+                let gate = candle_nn::ops::sigmoid(&g.to_dtype(y.dtype())?)?;
+                y.broadcast_mul(&gate)?
+            },
+            None => y,
+        };
+        Ok(Some(self.o_proj.forward(&y)?))
     }
 }
 

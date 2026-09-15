@@ -190,12 +190,12 @@ impl Attention {
 
         let (query_layernorm, key_layernorm) = if config.use_qk_norm {
             (
-                Some(candle_nn::rms_norm(
+                Some(crate::models::with_tracing::rms_norm(
                     head_dim,
                     config.rms_norm_eps,
                     vb.pp("query_layernorm"),
                 )?),
-                Some(candle_nn::rms_norm(
+                Some(crate::models::with_tracing::rms_norm(
                     head_dim,
                     config.rms_norm_eps,
                     vb.pp("key_layernorm"),
@@ -625,12 +625,12 @@ impl DecoderLayer {
     fn new(config: &Config, vb: &VarBuilder) -> Result<Self> {
         let self_attn = Attention::new(config, &vb.pp("self_attn"))?;
         let mlp = Mlp::new(config, &vb.pp("mlp"))?;
-        let input_layernorm = candle_nn::rms_norm(
+        let input_layernorm = crate::models::with_tracing::rms_norm(
             config.hidden_size,
             config.rms_norm_eps,
             vb.pp("input_layernorm"),
         )?;
-        let post_attention_layernorm = candle_nn::rms_norm(
+        let post_attention_layernorm = crate::models::with_tracing::rms_norm(
             config.hidden_size,
             config.rms_norm_eps,
             vb.pp("post_attention_layernorm"),
@@ -719,11 +719,14 @@ impl HunYuanDenseV1 {
             layers.push(DecoderLayer::new(config, &layers_vb.pp(i))?);
         }
 
-        let norm =
-            candle_nn::rms_norm(config.hidden_size, config.rms_norm_eps, model_vb.pp("norm"))?;
+        let norm = crate::models::with_tracing::rms_norm(
+            config.hidden_size,
+            config.rms_norm_eps,
+            model_vb.pp("norm"),
+        )?;
 
         let lm_head = if config.tie_word_embeddings {
-            embed_tokens.tied_output()?
+            embed_tokens.tied_output_upcast_f16(dtype)?
         } else {
             LinearLayer::Standard(linear_no_bias(
                 config.hidden_size,
@@ -871,9 +874,9 @@ impl HunYuanDenseV1 {
         // Final norm
         let norm = gg.rms_norm("output_norm.weight", rms_norm_eps)?;
 
-        // LM head (may be tied to embeddings)
+        // LM head (may be tied to embeddings).
         let lm_head = if tie_word_embeddings {
-            embed_tokens.tied_output()?
+            embed_tokens.tied_output_upcast_f16(dtype)?
         } else {
             gg.linear("output.weight")?
         };
@@ -936,8 +939,8 @@ impl HunYuanDenseV1 {
             // Convert: 0.0 (masked) -> -1e9, 1.0 (attend) -> 0.0
             let mask = mask
                 .broadcast_lt(&Tensor::new(0.5f32, input_ids.device())?)?
-                .to_dtype(self.dtype)?;
-            let mask = (mask * (-1e9f64))?;
+                .to_dtype(DType::F32)?;
+            let mask = (mask * (-1e9f64))?.to_dtype(self.dtype)?;
             Some(mask.unsqueeze(0)?.unsqueeze(0)?) // [1, 1, seq_len, total_len]
         } else {
             None
@@ -977,7 +980,7 @@ impl HunYuanDenseV1 {
         let hidden_states = self.norm.forward(&hidden_states)?;
         let logits = self
             .lm_head
-            .forward(&hidden_states.narrow(1, seq_len - 1, 1)?)?;
+            .forward_logits(&hidden_states.narrow(1, seq_len - 1, 1)?)?;
         Ok(logits)
     }
 
@@ -1177,7 +1180,7 @@ impl HunYuanDenseV1 {
         }
 
         let hidden_states = self.norm.forward(&hidden_states)?;
-        self.lm_head.forward(&hidden_states) // [N, 1, vocab]
+        self.lm_head.forward_logits(&hidden_states) // [N, 1, vocab]
     }
 
     /// Extract per-sequence KV caches from the batched state, removing padding.

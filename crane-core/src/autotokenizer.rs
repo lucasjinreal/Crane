@@ -595,6 +595,14 @@ impl AutoTokenizer {
             Some(v) => minijinja::Value::from(v),
             None => minijinja::Value::UNDEFINED,
         };
+        // Same undefined-vs-none reasoning as above: templates gate on
+        // `tools is defined` (or `not tools is defined`) before falling back
+        // to `[]`, so an explicit `none` skips that fallback and later fails
+        // on `tools | length`.
+        let tools = match tools {
+            Some(ref t) => minijinja::Value::from_serialize(t),
+            None => minijinja::Value::UNDEFINED,
+        };
 
         match tmpl.render(context! {
             messages=> ctx,
@@ -724,6 +732,66 @@ mod tests {
         assert_eq!(
             render_full(UNSLOTH_TAIL, Some(true), Some("low")).unwrap(),
             "ON"
+        );
+    }
+
+    // ── tools ────────────────────────────────────────────────────────────
+
+    /// The Qwen-family `tools` gate, reduced to its essentials: fall back to
+    /// `[]` when undefined, then take `| length`.
+    const TOOLS_TAIL: &str = "{%- if not tools is defined %}\
+{%- set tools = [] %}\
+{%- endif %}\
+{%- if tools is iterable and tools | length > 0 %}{{- 'HAS_TOOLS' }}{%- else %}{{- 'NO_TOOLS' }}{%- endif %}";
+
+    fn render_with_tools(
+        template: &str,
+        tools: Option<&serde_json::Value>,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let config = AutoTokenizerConfig {
+            add_bos_token: None,
+            add_eos_token: None,
+            clean_up_tokenization_spaces: false,
+            legacy: None,
+            tokenizer_class: "test".to_string(),
+            model_max_length: 32,
+            bos_token: None,
+            eos_token: None,
+            pad_token: None,
+            unk_token: None,
+            chat_template: Some(template.to_string()),
+        };
+        let tok = AutoTokenizer {
+            config,
+            tokenizer: Tokenizer::new(tokenizers::models::bpe::BPE::default()),
+        };
+        tok.apply_chat_template_with_tools(Vec::<serde_json::Value>::new(), tools, true)
+    }
+
+    /// `None` must leave `tools` UNDEFINED, not set it to `none` — Jinja
+    /// treats an explicit `none` as *defined*, so the template's own
+    /// `{%- set tools = [] %}` fallback never fires and `tools | length`
+    /// crashes with "cannot calculate length of value of type none".
+    #[test]
+    fn tools_none_leaves_template_default() {
+        assert_eq!(render_with_tools(TOOLS_TAIL, None).unwrap(), "NO_TOOLS");
+    }
+
+    #[test]
+    fn tools_explicit_empty_array_is_no_tools() {
+        let empty = serde_json::json!([]);
+        assert_eq!(
+            render_with_tools(TOOLS_TAIL, Some(&empty)).unwrap(),
+            "NO_TOOLS"
+        );
+    }
+
+    #[test]
+    fn tools_explicit_nonempty_array_is_has_tools() {
+        let tools = serde_json::json!([{"name": "search"}]);
+        assert_eq!(
+            render_with_tools(TOOLS_TAIL, Some(&tools)).unwrap(),
+            "HAS_TOOLS"
         );
     }
 

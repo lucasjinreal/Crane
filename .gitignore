@@ -14,3 +14,4 @@ outputs/
 /vendor
 __pycache__/
 output/
+/prompt-logs/

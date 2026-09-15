@@ -2,14 +2,30 @@
 
 use std::sync::Arc;
 
-use axum::{Json, extract::State, response::IntoResponse};
+use axum::{
+    Json,
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
 use serde_json::json;
 
 use crate::AppState;
 
 /// `GET /health`
-pub async fn health() -> impl IntoResponse {
-    Json(json!({"status": "ok"}))
+pub async fn health(State(state): State<Arc<AppState>>) -> Response {
+    let fatal_error = state
+        .engine
+        .as_ref()
+        .and_then(|e| e.stats.get_fatal_error());
+    match fatal_error {
+        Some(err) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"status": "unhealthy", "error": err})),
+        )
+            .into_response(),
+        None => Json(json!({"status": "ok"})).into_response(),
+    }
 }
 
 /// `GET /v1/stats`

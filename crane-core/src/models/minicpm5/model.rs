@@ -164,9 +164,7 @@ impl Model {
     /// a sibling `tokenizer.json` is only consulted as a fallback for older
     /// or third-party quantizers that lack the embedded metadata.
     fn from_gguf(model_path: &str, device: &Device) -> Result<Model> {
-        use crate::utils::tokenizer_utils::{
-            build_tokenizer_from_gguf_path, gguf_has_embedded_tokenizer,
-        };
+        use crate::utils::tokenizer_utils::resolve_gguf_tokenizer;
 
         let gguf_path = std::path::Path::new(model_path);
         let parent = gguf_path.parent().unwrap_or(gguf_path);
@@ -182,35 +180,7 @@ impl Model {
             ct.metadata.len(),
         );
 
-        // Prefer the embedded tokenizer; fall back to a sibling
-        // tokenizer.json only when the GGUF lacks the necessary metadata.
-        let tokenizer = if gguf_has_embedded_tokenizer(&ct) {
-            build_tokenizer_from_gguf_path(gguf_path)?.ok_or_else(|| {
-                anyhow::anyhow!("GGUF reports embedded tokenizer but build returned None")
-            })?
-        } else {
-            let same_dir = parent.join("tokenizer.json");
-            let tokenizer_path = if same_dir.exists() {
-                same_dir
-            } else {
-                let grandparent = parent.parent().unwrap_or(parent).join("tokenizer.json");
-                if grandparent.exists() {
-                    grandparent
-                } else {
-                    anyhow::bail!(
-                        "GGUF lacks `tokenizer.ggml.tokens`/`merges` metadata and no sibling \
-                         tokenizer.json was found near {}. Place tokenizer.json next to the \
-                         GGUF file, or re-export with a current llama.cpp to embed the tokenizer.",
-                        gguf_path.display()
-                    );
-                }
-            };
-            eprintln!(
-                "GGUF has no embedded tokenizer; falling back to {}",
-                tokenizer_path.display()
-            );
-            Tokenizer::from_file(&tokenizer_path).map_err(E::msg)?
-        };
+        let tokenizer = resolve_gguf_tokenizer(&ct, gguf_path)?;
 
         // EOS: sibling generation_config.json/config.json wins (may hold the
         // full multi-id set, e.g. MiniCPM5's `[1, 130073]` — GGUF metadata's

@@ -15,8 +15,10 @@ use candle_transformers::generation::LogitsProcessor;
 use tokenizers::Tokenizer;
 
 use super::config::{MiniCpmOConfig, load_config};
+use crate::device::{DeviceAssignment, GpuBudget};
 use crate::generation::GenerationConfig;
 use crate::generation::based::ModelForCausalLM;
+use crate::models::modules::quant_kv_cache::KvCacheState;
 use crate::models::qwen3::modeling::Qwen3Model;
 use crate::utils::token_output_stream::TokenOutputStream;
 use crate::utils::utils;
@@ -50,7 +52,13 @@ impl MiniCpmOLlm {
         // `llm.lm_head.weight` as a sibling (not the `model.*` /
         // `lm_head.weight` layout `Qwen3Model::new` assumes).
         let llm_vb = vb.pp("llm");
-        let inner = Qwen3Model::new_from_model_vb(&config.llm, llm_vb.pp("model"), llm_vb)?;
+        let inner = Qwen3Model::new_from_model_vb(
+            &config.llm,
+            llm_vb.pp("model"),
+            llm_vb,
+            device,
+            &GpuBudget::for_device(device),
+        )?;
 
         Ok(Self {
             tokenizer: TokenOutputStream::new(tokenizer),
@@ -98,7 +106,12 @@ impl MiniCpmOLlm {
         let mut cursor = std::io::Cursor::new(mmap.as_ref());
         let ct = candle_core::quantized::gguf_file::Content::read(&mut cursor)
             .map_err(|e| anyhow::anyhow!("failed to parse GGUF file {gguf_path}: {e}"))?;
-        let inner = Qwen3Model::from_gguf(ct, &mut cursor, device)?;
+        let inner = Qwen3Model::from_gguf(
+            ct,
+            &mut cursor,
+            &DeviceAssignment::uniform(device),
+            &GpuBudget::for_device(device),
+        )?;
         let dtype = inner.model_dtype();
 
         Ok(Self {
@@ -197,14 +210,45 @@ impl MiniCpmOLlm {
     /// each, post-RoPE (RoPE is applied before caching, same as the real
     /// HF `DynamicCache`) — needed for sliding-window eviction, which must
     /// realign the survivors' RoPE after dropping a range from the middle.
-    #[must_use]
-    pub fn get_kv_caches(&self) -> Vec<Option<(Tensor, Tensor)>> {
-        self.inner.get_kv_caches()
+    ///
+    /// Dequantizes to the raw pair regardless of the active `CRANE_KV_QUANT`
+    /// representation, so `sliding_window`'s eviction logic can manipulate
+    /// K/V directly without knowing about quantization.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if dequantizing any layer's cache state fails.
+    pub fn get_kv_caches(&self) -> candle_core::Result<Vec<Option<(Tensor, Tensor)>>> {
+        let dtype = self.inner.model_dtype();
+        let caches = self
+            .inner
+            .get_kv_caches()
+            .into_iter()
+            .map(|c| c.map(|s| s.to_fp_pair(dtype)).transpose())
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(caches)
     }
 
-    /// Restore per-layer KV caches after out-of-place eviction/realignment.
-    pub fn set_kv_caches(&mut self, caches: Vec<Option<(Tensor, Tensor)>>) {
-        self.inner.set_kv_caches(caches);
+    /// Restore per-layer KV caches after out-of-place eviction/realignment,
+    /// re-quantizing into the model's active `CRANE_KV_QUANT` representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if re-quantizing any layer's cache state fails.
+    pub fn set_kv_caches(
+        &mut self,
+        caches: Vec<Option<(Tensor, Tensor)>>,
+    ) -> candle_core::Result<()> {
+        let kv_kind = self.inner.kv_kind();
+        let wrapped = caches
+            .into_iter()
+            .map(|c| {
+                c.map(|(k, v)| KvCacheState::from_fp_pair(&k, &v, kv_kind))
+                    .transpose()
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        self.inner.set_kv_caches(wrapped);
+        Ok(())
     }
 
     #[must_use]

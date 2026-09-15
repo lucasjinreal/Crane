@@ -173,9 +173,42 @@ pub fn layer_norm<C: Into<candle_nn::LayerNormConfig>>(
     c: C,
     vb: VarBuilder,
 ) -> Result<LayerNorm> {
-    let inner = candle_nn::layer_norm(size, c, vb)?;
+    let config = c.into();
     let span = tracing::span!(tracing::Level::TRACE, "layer-norm");
+    // See `rms_norm()`'s doc comment above: the pinned candle fork's
+    // `layer_norm()` gates its weight/bias lookups behind `contains_tensor()`
+    // (added for BERT gamma/beta checkpoint compat, which Crane's models
+    // never need), which returns false for a tensor a VarMap-backed builder
+    // hasn't lazily created yet via `Init` — breaking construction from a
+    // fresh `VarMap`, not just the non-affine case. Look the tensors up
+    // directly instead.
+    let weight = vb.get_with_hints(size, "weight", candle_nn::Init::Const(1.))?;
+    let inner = if config.affine {
+        let bias = vb.get_with_hints(size, "bias", candle_nn::Init::Const(0.))?;
+        candle_nn::LayerNorm::new(weight, bias, config.eps)
+    } else if config.remove_mean {
+        candle_nn::LayerNorm::new_no_bias(weight, config.eps)
+    } else {
+        candle_nn::LayerNorm::rms_norm(weight, config.eps)
+    };
     Ok(LayerNorm { inner, span })
+}
+
+/// Drop-in replacement for `candle_nn::rms_norm()`. The pinned candle fork's
+/// `layer_norm()` (which `candle_nn::rms_norm()` delegates to) looks up a
+/// bias/beta tensor unconditionally, even for a non-affine (`RmsNorm`) config —
+/// `RmsNorm` weights never have a bias, so that lookup always fails with
+/// "Failed to find weight tensor". Fetch the weight directly and construct
+/// without going through the bias-requiring path. Returns the same
+/// `candle_nn::RmsNorm` type, so it's safe as a direct replacement anywhere
+/// `candle_nn::rms_norm(...)` is called.
+///
+/// # Errors
+///
+/// Returns an error if the `weight` tensor can't be found or built.
+pub fn rms_norm(size: usize, eps: f64, vb: VarBuilder) -> Result<candle_nn::RmsNorm> {
+    let weight = vb.get_with_hints(size, "weight", candle_nn::Init::Const(1.))?;
+    Ok(candle_nn::RmsNorm::new(weight, eps))
 }
 
 #[derive(Debug, Clone)]
@@ -187,7 +220,7 @@ pub struct RmsNorm {
 impl RmsNorm {
     pub fn new(size: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
         let span = tracing::span!(tracing::Level::TRACE, "rms-norm");
-        let inner = candle_nn::rms_norm(size, eps, vb)?;
+        let inner = rms_norm(size, eps, vb)?;
         Ok(Self { inner, span })
     }
 

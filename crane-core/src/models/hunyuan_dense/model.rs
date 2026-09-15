@@ -18,6 +18,7 @@ use super::modeling::{Config, HunYuanDenseV1};
 use crate::generation::GenerationConfig;
 use crate::generation::based::ModelForCausalLM;
 use crate::utils::token_output_stream::TokenOutputStream;
+use crate::utils::tokenizer_utils;
 use crate::utils::utils;
 
 /// Format of model weights on disk.
@@ -112,38 +113,11 @@ impl Model {
 
     /// Load a GGUF quantized model file.
     ///
-    /// `model_path` should point to a `.gguf` file. The tokenizer is loaded
-    /// from a `tokenizer.json` in the same directory (or a sibling directory).
+    /// `model_path` should point to a `.gguf` file. The tokenizer is read
+    /// from the GGUF metadata if present; a sibling `tokenizer.json` is
+    /// only consulted as a fallback.
     fn from_gguf(model_path: &str, device: &Device) -> Result<Model> {
         let gguf_path = std::path::Path::new(model_path);
-
-        // Find tokenizer: same dir, parent dir, or model_path if it's a directory
-        let tokenizer_path = {
-            let same_dir = gguf_path
-                .parent()
-                .unwrap_or(gguf_path)
-                .join("tokenizer.json");
-            if same_dir.exists() {
-                same_dir
-            } else {
-                // Try parent directory (common layout: models/model.gguf, models/../tokenizer.json)
-                let parent = gguf_path
-                    .parent()
-                    .and_then(|p| p.parent())
-                    .unwrap_or(gguf_path)
-                    .join("tokenizer.json");
-                if parent.exists() {
-                    parent
-                } else {
-                    anyhow::bail!(
-                        "Cannot find tokenizer.json near {}. \
-                         Place tokenizer.json in the same directory as the GGUF file.",
-                        gguf_path.display()
-                    );
-                }
-            }
-        };
-        let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(E::msg)?;
 
         // Open and parse GGUF
         let mmap = crate::quantized::gguf_file::mmap_gguf_file(gguf_path)?;
@@ -155,6 +129,8 @@ impl Model {
             ct.tensor_infos.len(),
             ct.metadata.len(),
         );
+
+        let tokenizer = tokenizer_utils::resolve_gguf_tokenizer(&ct, gguf_path)?;
 
         let inner = HunYuanDenseV1::from_gguf(ct, &mut cursor, device)?;
         let dtype = inner.model_dtype();

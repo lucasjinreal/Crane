@@ -41,13 +41,20 @@ use candle_core::{D, DType, Device, Module, Result, Tensor};
 use candle_nn::attention::AttnMask;
 use candle_nn::rotary_emb::rope_thd;
 use candle_nn::{Linear, RmsNorm, VarBuilder, linear_no_bias};
+use ribo::utils::log;
 use serde::Deserialize;
 use std::io::{Read, Seek};
 
+use crate::device::{
+    DeviceAssignment, GpuBudget, WeightBudget, format_budget, greedy_fit_layers, query_gpu_memory,
+};
 use crate::models::modules::embedding::EmbeddingLayer;
 use crate::models::modules::flash_attn::dispatch_flash_attn;
-use crate::models::modules::kv_cache;
+use crate::models::modules::moe::{MlpOrMoe, MoeConfig, SparseMoeBlock};
+use crate::models::modules::quant_kv_cache;
+use crate::models::modules::quant_kv_cache::{FpKvCache, KvCache, KvCacheKind, KvCacheState};
 use crate::models::modules::rotary::RotaryEmbedding;
+use crate::ops::fused_ops::quant_attn;
 use crate::utils::DeviceExt;
 
 // Reuse the polymorphic linear layer and the shared GGUF loader.
@@ -79,7 +86,7 @@ impl EventTrackingGuard {
 
 /// Per-layer, per-sequence KV cache tensors, as returned by
 /// [`Qwen3Model::extract_batch_kv`].
-pub type BatchKvCache = Vec<Vec<Option<(Tensor, Tensor)>>>;
+pub type BatchKvCache = Vec<Vec<Option<KvCacheState>>>;
 
 // ── Config ──────────────────────────────────────────────────────────────
 
@@ -121,6 +128,21 @@ pub struct Config {
     pub use_sliding_window: bool,
     #[serde(default)]
     pub eos_token_id: Option<u32>,
+    /// Total number of experts per `MoE` layer. `None` for dense checkpoints.
+    #[serde(default)]
+    pub num_experts: Option<usize>,
+    /// Number of experts activated per token (top-K). `None` for dense checkpoints.
+    #[serde(default)]
+    pub num_experts_per_tok: Option<usize>,
+    /// Hidden dimension of each expert's feed-forward network.
+    #[serde(default)]
+    pub moe_intermediate_size: Option<usize>,
+    /// Whether to renormalize the top-K routing weights to sum to 1.
+    #[serde(default)]
+    pub norm_topk_prob: Option<bool>,
+    /// Every Nth layer is `MoE`; the rest stay dense MLP.
+    #[serde(default)]
+    pub decoder_sparse_step: Option<usize>,
 }
 
 impl Config {
@@ -128,6 +150,52 @@ impl Config {
     pub fn head_dim(&self) -> usize {
         self.head_dim
             .unwrap_or(self.hidden_size / self.num_attention_heads)
+    }
+
+    /// Bytes of KV cache one sequence consumes per generated token, summed
+    /// across every layer (standard full-attention: one K and one V tensor
+    /// per layer, no sharing).
+    #[must_use]
+    pub fn kv_bytes_per_token(&self, dtype_bytes: usize) -> u64 {
+        2 * self.num_hidden_layers as u64
+            * self.num_key_value_heads as u64
+            * self.head_dim() as u64
+            * dtype_bytes as u64
+    }
+
+    /// Bytes of KV cache one sequence consumes per generated token when K/V
+    /// are stored as `bits`-wide (4 or 8) quantized codes plus a per-token
+    /// f32 scale per head, instead of the compute dtype (see
+    /// [`crate::models::modules::quant_kv_cache::QuantKvCache`]). Only an
+    /// accurate estimate when the fused dequantize-in-attention kernel
+    /// (`crate::ops::fused_ops::quant_attn`) covers the sequence's entire
+    /// lifetime — see [`Self::kv_bytes_per_token`]'s doc for why plain
+    /// compute-dtype pricing is required otherwise.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `bits` is neither 4 nor 8.
+    #[must_use]
+    pub fn quantized_kv_bytes_per_token(&self, bits: u32) -> u64 {
+        quant_kv_cache::quantized_kv_bytes_per_token(
+            bits,
+            self.num_hidden_layers,
+            self.num_key_value_heads,
+            self.head_dim(),
+        )
+    }
+
+    /// Builds the `MoE` configuration for this model, or `None` if this is a
+    /// dense (non-`MoE`) checkpoint.
+    #[must_use]
+    pub fn moe_config(&self) -> Option<MoeConfig> {
+        Some(MoeConfig {
+            num_experts: self.num_experts?,
+            num_experts_per_tok: self.num_experts_per_tok?,
+            moe_intermediate_size: self.moe_intermediate_size?,
+            norm_topk_prob: self.norm_topk_prob.unwrap_or(true),
+            decoder_sparse_step: self.decoder_sparse_step,
+        })
     }
 }
 
@@ -148,10 +216,11 @@ struct Attention {
     head_dim: usize,
     q_dim: usize,
     kv_dim: usize,
-    /// Pre-allocated KV cache buffer (may be larger than `cache_seq_len`).
-    kv_cache: Option<(Tensor, Tensor)>,
-    /// Number of valid (filled) positions in the KV cache buffer.
-    cache_seq_len: usize,
+    /// Per-token K/V cache, plain or quantized depending on `CRANE_KV_QUANT`
+    /// (see [`KvCacheKind::from_env`]). `KvCache::default()` (the `Fp`
+    /// variant) behaves identically to the plain pre-allocated buffer this
+    /// replaced.
+    kv_cache: KvCache,
 }
 
 impl Attention {
@@ -159,7 +228,7 @@ impl Attention {
     // codebase (its `pp`/`device`/`dtype` accessors take `&self` and are
     // cheap to call repeatedly); matching that convention here.
     #[allow(clippy::needless_pass_by_value)]
-    fn new(config: &Config, vb: VarBuilder) -> Result<Self> {
+    fn new(config: &Config, vb: VarBuilder, kv_kind: KvCacheKind) -> Result<Self> {
         let head_dim = config.head_dim();
         let num_heads = config.num_attention_heads;
         let num_kv_heads = config.num_key_value_heads;
@@ -207,12 +276,12 @@ impl Attention {
 
         let (q_norm, k_norm) = if config.use_qk_norm {
             (
-                Some(candle_nn::rms_norm(
+                Some(crate::models::with_tracing::rms_norm(
                     head_dim,
                     config.rms_norm_eps,
                     vb.pp("q_norm"),
                 )?),
-                Some(candle_nn::rms_norm(
+                Some(crate::models::with_tracing::rms_norm(
                     head_dim,
                     config.rms_norm_eps,
                     vb.pp("k_norm"),
@@ -235,8 +304,7 @@ impl Attention {
             head_dim,
             q_dim,
             kv_dim,
-            kv_cache: None,
-            cache_seq_len: 0,
+            kv_cache: KvCache::new(kv_kind),
         })
     }
 
@@ -245,6 +313,7 @@ impl Attention {
         config: &Config,
         gg: &mut Gguf<R>,
         layer_idx: usize,
+        kv_kind: KvCacheKind,
     ) -> Result<Self> {
         let head_dim = config.head_dim();
         let num_heads = config.num_attention_heads;
@@ -278,22 +347,14 @@ impl Attention {
             head_dim,
             q_dim: num_heads * head_dim,
             kv_dim: num_kv_heads * head_dim,
-            kv_cache: None,
-            cache_seq_len: 0,
+            kv_cache: KvCache::new(kv_kind),
         })
     }
 
-    /// Update the pre-allocated KV cache with new K,V tensors.
-    ///
-    /// Uses `slice_set` for O(1) in-place writes when the buffer has room.
-    /// Falls back to cat + reallocate when the buffer is full.
+    /// Append this step's K/V to the cache and return the full cached K/V in
+    /// the compute dtype, ready for attention. See [`KvCache::append`].
     fn update_kv_cache(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
-        let cache = self.kv_cache.take();
-        let prev_seq_len = std::mem::replace(&mut self.cache_seq_len, 0);
-        let update = kv_cache::update_kv_cache(cache, prev_seq_len, k, v)?;
-        self.kv_cache = Some(update.buffer);
-        self.cache_seq_len = update.seq_len;
-        Ok((update.k, update.v))
+        self.kv_cache.append(k, v)
     }
 
     // q/k/v/b/h/s/d are standard ML tensor-shape notation (query, key,
@@ -364,9 +425,6 @@ impl Attention {
         let q = q.transpose(1, 2)?;
         let k = k.transpose(1, 2)?;
 
-        // Update KV cache (pre-allocated with slice_set)
-        let (k, v) = self.update_kv_cache(&k, &v)?;
-
         // ── SDPA ──
         let n_rep = self.num_heads / self.num_kv_heads;
         // head_dim is a small model hyperparameter (e.g. <= a few hundred),
@@ -378,6 +436,51 @@ impl Attention {
         // discard anyway.
         #[allow(clippy::cast_possible_truncation)]
         let scale_f32 = scale as f32;
+
+        // ── Fused dequantize-in-attention, GPU + quantized cache only
+        // (Phase 5) ── Reads int8/int4 codes + scales directly and
+        // dequantizes inside the QK/SV matmuls instead of reading a
+        // fully-dequantized K/V back from `QuantKvCache`'s scratch buffer,
+        // so this step never materializes a full-context-length
+        // compute-dtype K/V tensor -- covers both decode (seq_len == 1) and
+        // prefill (seq_len > 1). `try_quantized_append` returns `None`
+        // (falling through below) for an `Fp` cache, a CPU/Metal device, or
+        // `CRANE_QUANT_ATTN_FUSED=0`.
+        if let Some(kv_ref) = self.kv_cache.try_quantized_append(&k, &v)? {
+            // q is [B, num_heads, seq_len, D]; fold (n_rep, seq_len) into a
+            // single R axis per kv head (rep-major, position-minor), the
+            // same merge `quant_qk_dot`'s kernel already expects for decode
+            // (there seq_len == 1 so R == n_rep).
+            let q_g =
+                (q.reshape((b_sz, self.num_kv_heads, n_rep * seq_len, self.head_dim))? * scale)?;
+            let scores = quant_attn::quant_qk_dot(&q_g, &kv_ref)?;
+            let total_kv = scores.dim(D::Minus1)?;
+            // The mask varies per query position, not per rep, so unfold R
+            // back into (n_rep, seq_len) merged with kv_heads into
+            // num_heads before adding it — the exact inverse of the q_g
+            // fold above.
+            let scores = scores.reshape((b_sz, self.num_heads, seq_len, total_kv))?;
+            let scores = match attention_mask {
+                Some(mask) => scores.broadcast_add(mask)?,
+                None => scores,
+            };
+            let scores = candle_nn::ops::softmax_last_dim(&scores)?.reshape((
+                b_sz,
+                self.num_kv_heads,
+                n_rep * seq_len,
+                total_kv,
+            ))?;
+            let attn_output = quant_attn::quant_sv_dot(&scores, &kv_ref)?;
+            let attn_output = attn_output
+                .reshape((b_sz, self.num_heads, seq_len, self.head_dim))?
+                .transpose(1, 2)?
+                .contiguous()?
+                .reshape((b_sz, seq_len, ()))?;
+            return self.o_proj.forward(&attn_output);
+        }
+
+        // Update KV cache (pre-allocated with slice_set)
+        let (k, v) = self.update_kv_cache(&k, &v)?;
 
         if seq_len == 1 && b_sz == 1 && q.device().is_cpu() {
             // ── Fused flash attention for decode (seq_len=1), CPU only ──
@@ -535,8 +638,7 @@ impl Attention {
     }
 
     fn clear_kv_cache(&mut self) {
-        self.kv_cache = None;
-        self.cache_seq_len = 0;
+        self.kv_cache.reset();
     }
 }
 
@@ -644,11 +746,17 @@ impl Mlp {
     }
 }
 
+impl Module for Mlp {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        Self::forward(self, xs)
+    }
+}
+
 // ── Decoder Layer ───────────────────────────────────────────────────────
 
 struct DecoderLayer {
     self_attn: Attention,
-    mlp: Mlp,
+    mlp: MlpOrMoe<Mlp>,
     input_layernorm: RmsNorm,
     post_attention_layernorm: RmsNorm,
 }
@@ -656,15 +764,36 @@ struct DecoderLayer {
 impl DecoderLayer {
     // See `Attention::new`'s comment on `VarBuilder` by-value.
     #[allow(clippy::needless_pass_by_value)]
-    fn new(config: &Config, vb: VarBuilder) -> Result<Self> {
-        let self_attn = Attention::new(config, vb.pp("self_attn"))?;
-        let mlp = Mlp::new(config, vb.pp("mlp"))?;
-        let input_layernorm = candle_nn::rms_norm(
+    fn new(
+        config: &Config,
+        layer_idx: usize,
+        vb: VarBuilder,
+        expert_device: &Device,
+        kv_kind: KvCacheKind,
+    ) -> Result<Self> {
+        let self_attn = Attention::new(config, vb.pp("self_attn"), kv_kind)?;
+        let moe_config = config.moe_config();
+        // HF's `mlp_only_layers` override (per-layer dense exceptions) isn't
+        // modeled here; only the uniform `decoder_sparse_step` stride is.
+        let is_moe_layer = moe_config.as_ref().is_some_and(|mc| {
+            mc.decoder_sparse_step
+                .is_none_or(|step| (layer_idx + 1).is_multiple_of(step))
+        });
+        let mlp = match moe_config {
+            Some(mc) if is_moe_layer => MlpOrMoe::Moe(SparseMoeBlock::new(
+                &mc,
+                config.hidden_size,
+                vb.pp("mlp"),
+                expert_device,
+            )?),
+            _ => MlpOrMoe::Dense(Mlp::new(config, vb.pp("mlp"))?),
+        };
+        let input_layernorm = crate::models::with_tracing::rms_norm(
             config.hidden_size,
             config.rms_norm_eps,
             vb.pp("input_layernorm"),
         )?;
-        let post_attention_layernorm = candle_nn::rms_norm(
+        let post_attention_layernorm = crate::models::with_tracing::rms_norm(
             config.hidden_size,
             config.rms_norm_eps,
             vb.pp("post_attention_layernorm"),
@@ -681,9 +810,27 @@ impl DecoderLayer {
         config: &Config,
         gg: &mut Gguf<R>,
         layer_idx: usize,
+        expert_device: &Device,
+        kv_kind: KvCacheKind,
     ) -> Result<Self> {
-        let self_attn = Attention::new_from_gguf(config, gg, layer_idx)?;
-        let mlp = Mlp::new_from_gguf(gg, layer_idx, config.intermediate_size)?;
+        let self_attn = Attention::new_from_gguf(config, gg, layer_idx, kv_kind)?;
+        let is_moe = gg.contains_tensor(&format!("blk.{layer_idx}.ffn_gate_inp.weight"));
+        let mlp = if is_moe {
+            let moe_config = config.moe_config().ok_or_else(|| {
+                candle_core::Error::Msg(format!(
+                    "layer {layer_idx} has MoE tensors but Config lacks MoE fields"
+                ))
+                .bt()
+            })?;
+            MlpOrMoe::Moe(SparseMoeBlock::new_from_gguf(
+                &moe_config,
+                gg,
+                layer_idx,
+                expert_device,
+            )?)
+        } else {
+            MlpOrMoe::Dense(Mlp::new_from_gguf(gg, layer_idx, config.intermediate_size)?)
+        };
         let prefix = format!("blk.{layer_idx}");
         let input_layernorm =
             gg.rms_norm(&format!("{prefix}.attn_norm.weight"), config.rms_norm_eps)?;
@@ -735,17 +882,171 @@ pub struct Qwen3Model {
     /// Full-sequence post-norm hidden states from the most recent forward
     /// call — see [`Self::last_hidden_states`].
     last_hidden_states: Option<Tensor>,
+    /// KV cache representation in use, selected at construction either
+    /// from `CRANE_KV_QUANT` or an explicit `kv_kind` argument (e.g.
+    /// `--kv-quant`). Needed by [`Self::extract_batch_kv`] to decide
+    /// whether to re-quantize.
+    kv_kind: KvCacheKind,
+}
+
+/// `MoE` expert metadata read from GGUF, all `None` for dense
+/// (non-`MoE`) checkpoints.
+struct GgufMoeMetadata {
+    num_experts: Option<usize>,
+    num_experts_per_tok: Option<usize>,
+    moe_intermediate_size: Option<usize>,
+    norm_topk_prob: Option<bool>,
+}
+
+/// Reads `MoE` expert metadata from GGUF, if present.
+fn read_moe_metadata<R: Read + Seek>(gg: &Gguf<R>, arch: &str) -> GgufMoeMetadata {
+    let num_experts = gg
+        .metadata()
+        .get(&format!("{arch}.expert_count"))
+        .and_then(|v| v.to_u32().ok())
+        .map(|v| v as usize)
+        // Some dense GGUF exports write an explicit `expert_count = 0`
+        // rather than omitting the key; treat that the same as absent.
+        .filter(|&n| n > 0);
+    let num_experts_per_tok = gg
+        .metadata()
+        .get(&format!("{arch}.expert_used_count"))
+        .and_then(|v| v.to_u32().ok())
+        .map(|v| v as usize);
+    let moe_intermediate_size = gg
+        .metadata()
+        .get(&format!("{arch}.expert_feed_forward_length"))
+        .and_then(|v| v.to_u32().ok())
+        .map(|v| v as usize);
+    let expert_shared_ffn_length = gg
+        .metadata()
+        .get(&format!("{arch}.expert_shared_feed_forward_length"))
+        .and_then(|v| v.to_u32().ok())
+        .map(|v| v as usize);
+    // Qwen3 MoE has no shared experts, so an absent or zero shared-FFN
+    // length means the top-K routing weights should be renormalized.
+    let norm_topk_prob = num_experts
+        .map(|_| expert_shared_ffn_length.is_none() || expert_shared_ffn_length == Some(0));
+    GgufMoeMetadata {
+        num_experts,
+        num_experts_per_tok,
+        moe_intermediate_size,
+        norm_topk_prob,
+    }
+}
+
+/// Quantized on-disk byte size of a GGUF tensor, computed from header
+/// metadata alone (no tensor data read).
+fn gguf_tensor_bytes(info: &gguf_file::TensorInfo) -> u64 {
+    let elem_count = info.shape.elem_count() as u64;
+    let block_size = info.ggml_dtype.block_size() as u64;
+    let type_size = info.ggml_dtype.type_size() as u64;
+    elem_count / block_size * type_size
+}
+
+/// Whether a GGUF tensor name is an `MoE` expert weight (packed or
+/// per-expert layout) — see [`SparseMoeBlock::new_from_gguf`] for the two
+/// layouts. Excludes the router (`ffn_gate_inp`), which always stays on the
+/// main device.
+fn is_expert_tensor(name: &str) -> bool {
+    if name.contains("ffn_gate_exps")
+        || name.contains("ffn_up_exps")
+        || name.contains("ffn_down_exps")
+    {
+        return true;
+    }
+    ["ffn_gate.", "ffn_up.", "ffn_down."].iter().any(|prefix| {
+        name.split(prefix)
+            .nth(1)
+            .and_then(|rest| rest.chars().next())
+            .is_some_and(|c| c.is_ascii_digit())
+    })
+}
+
+/// Extracts the decoder layer index from a `blk.{i}.*` tensor name.
+fn expert_tensor_layer(name: &str) -> Option<usize> {
+    let rest = name.strip_prefix("blk.")?;
+    let dot = rest.find('.')?;
+    rest[..dot].parse().ok()
+}
+
+/// Estimated GPU VRAM cost of loading one `MoE` layer's expert weights.
+///
+/// Packed experts are dequantized to `compute_dtype_bytes` up front (see
+/// [`SparseMoeBlock::new_from_gguf`]'s doc comment on `load_packed_experts`),
+/// so their cost is the dequantized size, not the on-disk quantized size.
+/// Per-expert tensors are loaded quantized but are also dequantized to
+/// `compute_dtype_bytes` on promotion (see `LinearLayer::to_device`), so
+/// their cost estimate uses the same dequantized size, not the smaller
+/// on-disk quantized size.
+fn estimate_expert_layer_vram(
+    tensor_infos: &std::collections::HashMap<String, gguf_file::TensorInfo>,
+    layer_idx: usize,
+    is_packed: bool,
+    compute_dtype_bytes: usize,
+) -> u64 {
+    if is_packed {
+        ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"]
+            .iter()
+            .map(|suffix| {
+                let name = format!("blk.{layer_idx}.{suffix}.weight");
+                tensor_infos.get(&name).map_or(0, |info| {
+                    info.shape.elem_count() as u64 * compute_dtype_bytes as u64
+                })
+            })
+            .sum()
+    } else {
+        tensor_infos
+            .iter()
+            .filter(|(name, _)| {
+                is_expert_tensor(name) && expert_tensor_layer(name) == Some(layer_idx)
+            })
+            .map(|(_, info)| info.shape.elem_count() as u64 * compute_dtype_bytes as u64)
+            .sum()
+    }
 }
 
 impl Qwen3Model {
     /// Construct from safetensors / `HuggingFace` checkpoint.
     ///
+    /// `gpu_budget` constrains `MoE` expert placement; only consumed once
+    /// the checkpoint is `MoE` (see [`crate::device::GpuBudget`]).
+    ///
     /// # Errors
     ///
     /// Returns an error if a required weight tensor is missing or has an
     /// unexpected shape.
-    pub fn new(config: &Config, vb: VarBuilder) -> Result<Self> {
-        Self::new_inner(config, vb.pp("model"), vb)
+    pub fn new(
+        config: &Config,
+        vb: VarBuilder,
+        expert_device: &Device,
+        gpu_budget: &GpuBudget,
+    ) -> Result<Self> {
+        Self::new_inner(config, vb.pp("model"), vb, expert_device, gpu_budget)
+    }
+
+    /// Like [`Self::new`], but takes an explicit `kv_kind` (e.g. from a
+    /// `--kv-quant` CLI flag) instead of reading `CRANE_KV_QUANT`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a required weight tensor is missing or has an
+    /// unexpected shape.
+    pub fn new_with_kv_kind(
+        config: &Config,
+        vb: VarBuilder,
+        expert_device: &Device,
+        gpu_budget: &GpuBudget,
+        kv_kind: KvCacheKind,
+    ) -> Result<Self> {
+        Self::new_inner_with_kv_kind(
+            config,
+            vb.pp("model"),
+            vb,
+            expert_device,
+            gpu_budget,
+            kv_kind,
+        )
     }
 
     /// Construct from a checkpoint where the decoder is nested under a
@@ -753,6 +1054,8 @@ impl Qwen3Model {
     /// `model.language_model.*`). `model_vb` must already be scoped to the
     /// decoder's root (what would otherwise be `vb.pp("model")`); `root_vb`
     /// is the checkpoint root, used to resolve an untied `lm_head` sibling.
+    /// `gpu_budget` constrains `MoE` expert placement; only consumed once
+    /// the checkpoint is `MoE` (see [`crate::device::GpuBudget`]).
     ///
     /// # Errors
     ///
@@ -762,13 +1065,45 @@ impl Qwen3Model {
         config: &Config,
         model_vb: VarBuilder,
         root_vb: VarBuilder,
+        expert_device: &Device,
+        gpu_budget: &GpuBudget,
     ) -> Result<Self> {
-        Self::new_inner(config, model_vb, root_vb)
+        Self::new_inner(config, model_vb, root_vb, expert_device, gpu_budget)
     }
 
     // See `Attention::new`'s comment on `VarBuilder` by-value.
     #[allow(clippy::needless_pass_by_value)]
-    fn new_inner(config: &Config, model_vb: VarBuilder, root_vb: VarBuilder) -> Result<Self> {
+    fn new_inner(
+        config: &Config,
+        model_vb: VarBuilder,
+        root_vb: VarBuilder,
+        expert_device: &Device,
+        gpu_budget: &GpuBudget,
+    ) -> Result<Self> {
+        Self::new_inner_with_kv_kind(
+            config,
+            model_vb,
+            root_vb,
+            expert_device,
+            gpu_budget,
+            KvCacheKind::from_env(),
+        )
+    }
+
+    /// Like [`Self::new_inner`], but takes an explicit `kv_kind` instead of
+    /// reading `CRANE_KV_QUANT` — used by [`Self::new_with_kv_kind`] and by
+    /// tests (avoids mutating process-wide env state from parallel tests).
+    // See `Attention::new`'s comment on `VarBuilder` by-value.
+    #[allow(clippy::needless_pass_by_value)]
+    fn new_inner_with_kv_kind(
+        config: &Config,
+        model_vb: VarBuilder,
+        root_vb: VarBuilder,
+        expert_device: &Device,
+        _gpu_budget: &GpuBudget,
+        kv_kind: KvCacheKind,
+    ) -> Result<Self> {
+        log::info!("KV cache: {}", kv_kind.describe());
         let dtype = model_vb.dtype();
         let embed_tokens = EmbeddingLayer::Dense(candle_nn::embedding(
             config.vocab_size,
@@ -779,20 +1114,42 @@ impl Qwen3Model {
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         let layers_vb = model_vb.pp("layers");
         for i in 0..config.num_hidden_layers {
-            layers.push(DecoderLayer::new(config, layers_vb.pp(i))?);
+            layers.push(DecoderLayer::new(
+                config,
+                i,
+                layers_vb.pp(i),
+                expert_device,
+                kv_kind,
+            )?);
         }
 
-        let norm =
-            candle_nn::rms_norm(config.hidden_size, config.rms_norm_eps, model_vb.pp("norm"))?;
+        let norm = crate::models::with_tracing::rms_norm(
+            config.hidden_size,
+            config.rms_norm_eps,
+            model_vb.pp("norm"),
+        )?;
 
-        let lm_head = if config.tie_word_embeddings {
-            embed_tokens.tied_output()?
+        // Pre-stored in F32 only when the compute dtype is F16: raw logits
+        // over a 100k+ vocab routinely exceed F16's 65504 max, and
+        // pre-converting avoids a per-token cast of the weight at the
+        // `LinearLayer::forward_logits` call site. BF16/F32 share F32's
+        // exponent range and can't overflow, so they stay native -- BF16 in
+        // particular must stay BF16 for the CUDA `gpu_argmax` sampling fast
+        // path, which only accepts BF16 logits.
+        let lm_head_dtype = if dtype == DType::F16 {
+            DType::F32
         } else {
-            LinearLayer::Standard(linear_no_bias(
-                config.hidden_size,
-                config.vocab_size,
-                root_vb.pp("lm_head"),
-            )?)
+            dtype
+        };
+        let lm_head = if config.tie_word_embeddings {
+            embed_tokens.tied_output_upcast_f16(dtype)?
+        } else {
+            LinearLayer::Standard(Linear::new(
+                linear_no_bias(config.hidden_size, config.vocab_size, root_vb.pp("lm_head"))?
+                    .weight()
+                    .to_dtype(lm_head_dtype)?,
+                None,
+            ))
         };
 
         let rotary_emb = RotaryEmbedding::new(
@@ -811,10 +1168,17 @@ impl Qwen3Model {
             config: config.clone(),
             dtype,
             last_hidden_states: None,
+            kv_kind,
         })
     }
 
     /// Construct from a GGUF file.
+    ///
+    /// `devices.main` holds every weight, including `MoE` experts that fit
+    /// in `gpu_budget`; `devices.expert` is not used by this loading path.
+    /// `gpu_budget` decides, per `MoE` layer, whether that layer's experts
+    /// load to `devices.main` or `Device::Cpu`; only consumed once the
+    /// checkpoint is `MoE` (see [`crate::device::GpuBudget`]).
     ///
     /// # Errors
     ///
@@ -823,8 +1187,32 @@ impl Qwen3Model {
     pub fn from_gguf<R: Read + Seek>(
         ct: gguf_file::Content,
         reader: &mut R,
-        device: &Device,
+        devices: &DeviceAssignment,
+        gpu_budget: &GpuBudget,
     ) -> Result<Self> {
+        Self::from_gguf_with_kv_kind(ct, reader, devices, gpu_budget, KvCacheKind::from_env())
+    }
+
+    /// Like [`Self::from_gguf`], but takes an explicit `kv_kind` (e.g. from
+    /// a `--kv-quant` CLI flag) instead of reading `CRANE_KV_QUANT`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a required tensor or metadata entry is missing
+    /// or has an unexpected shape.
+    // This function's length comes from reading many independent GGUF
+    // metadata keys (attention, RoPE, MoE) into `Config` one field at a
+    // time; splitting it up would scatter that flat read-and-assign
+    // sequence across several small functions without simplifying it.
+    #[allow(clippy::too_many_lines)]
+    pub fn from_gguf_with_kv_kind<R: Read + Seek>(
+        ct: gguf_file::Content,
+        reader: &mut R,
+        devices: &DeviceAssignment,
+        gpu_budget: &GpuBudget,
+        kv_kind: KvCacheKind,
+    ) -> Result<Self> {
+        let device = &devices.main;
         let dtype = if device.is_cuda() {
             DType::BF16
         } else if device.is_metal() || device.is_rocm() {
@@ -874,6 +1262,8 @@ impl Qwen3Model {
                 .unwrap_or(1_000_000.0),
         );
 
+        let moe_meta = read_moe_metadata(&gg, &arch);
+
         let use_qk_norm = gg.ct.tensor_infos.contains_key("blk.0.attn_q_norm.weight");
         let tie_word_embeddings = !gg.ct.tensor_infos.contains_key("output.weight");
 
@@ -895,6 +1285,13 @@ impl Qwen3Model {
             max_window_layers: 0,
             use_sliding_window: false,
             eos_token_id: None,
+            num_experts: moe_meta.num_experts,
+            num_experts_per_tok: moe_meta.num_experts_per_tok,
+            moe_intermediate_size: moe_meta.moe_intermediate_size,
+            norm_topk_prob: moe_meta.norm_topk_prob,
+            // Not a standard GGUF metadata key; the GGUF layer-construction
+            // path detects MoE-vs-dense per layer by tensor presence instead.
+            decoder_sparse_step: None,
         };
 
         let embed_tokens = gg.quantized_embedding("token_embd.weight", hidden_size)?;
@@ -904,15 +1301,56 @@ impl Qwen3Model {
             ..config
         };
 
+        // ── Per-layer expert placement ───────────────────────────────────
+        //
+        // Non-expert weights (attention, norms, embeddings, router) always
+        // load to `devices.main`; only MoE expert weights are considered
+        // for offloading to `Device::Cpu`, based on `gpu_budget`.
+        //
+        // `WeightBudget::Limited` loads every MoE layer to CPU here (a safe
+        // default) and defers the real GPU/CPU decision to
+        // `promote_experts_after_probe`, called once this model exists and
+        // can run a probe forward pass — see that method's doc comment for
+        // why a static pre-load estimate isn't good enough on its own.
+        let is_moe_checkpoint = config.num_experts.is_some_and(|n| n > 0);
+        let expert_devices: Vec<Device> = if !is_moe_checkpoint {
+            vec![devices.main.clone(); num_hidden_layers]
+        } else if gpu_budget.offload_all_experts {
+            log::info!("--offload-experts: all MoE expert layers -> CPU");
+            vec![Device::Cpu; num_hidden_layers]
+        } else {
+            match gpu_budget.weight_budget {
+                WeightBudget::NoGpu | WeightBudget::Unlimited => {
+                    vec![devices.main.clone(); num_hidden_layers]
+                },
+                WeightBudget::Limited(_) => vec![Device::Cpu; num_hidden_layers],
+            }
+        };
+
+        log::info!("KV cache: {}", kv_kind.describe());
+        log::info!(
+            "Loading {num_hidden_layers} layers from GGUF (attention{} weights stay quantized)...",
+            if is_moe_checkpoint {
+                " + MoE expert"
+            } else {
+                ""
+            },
+        );
         let mut layers = Vec::with_capacity(num_hidden_layers);
         for i in 0..num_hidden_layers {
-            layers.push(DecoderLayer::new_from_gguf(&config, &mut gg, i)?);
+            layers.push(DecoderLayer::new_from_gguf(
+                &config,
+                &mut gg,
+                i,
+                &expert_devices[i],
+                kv_kind,
+            )?);
         }
 
         let norm = gg.rms_norm("output_norm.weight", rms_norm_eps)?;
 
         let lm_head = if tie_word_embeddings {
-            embed_tokens.tied_output()?
+            embed_tokens.tied_output_upcast_f16(dtype)?
         } else {
             gg.linear("output.weight")?
         };
@@ -924,7 +1362,7 @@ impl Qwen3Model {
             device,
         )?;
 
-        Ok(Self {
+        let mut model = Self {
             embed_tokens,
             layers,
             norm,
@@ -933,7 +1371,271 @@ impl Qwen3Model {
             config,
             dtype,
             last_hidden_states: None,
-        })
+            kv_kind,
+        };
+
+        if is_moe_checkpoint
+            && !gpu_budget.offload_all_experts
+            && let WeightBudget::Limited(total_vram) = gpu_budget.weight_budget
+        {
+            // Quantized pricing is only valid when the fused
+            // dequantize-in-attention kernel covers the whole sequence
+            // lifetime: CUDA/ROCm, `max_concurrent == 1` so batch-decode's
+            // to_fp_pair()/from_fp_pair() round-trip (which always peaks at
+            // the compute dtype) never applies, and `CRANE_QUANT_ATTN_FUSED`
+            // isn't `0` (which forces every append onto the unfused path).
+            // Otherwise price at the compute dtype's size — see
+            // `Model::kv_bytes_per_token`'s doc comment for the same
+            // reasoning.
+            let fused_covers_full_lifetime = (device.is_cuda() || device.is_rocm())
+                && gpu_budget.max_concurrent == Some(1)
+                && !quant_attn::fused_disabled();
+            let kv_bytes_per_token = kv_kind.effective_kv_bytes_per_token(
+                fused_covers_full_lifetime,
+                num_hidden_layers,
+                num_kv_heads,
+                head_dim,
+                dtype.size_in_bytes(),
+            );
+            let runtime_reservation =
+                gpu_budget.runtime_reservation_bytes_for_kv_bytes_per_token(kv_bytes_per_token);
+            model.promote_experts_after_probe(
+                devices,
+                total_vram,
+                runtime_reservation,
+                &gg.ct.tensor_infos,
+                num_hidden_layers,
+                dtype.size_in_bytes(),
+            )?;
+        }
+
+        Ok(model)
+    }
+
+    /// Runs a probe forward pass to force GPU backends' lazy first-use
+    /// library initialization (rocBLAS/hipRAND/JIT-compiled kernels), then
+    /// live-queries actual free VRAM and promotes CPU-placed `MoE` expert
+    /// layers to GPU based on real remaining headroom.
+    ///
+    /// A purely static pre-load estimate (subtracting an estimated
+    /// KV-cache reservation from `--gpu-memory-limit`) was found, via
+    /// `crane-serve`'s live-queried `record_baseline()` compared across
+    /// several real `ROCm` runs, to consistently underestimate actual
+    /// post-warmup VRAM usage by several GB — a gap that didn't scale
+    /// with the number of GPU-resident expert layers, so it isn't a
+    /// weight-sizing bug. It's the cost of compute libraries that don't
+    /// initialize until something actually runs on the device, which is
+    /// unavoidably *after* model loading decides placement unless loading
+    /// itself forces that initialization first.
+    ///
+    /// Best effort: if the probe forward pass fails, this logs a warning
+    /// and leaves every expert on CPU (safe, just unoptimized) rather
+    /// than failing model load. If live VRAM querying isn't supported for
+    /// this device (e.g. Metal), falls back to the static estimate this
+    /// replaces.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if constructing the probe input tensor fails.
+    /// A failed probe forward pass or failed expert promotion is handled
+    /// gracefully (logged, affected experts left on CPU) and does not
+    /// propagate an error.
+    // One sequential pipeline (probe -> cost estimate -> budget -> promote)
+    // sharing local state (`gpu_location`, `layer_costs`) throughout;
+    // splitting it up would scatter that shared context across several
+    // small functions without simplifying the control flow itself — same
+    // rationale as `Attention::forward`'s existing `too_many_lines` allow.
+    #[allow(clippy::too_many_lines)]
+    fn promote_experts_after_probe(
+        &mut self,
+        devices: &DeviceAssignment,
+        total_vram: u64,
+        runtime_reservation: u64,
+        tensor_infos: &std::collections::HashMap<String, gguf_file::TensorInfo>,
+        num_hidden_layers: usize,
+        dtype_bytes: usize,
+    ) -> Result<()> {
+        // `RocmDevice`'s `Debug` output (e.g. `DeviceId(1)`) is a
+        // process-wide counter of *how many `RocmDevice`s this process has
+        // ever constructed* — it is not the physical GPU ordinal, and is
+        // frequently `1` even when the real ordinal is `0`. `location()`
+        // is the only way to recover the real ordinal (CUDA/ROCm/Metal
+        // `gpu_id`) for logging.
+        let gpu_location = devices.main.location();
+        log::info!(
+            "Expert placement: running probe forward pass + live VRAM query on {gpu_location:?} \
+             before deciding MoE GPU/CPU split (may take a few seconds)"
+        );
+        let probe_ids = Tensor::new(&[45u32, 546, 456], &devices.main)?.unsqueeze(0)?;
+        if let Err(e) = self.forward(&probe_ids, 0) {
+            log::warn!(
+                "expert-placement probe forward failed on {gpu_location:?} (non-fatal, all \
+                 experts stay on CPU): {e}"
+            );
+            return Ok(());
+        }
+        self.clear_kv_cache();
+
+        // All MoE layers in a checkpoint share the same expert tensor
+        // layout; detect it from the first MoE layer found.
+        let is_packed = (0..num_hidden_layers)
+            .find(|&i| tensor_infos.contains_key(&format!("blk.{i}.ffn_gate_inp.weight")))
+            .is_some_and(|i| tensor_infos.contains_key(&format!("blk.{i}.ffn_gate_exps.weight")));
+
+        let is_moe_layer: Vec<bool> = (0..num_hidden_layers)
+            .map(|i| tensor_infos.contains_key(&format!("blk.{i}.ffn_gate_inp.weight")))
+            .collect();
+        // Every MoE layer in a Qwen3 checkpoint has identical expert-tensor
+        // shapes, so this cost is uniform across MoE layers; non-MoE
+        // layers cost 0 so they never affect the greedy budget below.
+        let layer_costs: Vec<u64> = (0..num_hidden_layers)
+            .map(|i| {
+                if is_moe_layer[i] {
+                    estimate_expert_layer_vram(tensor_infos, i, is_packed, dtype_bytes)
+                } else {
+                    0
+                }
+            })
+            .collect();
+        let total_moe_layers = is_moe_layer.iter().filter(|&&m| m).count();
+        log::debug!(
+            "MoE layout: {total_moe_layers} layers, packed={is_packed}, \
+             per-layer expert cost estimate={}",
+            format_budget(layer_costs.iter().copied().find(|&c| c > 0).unwrap_or(0)),
+        );
+
+        let available = if let Some((free, total)) = query_gpu_memory(&devices.main) {
+            let used = total.saturating_sub(free);
+            let ceiling = total_vram.min(total);
+            let remaining = ceiling.saturating_sub(used);
+            let available = remaining.saturating_sub(runtime_reservation);
+            log::info!(
+                "Live VRAM on {gpu_location:?} after probe: free={}, total={}, used={}, \
+                 available_for_experts={} (configured limit={})",
+                format_budget(free),
+                format_budget(total),
+                format_budget(used),
+                format_budget(available),
+                format_budget(total_vram),
+            );
+            available
+        } else {
+            // `token_embd.weight` stays quantized (`gg.quantized_embedding()`),
+            // so it costs its on-disk size like every other non-expert
+            // tensor and needs no special-casing here.
+            let non_expert_bytes: u64 = tensor_infos
+                .iter()
+                .filter(|(name, _)| !is_expert_tensor(name))
+                .map(|(_, info)| gguf_tensor_bytes(info))
+                .sum::<u64>();
+            let weight_budget = total_vram.saturating_sub(runtime_reservation);
+            let available = weight_budget.saturating_sub(non_expert_bytes);
+            log::warn!(
+                "No live VRAM query available for {gpu_location:?}; falling back to static \
+                 estimate: total={}, runtime_reserved={}, non_expert_weights={}, \
+                 expert_budget={}",
+                format_budget(total_vram),
+                format_budget(runtime_reservation),
+                format_budget(non_expert_bytes),
+                format_budget(available),
+            );
+            available
+        };
+
+        let promoted: std::collections::HashSet<usize> = greedy_fit_layers(&layer_costs, available)
+            .into_iter()
+            .filter(|&i| is_moe_layer[i])
+            .collect();
+        log::debug!(
+            "Attempting promotion of {} of {total_moe_layers} MoE layers to {gpu_location:?}: {:?}",
+            promoted.len(),
+            {
+                let mut sorted: Vec<usize> = promoted.iter().copied().collect();
+                sorted.sort_unstable();
+                sorted
+            },
+        );
+        // The greedy budget above is a heuristic upper bound on what to
+        // *attempt* — allocator fragmentation and per-expert allocation
+        // overhead (128 experts, each its own device transfer) mean actual
+        // usage can still exceed it even though `promote_experts_to` is
+        // itself atomic per layer. A failed promotion here (e.g. real GPU
+        // out-of-memory) must not abort model load: stop promoting further
+        // layers and leave the rest on CPU — degraded, not fatal.
+        let mut gpu_layers = 0usize;
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            if !promoted.contains(&i) {
+                continue;
+            }
+            let MlpOrMoe::Moe(block) = &mut layer.mlp else {
+                continue;
+            };
+            // Re-query immediately before attempting, not the stale
+            // snapshot from before this loop started: this tells us
+            // whether a failure below reflects state that already
+            // changed by the time we act, or whether it was already
+            // consistent with the earlier estimate right up to the
+            // moment of the actual allocation call.
+            if let Some((free_before, total_before)) = query_gpu_memory(&devices.main) {
+                log::debug!(
+                    "layer {i}: live VRAM immediately before attempt on {gpu_location:?}: \
+                     free={}, total={}, layer_cost={}",
+                    format_budget(free_before),
+                    format_budget(total_before),
+                    format_budget(layer_costs[i]),
+                );
+            }
+            match block.promote_experts_to(&devices.main, self.dtype) {
+                Ok(()) => {
+                    gpu_layers += 1;
+                    log::debug!(
+                        "layer {i}: promoted to {gpu_location:?} (cost={})",
+                        format_budget(layer_costs[i]),
+                    );
+                },
+                Err(e) => {
+                    // Re-query right after the failure: if free VRAM
+                    // dropped far more than `layer_costs[i]` despite the
+                    // allocation itself failing, that points at the
+                    // underlying GPU allocator reserving/growing a much
+                    // larger pool on a failed attempt, rather than at
+                    // Crane's own cost estimate being wrong.
+                    if let Some((free_after, total_after)) = query_gpu_memory(&devices.main) {
+                        log::warn!(
+                            "layer {i}: live VRAM immediately after the failed attempt on \
+                             {gpu_location:?}: free={}, total={} (compare to the \"before\" line \
+                             above to see if the failed allocation itself consumed VRAM)",
+                            format_budget(free_after),
+                            format_budget(total_after),
+                        );
+                    }
+                    log::warn!(
+                        "expert promotion stopped at layer {i} on {gpu_location:?} (device \
+                         allocation failed, this and remaining layers stay on CPU): {e}"
+                    );
+                    break;
+                },
+            }
+        }
+
+        log::info!(
+            "Expert placement: {gpu_layers}/{total_moe_layers} MoE layers on {gpu_location:?}, \
+             {} on CPU",
+            total_moe_layers - gpu_layers,
+        );
+        // Final checkpoint before returning to the caller (crane-serve's
+        // own separate `Model::warmup()` + `record_baseline()` run next):
+        // if VRAM usage jumps between this line and that later baseline,
+        // the growth happened *after* model loading, not during it.
+        if let Some((free, total)) = query_gpu_memory(&devices.main) {
+            log::info!(
+                "Live VRAM on {gpu_location:?} at end of from_gguf(): free={}, total={}, used={}",
+                format_budget(free),
+                format_budget(total),
+                format_budget(total.saturating_sub(free)),
+            );
+        }
+        Ok(())
     }
 
     // ── Forward ─────────────────────────────────────────────────────────
@@ -1009,10 +1711,17 @@ impl Qwen3Model {
                 }
             }
             let mask = Tensor::from_vec(mask_data, (seq_len, total_len), device)?;
+            // Multiply in F32, cast to `self.dtype` last: candle's affine op
+            // converts the -1e9 scalar to the tensor's own dtype *before*
+            // multiplying, so doing this in F16 turns -1e9 into literal
+            // -Inf and then corrupts every *unmasked* (0.0) position to NaN
+            // via 0.0 * -Inf. F32 keeps -1e9 finite through the multiply;
+            // only the final cast may turn masked positions into -Inf
+            // (which softmax handles correctly via max-subtraction).
             let mask = mask
                 .broadcast_lt(&Tensor::new(0.5f32, device)?)?
-                .to_dtype(self.dtype)?;
-            let mask = (mask * (-1e9f64))?;
+                .to_dtype(DType::F32)?;
+            let mask = (mask * (-1e9f64))?.to_dtype(self.dtype)?;
             Some(mask.unsqueeze(0)?.unsqueeze(0)?)
         } else {
             None
@@ -1033,7 +1742,7 @@ impl Qwen3Model {
         self.last_hidden_states = Some(hidden_states.clone());
         let logits = self
             .lm_head
-            .forward(&hidden_states.narrow(1, seq_len - 1, 1)?)?;
+            .forward_logits(&hidden_states.narrow(1, seq_len - 1, 1)?)?;
         Ok(logits)
     }
 
@@ -1075,56 +1784,46 @@ impl Qwen3Model {
     /// rather than a separately-tracked running position counter.
     #[must_use]
     pub fn kv_cache_len(&self) -> usize {
-        self.layers.first().map_or(0, |l| l.self_attn.cache_seq_len)
+        self.layers
+            .first()
+            .map_or(0, |l| l.self_attn.kv_cache.len())
     }
 
-    /// Total bytes held by the model's KV caches (no GPU copies).
+    /// Total bytes held by the model's KV caches (no GPU copies). Reflects
+    /// the real, smaller footprint when `CRANE_KV_QUANT` is active, since
+    /// [`KvCacheBackend::byte_size`] accounts for whatever representation
+    /// each layer's cache actually stores.
     #[must_use]
     pub fn active_kv_cache_bytes(&self) -> u64 {
         self.layers
             .iter()
-            .map(|l| {
-                l.self_attn.kv_cache.as_ref().map_or(0, |(k, v)| {
-                    let k_bytes = k.elem_count() as u64 * k.dtype().size_in_bytes() as u64;
-                    let v_bytes = v.elem_count() as u64 * v.dtype().size_in_bytes() as u64;
-                    k_bytes + v_bytes
-                })
-            })
+            .map(|l| l.self_attn.kv_cache.byte_size() as u64)
             .sum()
     }
 
-    /// Extract per-layer KV caches (valid portion only, zero-copy narrow views).
-    ///
-    /// The returned views still reference the pre-allocated buffer.  Callers
-    /// that need to free the buffer (e.g. batch-decode extract) should use
-    /// `Tensor::contiguous()` on their side, or clear `seq.kv_caches` after
-    /// consuming the views.
+    /// Extract per-layer KV cache state (valid portion only). Plain or
+    /// quantized depending on the active `CRANE_KV_QUANT` setting — see
+    /// [`KvCacheState`].
     #[must_use]
-    pub fn get_kv_caches(&self) -> Vec<Option<(Tensor, Tensor)>> {
+    pub fn get_kv_caches(&self) -> Vec<Option<KvCacheState>> {
         self.layers
             .iter()
-            .map(|l| {
-                l.self_attn.kv_cache.as_ref().map(|(k, v)| {
-                    let len = l.self_attn.cache_seq_len;
-                    if len > 0 && len < k.dim(2).unwrap_or(0) {
-                        (
-                            k.narrow(2, 0, len).unwrap_or_else(|_| k.clone()),
-                            v.narrow(2, 0, len).unwrap_or_else(|_| v.clone()),
-                        )
-                    } else {
-                        (k.clone(), v.clone())
-                    }
-                })
-            })
+            .map(|l| l.self_attn.kv_cache.extract().ok().flatten())
             .collect()
     }
 
-    /// Restore per-layer KV caches.
-    pub fn set_kv_caches(&mut self, caches: Vec<Option<(Tensor, Tensor)>>) {
+    /// Restore per-layer KV cache state extracted by [`Self::get_kv_caches`].
+    pub fn set_kv_caches(&mut self, caches: Vec<Option<KvCacheState>>) {
         for (layer, cache) in self.layers.iter_mut().zip(caches) {
-            let seq_len = cache.as_ref().map_or(0, |(k, _)| k.dim(2).unwrap_or(0));
-            layer.self_attn.kv_cache = cache;
-            layer.self_attn.cache_seq_len = seq_len;
+            match cache {
+                Some(state) => {
+                    if let Err(e) = layer.self_attn.kv_cache.install(state) {
+                        log::warn!("set_kv_caches: failed to install layer state, resetting: {e}");
+                        layer.self_attn.kv_cache.reset();
+                    }
+                },
+                None => layer.self_attn.kv_cache.reset(),
+            }
         }
     }
 
@@ -1142,7 +1841,7 @@ impl Qwen3Model {
     #[allow(clippy::many_single_char_names)]
     pub fn setup_batch_decode(
         &mut self,
-        seq_kv_caches: &[Vec<Option<(Tensor, Tensor)>>],
+        seq_kv_caches: &[Vec<Option<KvCacheState>>],
         extra_room: usize,
     ) -> Result<(Vec<usize>, usize)> {
         let kv_heads = self.config.num_key_value_heads;
@@ -1156,17 +1855,29 @@ impl Qwen3Model {
                 caches
                     .first()
                     .and_then(|c| c.as_ref())
-                    .map_or(0, |(k, _)| k.dim(2).unwrap_or(0))
+                    .and_then(|s| s.seq_len().ok())
+                    .unwrap_or(0)
             })
             .collect();
         let max_kv_len = kv_lens.iter().copied().max().unwrap_or(0);
 
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
-            let layer_caches: Vec<&Option<(Tensor, Tensor)>> =
-                seq_kv_caches.iter().map(|seq| &seq[layer_idx]).collect();
+            // The batch itself always runs in plain compute dtype regardless
+            // of each sequence's stored representation — dequantize here,
+            // re-quantize on extract (see `extract_batch_kv`).
+            let layer_caches: Vec<Option<(Tensor, Tensor)>> = seq_kv_caches
+                .iter()
+                .map(|seq| {
+                    seq[layer_idx]
+                        .as_ref()
+                        .map(|s| s.to_fp_pair(dtype))
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let layer_caches_refs: Vec<&Option<(Tensor, Tensor)>> = layer_caches.iter().collect();
 
             let batched_kv = pad_and_stack_kv_caches(
-                &layer_caches,
+                &layer_caches_refs,
                 max_kv_len,
                 kv_heads,
                 head_dim,
@@ -1174,6 +1885,7 @@ impl Qwen3Model {
                 dtype,
             )?;
 
+            let mut fp_cache = FpKvCache::new();
             if let Some((k, v)) = batched_kv {
                 let k = k.contiguous()?;
                 let v = v.contiguous()?;
@@ -1183,15 +1895,12 @@ impl Qwen3Model {
                     let buf_v = Tensor::zeros((b, h, s + extra_room, d), v.dtype(), v.device())?;
                     buf_k.slice_set(&k, 2, 0)?;
                     buf_v.slice_set(&v, 2, 0)?;
-                    layer.self_attn.kv_cache = Some((buf_k, buf_v));
+                    fp_cache.install_with_headroom(buf_k, buf_v, max_kv_len);
                 } else {
-                    layer.self_attn.kv_cache = Some((k, v));
+                    fp_cache.install_with_headroom(k, v, max_kv_len);
                 }
-                layer.self_attn.cache_seq_len = max_kv_len;
-            } else {
-                layer.self_attn.kv_cache = None;
-                layer.self_attn.cache_seq_len = 0;
             }
+            layer.self_attn.kv_cache = KvCache::Fp(fp_cache);
         }
 
         Ok((kv_lens, max_kv_len))
@@ -1233,7 +1942,7 @@ impl Qwen3Model {
         }
 
         let hidden_states = self.norm.forward(&hidden_states)?;
-        self.lm_head.forward(&hidden_states) // [N, 1, vocab]
+        self.lm_head.forward_logits(&hidden_states) // [N, 1, vocab]
     }
 
     /// Extract per-sequence KV caches from batched state.
@@ -1249,31 +1958,44 @@ impl Qwen3Model {
     ) -> Result<BatchKvCache> {
         let n_seqs = kv_lens.len();
         let num_layers = self.layers.len();
-        let mut result: Vec<Vec<Option<(Tensor, Tensor)>>> = (0..n_seqs)
+        let mut result: Vec<Vec<Option<KvCacheState>>> = (0..n_seqs)
             .map(|_| Vec::with_capacity(num_layers))
             .collect();
+        let dtype = self.dtype;
+        let kv_kind = self.kv_kind;
 
+        // Extract every layer's batched state and reset it to a fresh cache
+        // of the correct kind up front, before any fallible per-sequence
+        // slicing below. Otherwise a failure partway through a combined
+        // loop would leave already-processed layers reset while later
+        // layers keep stale batched (Fp) state — a mixed-variant model.
+        let mut layer_states = Vec::with_capacity(num_layers);
         for layer in &mut self.layers {
-            if let Some((ref full_k, ref full_v)) = layer.self_attn.kv_cache {
+            layer_states.push(layer.self_attn.kv_cache.extract()?);
+            layer.self_attn.kv_cache = KvCache::new(kv_kind);
+        }
+
+        for state in layer_states {
+            if let Some(state) = state {
+                // The batch always runs in plain compute dtype (see
+                // `setup_batch_decode`); `to_fp_pair` is a no-op cast here.
+                let (full_k, full_v) = state.to_fp_pair(dtype)?;
                 for i in 0..n_seqs {
                     let row_k = full_k.narrow(0, i, 1)?;
                     let row_v = full_v.narrow(0, i, 1)?;
                     let total = kv_lens[i] + rounds_done;
                     let offset = original_max_kv - kv_lens[i];
                     // Contiguous copy — breaks ref to padded batch buffer.
-                    let clean = Some((
-                        row_k.narrow(2, offset, total)?.contiguous()?,
-                        row_v.narrow(2, offset, total)?.contiguous()?,
-                    ));
-                    result[i].push(clean);
+                    let k = row_k.narrow(2, offset, total)?.contiguous()?;
+                    let v = row_v.narrow(2, offset, total)?.contiguous()?;
+                    // Re-quantize into this sequence's stored representation.
+                    result[i].push(Some(KvCacheState::from_fp_pair(&k, &v, kv_kind)?));
                 }
             } else {
                 for row in &mut result {
                     row.push(None);
                 }
             }
-            layer.self_attn.kv_cache = None;
-            layer.self_attn.cache_seq_len = 0;
         }
 
         Ok(result)
@@ -1283,6 +2005,14 @@ impl Qwen3Model {
     #[must_use]
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// The KV cache representation this model was constructed with, either
+    /// from `CRANE_KV_QUANT` (see [`KvCacheKind::from_env`]) or an explicit
+    /// `kv_kind` argument (see [`KvCacheKind::parse`]).
+    #[must_use]
+    pub fn kv_kind(&self) -> KvCacheKind {
+        self.kv_kind
     }
 
     /// Access the model dtype.
@@ -1361,7 +2091,10 @@ fn pad_and_stack_kv_caches(
             let cur_len = k.dim(2)?;
             let pad_len = max_len - cur_len;
             if pad_len > 0 {
-                let pad = zero_pad.as_ref().unwrap().narrow(2, 0, pad_len)?;
+                let pad = zero_pad
+                    .as_ref()
+                    .expect("zero_pad is Some when pad_len > 0 because max_pad_needed > 0")
+                    .narrow(2, 0, pad_len)?;
                 padded_keys.push(Tensor::cat(&[&pad, k], 2)?);
                 padded_values.push(Tensor::cat(&[&pad, v], 2)?);
             } else {
@@ -1405,6 +2138,221 @@ mod tests {
         serde_json::from_str(json).expect("tiny_config parse")
     }
 
+    // Formula matches the real Qwen3-Coder-30B-A3B GGUF geometry verified
+    // against its own metadata: 48 layers, 4 KV heads, head_dim 128, F16
+    // (2 bytes) -> 96 KiB/token.
+    #[test]
+    fn test_kv_bytes_per_token_matches_qwen3_coder_30b_a3b() {
+        let config = Config {
+            num_hidden_layers: 48,
+            num_key_value_heads: 4,
+            head_dim: Some(128),
+            ..tiny_config()
+        };
+        assert_eq!(config.kv_bytes_per_token(2), 96 * 1024);
+    }
+
+    // Uses the tiny test config's own geometry: 1 layer, 2 KV heads,
+    // head_dim 4, F32 (4 bytes) -> 2*1*2*4*4 = 64 bytes/token.
+    #[test]
+    fn test_kv_bytes_per_token_tiny_config() {
+        assert_eq!(tiny_config().kv_bytes_per_token(4), 64);
+    }
+
+    // int8: 1 byte/code + 4 byte f32 scale per head -> 2*48*4*(128+4) =
+    // 50,688 bytes/token for the Qwen3-Coder-30B-A3B geometry, about half
+    // the 96 KiB (98,304 bytes) f16 pricing above.
+    #[test]
+    fn test_quantized_kv_bytes_per_token_int8_matches_qwen3_coder_30b_a3b() {
+        let config = Config {
+            num_hidden_layers: 48,
+            num_key_value_heads: 4,
+            head_dim: Some(128),
+            ..tiny_config()
+        };
+        assert_eq!(
+            config.quantized_kv_bytes_per_token(8),
+            2 * 48 * 4 * (128 + 4)
+        );
+    }
+
+    // int4: nibble-packed codes (head_dim/2 bytes) + 4 byte f32 scale per
+    // head -> 2*48*4*(64+4) bytes/token, about half int8's cost.
+    #[test]
+    fn test_quantized_kv_bytes_per_token_int4_matches_qwen3_coder_30b_a3b() {
+        let config = Config {
+            num_hidden_layers: 48,
+            num_key_value_heads: 4,
+            head_dim: Some(128),
+            ..tiny_config()
+        };
+        assert_eq!(
+            config.quantized_kv_bytes_per_token(4),
+            2 * 48 * 4 * (64 + 4)
+        );
+    }
+
+    // Both quantized bit widths must cost strictly less than compute-dtype
+    // (f16) pricing for the same geometry -- otherwise there's no point
+    // ever using quantized pricing.
+    #[test]
+    fn test_quantized_kv_bytes_per_token_smaller_than_fp16() {
+        let config = Config {
+            num_hidden_layers: 48,
+            num_key_value_heads: 4,
+            head_dim: Some(128),
+            ..tiny_config()
+        };
+        let fp16_bytes = config.kv_bytes_per_token(2);
+        assert!(config.quantized_kv_bytes_per_token(8) < fp16_bytes);
+        assert!(config.quantized_kv_bytes_per_token(4) < fp16_bytes);
+    }
+
+    #[test]
+    #[should_panic(expected = "bits must be 4 or 8")]
+    fn test_quantized_kv_bytes_per_token_rejects_invalid_bits() {
+        let _ = tiny_config().quantized_kv_bytes_per_token(16);
+    }
+
+    // Dense checkpoints carry no MoE fields, so `moe_config()` must return `None`.
+    #[test]
+    fn test_moe_config_none_for_dense_checkpoint() {
+        assert!(tiny_config().moe_config().is_none());
+    }
+
+    // A checkpoint with all five MoE fields set builds a matching `MoeConfig`.
+    #[test]
+    fn test_moe_config_some_for_full_moe_checkpoint() {
+        let config = Config {
+            num_experts: Some(8),
+            num_experts_per_tok: Some(2),
+            moe_intermediate_size: Some(64),
+            norm_topk_prob: Some(false),
+            decoder_sparse_step: Some(2),
+            ..tiny_config()
+        };
+        let moe_config = config.moe_config().expect("moe_config");
+        assert_eq!(moe_config.num_experts, 8);
+        assert_eq!(moe_config.num_experts_per_tok, 2);
+        assert_eq!(moe_config.moe_intermediate_size, 64);
+        assert!(!moe_config.norm_topk_prob);
+        assert_eq!(moe_config.decoder_sparse_step, Some(2));
+    }
+
+    // Packed and per-expert tensor names are recognized; router and
+    // attention tensor names are not mistaken for expert weights.
+    #[test]
+    fn test_is_expert_tensor() {
+        assert!(is_expert_tensor("blk.0.ffn_gate_exps.weight"));
+        assert!(is_expert_tensor("blk.0.ffn_up_exps.weight"));
+        assert!(is_expert_tensor("blk.0.ffn_down_exps.weight"));
+        assert!(is_expert_tensor("blk.5.ffn_gate.3.weight"));
+        assert!(is_expert_tensor("blk.5.ffn_up.3.weight"));
+        assert!(is_expert_tensor("blk.5.ffn_down.3.weight"));
+        assert!(!is_expert_tensor("blk.0.ffn_gate_inp.weight"));
+        assert!(!is_expert_tensor("blk.0.attn_q.weight"));
+        assert!(!is_expert_tensor("token_embd.weight"));
+        // Dense MLP tensors (no trailing expert index) from a mixed
+        // dense+MoE checkpoint must not be mistaken for expert weights.
+        assert!(!is_expert_tensor("blk.5.ffn_gate.weight"));
+        assert!(!is_expert_tensor("blk.5.ffn_up.weight"));
+        assert!(!is_expert_tensor("blk.5.ffn_down.weight"));
+    }
+
+    // Layer index is parsed out of the `blk.{i}.` prefix for both expert
+    // tensor layouts; non-`blk`-prefixed tensors have no layer.
+    #[test]
+    fn test_expert_tensor_layer() {
+        assert_eq!(expert_tensor_layer("blk.5.ffn_gate_exps.weight"), Some(5));
+        assert_eq!(expert_tensor_layer("blk.12.ffn_gate.3.weight"), Some(12));
+        assert_eq!(expert_tensor_layer("token_embd.weight"), None);
+    }
+
+    // Byte size matches candle's own quantized allocation formula:
+    // elem_count / block_size * type_size.
+    #[test]
+    fn test_gguf_tensor_bytes() {
+        use candle_core::quantized::GgmlDType;
+        let info = gguf_file::TensorInfo {
+            ggml_dtype: GgmlDType::Q4K,
+            shape: candle_core::Shape::from(256usize),
+            offset: 0,
+        };
+        let expected = GgmlDType::Q4K.type_size() as u64;
+        assert_eq!(gguf_tensor_bytes(&info), expected);
+    }
+
+    // A missing required sizing field (here `moe_intermediate_size`) means
+    // `moe_config()` must return `None`, even if other MoE fields are set.
+    #[test]
+    fn test_moe_config_none_when_required_field_missing() {
+        let config = Config {
+            num_experts: Some(8),
+            num_experts_per_tok: Some(2),
+            ..tiny_config()
+        };
+        assert!(config.moe_config().is_none());
+    }
+
+    // An absent `norm_topk_prob` defaults to `true`.
+    #[test]
+    fn test_moe_config_norm_topk_prob_defaults_to_true() {
+        let config = Config {
+            num_experts: Some(8),
+            num_experts_per_tok: Some(2),
+            moe_intermediate_size: Some(64),
+            ..tiny_config()
+        };
+        assert!(config.moe_config().expect("moe_config").norm_topk_prob);
+    }
+
+    fn moe_layer_config(num_hidden_layers: usize, decoder_sparse_step: Option<usize>) -> Config {
+        Config {
+            num_hidden_layers,
+            num_experts: Some(2),
+            num_experts_per_tok: Some(1),
+            moe_intermediate_size: Some(32),
+            decoder_sparse_step,
+            ..tiny_config()
+        }
+    }
+
+    // `decoder_sparse_step: Some(2)` makes every 2nd layer (1-indexed) MoE;
+    // the rest stay dense.
+    #[test]
+    fn test_moe_layer_selection_respects_decoder_sparse_step() {
+        let cfg = moe_layer_config(4, Some(2));
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let model = Qwen3Model::new(&cfg, vb, &device, &GpuBudget::default()).expect("new");
+
+        let is_moe: Vec<bool> = model
+            .layers
+            .iter()
+            .map(|l| matches!(l.mlp, MlpOrMoe::Moe(_)))
+            .collect();
+        assert_eq!(is_moe, vec![false, true, false, true]);
+    }
+
+    // An absent `decoder_sparse_step` on a MoE checkpoint means every layer
+    // is MoE, matching HF's default of `1`.
+    #[test]
+    fn test_moe_all_layers_when_decoder_sparse_step_none() {
+        let cfg = moe_layer_config(2, None);
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let model = Qwen3Model::new(&cfg, vb, &device, &GpuBudget::default()).expect("new");
+
+        assert!(
+            model
+                .layers
+                .iter()
+                .all(|l| matches!(l.mlp, MlpOrMoe::Moe(_)))
+        );
+    }
+
     fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
         (a - b)
             .expect("sub")
@@ -1426,9 +2374,11 @@ mod tests {
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
 
-        let mut model_a = Qwen3Model::new(&cfg, vb.clone()).expect("new");
+        let mut model_a =
+            Qwen3Model::new(&cfg, vb.clone(), &device, &GpuBudget::default()).expect("new");
         let mut model_b =
-            Qwen3Model::new_from_model_vb(&cfg, vb.pp("model"), vb).expect("new_from_model_vb");
+            Qwen3Model::new_from_model_vb(&cfg, vb.pp("model"), vb, &device, &GpuBudget::default())
+                .expect("new_from_model_vb");
 
         let input_ids = Tensor::new(&[[1u32, 2, 3]], &device).expect("input_ids");
         let out_a = model_a.forward(&input_ids, 0).expect("forward a");
@@ -1446,7 +2396,7 @@ mod tests {
         let device = Device::Cpu;
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-        let mut model = Qwen3Model::new(&cfg, vb).expect("new");
+        let mut model = Qwen3Model::new(&cfg, vb, &device, &GpuBudget::default()).expect("new");
 
         let input_ids = Tensor::new(&[[1u32, 2, 3]], &device).expect("input_ids");
         let out_forward = model.forward(&input_ids, 0).expect("forward");
@@ -1462,6 +2412,255 @@ mod tests {
 
         assert_eq!(out_forward.dims(), out_embeds.dims());
         assert!(max_abs_diff(&out_forward, &out_embeds) < 1e-5);
+    }
+
+    /// With identical weights (one `VarMap` reused across three models),
+    /// quantized KV cache's forward output must stay close to the lossless
+    /// `Fp` baseline through both prefill and a decode step — not just
+    /// structurally valid, but numerically sane. Precise error bounds on
+    /// the quantization math itself are covered in
+    /// `crate::models::modules::quant_kv_cache`'s own tests; this is an
+    /// integration check that the model wiring doesn't introduce its own
+    /// corruption (e.g. wrong dtype, wrong axis) on top of that.
+    #[test]
+    fn test_quantized_kv_forward_close_to_fp() {
+        let cfg = tiny_config();
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+
+        let mut model_fp = Qwen3Model::new_inner_with_kv_kind(
+            &cfg,
+            vb.clone(),
+            vb.clone(),
+            &device,
+            &GpuBudget::default(),
+            KvCacheKind::Fp,
+        )
+        .expect("fp model");
+        let mut model_int8 = Qwen3Model::new_inner_with_kv_kind(
+            &cfg,
+            vb.clone(),
+            vb.clone(),
+            &device,
+            &GpuBudget::default(),
+            KvCacheKind::Int8,
+        )
+        .expect("int8 model");
+        let mut model_int4 = Qwen3Model::new_inner_with_kv_kind(
+            &cfg,
+            vb.clone(),
+            vb.clone(),
+            &device,
+            &GpuBudget::default(),
+            KvCacheKind::Int4,
+        )
+        .expect("int4 model");
+
+        let prompt = Tensor::new(&[[1u32, 2, 3, 4, 5]], &device).expect("prompt");
+        model_fp.forward(&prompt, 0).expect("fp prefill");
+        model_int8.forward(&prompt, 0).expect("int8 prefill");
+        model_int4.forward(&prompt, 0).expect("int4 prefill");
+
+        let next = Tensor::new(&[[6u32]], &device).expect("next token");
+        let out_fp = model_fp.forward(&next, 5).expect("fp decode");
+        let out_int8 = model_int8.forward(&next, 5).expect("int8 decode");
+        let out_int4 = model_int4.forward(&next, 5).expect("int4 decode");
+
+        assert_eq!(out_fp.dims(), out_int8.dims());
+        assert_eq!(out_fp.dims(), out_int4.dims());
+
+        let scale = max_abs_diff(&out_fp, &Tensor::zeros_like(&out_fp).expect("zeros")).max(1e-3);
+        let diff8 = max_abs_diff(&out_fp, &out_int8);
+        let diff4 = max_abs_diff(&out_fp, &out_int4);
+        assert!(
+            diff8 < scale,
+            "int8 diverged too far from fp: diff={diff8} scale={scale}"
+        );
+        assert!(
+            diff4 < scale,
+            "int4 diverged too far from fp: diff={diff4} scale={scale}"
+        );
+        assert!(!diff8.is_nan() && !diff4.is_nan());
+    }
+
+    /// The capability the KV-swap interface redesign exists for: a
+    /// quantized sequence's cache must survive being extracted (simulating
+    /// eviction), another sequence running in between, and reinstalling —
+    /// producing an *identical* continuation to an uninterrupted run, since
+    /// `get_kv_caches`/`set_kv_caches` only narrow/reinstall the existing
+    /// quantized tensors (no re-quantization happens on this path, unlike
+    /// the batch-decode path — see `setup_batch_decode`'s doc comment).
+    #[test]
+    fn test_kv_swap_round_trip_preserves_quantized_continuation() {
+        let cfg = tiny_config();
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+
+        let mut reference = Qwen3Model::new_inner_with_kv_kind(
+            &cfg,
+            vb.clone(),
+            vb.clone(),
+            &device,
+            &GpuBudget::default(),
+            KvCacheKind::Int8,
+        )
+        .expect("reference model");
+        let prompt = Tensor::new(&[[1u32, 2, 3]], &device).expect("prompt");
+        reference.forward(&prompt, 0).expect("reference prefill");
+        let next = Tensor::new(&[[4u32]], &device).expect("next");
+        let reference_out = reference.forward(&next, 3).expect("reference decode");
+
+        let mut model = Qwen3Model::new_inner_with_kv_kind(
+            &cfg,
+            vb.clone(),
+            vb.clone(),
+            &device,
+            &GpuBudget::default(),
+            KvCacheKind::Int8,
+        )
+        .expect("model");
+        model.forward(&prompt, 0).expect("prefill");
+        let saved = model.get_kv_caches();
+        assert!(saved.iter().all(Option::is_some));
+        assert_eq!(saved[0].as_ref().expect("state").kind(), KvCacheKind::Int8);
+
+        // Another sequence runs on the same model in between.
+        model.clear_kv_cache();
+        let other_prompt = Tensor::new(&[[9u32, 8]], &device).expect("other prompt");
+        model
+            .forward(&other_prompt, 0)
+            .expect("other sequence prefill");
+
+        model.clear_kv_cache();
+        model.set_kv_caches(saved);
+        let resumed_out = model.forward(&next, 3).expect("resumed decode");
+
+        assert_eq!(reference_out.dims(), resumed_out.dims());
+        let diff = max_abs_diff(&reference_out, &resumed_out);
+        assert!(
+            diff < 1e-4,
+            "KV swap round trip diverged from uninterrupted continuation: {diff}"
+        );
+    }
+
+    /// Quantized KV must also survive the batch-decode path (dequantize at
+    /// `setup_batch_decode`, re-quantize at `extract_batch_kv` — see that
+    /// pair's doc comments), used when multiple sequences decode together.
+    /// Also checks the batched logits stay numerically close to an
+    /// identical-weights `Fp` model run through the same batch sequence,
+    /// not just structurally valid.
+    #[test]
+    fn test_batch_decode_round_trips_quantized_kv() {
+        let cfg = tiny_config();
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+
+        let mut model = Qwen3Model::new_inner_with_kv_kind(
+            &cfg,
+            vb.clone(),
+            vb.clone(),
+            &device,
+            &GpuBudget::default(),
+            KvCacheKind::Int8,
+        )
+        .expect("model");
+        // Same varmap (identical weights) at `Fp` — the numerical baseline
+        // the batch-decode logits must stay close to.
+        let mut model_fp = Qwen3Model::new_inner_with_kv_kind(
+            &cfg,
+            vb.clone(),
+            vb.clone(),
+            &device,
+            &GpuBudget::default(),
+            KvCacheKind::Fp,
+        )
+        .expect("fp model");
+
+        let prompt_a = Tensor::new(&[[1u32, 2, 3]], &device).expect("prompt a");
+        let prompt_b = Tensor::new(&[[4u32, 5]], &device).expect("prompt b");
+
+        model.forward(&prompt_a, 0).expect("prefill a");
+        let cache_a = model.get_kv_caches();
+        model.clear_kv_cache();
+
+        model.forward(&prompt_b, 0).expect("prefill b");
+        let cache_b = model.get_kv_caches();
+        model.clear_kv_cache();
+
+        model_fp.forward(&prompt_a, 0).expect("fp prefill a");
+        let cache_a_fp = model_fp.get_kv_caches();
+        model_fp.clear_kv_cache();
+
+        model_fp.forward(&prompt_b, 0).expect("fp prefill b");
+        let cache_b_fp = model_fp.get_kv_caches();
+        model_fp.clear_kv_cache();
+
+        assert_eq!(cache_a[0].as_ref().expect("a").kind(), KvCacheKind::Int8);
+        assert_eq!(cache_b[0].as_ref().expect("b").kind(), KvCacheKind::Int8);
+
+        let (kv_lens, max_kv_len) = model
+            .setup_batch_decode(&[vec![cache_a[0].clone()], vec![cache_b[0].clone()]], 4)
+            .expect("setup_batch_decode");
+        assert_eq!(kv_lens, vec![3, 2]);
+        assert_eq!(max_kv_len, 3);
+
+        let (kv_lens_fp, max_kv_len_fp) = model_fp
+            .setup_batch_decode(
+                &[vec![cache_a_fp[0].clone()], vec![cache_b_fp[0].clone()]],
+                4,
+            )
+            .expect("fp setup_batch_decode");
+        assert_eq!(kv_lens_fp, kv_lens);
+        assert_eq!(max_kv_len_fp, max_kv_len);
+
+        // Width covers the K length *after* this round's append (kv_lens'
+        // max, plus the one new token each sequence appends this round) —
+        // matching `crane-serve/src/engine/mod.rs`'s `mask_width =
+        // original_max_kv + round + 1` for round 0.
+        let mask =
+            build_batch_decode_mask(&kv_lens, max_kv_len, max_kv_len + 1, &device, DType::F32)
+                .expect("mask");
+        let tokens = Tensor::new(&[6u32, 7], &device)
+            .expect("tokens")
+            .reshape((2, 1))
+            .expect("reshape");
+        let positions = [3usize, 2usize];
+        let logits = model
+            .step_batch_decode(&tokens, &positions, mask.as_ref(), None)
+            .expect("step_batch_decode");
+        assert_eq!(logits.dims()[0], 2);
+        let flat = logits
+            .flatten_all()
+            .expect("flatten")
+            .to_vec1::<f32>()
+            .expect("to_vec1");
+        assert!(!flat.iter().any(|v| v.is_nan() || v.is_infinite()));
+
+        let logits_fp = model_fp
+            .step_batch_decode(&tokens, &positions, mask.as_ref(), None)
+            .expect("fp step_batch_decode");
+        assert_eq!(logits.dims(), logits_fp.dims());
+        let scale =
+            max_abs_diff(&logits_fp, &Tensor::zeros_like(&logits_fp).expect("zeros")).max(1e-3);
+        let diff = max_abs_diff(&logits, &logits_fp);
+        assert!(
+            diff < scale,
+            "batch-decode int8 diverged too far from fp: diff={diff} scale={scale}"
+        );
+
+        let extracted = model
+            .extract_batch_kv(&kv_lens, max_kv_len, 1)
+            .expect("extract_batch_kv");
+        assert_eq!(extracted.len(), 2);
+        let state_a = extracted[0][0].as_ref().expect("extracted a");
+        let state_b = extracted[1][0].as_ref().expect("extracted b");
+        assert_eq!(state_a.kind(), KvCacheKind::Int8);
+        assert_eq!(state_b.kind(), KvCacheKind::Int8);
+        assert_eq!(state_a.seq_len().expect("seq_len"), 4); // 3 + 1 round
+        assert_eq!(state_b.seq_len().expect("seq_len"), 3); // 2 + 1 round
     }
 
     /// The CPU `flash_attn` decode path must compute the same attention
@@ -1610,7 +2809,7 @@ mod tests {
         let device = Device::Cpu;
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-        let mut model = Qwen3Model::new(&cfg, vb).expect("new");
+        let mut model = Qwen3Model::new(&cfg, vb, &device, &GpuBudget::default()).expect("new");
 
         let prefill_ids = Tensor::new(&[[1u32, 2, 3]], &device).expect("prefill_ids");
         let decode_ids = Tensor::new(&[[4u32]], &device).expect("decode_ids");
@@ -1746,7 +2945,7 @@ mod tests {
         let device = Device::Cpu;
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-        let mut model = Qwen3Model::new(&cfg, vb).expect("new");
+        let mut model = Qwen3Model::new(&cfg, vb, &device, &GpuBudget::default()).expect("new");
 
         let prefill_ids = Tensor::new(&[[1u32, 2, 3, 4, 5]], &device).expect("prefill_ids");
 
@@ -1758,6 +2957,39 @@ mod tests {
 
         assert_eq!(out_a.dims(), out_b.dims());
         assert!(max_abs_diff(&out_a, &out_b) < 1e-5);
+    }
+
+    /// Regression test for the causal mask's additive penalty overflowing
+    /// F16: `b_sz > 1` forces `decode()`'s `broadcast_add` mask path (skips
+    /// the CPU/`b_sz==1` flash_attn fast path, which builds its mask via
+    /// `AttnMask::Causal` instead and never hits this code). In F16, naively
+    /// casting the boolean mask to F16 *before* multiplying by -1e9 makes
+    /// candle's affine op convert -1e9 to literal -Inf first, so every
+    /// *unmasked* (0.0) position computes `0.0 * -Inf = NaN`.
+    #[test]
+    fn test_prefill_batch_gt1_f16_mask_stays_finite() {
+        let cfg = tiny_config();
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F16, &device);
+        let mut model = Qwen3Model::new(&cfg, vb, &device, &GpuBudget::default()).expect("new");
+
+        // b_sz=2, seq_len=3: not the b_sz==1 CPU fast path, so this hits
+        // decode()'s broadcast_add causal mask in F16.
+        let prefill_ids = Tensor::new(&[[1u32, 2, 3], [4u32, 5, 6]], &device).expect("ids");
+        let logits = model.forward(&prefill_ids, 0).expect("prefill");
+
+        let values = logits
+            .to_dtype(DType::F32)
+            .expect("to_dtype")
+            .flatten_all()
+            .expect("flatten")
+            .to_vec1::<f32>()
+            .expect("to_vec1");
+        assert!(
+            values.iter().all(|v| v.is_finite()),
+            "logits contain a non-finite value: {values:?}"
+        );
     }
 
     /// Chunked prefill (two smaller prefills) must produce the same decode
@@ -1774,12 +3006,20 @@ mod tests {
         // once-per-construction merged `qkv_proj`, which is a fresh
         // concatenation `Var::set` can't retroactively update).
         let varmap = VarMap::new();
-        let mut model_single =
-            Qwen3Model::new(&cfg, VarBuilder::from_varmap(&varmap, DType::F32, &device))
-                .expect("new single");
-        let mut model_chunked =
-            Qwen3Model::new(&cfg, VarBuilder::from_varmap(&varmap, DType::F32, &device))
-                .expect("new chunked");
+        let mut model_single = Qwen3Model::new(
+            &cfg,
+            VarBuilder::from_varmap(&varmap, DType::F32, &device),
+            &device,
+            &GpuBudget::default(),
+        )
+        .expect("new single");
+        let mut model_chunked = Qwen3Model::new(
+            &cfg,
+            VarBuilder::from_varmap(&varmap, DType::F32, &device),
+            &device,
+            &GpuBudget::default(),
+        )
+        .expect("new chunked");
 
         let decode_id = Tensor::new(&[[6u32]], &device).expect("decode_id");
 

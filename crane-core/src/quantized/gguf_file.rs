@@ -61,7 +61,26 @@ impl<R: Read + Seek> Gguf<R> {
     ///
     /// Returns an error if the named tensor is missing or malformed.
     pub fn linear(&mut self, name: &str) -> Result<crate::ops::linear::LinearLayer> {
-        let ws = self.ct.tensor(&mut self.reader, name, &self.device)?;
+        let device = self.device.clone();
+        self.linear_on(name, &device)
+    }
+
+    /// Load a quantized tensor onto `device` and wrap as a `LinearLayer` (`QMatMul`).
+    ///
+    /// Identical to [`Self::linear`] but places the weight on a caller-chosen
+    /// device instead of `self.device` — used for `MoE` expert offloading where
+    /// experts may live on a different device (e.g. CPU) than the rest of the
+    /// model.
+    ///
+    /// # Errors
+    /// Returns an error if the tensor is missing from the GGUF file, the
+    /// quantization type is unsupported, or the `QMatMul` construction fails.
+    pub fn linear_on(
+        &mut self,
+        name: &str,
+        device: &Device,
+    ) -> Result<crate::ops::linear::LinearLayer> {
+        let ws = self.ct.tensor(&mut self.reader, name, device)?;
         let qmm = candle_core::quantized::QMatMul::from_arc(Arc::new(ws))?;
         Ok(crate::ops::linear::LinearLayer::Quantized(qmm))
     }
@@ -118,6 +137,20 @@ impl<R: Read + Seek> Gguf<R> {
         self.ct.tensor(&mut self.reader, name, &self.device)
     }
 
+    /// Load a raw `QTensor` by name onto `device`.
+    ///
+    /// Identical to [`Self::tensor`] but places the weight on a
+    /// caller-chosen device instead of `self.device` — used for `MoE`
+    /// packed expert tensors, which must load directly onto
+    /// `expert_device` rather than the main model device.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the named tensor is missing.
+    pub fn tensor_on(&mut self, name: &str, device: &Device) -> Result<QTensor> {
+        self.ct.tensor(&mut self.reader, name, device)
+    }
+
     /// Load a tensor, dequantize, and cast to the target compute dtype.
     /// For small full-precision tensors (norm weights, biases, conv kernels).
     ///
@@ -125,8 +158,28 @@ impl<R: Read + Seek> Gguf<R> {
     ///
     /// Returns an error if the named tensor is missing or malformed.
     pub fn dequant_tensor(&mut self, name: &str) -> Result<candle_core::Tensor> {
-        let ws = self.ct.tensor(&mut self.reader, name, &self.device)?;
-        ws.dequantize(&self.device)?.to_dtype(self.dtype)
+        let device = self.device.clone();
+        self.dequant_tensor_on(name, &device)
+    }
+
+    /// Load a tensor onto `device`, dequantize, and cast to the target compute
+    /// dtype.
+    ///
+    /// Identical to [`Self::dequant_tensor`] but places the result on a
+    /// caller-chosen device instead of `self.device` — used for `MoE` packed
+    /// expert tensors, which must be dequantized directly onto
+    /// `expert_device` rather than the main model device.
+    ///
+    /// # Errors
+    /// Returns an error if the tensor is missing from the GGUF file, the
+    /// quantization type is unsupported, or dequantization fails.
+    pub fn dequant_tensor_on(
+        &mut self,
+        name: &str,
+        device: &Device,
+    ) -> Result<candle_core::Tensor> {
+        let ws = self.ct.tensor(&mut self.reader, name, device)?;
+        ws.dequantize(device)?.to_dtype(self.dtype)
     }
 
     /// Whether the file contains a tensor with this exact name.

@@ -472,12 +472,12 @@ impl TokenizerTransformerLayer {
                 Activation::Silu,
                 vb.pp("mlp"),
             )?,
-            input_layernorm: candle_nn::rms_norm(
+            input_layernorm: crate::models::with_tracing::rms_norm(
                 cfg.hidden_size,
                 cfg.rms_norm_eps,
                 vb.pp("input_layernorm"),
             )?,
-            post_attention_layernorm: candle_nn::rms_norm(
+            post_attention_layernorm: crate::models::with_tracing::rms_norm(
                 cfg.hidden_size,
                 cfg.rms_norm_eps,
                 vb.pp("post_attention_layernorm"),
@@ -526,7 +526,11 @@ impl TokenizerTransformer {
             input_proj: linear(cfg.latent_dim, cfg.hidden_size, vb.pp("input_proj"))?,
             output_proj: linear(cfg.hidden_size, cfg.latent_dim, vb.pp("output_proj"))?,
             layers,
-            norm: candle_nn::rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("norm"))?,
+            norm: crate::models::with_tracing::rms_norm(
+                cfg.hidden_size,
+                cfg.rms_norm_eps,
+                vb.pp("norm"),
+            )?,
         })
     }
 

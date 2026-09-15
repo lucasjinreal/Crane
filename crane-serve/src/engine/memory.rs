@@ -59,7 +59,10 @@ impl MemoryConfig {
         ("M", 20),
     ];
 
-    fn parse_memory_limit(s: &str, device: &Device) -> u64 {
+    /// Parse a single size string as accepted by [`Self::parse`]. Returns 0
+    /// (unlimited) for empty, `"0"`, or unparseable input.
+    #[must_use]
+    pub(crate) fn parse_memory_limit(s: &str, device: &Device) -> u64 {
         let s = s.trim();
         if s.is_empty() || s == "0" {
             return 0;
@@ -111,7 +114,8 @@ impl MemoryConfig {
     }
 
     /// Query total GPU memory (bytes). Returns 0 if unavailable.
-    fn query_total_gpu_memory(_device: &Device) -> u64 {
+    #[must_use]
+    pub(crate) fn query_total_gpu_memory(_device: &Device) -> u64 {
         #[cfg(feature = "cuda")]
         {
             if let Device::Cuda(_) = _device {
@@ -136,6 +140,10 @@ impl MemoryConfig {
 
 /// Query current GPU memory usage. Returns (`used_bytes`, `total_bytes`).
 /// Returns (0, 0) if the device is neither CUDA nor ROCm (or the query fails).
+///
+/// Mirrors `crane-core/src/device.rs`'s `query_gpu_memory` (duplicated, not
+/// reused, since `crane-core` cannot depend on `crane-serve`). Keep the two
+/// in sync if the underlying query logic changes.
 pub(super) fn query_gpu_memory_usage(_device: &Device) -> (u64, u64) {
     #[cfg(feature = "cuda")]
     {
@@ -156,6 +164,38 @@ pub(super) fn query_gpu_memory_usage(_device: &Device) -> (u64, u64) {
         }
     }
     (0, 0)
+}
+
+/// Raise a KV budget to fit at least one full `max_seq_len` sequence.
+///
+/// A configured `max_seq_len` must be satisfiable by at least one sequence,
+/// or eviction has nothing else to blame and loops forever evicting the only
+/// sequence, re-prefilling it, and evicting it again. Floors at only one
+/// sequence's worth, not `max_concurrent` of them — a bigger floor would
+/// blunt eviction's whole purpose of triggering under real multi-sequence
+/// contention.
+///
+/// Returns `budget` unchanged when `kv_bytes_per_token` is `None` (the
+/// backend's cache layout doesn't support a simple per-token rate).
+/// `max_seq_len == 0` (unlimited) falls back to `DEFAULT_SEQ_LEN`, mirroring
+/// `GpuBudget::runtime_reservation_bytes`'s default.
+pub(super) fn floor_kv_budget(
+    budget: u64,
+    kv_bytes_per_token: Option<u64>,
+    max_seq_len: usize,
+) -> u64 {
+    const DEFAULT_SEQ_LEN: u64 = 4096;
+
+    let Some(kv_bytes_per_token) = kv_bytes_per_token else {
+        return budget;
+    };
+    let seq_len = if max_seq_len > 0 {
+        max_seq_len as u64
+    } else {
+        DEFAULT_SEQ_LEN
+    };
+    let min_required = kv_bytes_per_token.saturating_mul(seq_len);
+    budget.max(min_required)
 }
 
 /// Format a byte count as a human-readable string (used in engine log messages).
@@ -266,5 +306,30 @@ mod tests {
         assert_eq!(format_bytes_engine(1u64 << 30), "1.0G");
         assert_eq!(format_bytes_engine(1u64 << 20), "1M");
         assert_eq!(format_bytes_engine(512), "512B");
+    }
+
+    #[test]
+    fn floor_kv_budget_leaves_sufficient_budget_untouched() {
+        assert_eq!(floor_kv_budget(1_000_000, Some(100), 4096), 1_000_000);
+    }
+
+    #[test]
+    fn floor_kv_budget_raises_insufficient_budget() {
+        assert_eq!(floor_kv_budget(100, Some(1000), 4096), 1000 * 4096);
+    }
+
+    #[test]
+    fn floor_kv_budget_passes_through_when_backend_has_no_rate() {
+        assert_eq!(floor_kv_budget(100, None, 4096), 100);
+    }
+
+    #[test]
+    fn floor_kv_budget_unlimited_max_seq_len_uses_default() {
+        assert_eq!(floor_kv_budget(0, Some(1000), 0), 1000 * 4096);
+    }
+
+    #[test]
+    fn floor_kv_budget_saturates_on_overflow() {
+        assert_eq!(floor_kv_budget(0, Some(u64::MAX), 4096), u64::MAX);
     }
 }

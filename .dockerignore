@@ -1,0 +1,12 @@
+target/
+models/
+tests/
+tools/
+.git/
+.github/
+*.md
+
+# Note: `example` (a workspace member in the root Cargo.toml) is
+# deliberately NOT excluded here, even though the Containerfile only
+# builds crane-serve -- Cargo needs every workspace member's Cargo.toml
+# (and crate-root file) present to resolve the workspace at all.

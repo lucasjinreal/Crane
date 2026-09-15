@@ -61,9 +61,12 @@ pub struct ChatCompletionRequest {
     /// Function/tool specs, passed to the chat template verbatim — the
     /// template owns the prompt syntax (`tool | tojson` for the Qwen family).
     pub tools: Option<Vec<Tool>>,
-    /// Accepted for OpenAI compatibility. `"none"` suppresses the tool block;
-    /// anything else is advisory, since forcing a specific call would require
-    /// constrained decoding the engine does not implement.
+    /// Accepted for OpenAI compatibility. `"none"` suppresses the tool
+    /// block. Other values (`"auto"`, `"required"`, or a specific named
+    /// tool) are advisory: the engine grammar-constrains the tool-call XML
+    /// *skeleton* once triggered (see `engine::grammar`), but does not yet
+    /// force triggering it, or restrict which of the offered tools gets
+    /// called.
     pub tool_choice: Option<serde_json::Value>,
 }
 

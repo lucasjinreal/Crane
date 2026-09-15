@@ -934,7 +934,7 @@ impl DuplexSession {
                 break;
             };
             let length = record.length;
-            let mut caches = self.llm.get_kv_caches();
+            let mut caches = self.llm.get_kv_caches()?;
             let dropped = sliding_window::drop_tokens_from_cache(
                 &mut caches,
                 length,
@@ -944,7 +944,7 @@ impl DuplexSession {
             if !dropped {
                 break;
             }
-            self.llm.set_kv_caches(caches);
+            self.llm.set_kv_caches(caches)?;
             self.unit_records.pop_front();
             dropped_any = true;
         }
@@ -1026,7 +1026,7 @@ impl DuplexSession {
         let units_to_keep_len: usize = self.unit_records.iter().map(|r| r.length).sum();
         let old_units_start = total_len - units_to_keep_len;
 
-        let full = self.llm.get_kv_caches();
+        let full = self.llm.get_kv_caches()?;
         let mut prefix_only = Vec::with_capacity(full.len());
         let mut units_cache = Vec::with_capacity(full.len());
         for layer in &full {
@@ -1055,13 +1055,13 @@ impl DuplexSession {
         }
         drop(full);
 
-        self.llm.set_kv_caches(prefix_only);
+        self.llm.set_kv_caches(prefix_only)?;
         let previous_tokens = self.previous_token_ids.clone();
         self.feed_tokens(&previous_tokens)?;
         let new_system_total = self.llm.kv_cache_len();
 
         if units_to_keep_len > 0 {
-            let mut current = self.llm.get_kv_caches();
+            let mut current = self.llm.get_kv_caches()?;
             for (layer, unit_layer) in current.iter_mut().zip(units_cache) {
                 if let (Some(kv), Some((uk, uv))) = (layer.as_mut(), unit_layer) {
                     let (k, v) = kv;
@@ -1080,7 +1080,7 @@ impl DuplexSession {
                     *v = Tensor::cat(&[&*v, &uv], 2)?.contiguous()?;
                 }
             }
-            self.llm.set_kv_caches(current);
+            self.llm.set_kv_caches(current)?;
         }
 
         self.system_preserve_length = new_system_total;

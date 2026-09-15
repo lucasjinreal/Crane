@@ -29,6 +29,7 @@
 //! | `memory`        | GPU memory-limit parsing + usage queries          |
 
 pub mod backend;
+pub mod grammar;
 mod memory;
 pub mod model_factory;
 pub mod sampling;
@@ -44,16 +45,17 @@ pub use types::{EngineHandle, EngineRequest, EngineResponse, GenerationParams};
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-use candle_core::Tensor;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use backend::ModelBackend;
+use crane_core::models::modules::quant_kv_cache::KvCacheState;
 use crane_core::utils::token_output_stream::TokenOutputStream;
-use memory::{format_bytes_engine, query_gpu_memory_usage};
+use memory::{floor_kv_budget, format_bytes_engine, query_gpu_memory_usage};
 use sampling::SamplingBuffers;
 use scheduler::{Scheduler, SchedulerOutput};
 use sequence::{Sequence, SequenceStatus};
@@ -64,22 +66,59 @@ use sequence::{Sequence, SequenceStatus};
 /// recurrent scratch) stays bounded. See [`InferenceEngine::step_prefill`].
 const PREFILL_CHUNK_SIZE: usize = 2048;
 
+/// Whether to log real/tracked VRAM usage on every engine step
+/// (`CRANE_VRAM_TRACE=1`).
+///
+/// Diagnostic for confirming or ruling out a real-VRAM leak over a long
+/// decode run (e.g. a caching allocator never reusing buffers for a
+/// strictly growing KV length) — unlike [`InferenceEngine::log_stats`],
+/// which only logs every 50 steps, this fires every step so a leak can be
+/// seen trending well before a crash a few hundred tokens in.
+#[must_use]
+fn vram_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("CRANE_VRAM_TRACE").as_deref() == Ok("1"))
+}
+
+/// Whether to log every tool-call grammar state transition and the
+/// resulting next-token mask (`CRANE_GRAMMAR_TRACE=1`).
+///
+/// Diagnostic for confirming whether `grammar::tool_call_skeleton`'s
+/// `<tool_call>` wrapper enforcement is actually engaging for a request,
+/// as opposed to silently degrading to unconstrained (e.g. because
+/// `VocabByteTable::tokens_matching_prefix` found no token able to start
+/// a forced literal — see [`InferenceEngine::new`]'s startup sanity log).
+#[must_use]
+fn grammar_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("CRANE_GRAMMAR_TRACE").as_deref() == Ok("1"))
+}
+
 // ─────────────────────────────────────────────────────────────
 //  InferenceEngine
 // ─────────────────────────────────────────────────────────────
 
-/// KV-to-GPU overhead factor.
+/// KV-cache batch-padding factor, safety margin, and the shared
+/// `kv_budget_from_headroom` inverse-overhead formula, all defined in
+/// `crane_core::device` (not here) so the model-load-time reservation in
+/// `GpuBudget::runtime_reservation_bytes` and this engine's runtime
+/// KV-eviction budget share one formula instead of separate copies that
+/// can drift apart.
 ///
-/// `tracked_kv_bytes` only captures live per-sequence KV cache tensors, which
-/// is roughly 15-20% of the *real* GPU memory consumed.  Batch-decode setup
-/// creates padded copies, the CUDA caching allocator retains freed blocks,
-/// and forward-pass intermediates add extra pressure.  Empirically the ratio
-/// between actual GPU growth over baseline and tracked KV bytes is 5-8×.
-///
-/// We use 6× so that `kv_budget = (limit - baseline) / 6`.  This gives the
-/// engine a realistic estimate of how much KV it can afford before the GPU
-/// runs out of memory.
-const KV_GPU_OVERHEAD_FACTOR: u64 = 6;
+/// [`InferenceEngine::raw_kv_budget`] calls `kv_budget_from_headroom`
+/// directly rather than re-deriving `(raw - KV_SAFETY_MARGIN_BYTES) /
+/// kv_batch_factor(max_running)` inline; `KV_SAFETY_MARGIN_BYTES` and
+/// `kv_batch_factor` are still imported here for diagnostic logging (see
+/// `run()`'s startup log and `is_over_kv_budget`'s warning). Also reused
+/// by `crate::derive_safe_max_seq_len` for the same reason: a naive
+/// raw-KV-bytes budget (no batch-padding factor) undercounts real usage
+/// under concurrent load and lets a single long-running session's own
+/// prefill blow past physical VRAM (verified in production — see git
+/// history). See `kv_batch_factor`'s doc comment for the reasoning behind
+/// the factor's value.
+pub(crate) use crane_core::device::{
+    KV_SAFETY_MARGIN_BYTES, kv_batch_factor, kv_budget_from_headroom,
+};
 
 /// Continuous-batching inference engine.
 ///
@@ -113,15 +152,28 @@ pub struct InferenceEngine {
     /// grant a short cooldown after preemption to avoid a deadlock where
     /// cuMemGetInfo always reports over-limit.
     eviction_cooldown: u32,
+    /// Token-id → decoded-text lookup for the whole vocabulary, built once
+    /// from the loaded model's tokenizer. Shared (via `Arc`) into every
+    /// sequence's grammar constraint, since it depends only on the model,
+    /// not the request. `None` for models that don't use the tool-call XML
+    /// skeleton grammar (see [`InferenceEngine::new`]'s `uses_xml_tool_format`
+    /// parameter).
+    vocab_byte_table: Option<Arc<grammar::VocabByteTable>>,
 }
 
 impl InferenceEngine {
     /// Create the engine and return a handle for submitting requests.
+    ///
+    /// `uses_xml_tool_format` gates the tool-call XML skeleton grammar
+    /// (see `grammar::tool_call_skeleton`): only Qwen3-Coder checkpoints
+    /// emit that format, so the grammar must stay off for every other
+    /// model or it would corrupt their (already well-formed) tool calls.
     pub fn new(
         model: Box<dyn ModelBackend>,
         max_concurrent: usize,
         decode_tokens_per_seq: usize,
         memory_config: MemoryConfig,
+        uses_xml_tool_format: bool,
     ) -> (Self, EngineHandle) {
         let (request_tx, request_rx) = mpsc::unbounded_channel();
         let num_layers = model.num_layers();
@@ -136,6 +188,22 @@ impl InferenceEngine {
             info!("Model does not support KV swap — limiting max_concurrent to {effective_max}");
         }
 
+        let vocab_byte_table = uses_xml_tool_format.then(|| {
+            let table = Arc::new(grammar::VocabByteTable::build(model.tokenizer()));
+            // One-time sanity check: does the vocab contain any token able to
+            // *start* forcing each literal the tool-call grammar relies on? A
+            // zero here means `apply_grammar_mask` will always see an empty
+            // allow-list for that literal and silently degrade to
+            // unconstrained (see `VocabByteTable::tokens_matching_prefix`'s
+            // doc) — i.e. the grammar would never actually constrain anything
+            // at that point, without erroring.
+            info!(
+                wrapper_open_from_idle = table.tokens_matching_prefix("\n<function=", 0).len(),
+                call_close = table.tokens_matching_prefix("\n</tool_call>", 0).len(),
+                "Grammar vocab sanity check (0 = that literal can never be forced)",
+            );
+            table
+        });
         let stats = Arc::new(EngineStats::new());
         let engine = Self {
             model,
@@ -156,6 +224,7 @@ impl InferenceEngine {
                 .unwrap_or_else(Instant::now),
             tracked_kv_bytes: 0,
             eviction_cooldown: 0,
+            vocab_byte_table,
         };
         let handle = EngineHandle { request_tx, stats };
         (engine, handle)
@@ -170,34 +239,63 @@ impl InferenceEngine {
         // Log effective memory budget.
         let baseline = self.memory_config.baseline_gpu_bytes;
         let limit = self.memory_config.gpu_memory_limit_bytes;
+        let max_seq_len_str = if self.memory_config.max_seq_len == 0 {
+            "unlimited".to_string()
+        } else {
+            self.memory_config.max_seq_len.to_string()
+        };
         if limit > 0 {
             let kv_budget = self.kv_budget_bytes();
-            if kv_budget == 0 || limit <= baseline {
+            if limit <= baseline {
                 warn!(
                     "gpu_memory_limit ({}) <= model baseline ({}). \
                      KV-cache budget is 0 — all sequences will be immediately preempted.",
                     format_bytes_engine(limit),
                     format_bytes_engine(baseline),
                 );
+            } else if kv_budget == 0 {
+                warn!(
+                    "gpu_memory_limit ({}) leaves less than {} after subtracting model \
+                     baseline ({}). KV-cache budget is 0 — all sequences will be \
+                     immediately preempted.",
+                    format_bytes_engine(limit),
+                    format_bytes_engine(KV_SAFETY_MARGIN_BYTES),
+                    format_bytes_engine(baseline),
+                );
             } else {
                 info!(
-                    "Memory budget: total_limit={}, model_baseline={}, kv_budget={} (overhead={}x, also checked by cuMemGetInfo)",
+                    "Memory budget: total_limit={}, model_baseline={}, kv_budget={} (batch_factor={}, also checked by cuMemGetInfo)",
                     format_bytes_engine(limit),
                     format_bytes_engine(baseline),
                     format_bytes_engine(kv_budget),
-                    KV_GPU_OVERHEAD_FACTOR,
+                    kv_batch_factor(self.scheduler.max_running),
+                );
+            }
+
+            // These two warnings are mutually exclusive: floor_kv_budget only
+            // raises the budget when kv_bytes_per_token() is Some, so a raise
+            // is only observable when the backend does report a rate.
+            let raw_budget = self.raw_kv_budget();
+            if kv_budget > raw_budget {
+                warn!(
+                    "KV budget {} raised to {} to fit one full sequence (max_seq_len={}) \
+                     (gpu_memory_limit may be too low for this context length)",
+                    format_bytes_engine(raw_budget),
+                    format_bytes_engine(kv_budget),
+                    max_seq_len_str,
+                );
+            } else if self.model.kv_bytes_per_token().is_none() {
+                warn!(
+                    "Model backend does not report kv_bytes_per_token; cannot verify \
+                     the KV budget can fit one full max_seq_len={} sequence \
+                     (gpu_memory_limit may be too low for this context length)",
+                    max_seq_len_str,
                 );
             }
         }
         info!(
             "Engine started (max_concurrent={}, decode_tokens_per_seq={}, max_seq_len={})",
-            self.scheduler.max_running,
-            self.decode_tokens_per_seq,
-            if self.memory_config.max_seq_len == 0 {
-                "unlimited".to_string()
-            } else {
-                self.memory_config.max_seq_len.to_string()
-            },
+            self.scheduler.max_running, self.decode_tokens_per_seq, max_seq_len_str,
         );
 
         // Install candle's private, affinity-pinned rayon pool for the
@@ -247,13 +345,52 @@ impl InferenceEngine {
                                 // Budget OK after eviction (or nothing running) — proceed.
                                 self.execute_step(output);
                             }
-                        } else {
+                        } else if output.is_prefill {
                             self.execute_step(output);
+                        } else {
+                            // Decode step — re-check the KV budget, since KV
+                            // usage grows every decode step and a lone
+                            // session's own growth is never checked at
+                            // prefill time (there is no new prefill here).
+                            if self.is_over_kv_budget() {
+                                self.evict_if_needed();
+                                while self.is_over_kv_budget() && !self.scheduler.running.is_empty()
+                                {
+                                    self.abort_largest_running(
+                                        "KV cache budget exceeded during decode",
+                                    );
+                                }
+                            }
+                            // Eviction/abort may have removed sequences from
+                            // `running` since `output` was scheduled — only
+                            // decode survivors.
+                            let surviving: Vec<String> = output
+                                .batch
+                                .into_iter()
+                                .filter(|id| self.scheduler.running.contains(id))
+                                .collect();
+                            if !surviving.is_empty() {
+                                self.execute_step(SchedulerOutput {
+                                    batch: surviving,
+                                    is_prefill: false,
+                                });
+                            }
                         }
                         self.step_counter += 1;
 
                         if self.step_counter.is_multiple_of(50) {
                             self.log_stats();
+                        }
+
+                        if vram_trace_enabled() {
+                            let (gpu_used, gpu_total) = query_gpu_memory_usage(self.model.device());
+                            debug!(
+                                step = self.step_counter,
+                                tracked_kv = %format_bytes_engine(self.tracked_kv_bytes),
+                                gpu_used = %format_bytes_engine(gpu_used),
+                                gpu_total = %format_bytes_engine(gpu_total),
+                                "CRANE_VRAM_TRACE",
+                            );
                         }
                     },
                     None => {
@@ -338,24 +475,48 @@ impl InferenceEngine {
         self.tracked_kv_bytes = total;
     }
 
-    /// KV cache budget **in KV-cache bytes** (not raw GPU bytes).
-    ///
-    /// Each byte of live KV cache costs roughly `KV_GPU_OVERHEAD_FACTOR` bytes
-    /// of real GPU memory (due to padded batch copies, CUDA pool bloat, and
-    /// forward-pass intermediates).  The budget is therefore:
-    ///
-    /// ```text
-    /// kv_budget = (gpu_limit - baseline) / KV_GPU_OVERHEAD_FACTOR
-    /// ```
+    /// Un-floored KV cache budget in KV-cache bytes: `gpu_limit - baseline`,
+    /// run through [`kv_budget_from_headroom`] — the exact inverse of
+    /// `GpuBudget::runtime_reservation_bytes`'s `kv_vram_overhead` call, so
+    /// the two ends of the formula can't drift apart. Shared by
+    /// [`Self::kv_budget_bytes`] (which floors it) and `run()`'s startup
+    /// log (which compares the floored and un-floored values to decide
+    /// whether to warn).
     ///
     /// Returns `u64::MAX` when no limit is configured.
-    fn kv_budget_bytes(&self) -> u64 {
+    fn raw_kv_budget(&self) -> u64 {
         let limit = self.memory_config.gpu_memory_limit_bytes;
         if limit == 0 {
             return u64::MAX;
         }
-        let raw = limit.saturating_sub(self.memory_config.baseline_gpu_bytes);
-        raw / KV_GPU_OVERHEAD_FACTOR
+        let headroom = limit.saturating_sub(self.memory_config.baseline_gpu_bytes);
+        kv_budget_from_headroom(headroom, self.scheduler.max_running)
+    }
+
+    /// KV cache budget **in KV-cache bytes** (not raw GPU bytes).
+    ///
+    /// [`Self::raw_kv_budget`], floored at what one full `max_seq_len`
+    /// sequence needs — a configured `max_seq_len` must be satisfiable by
+    /// at least one sequence, or eviction has nothing else to blame and
+    /// loops forever evicting the only sequence, re-prefilling it, and
+    /// evicting it again (observed in the field: a single request whose
+    /// own KV footprint alone exceeded this budget never completed). The
+    /// floor only applies when the backend reports `kv_bytes_per_token`;
+    /// backends that return `None` (hybrid/shared KV architectures) get
+    /// the un-floored budget, and `run()`'s startup log warns that
+    /// satisfiability couldn't be verified.
+    ///
+    /// Returns `u64::MAX` when no limit is configured.
+    fn kv_budget_bytes(&self) -> u64 {
+        let budget = self.raw_kv_budget();
+        if budget == u64::MAX {
+            return u64::MAX;
+        }
+        floor_kv_budget(
+            budget,
+            self.model.kv_bytes_per_token(),
+            self.memory_config.max_seq_len,
+        )
     }
 
     /// Check whether the engine should block new prefills due to memory
@@ -378,21 +539,21 @@ impl InferenceEngine {
 
         let budget = self.kv_budget_bytes();
         if budget == 0 {
-            return true; // limit <= baseline
+            return true; // limit <= baseline, or headroom consumed by safety margin
         }
 
-        // Check 1: tracked KV bytes vs overhead-adjusted budget.
+        // Check 1: tracked KV bytes vs batch-padding-adjusted budget.
         if self.tracked_kv_bytes > budget {
             let now = Instant::now();
             if now.duration_since(self.last_mem_warn).as_secs() >= 5 {
                 self.last_mem_warn = now;
                 warn!(
-                    "KV budget exceeded: kv_used={} > kv_budget={} (limit={} baseline={} overhead={}x)",
+                    "KV budget exceeded: kv_used={} > kv_budget={} (limit={} baseline={} batch_factor={})",
                     format_bytes_engine(self.tracked_kv_bytes),
                     format_bytes_engine(budget),
                     format_bytes_engine(limit),
                     format_bytes_engine(self.memory_config.baseline_gpu_bytes),
-                    KV_GPU_OVERHEAD_FACTOR,
+                    kv_batch_factor(self.scheduler.max_running),
                 );
             }
             return true;
@@ -451,11 +612,17 @@ impl InferenceEngine {
                 break;
             };
 
-            // Compute bytes being freed.
-            let freed = self
-                .sequences
-                .get(&victim_id)
-                .map_or(0, |seq| sequence::kv_cache_bytes(&seq.kv_caches));
+            // Compute bytes being freed. If active, bytes are in the model
+            // (not in seq.kv_caches) — mirrors cleanup_sequence's branch.
+            // Must run before clear_kv_cache() below while the cache is
+            // still live.
+            let freed = if self.active_seq_id.as_deref() == Some(&victim_id) {
+                self.model.active_kv_cache_bytes()
+            } else {
+                self.sequences
+                    .get(&victim_id)
+                    .map_or(0, |seq| sequence::kv_cache_bytes(&seq.kv_caches))
+            };
 
             info!(
                 id = %victim_id,
@@ -503,6 +670,37 @@ impl InferenceEngine {
         self.eviction_cooldown = 5;
     }
 
+    /// Aborts the running sequence with the most generated tokens (largest
+    /// KV cache) with an error, for when eviction alone cannot bring KV
+    /// usage under budget — e.g. a single session whose own KV cache
+    /// already exceeds the budget, which `evict_if_needed` cannot shrink
+    /// by moving other sequences back to waiting.
+    fn abort_largest_running(&mut self, reason: &str) {
+        let victim_id = self
+            .scheduler
+            .running
+            .iter()
+            .filter_map(|id| {
+                self.sequences
+                    .get(id)
+                    .map(|seq| (id.clone(), seq.tokens.len()))
+            })
+            .max_by_key(|(_, len)| *len)
+            .map(|(id, _)| id);
+
+        let Some(victim_id) = victim_id else {
+            return;
+        };
+
+        warn!(
+            id = %victim_id,
+            kv_used = %format_bytes_engine(self.tracked_kv_bytes),
+            kv_budget = %format_bytes_engine(self.kv_budget_bytes()),
+            "{reason}",
+        );
+        self.send_error(&victim_id, reason);
+    }
+
     /// Effective `max_tokens` for a request, taking server-level `max_seq_len` into account.
     fn effective_max_tokens(&self, prompt_len: usize, requested_max_tokens: usize) -> usize {
         if self.memory_config.max_seq_len == 0 {
@@ -523,6 +721,18 @@ impl InferenceEngine {
     }
 
     fn accept_request(&mut self, req: EngineRequest) {
+        // Reject requests that were already queued when the engine hit a
+        // fatal GPU error. `EngineHandle::submit` rejects new requests once
+        // this flag is set, but a request enqueued just before the flag was
+        // set can still reach here.
+        if let Some(err) = self.stats.get_fatal_error() {
+            let _ = req.response_tx.send(EngineResponse::Error(format!(
+                "Engine is unavailable due to a fatal GPU error: {err}"
+            )));
+            self.stats.failed_requests.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
         let prompt_len = req.tokens.len();
         let tokenizer = self.model.tokenizer().clone();
 
@@ -555,6 +765,8 @@ impl InferenceEngine {
             rep_penalty = req.repetition_penalty,
             freq_penalty = req.frequency_penalty,
             pres_penalty = req.presence_penalty,
+            stop_sequences = ?req.stop,
+            eos_token_ids = ?req.eos_token_id,
             "New request accepted (queue: waiting={} running={})",
             self.scheduler.waiting.len() + 1,
             self.scheduler.running.len(),
@@ -564,6 +776,35 @@ impl InferenceEngine {
         self.stats
             .total_prompt_tokens
             .fetch_add(prompt_len as u64, Ordering::Relaxed);
+
+        // Constrains the tool-call XML skeleton so Qwen3-Coder's documented
+        // quirk of occasionally omitting the `<tool_call>` opener can't
+        // reach the client. `None` when the request offers no tools, or when
+        // the loaded model isn't Qwen3-Coder (`vocab_byte_table` is only
+        // built for that format — see `InferenceEngine::new`).
+        info!(
+            id = %req.id,
+            tool_count = req.tool_names.len(),
+            tool_names = ?req.tool_names,
+            "Grammar constraint: {}",
+            if req.tool_names.is_empty() {
+                "no tools offered, none constructed"
+            } else if self.vocab_byte_table.is_none() {
+                "tools offered, but model doesn't use the XML tool-call format — none constructed"
+            } else {
+                "constructed"
+            },
+        );
+        let grammar: Option<Box<dyn grammar::GrammarConstraint>> = if req.tool_names.is_empty() {
+            None
+        } else {
+            self.vocab_byte_table.as_ref().map(|vocab_byte_table| {
+                Box::new(grammar::tool_call_skeleton::ToolCallSkeleton::new(
+                    req.tool_names,
+                    vocab_byte_table.clone(),
+                )) as Box<dyn grammar::GrammarConstraint>
+            })
+        };
 
         let seq = Sequence {
             id: req.id.clone(),
@@ -581,12 +822,16 @@ impl InferenceEngine {
             top_k: req.top_k,
             max_tokens: effective_max_tokens,
             eos_token_id: req.eos_token_id,
+            grammar,
             repetition_penalty: req.repetition_penalty,
             frequency_penalty: req.frequency_penalty,
             presence_penalty: req.presence_penalty,
             repeat_last_n: 64,
             stop_sequences: req.stop,
             unsent_text: String::new(),
+            decode_start: None,
+            created_at: Instant::now(),
+            first_token_at: None,
             response_tx: req.response_tx,
         };
 
@@ -607,6 +852,10 @@ impl InferenceEngine {
             .filter(|(_, seq)| seq.response_tx.is_closed())
             .map(|(id, _)| id.clone())
             .collect();
+
+        if !cancelled.is_empty() {
+            debug!(count = cancelled.len(), "Detected cancelled sequences");
+        }
 
         for id in cancelled {
             warn!(id = %id, "Client disconnected, cancelling sequence");
@@ -711,6 +960,7 @@ impl InferenceEngine {
             let seq = self.sequences.get_mut(&seq_id).unwrap();
             seq.tokens.push(next_token);
             seq.status = SequenceStatus::Running;
+            seq.decode_start = Some(Instant::now());
         }
 
         info!(
@@ -813,6 +1063,24 @@ impl InferenceEngine {
         }
     }
 
+    /// Finalize sequences that completed or were cancelled during a decode
+    /// round before the round loop itself exited (normally or via an error
+    /// return). Must be called on every exit path out of
+    /// `step_decode_batch`'s round loop, not just the success path, or these
+    /// sequences leak: their client never gets a terminal response and their
+    /// `seq_id` is never freed from the scheduler.
+    fn drain_pending_completions(&mut self, pending_finish: &[String], pending_cancel: &[String]) {
+        for id in pending_finish {
+            self.finish_sequence(id);
+        }
+        for id in pending_cancel {
+            self.stats
+                .cancelled_requests
+                .fetch_add(1, Ordering::Relaxed);
+            self.cleanup_sequence(id);
+        }
+    }
+
     /// Decode step for all running sequences — TRUE BATCHED forward.
     ///
     /// Uses **lazy eviction**: when a sequence completes or is cancelled
@@ -835,7 +1103,7 @@ impl InferenceEngine {
         self.flush_active_kv_for_batch();
 
         // Collect KV caches and setup batched decode.
-        let kv_caches: Vec<Vec<Option<(Tensor, Tensor)>>> = batch
+        let kv_caches: Vec<Vec<Option<KvCacheState>>> = batch
             .iter()
             .map(|id| self.sequences.get(id).unwrap().kv_caches.clone())
             .collect();
@@ -877,7 +1145,9 @@ impl InferenceEngine {
             {
                 Ok(m) => m,
                 Err(e) => {
-                    error!("Mask build failed: {e}");
+                    for seq_id in &batch {
+                        self.send_error(seq_id, &format!("Mask build failed: {e}"));
+                    }
                     self.model.clear_kv_cache();
                     return;
                 },
@@ -926,8 +1196,16 @@ impl InferenceEngine {
             {
                 Ok(t) => t,
                 Err(e) => {
-                    error!("Decode input_ids upload failed: {e}");
+                    for (i, seq_id) in batch.iter().enumerate() {
+                        if alive[i] {
+                            self.send_error(
+                                seq_id,
+                                &format!("Decode input_ids upload failed: {e}"),
+                            );
+                        }
+                    }
                     self.model.clear_kv_cache();
+                    self.drain_pending_completions(&pending_finish, &pending_cancel);
                     return;
                 },
             };
@@ -953,6 +1231,7 @@ impl InferenceEngine {
                         }
                     }
                     self.model.clear_kv_cache();
+                    self.drain_pending_completions(&pending_finish, &pending_cancel);
                     return;
                 },
             };
@@ -1020,15 +1299,7 @@ impl InferenceEngine {
 
         self.save_extracted_batch_kv(&batch, &alive, &kv_lens, original_max_kv, rounds_done);
 
-        for id in &pending_finish {
-            self.finish_sequence(id);
-        }
-        for id in &pending_cancel {
-            self.stats
-                .cancelled_requests
-                .fetch_add(1, Ordering::Relaxed);
-            self.cleanup_sequence(id);
-        }
+        self.drain_pending_completions(&pending_finish, &pending_cancel);
 
         #[allow(clippy::cast_possible_truncation)]
         let decode_us = t0.elapsed().as_micros() as u64;
@@ -1256,6 +1527,26 @@ impl InferenceEngine {
 
         if let Some(seq) = self.sequences.get_mut(seq_id) {
             seq.unsent_text.push_str(&text);
+            if let Some(g) = seq.grammar.as_mut() {
+                g.advance(token_id, &text);
+                if grammar_trace_enabled() {
+                    let mask_desc = match g.token_mask() {
+                        grammar::TokenMask::Unconstrained => "unconstrained".to_string(),
+                        grammar::TokenMask::AllowOnly(ids) => format!("allow_only({})", ids.len()),
+                    };
+                    debug!(
+                        id = %seq_id,
+                        token_id,
+                        text = %text,
+                        allows_eos = g.allows_eos(),
+                        next_mask = %mask_desc,
+                        "CRANE_GRAMMAR_TRACE",
+                    );
+                }
+                if g.is_finished() {
+                    seq.grammar = None;
+                }
+            }
         }
     }
 
@@ -1273,13 +1564,17 @@ impl InferenceEngine {
             return;
         };
 
-        if let Some(seq) = self.sequences.get(seq_id)
-            && seq
+        if let Some(seq) = self.sequences.get_mut(seq_id) {
+            if seq.first_token_at.is_none() {
+                seq.first_token_at = Some(Instant::now());
+            }
+            if seq
                 .response_tx
                 .send(EngineResponse::Token { text, token_id: 0 })
                 .is_err()
-        {
-            debug!(id = %seq_id, "Response channel closed (client disconnected)");
+            {
+                debug!(id = %seq_id, "Response channel closed (client disconnected)");
+            }
         }
     }
 
@@ -1289,6 +1584,9 @@ impl InferenceEngine {
             let _ = seq.response_tx.send(EngineResponse::Error(msg.to_string()));
         }
         self.stats.failed_requests.fetch_add(1, Ordering::Relaxed);
+        if stats::is_fatal_gpu_error(msg) {
+            self.stats.set_fatal_error(msg);
+        }
         self.cleanup_sequence(seq_id);
     }
 
@@ -1301,6 +1599,13 @@ impl InferenceEngine {
             .sequences
             .get(seq_id)
             .is_some_and(|s| s.stop_sequence_match().is_some());
+
+        if stopped_by_stop_sequence
+            && let Some(seq) = self.sequences.get(seq_id)
+            && let Some(matched) = seq.stop_sequence_match()
+        {
+            debug!(id = %seq_id, matched, "Finishing sequence on stop-sequence match");
+        }
 
         let remaining = if stopped_by_stop_sequence {
             self.sequences
@@ -1326,8 +1631,11 @@ impl InferenceEngine {
         };
 
         if !remaining.is_empty()
-            && let Some(seq) = self.sequences.get(seq_id)
+            && let Some(seq) = self.sequences.get_mut(seq_id)
         {
+            if seq.first_token_at.is_none() {
+                seq.first_token_at = Some(Instant::now());
+            }
             let _ = seq.response_tx.send(EngineResponse::Token {
                 text: remaining,
                 token_id: 0,
@@ -1343,8 +1651,8 @@ impl InferenceEngine {
                 .decode(generated_ids, true)
                 .unwrap_or_default();
 
-            if let Some(stop_seq) = seq.stop_sequence_match() {
-                if let Some(pos) = full_text.rfind(stop_seq) {
+            if stopped_by_stop_sequence {
+                if let Some(pos) = full_text.rfind(seq.unsent_text.as_str()) {
                     full_text.truncate(pos);
                 } else {
                     warn!(
@@ -1355,13 +1663,21 @@ impl InferenceEngine {
                 }
             }
 
-            let finish_reason = seq.finish_reason().to_string();
+            let finish_reason = if stopped_by_stop_sequence {
+                "stop".to_string()
+            } else {
+                seq.finish_reason().to_string()
+            };
+            let decode_tok_s = seq.decode_tokens_per_sec();
+            let ttft_ms = seq.ttft_ms();
 
             info!(
                 id = %seq_id,
                 prompt_tokens = seq.prompt_len,
                 completion_tokens,
                 finish_reason = %finish_reason,
+                decode_tok_s = format!("{:.1}", decode_tok_s),
+                ttft_ms = ?ttft_ms,
                 "Sequence finished",
             );
 
@@ -1370,6 +1686,8 @@ impl InferenceEngine {
                 prompt_tokens: seq.prompt_len,
                 completion_tokens,
                 finish_reason,
+                ttft_ms,
+                decode_tokens_per_sec: decode_tok_s,
             });
 
             self.stats
@@ -1378,6 +1696,12 @@ impl InferenceEngine {
             self.stats
                 .completed_requests
                 .fetch_add(1, Ordering::Relaxed);
+            if let Some(ttft) = ttft_ms {
+                self.stats
+                    .total_ttft_us
+                    .fetch_add(ttft * 1000, Ordering::Relaxed);
+                self.stats.ttft_count.fetch_add(1, Ordering::Relaxed);
+            }
         }
 
         self.cleanup_sequence(seq_id);

@@ -640,6 +640,108 @@ crane-serve --model-path /path/to/Qwen3-8B-Q4_K_M.gguf \
     --gpu-memory-limit 8G
 ```
 
+### Mixture-of-Experts models (Qwen3-Coder and similar) — long context on limited VRAM
+
+Mixture-of-Experts (MoE) models — Qwen3-Coder-30B-A3B and other `qwen3moe`
+GGUF checkpoints — split each layer's feed-forward network into many
+smaller "expert" networks and only run a handful of them per token. That
+means most of the model's weights don't need to sit on the GPU at once:
+Crane loads every expert to CPU by default, then promotes as many as fit
+in `--gpu-memory-limit` onto the GPU, based on a live VRAM measurement
+taken right after the model loads (see the startup log lines starting with
+`Expert placement:` and `Live VRAM ...`). If you already know your VRAM
+budget won't fit any experts, `--offload-experts` skips that measurement
+step and keeps every expert on CPU, saving a bit of startup time.
+
+For long-context tools like opencode or aider that keep feeding a growing
+conversation back into the model, two things compete for the same VRAM:
+how many experts get promoted to the GPU (decided once, at startup), and
+how much room is left for the KV cache — the per-conversation memory that
+grows as your prompt and its response do.
+
+**A large `--max-seq-len` reserves more room for the KV cache up front**,
+which can mean fewer (or zero) experts get promoted to the GPU — the model
+still works correctly, just runs those experts on CPU instead, which is
+slower but not unsafe.
+
+There's also a real limitation worth knowing: once the server is running,
+it can only free up VRAM by evicting a request when a *new* request needs
+to start and there isn't room — it can't shrink a request that's already
+running on its own. If you're running one long-lived session
+(`--max-concurrent 1`, matching how most coding assistants use the API),
+nothing else is competing for room, so nothing ever gets evicted to make
+space. In that case, **`--max-seq-len` is your only real safety net**
+against running out of VRAM mid-session, and it needs to be sized to fit
+your actual hardware — not just picked to match how much context you'd
+like to have.
+
+#### Worked example: Qwen3-Coder-30B-A3B GGUF on a 16 GB card
+
+This model uses 48 layers, 4 KV attention heads, and a head size of 128
+(read from the GGUF file's own metadata). That works out to roughly:
+
+```
+96 KiB of KV-cache memory per token of conversation
+```
+
+But that raw number undercounts what the GPU actually needs by 5-8x in
+practice — extra copies made while batching multiple requests together,
+memory the allocator holds onto after freeing it, and temporary buffers
+needed while processing a long prompt all add up. Crane's engine already
+builds in a 6x safety margin when deciding whether to evict a request at
+runtime; use that same margin when sizing `--max-seq-len` by hand, or a
+setting that looks fine at first can still run out of memory partway
+through a long session.
+
+So the safe formula is: `safe_tokens = (gpu_memory_limit − the model's
+fixed weight usage) / 6 / 96 KiB`. On this 16 GB card, with
+`--gpu-memory-limit 10G` and about 3.4 GB of fixed (non-expert) weight
+usage, that works out to roughly **12,000 tokens** — noticeably less than
+a typical 15K-token prompt plus a 32K-token response. Raising
+`--gpu-memory-limit` further doesn't help much either: even using the
+card's entire 16 GB only gets to about 22,800 tokens.
+
+If your prompts routinely need more context than this hardware can safely
+give, `--kv-quant int8` (or `CRANE_KV_QUANT=int8`; see the environment
+variables table below) shrinks the KV cache itself, which is the setting
+that actually helps here. Most of this model's weights are already off the
+GPU, so quantizing them wouldn't free up much room — it's the growing
+per-conversation memory that needs to shrink. Halving the per-token cost
+from 96 KiB to ~48 KiB doubles the safe token count for the same budget,
+to roughly 24,000 tokens.
+
+```bash
+crane-serve --model-path /path/to/Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL.gguf \
+    --format gguf \
+    --gpu-memory-limit 10G \
+    --max-concurrent 1 \
+    --kv-quant int8 \
+    --max-seq-len 24000
+```
+
+- `--gpu-memory-limit 10G` leaves about 6 GB of the 16 GB card free for
+  your desktop and other programs. Don't set this close to the card's full
+  capacity — anything else using the same GPU can crash the graphics driver.
+- `--max-concurrent 1` matches how these tools actually use the server —
+  one active conversation, not several at once — so the whole KV-cache
+  budget goes to that conversation instead of being split across slots
+  you're not using.
+- `--kv-quant int8` halves the KV cache's per-token footprint, which is
+  what makes the larger `--max-seq-len` below safe.
+- `--max-seq-len 24000` is the safe limit for this hardware and model with
+  `--kv-quant int8`. Prompts longer than this are rejected outright
+  (you'll see `Prompt exceeds max_seq_len` in the log), not silently cut
+  short.
+
+Check the startup log's `Expert placement: N/48 layers on <device>, M on
+CPU` and `Live VRAM ... available_for_experts=...` lines to see what your
+settings actually produced.
+
+If you leave `--max-seq-len` unset, Crane computes essentially this same
+number for you automatically (see "Auto-derived `--max-seq-len`" further
+down) — this walkthrough exists so you understand *why* that number is
+what it is, not because you need to compute it by hand.
+
 ### Multi-GPU note
 
 Currently crane-serve runs on a single CUDA device (device 0). Multi-GPU tensor parallelism is not yet supported.
@@ -657,8 +759,9 @@ Currently crane-serve runs on a single CUDA device (device 0). Multi-GPU tensor 
 | `--max-concurrent` | `16` | Hard cap on concurrently decoding sequences. Actual concurrency may be lower when `--gpu-memory-limit` is active. |
 | `--decode-tokens-per-seq` | `16` | Max decode rounds per scheduling step. Higher = less scheduling overhead, higher TTFT for queued requests. |
 | `--format` | `auto` | Weight format: `auto`, `safetensors`, `gguf` |
-| `--max-seq-len` | `0` | Max sequence length (prompt + generation); `0` = unlimited |
+| `--max-seq-len` | `0` | Max sequence length (prompt + generation); `0` = unlimited. If left at `0` while `--gpu-memory-limit` is set, and the loaded model supports it (currently Qwen3), a safe value is auto-derived from measured VRAM headroom at load time — see "Auto-derived `--max-seq-len`" below. |
 | `--gpu-memory-limit` | *(none)* | VRAM cap: absolute (`5G`, `8G`, `5120M`) or fractional (`0.7` = 70% of total) |
+| `--kv-quant` | *(none)* | Shrink the KV cache to fit more context in the same VRAM: `int8` (~2x smaller) or `int4` (~4x smaller). Currently supported for Qwen 3 only. Same effect as setting `CRANE_KV_QUANT`, just as a flag instead of an environment variable. |
 | `--text-only` | `false` | Qwen 3.5-VL / Ornith only: opt out of the vision tower and load the same checkpoint as a plain text model (skips the ~600M-param ViT entirely — no extra VRAM — and unlocks `--quant`, which the VLM path doesn't support). Vision-capable checkpoints load with vision by default; this flag is the opt-out. |
 
 ### Parameter tuning guide
@@ -1343,7 +1446,7 @@ Tool calling and reasoning control are **template-driven**, not model-type-drive
 | `CRANE_TOPP_FALLBACK_TOPK` | `64` | k value for GPU top-k fallback |
 | `CRANE_TOPK_SAMPLE_ON_CPU` | `0` | Sample on CPU after GPU top-k |
 | `CRANE_SAMPLE_TRACE` | `0` | Verbose sampling timing logs |
-| `CRANE_KV_QUANT` | unset | Qwen 3.5 family K/V cache: `int8` (~2x smaller) or `int4` (~4x smaller) |
+| `CRANE_KV_QUANT` | unset | Qwen 3 and Qwen 3.5 family K/V cache: `int8` (~2x smaller) or `int4` (~4x smaller). Auto-derived `--max-seq-len` conservatively assumes ~2x for both. For Qwen 3, `--kv-quant` does the same thing as a CLI flag and takes precedence over this variable. |
 | `CRANE_EMBED_DENSE` | `0` | GGUF: dequantize the whole embedding table at load instead of gathering rows (pre-optimization behaviour; costs ~1.7 GiB on Qwen 3.8-27B) |
 | `CRANE_PROF` | `0` | Per-forward-pass profiler: splits kernel *submission* time from wall time after a device sync |
 
@@ -1351,8 +1454,9 @@ Tool calling and reasoning control are **template-driven**, not model-type-drive
 
 - **No API key required** — crane-serve does not authenticate requests.
 - **Single CUDA device** — The server uses CUDA device 0. Multi-GPU tensor parallelism is not yet supported.
-- **KV eviction is lossless** — Evicted sequences preserve their full state and resume automatically; in-flight requests are not dropped or errored.
-- **`--max-seq-len 0`** means no limit. On constrained hardware, always set an explicit value to avoid runaway memory growth.
+- **KV eviction is lossless, but only guards against competing sequences** — Evicted requests preserve their full state and resume automatically; in-flight requests are not dropped or errored. Eviction only happens when a *new* request needs to start and has to make room by preempting other running requests — a single long-running session's own memory growth is never evicted this way, so `--max-seq-len` is the only real cap on it (see the Mixture-of-Experts section above).
+- **`--max-seq-len 0`** means no limit. On constrained hardware, always set an explicit value to avoid runaway memory growth — or rely on auto-derivation (next bullet) as a safety net if you don't.
+- **Auto-derived `--max-seq-len`** — If left at `0` while `--gpu-memory-limit` is set, and the loaded model supports it (currently Qwen3), crane-serve computes a safe cap after loading from measured VRAM, actual weight usage, and the model's per-token memory cost, applying the same 6x safety margin the engine uses at runtime (see the Mixture-of-Experts section above for why). Check the startup log for `auto-derived N tokens...`; if it instead logs a warning that no safe value could be derived (unsupported model/device), set `--max-seq-len` explicitly.
 - **GGUF quantization** is supported for Hunyuan Dense and Qwen 3. Qwen 2.5 requires Safetensors format.
 - **`--decode-tokens-per-seq`** controls decode rounds per engine step, not per request. Requests always complete fully regardless of this value.
 - **Log diagnostics** — The startup log prints `kv_bytes` and `kv_budget`. Monitor these to validate your `--gpu-memory-limit` headroom.

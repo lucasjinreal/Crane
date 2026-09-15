@@ -19,12 +19,13 @@ use axum::{
     routing::{get, post},
 };
 use clap::Parser;
+use crane_core::device::{GpuBudget, WeightBudget};
 use crane_core::utils::DeviceExt;
-use tracing::info;
+use tracing::{info, warn};
 
 use chat_template::ChatTemplateProcessor;
 use engine::model_factory::{ModelFormat, ModelType};
-use engine::{EngineHandle, InferenceEngine, MemoryConfig};
+use engine::{EngineHandle, InferenceEngine, MemoryConfig, kv_budget_from_headroom};
 use handlers::asr::AsrTranscribeRequest;
 use handlers::tts::TtsGenerateRequest;
 use handlers::vlm::{Gemma4VlmRequest, MinicpmVVlmRequest, Qwen3_5VlmRequest, VlmRequest};
@@ -64,18 +65,35 @@ pub struct Args {
     /// q8_0). Currently supported for qwen3_5 only. Overrides `CRANE_ISQ`.
     #[arg(long)]
     pub quant: Option<String>,
+    /// KV-cache quantization level: `int8` (~2x smaller) or `int4` (~4x
+    /// smaller). A separate setting from `--quant` (that's the model's
+    /// weights; this is the attention cache). Currently supported for
+    /// qwen3 only. Overrides `CRANE_KV_QUANT`.
+    #[arg(long)]
+    pub kv_quant: Option<String>,
     /// Compute dtype: f16, bf16 or f32. Defaults per device: BF16 on CUDA,
-    /// F16 on ROCm and Metal, and F32 on CPU.
+    /// F16 on ROCm (except `Qwen3-ASR`, which defaults to F32 there) and
+    /// Metal, and F32 on CPU.
     #[arg(long)]
     pub dtype: Option<String>,
     #[arg(long, default_value_t = 0)]
     pub max_seq_len: usize,
+    /// Maximum context length as a human-readable token count. Accepts K
+    /// (x1024) and M (x1024^2) suffixes, e.g. `128K` = 131072 tokens.
+    /// Mutually exclusive with `--max-seq-len`.
+    #[arg(long, conflicts_with = "max_seq_len")]
+    pub context: Option<String>,
     /// GPU memory budget: either a fraction of total VRAM (`0.9`), an absolute
     /// size (`8G`, `8GB`, `8GiB`, `5120M`, `5120MiB` — all binary units), or a
     /// plain byte count. Unset or `0` means unlimited. Only enforced for LLM
     /// engine mode (not TTS/ASR/VLM/duplex).
     #[arg(long)]
     pub gpu_memory_limit: Option<String>,
+    /// MoE models only: force all expert weights to CPU, keeping only
+    /// attention, norms, and router gates on GPU. Useful on GPUs too small
+    /// to fit any expert layers.
+    #[arg(long)]
+    pub offload_experts: bool,
     /// MiniCPM-o duplex only: load the LLM tower from a standalone
     /// quantized GGUF file (e.g. a llama.cpp-style Qwen3 conversion like
     /// `MiniCPM-o-4_5-Q8_0.gguf`) instead of the checkpoint's own bf16
@@ -509,11 +527,19 @@ pub(crate) fn is_gpu_device(device: &crane_core::models::Device) -> bool {
 
 /// Resolve the compute dtype. An explicit `--dtype` always wins; otherwise
 /// BF16 on CUDA, F16 on ROCm and Metal, and F32 on CPU. Metal's F16 path
-/// substantially reduces model and KV-cache memory use, including for
-/// Qwen3-ASR; pass `--dtype f32` to explicitly prefer full precision.
+/// substantially reduces model and KV-cache memory use; pass `--dtype f32`
+/// to explicitly prefer full precision.
+///
+/// ROCm excludes Qwen3-ASR from its F16 default: the audio encoder's
+/// intermediate activations overflow F16's smaller range (vs. the BF16 the
+/// checkpoint was trained in), producing NaN/garbage logits that never
+/// sample EOS and run decode out to `max_new_tokens` every time. Metal has
+/// not been verified against this same failure mode and still defaults
+/// Qwen3-ASR to F16.
 fn resolve_dtype(
     flag: Option<&str>,
     device: &crane_core::models::Device,
+    model_type: ModelType,
 ) -> Result<crane_core::models::DType> {
     use crane_core::models::DType;
     if let Some(name) = flag {
@@ -529,9 +555,18 @@ fn resolve_dtype(
     }
     // ROCm backend is experimental: F16 has the broadest kernel coverage on candle's
     // rocm path today, whereas BF16 support is still incomplete. Default there.
-    if device.is_rocm() {
+    //
+    // Qwen3-ASR is excluded: its audio encoder's intermediate activations
+    // overflow F16's much smaller range (vs. the BF16 the checkpoint was
+    // trained in), producing NaN/garbage logits that never sample EOS and
+    // run decode out to `max_new_tokens` every time. F32 is the verified-safe
+    // default for this family until it's been checked against F16 output
+    // quality on this backend.
+    if device.is_rocm() && model_type != ModelType::Qwen3ASR {
         return Ok(DType::F16);
     }
+    // TODO: Qwen3-ASR hasn't been verified on Metal; it may hit the same
+    // F16 overflow as on ROCm and need the same exclusion here.
     if device.is_metal() {
         return Ok(DType::F16);
     }
@@ -550,8 +585,137 @@ fn apply_text_only_override(
     }
 }
 
-pub async fn run(args: Args) -> Result<()> {
+/// Resolve the raw VRAM budget for MoE expert placement (Qwen3-Coder).
+///
+/// This is a *pre-reservation* budget: runtime needs (KV cache,
+/// activations) are subtracted later, once the model's own config is known
+/// (see `Qwen3Model::from_gguf()`). An explicit `--gpu-memory-limit 0` is
+/// therefore treated the same as an absent flag, both falling back to the
+/// full VRAM total, unlike `MemoryConfig::parse` where `"0"` means
+/// unlimited.
+///
+/// `max_concurrent` is the raw CLI value, not yet clamped by
+/// `InferenceEngine::new` based on `supports_kv_swap()`. If the engine
+/// later clamps it down (e.g. to 1 for a model without KV-swap support),
+/// the load-time reservation computed from this budget will have used a
+/// larger `kv_batch_factor` than the runtime KV budget does — harmless
+/// (it only over-reserves, never under-reserves), but worth knowing if
+/// this function is ever reused by a model whose effective concurrency
+/// can differ from the CLI flag.
+fn resolve_gpu_budget(
+    gpu_memory_limit: Option<&str>,
+    offload_experts: bool,
+    device: &crane_core::models::Device,
+    max_concurrent: usize,
+    max_seq_len: usize,
+) -> GpuBudget {
+    if !is_gpu_device(device) {
+        return GpuBudget::cpu();
+    }
+    let raw_limit = gpu_memory_limit.map_or(0, |s| MemoryConfig::parse_memory_limit(s, device));
+    let vram_limit = if raw_limit > 0 {
+        raw_limit
+    } else {
+        MemoryConfig::query_total_gpu_memory(device)
+    };
+    GpuBudget {
+        weight_budget: if vram_limit > 0 {
+            WeightBudget::Limited(vram_limit)
+        } else {
+            WeightBudget::Unlimited
+        },
+        offload_all_experts: offload_experts,
+        max_concurrent: Some(max_concurrent),
+        max_seq_len: Some(max_seq_len),
+    }
+}
+
+/// Parse a human-readable context size into a raw token count.
+///
+/// Accepts an optional `K` (x1024) or `M` (x1024^2) suffix (case-insensitive).
+/// A plain integer is passed through unchanged. No fractional suffixes
+/// (`1.5M`) — token counts are integers.
+fn parse_context_size(s: &str) -> Result<usize> {
+    let s = s.trim();
+    anyhow::ensure!(!s.is_empty(), "context size must not be empty");
+
+    let upper = s.to_ascii_uppercase();
+    let (digits, multiplier) = if let Some(d) = upper.strip_suffix('M') {
+        (d, 1024 * 1024)
+    } else if let Some(d) = upper.strip_suffix('K') {
+        (d, 1024)
+    } else {
+        (upper.as_str(), 1)
+    };
+
+    let n: usize = digits
+        .trim()
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid context size '{s}': {e}"))?;
+    anyhow::ensure!(n > 0, "context size must be greater than zero, got '{s}'");
+    n.checked_mul(multiplier)
+        .ok_or_else(|| anyhow::anyhow!("context size '{s}' overflows"))
+}
+
+/// Auto-derives a safe `--max-seq-len` when the caller left it at `0`
+/// (unlimited) while `--gpu-memory-limit` is set. Without this, a single
+/// long-running session's own KV cache can grow past physical VRAM with
+/// no runtime protection: eviction (`InferenceEngine::is_over_kv_budget`)
+/// only preempts *other* competing sequences when a new prefill is
+/// scheduled, never a lone session's own growth. The safe headroom is
+/// divided evenly across `max_concurrent`, since every concurrent slot
+/// could independently grow to the derived cap. Returns `None` when
+/// derivation isn't applicable (an explicit `--max-seq-len` or no
+/// `--gpu-memory-limit`) or isn't safely computable (VRAM query
+/// unsupported for this device, or zero headroom).
+fn derive_safe_max_seq_len(
+    memory_config: &MemoryConfig,
+    physical_total_bytes: u64,
+    kv_bytes_per_token: u64,
+    max_concurrent: usize,
+) -> Option<usize> {
+    if memory_config.max_seq_len != 0 || memory_config.gpu_memory_limit_bytes == 0 {
+        return None;
+    }
+    if physical_total_bytes == 0 || kv_bytes_per_token == 0 {
+        return None;
+    }
+    let ceiling = memory_config
+        .gpu_memory_limit_bytes
+        .min(physical_total_bytes);
+    let headroom = ceiling.saturating_sub(memory_config.baseline_gpu_bytes);
+    // Raw KV-tensor bytes alone understate real GPU growth (padded
+    // batch-decode copies, allocator retention, forward-pass intermediates
+    // like chunked-prefill attention scores that scale with chunk_size ×
+    // kv_len) — see `kv_batch_factor`'s doc comment. Reuse the same
+    // empirically-grounded formula (`kv_budget_from_headroom`, shared with
+    // `InferenceEngine::raw_kv_budget` and `GpuBudget::runtime_reservation_bytes`)
+    // here instead of a separate guess: an earlier version of this function
+    // used an arbitrary 80% margin, which was far too generous and let a
+    // single session's own prefill blow past physical VRAM in production.
+    let total_kv_budget = kv_budget_from_headroom(headroom, max_concurrent);
+    let per_seq_budget = total_kv_budget / max_concurrent.max(1) as u64;
+    let derived = per_seq_budget / kv_bytes_per_token;
+    if derived == 0 {
+        return None;
+    }
+    // Token counts are bounded by realistic VRAM sizes divided by
+    // per-token byte cost — always comfortably within usize range.
+    #[allow(clippy::cast_possible_truncation)]
+    let derived = derived as usize;
+    Some(derived)
+}
+
+pub async fn run(mut args: Args) -> Result<()> {
     info!("Loading model from: {}", args.model_path);
+
+    if let Some(ref ctx) = args.context {
+        args.max_seq_len = parse_context_size(ctx)?;
+        info!(
+            "--context {ctx} resolved to max_seq_len={}",
+            args.max_seq_len
+        );
+    }
 
     let device = if args.cpu {
         crane_core::models::Device::Cpu
@@ -580,6 +744,18 @@ pub async fn run(args: Args) -> Result<()> {
         }
     };
 
+    // args.max_concurrent is the raw CLI value; the engine may clamp it
+    // later based on supports_kv_swap(). See resolve_gpu_budget's doc
+    // comment.
+    let gpu_budget = resolve_gpu_budget(
+        args.gpu_memory_limit.as_deref(),
+        args.offload_experts,
+        &device,
+        args.max_concurrent,
+        args.max_seq_len,
+    );
+    info!("GPU budget: {gpu_budget:?}");
+
     let model_type = ModelType::from_str(&args.model_type);
     let format = ModelFormat::from_str(&args.format);
 
@@ -604,7 +780,7 @@ pub async fn run(args: Args) -> Result<()> {
     let (model_type, resolved_type) =
         apply_text_only_override(args.text_only, model_type, resolved_type);
 
-    let mut dtype = resolve_dtype(args.dtype.as_deref(), &device)?;
+    let mut dtype = resolve_dtype(args.dtype.as_deref(), &device, resolved_type)?;
 
     let is_vlm = resolved_type.is_vlm();
     let is_tts = resolved_type.is_tts();
@@ -1189,6 +1365,8 @@ pub async fn run(args: Args) -> Result<()> {
             &dtype,
             format,
             args.quant.as_deref(),
+            args.kv_quant.as_deref(),
+            &gpu_budget,
         )?;
         info!(
             "Model loaded successfully (type: {:?}, format: {:?})",
@@ -1204,6 +1382,35 @@ pub async fn run(args: Args) -> Result<()> {
         let mut memory_config =
             MemoryConfig::parse(args.max_seq_len, args.gpu_memory_limit.as_deref(), &device);
         memory_config.record_baseline(&device);
+        // This guard duplicates derive_safe_max_seq_len's own first-line check
+        // intentionally, so that function stays independently callable (and
+        // testable) without relying on the caller to have already checked.
+        if memory_config.max_seq_len == 0 && memory_config.gpu_memory_limit_bytes > 0 {
+            let physical_total = MemoryConfig::query_total_gpu_memory(&device);
+            match backend.kv_bytes_per_token().and_then(|kv_bpt| {
+                derive_safe_max_seq_len(&memory_config, physical_total, kv_bpt, args.max_concurrent)
+            }) {
+                Some(derived) => {
+                    info!(
+                        "max_seq_len unset with gpu_memory_limit set; auto-derived {derived} \
+                         tokens from physical_vram={}, baseline={}",
+                        format_bytes(physical_total),
+                        format_bytes(memory_config.baseline_gpu_bytes),
+                    );
+                    memory_config.max_seq_len = derived;
+                    args.max_seq_len = derived;
+                },
+                None => {
+                    warn!(
+                        "max_seq_len is unlimited (0) with gpu_memory_limit set; a single \
+                         long-running session's KV cache can grow past VRAM with no runtime \
+                         eviction protection (eviction only guards against multiple competing \
+                         sequences). Could not auto-derive a safe cap for this model/device — \
+                         set --max-seq-len explicitly."
+                    );
+                },
+            }
+        }
         let baseline_gpu = memory_config.baseline_gpu_bytes;
         info!(
             "Memory config: max_seq_len={}, gpu_limit={}, baseline_gpu={}",
@@ -1224,6 +1431,7 @@ pub async fn run(args: Args) -> Result<()> {
             args.max_concurrent,
             args.decode_tokens_per_seq,
             memory_config,
+            engine::model_factory::uses_xml_tool_format(&args.model_path),
         );
         std::thread::Builder::new()
             .name("inference-engine".into())
@@ -1444,23 +1652,36 @@ pub fn build_router_with_ui(state: Arc<AppState>, ui_enabled: bool) -> Router {
 }
 
 #[cfg(test)]
-mod dtype_tests {
+mod config_tests {
     use super::*;
     use crane_core::models::{DType, Device};
+    use engine::KV_SAFETY_MARGIN_BYTES;
 
     #[test]
     fn explicit_flag_wins() {
         let d = Device::Cpu;
-        assert_eq!(resolve_dtype(Some("f16"), &d).unwrap(), DType::F16);
-        assert_eq!(resolve_dtype(Some("BF16"), &d).unwrap(), DType::BF16);
-        assert_eq!(resolve_dtype(Some("fp32"), &d).unwrap(), DType::F32);
-        assert!(resolve_dtype(Some("int8"), &d).is_err());
+        assert_eq!(
+            resolve_dtype(Some("f16"), &d, ModelType::Qwen3).unwrap(),
+            DType::F16
+        );
+        assert_eq!(
+            resolve_dtype(Some("BF16"), &d, ModelType::Qwen3).unwrap(),
+            DType::BF16
+        );
+        assert_eq!(
+            resolve_dtype(Some("fp32"), &d, ModelType::Qwen3).unwrap(),
+            DType::F32
+        );
+        assert!(resolve_dtype(Some("int8"), &d, ModelType::Qwen3).is_err());
     }
 
     #[test]
     fn cpu_defaults_to_f32() {
         let d = Device::Cpu;
-        assert_eq!(resolve_dtype(None, &d).unwrap(), DType::F32);
+        assert_eq!(
+            resolve_dtype(None, &d, ModelType::Qwen3).unwrap(),
+            DType::F32
+        );
     }
 
     #[test]
@@ -1468,7 +1689,38 @@ mod dtype_tests {
         let Ok(Ok(d)) = std::panic::catch_unwind(|| Device::new_metal(0)) else {
             return; // no usable Metal device in this process/CI
         };
-        assert_eq!(resolve_dtype(None, &d).unwrap(), DType::F16);
+        assert_eq!(
+            resolve_dtype(None, &d, ModelType::Qwen3).unwrap(),
+            DType::F16
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "rocm")]
+    fn rocm_defaults_f32_for_qwen3_asr_only() {
+        // Qwen3-ASR's audio encoder overflows F16's range (the checkpoint is
+        // trained in BF16), so it must be excluded from ROCm's blanket F16
+        // default while every other family keeps defaulting to F16 there.
+        let Ok(d) = Device::new_rocm(0) else {
+            return; // no ROCm device on this machine/CI
+        };
+        assert_eq!(
+            resolve_dtype(None, &d, ModelType::Qwen3ASR).unwrap(),
+            DType::F32
+        );
+        assert_eq!(
+            resolve_dtype(None, &d, ModelType::Qwen3).unwrap(),
+            DType::F16
+        );
+        assert_eq!(
+            resolve_dtype(None, &d, ModelType::Qwen3_5).unwrap(),
+            DType::F16
+        );
+        // An explicit --dtype flag must still override the exclusion.
+        assert_eq!(
+            resolve_dtype(Some("f16"), &d, ModelType::Qwen3ASR).unwrap(),
+            DType::F16
+        );
     }
 
     // ── --text-only override ──
@@ -1503,5 +1755,207 @@ mod dtype_tests {
         let (mt, rt) = apply_text_only_override(true, ModelType::MinicpmV46, ModelType::MinicpmV46);
         assert_eq!(mt, ModelType::MinicpmV46);
         assert_eq!(rt, ModelType::MinicpmV46);
+    }
+
+    // ── resolve_gpu_budget ──
+
+    #[test]
+    fn gpu_budget_on_cpu_device_is_no_gpu() {
+        let budget = resolve_gpu_budget(None, false, &Device::Cpu, 16, 0);
+        assert_eq!(
+            budget.weight_budget,
+            crane_core::device::WeightBudget::NoGpu
+        );
+        assert!(!budget.offload_all_experts);
+    }
+
+    #[test]
+    fn gpu_budget_on_cpu_device_ignores_offload_flag() {
+        // --offload-experts is meaningless once everything is already on
+        // CPU; GpuBudget::cpu() always reports false.
+        let budget = resolve_gpu_budget(None, true, &Device::Cpu, 16, 0);
+        assert!(!budget.offload_all_experts);
+    }
+
+    #[test]
+    fn gpu_budget_without_gpu_device_ignores_configured_limit() {
+        // No GPU device short-circuits before the limit is even parsed.
+        let budget = resolve_gpu_budget(Some("8G"), false, &Device::Cpu, 16, 0);
+        assert_eq!(
+            budget.weight_budget,
+            crane_core::device::WeightBudget::NoGpu
+        );
+    }
+
+    // ── derive_safe_max_seq_len ──
+
+    fn memory_config_for_test(
+        max_seq_len: usize,
+        limit_bytes: u64,
+        baseline_bytes: u64,
+    ) -> MemoryConfig {
+        MemoryConfig {
+            max_seq_len,
+            gpu_memory_limit_bytes: limit_bytes,
+            baseline_gpu_bytes: baseline_bytes,
+        }
+    }
+
+    #[test]
+    fn derive_max_seq_len_none_when_already_set() {
+        // An explicit --max-seq-len must never be silently overridden.
+        let cfg = memory_config_for_test(4096, 10 << 30, 1 << 30);
+        assert!(derive_safe_max_seq_len(&cfg, 16 << 30, 1024, 1).is_none());
+    }
+
+    #[test]
+    fn derive_max_seq_len_none_when_no_gpu_limit() {
+        // No --gpu-memory-limit means genuinely unlimited — nothing to derive.
+        let cfg = memory_config_for_test(0, 0, 1 << 30);
+        assert!(derive_safe_max_seq_len(&cfg, 16 << 30, 1024, 1).is_none());
+    }
+
+    #[test]
+    fn derive_max_seq_len_none_when_vram_query_unsupported() {
+        // physical_total_bytes == 0 signals an unsupported device query
+        // (e.g. Metal) — can't safely compute a bound.
+        let cfg = memory_config_for_test(0, 10 << 30, 1 << 30);
+        assert!(derive_safe_max_seq_len(&cfg, 0, 1024, 1).is_none());
+    }
+
+    #[test]
+    fn derive_max_seq_len_none_when_backend_has_no_kv_cost() {
+        let cfg = memory_config_for_test(0, 10 << 30, 1 << 30);
+        assert!(derive_safe_max_seq_len(&cfg, 16 << 30, 0, 1).is_none());
+    }
+
+    #[test]
+    fn derive_max_seq_len_none_when_no_headroom() {
+        // Baseline already consumes the entire limit — zero room for KV.
+        let cfg = memory_config_for_test(0, 10 << 30, 10 << 30);
+        assert!(derive_safe_max_seq_len(&cfg, 16 << 30, 1024, 1).is_none());
+    }
+
+    #[test]
+    fn derive_max_seq_len_none_when_margin_exceeds_headroom() {
+        // Headroom exists (limit > baseline) but is smaller than
+        // KV_SAFETY_MARGIN_BYTES, so safe_headroom saturates to 0 and the
+        // derived sequence length is 0 => None.
+        let baseline: u64 = 8 << 30;
+        let limit = baseline + KV_SAFETY_MARGIN_BYTES / 2;
+        let cfg = memory_config_for_test(0, limit, baseline);
+        assert!(derive_safe_max_seq_len(&cfg, 16 << 30, 1024, 1).is_none());
+    }
+
+    #[test]
+    fn derive_max_seq_len_computes_expected_value() {
+        // 16 GiB card, 10 GiB limit, 4 GiB baseline, 96 KiB/token,
+        // max_concurrent=1 (batch_factor=1, no padding overhead).
+        // headroom=6 GiB, minus 256 MiB safety margin -> 5888 MiB safe
+        // budget -> 5888 MiB / 96 KiB = 62805 tokens (integer division).
+        let cfg = memory_config_for_test(0, 10 << 30, 4 << 30);
+        let kv_bytes_per_token = 96 * 1024;
+        let derived =
+            derive_safe_max_seq_len(&cfg, 16 << 30, kv_bytes_per_token, 1).expect("derived");
+        assert_eq!(derived, 62_805);
+    }
+
+    #[test]
+    fn derive_max_seq_len_divides_budget_across_max_concurrent() {
+        // Numbers chosen so every intermediate division is exact: safe
+        // headroom is 8,000,000 bytes (divisible by the 8x total scaling
+        // from batch_factor=2 * max_concurrent=4), kv_bytes_per_token=1
+        // removes any final-division rounding.
+        let safe_headroom: u64 = 8_000_000;
+        let limit = safe_headroom + KV_SAFETY_MARGIN_BYTES;
+        let cfg = memory_config_for_test(0, limit, 0);
+        let single = derive_safe_max_seq_len(&cfg, 1 << 32, 1, 1).expect("derived");
+        let quad = derive_safe_max_seq_len(&cfg, 1 << 32, 1, 4).expect("derived");
+        assert_eq!(single / 8, quad);
+    }
+
+    #[test]
+    fn derive_max_seq_len_clamps_to_physical_vram() {
+        // A --gpu-memory-limit larger than the card's actual physical VRAM
+        // (typo, or a shared/overcommitted device) must not let the
+        // headroom calculation use the inflated configured limit.
+        let cfg_inflated = memory_config_for_test(0, 20 << 30, 1 << 30);
+        let cfg_matching = memory_config_for_test(0, 10 << 30, 1 << 30);
+        let clamped = derive_safe_max_seq_len(&cfg_inflated, 10 << 30, 1024, 1).expect("derived");
+        let unclamped = derive_safe_max_seq_len(&cfg_matching, 10 << 30, 1024, 1).expect("derived");
+        assert_eq!(clamped, unclamped);
+    }
+
+    // ── parse_context_size ──
+
+    #[test]
+    fn context_parses_bare_number() {
+        assert_eq!(parse_context_size("4096").unwrap(), 4096);
+    }
+
+    #[test]
+    fn context_parses_k_suffix() {
+        assert_eq!(parse_context_size("128K").unwrap(), 131_072);
+    }
+
+    #[test]
+    fn context_parses_m_suffix() {
+        assert_eq!(parse_context_size("1M").unwrap(), 1_048_576);
+    }
+
+    #[test]
+    fn context_parses_case_insensitively() {
+        assert_eq!(parse_context_size("128k").unwrap(), 131_072);
+        assert_eq!(parse_context_size("1m").unwrap(), 1_048_576);
+    }
+
+    #[test]
+    fn context_rejects_empty_string() {
+        assert!(parse_context_size("").is_err());
+    }
+
+    #[test]
+    fn context_rejects_invalid_suffix() {
+        assert!(parse_context_size("128G").is_err());
+    }
+
+    #[test]
+    fn context_rejects_non_numeric() {
+        assert!(parse_context_size("abc").is_err());
+    }
+
+    #[test]
+    fn context_trims_whitespace() {
+        assert_eq!(parse_context_size("  128K  ").unwrap(), 131_072);
+    }
+
+    #[test]
+    fn context_rejects_zero() {
+        assert!(parse_context_size("0").is_err());
+        assert!(parse_context_size("0K").is_err());
+    }
+
+    #[test]
+    fn context_rejects_overflow() {
+        assert!(parse_context_size("99999999999999999999M").is_err());
+    }
+
+    #[test]
+    fn context_rejects_negative() {
+        assert!(parse_context_size("-128K").is_err());
+    }
+
+    #[test]
+    fn context_cli_rejects_context_and_max_seq_len_together() {
+        let result = Args::try_parse_from([
+            "crane-serve",
+            "-m",
+            "/tmp/model",
+            "--context",
+            "128K",
+            "--max-seq-len",
+            "4096",
+        ]);
+        assert!(result.is_err());
     }
 }

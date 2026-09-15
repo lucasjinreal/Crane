@@ -108,6 +108,14 @@ MODELS = {
         "quant_template": "Qwen3.8-27B-{quant}.gguf",
         "description": "Qwen 3.8 27B, same arch as Qwen 3.5 scaled up, GGUF quant (Apache-2.0)",
     },
+    "qwen3-coder-30b-a3b-gguf": {
+        "repo_id": "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF",
+        "dirname": "Qwen3-Coder-30B-A3B-Instruct-GGUF",
+        "kind": "llm",
+        "quant_template": "Qwen3-Coder-30B-A3B-Instruct-{quant}.gguf",
+        "default_quant": "UD-Q4_K_XL",
+        "description": "Qwen3-Coder 30B-A3B (MoE, 3.3B active), agentic coding, fits 8-24GB GPU, GGUF quant (Apache-2.0)",
+    },
     "g2p-lexicons": {
         "repo_id": "crane-local-ai/g2p-lexicons",
         "dirname": "g2p-lexicons",
@@ -245,12 +253,110 @@ for _key, _info in MODELS.items():
         )
 
 
+_KIND_SECTIONS = {
+    "llm": "LLM",
+    "vlm": "Vision-language",
+    "omni": "Omni (vision + audio)",
+    "tts": "TTS",
+    "asr": "ASR",
+    "vad": "VAD",
+    "g2p": "G2P",
+    "amt": "Audio-to-MIDI",
+}
+
+_QUANT_EXPLAINER = """\
+--quant picks a compressed version of the model: smaller file, less
+VRAM/RAM, faster loading -- but somewhat lower output quality. Rule of
+thumb, based on how much VRAM/RAM you have to spare for the model:
+  Q8_0             barely distinguishable from the original, biggest file
+  Q5_K_M / Q4_K_M  good default (Q4_K_M is used if --quant is omitted)
+  Q3_K_S / Q2_K    noticeably lower quality, smallest "regular" files
+  IQ* / UD-*       squeeze into very little VRAM (down to ~2 bits/weight);
+                   use these only if nothing else fits
+Not every model offers every option above -- run --list-quants <model> to
+see exactly which ones are available for that model.
+"""
+
+
 def list_models():
-    print("Available models:\n")
-    width = max(len(key) for key in MODELS)
+    by_kind = {}
     for key, info in MODELS.items():
-        kind = info["kind"].upper()
-        print(f"  {key:<{width}}  [{kind}]  {info['description']}")
+        by_kind.setdefault(info["kind"], []).append(key)
+
+    width = max(len(key) for key in MODELS)
+    for kind, title in _KIND_SECTIONS.items():
+        keys = by_kind.get(kind)
+        if not keys:
+            continue
+        print(f"{title}:")
+        for key in keys:
+            info = MODELS[key]
+            line = f"  {key:<{width}}  {info['description']}"
+            if info.get("quant_template"):
+                line += "  [--quant]"
+            print(line)
+        print()
+
+    print(_QUANT_EXPLAINER)
+
+
+def list_quants(model_key, token):
+    info = MODELS[model_key]
+    quant_template = info.get("quant_template")
+    if not quant_template:
+        print(
+            f"error: {model_key!r} is not a quantized model, it has no --quant options",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    try:
+        from huggingface_hub import HfApi
+        from huggingface_hub.utils import HfHubHTTPError
+    except ImportError:
+        print(
+            "error: huggingface_hub is not installed. Install it with:\n\n"
+            "    pip install huggingface_hub\n",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    prefix, _, suffix = quant_template.partition("{quant}")
+    repo_type = info.get("repo_type", "model")
+    try:
+        files = HfApi(token=token).list_repo_files(info["repo_id"], repo_type=repo_type)
+    except HfHubHTTPError as e:
+        status = e.response.status_code if e.response is not None else None
+        print(f"error: could not list files for {info['repo_id']}: {e}", file=sys.stderr)
+        if status in (401, 403):
+            print(
+                "\nThis model may be gated. Make sure you've accepted its "
+                "license on the Hugging Face model page, then pass a valid "
+                "--token (or set HF_TOKEN).",
+                file=sys.stderr,
+            )
+        sys.exit(1)
+
+    # Only top-level files matching the exact quant_template shape -- skips
+    # subfolder variants (e.g. an unquantized BF16/ dir) that don't fit the
+    # single-file --quant download path anyway.
+    quants = sorted(
+        f[len(prefix):-len(suffix)]
+        for f in files
+        if f.startswith(prefix)
+        and f.endswith(suffix)
+        and "/" not in f[len(prefix):-len(suffix)]
+    )
+    if not quants:
+        print(
+            f"error: no files matching {quant_template!r} found in {info['repo_id']}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    print(f"Available --quant values for {model_key} ({info['repo_id']}):\n")
+    for q in quants:
+        print(f"  {q}")
 
 
 def download_url_files(info, local_dir):
@@ -397,6 +503,7 @@ def main():
         "  crane-model-download --model qwen3-asr-0.6b --path ~/models\n"
         "  crane-model-download --model silero-vad --path ~/models\n"
         "  crane-model-download --model qwen3.5-9b-gguf --path ~/models --quant Q8_0\n"
+        "  crane-model-download --list-quants qwen3-coder-30b-a3b-gguf\n"
         "  crane-model-download --model g2p-lexicons --path ~/models\n"
         "  crane-model-download --model g2p-oov-en-us --path ~/models\n"
         "  crane-model-download --model kokoro --path ~/models\n",
@@ -409,6 +516,12 @@ def main():
     group.add_argument(
         "--model", choices=list(MODELS.keys()), help="Model to download"
     )
+    group.add_argument(
+        "--list-quants",
+        metavar="MODEL",
+        choices=list(MODELS.keys()),
+        help="Query Hugging Face for available --quant values for MODEL and exit",
+    )
     parser.add_argument(
         "--path", help="Parent directory to download the model into"
     )
@@ -419,9 +532,10 @@ def main():
     )
     parser.add_argument(
         "--quant",
-        default="Q4_K_M",
+        default=None,
         help="Quantization suffix to download, for GGUF models only "
-        "(e.g. Q4_K_M, Q5_K_M, Q8_0, UD-Q4_K_XL). Default: Q4_K_M",
+        "(e.g. Q4_K_M, Q5_K_M, Q8_0, UD-Q4_K_XL). "
+        "Default: model-specific if set, otherwise Q4_K_M",
     )
     args = parser.parse_args()
 
@@ -429,10 +543,18 @@ def main():
         list_models()
         return
 
+    if args.list_quants:
+        list_quants(args.list_quants, args.token)
+        return
+
     if not args.path:
         parser.error("--path is required when using --model")
 
-    download_model(args.model, args.path, args.token, args.quant)
+    quant = args.quant
+    if quant is None:
+        quant = MODELS[args.model].get("default_quant", "Q4_K_M")
+
+    download_model(args.model, args.path, args.token, quant)
 
 
 if __name__ == "__main__":

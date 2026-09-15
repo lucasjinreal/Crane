@@ -3,6 +3,7 @@ use crate::common::{
     config::{CommonConfig, DataType, DeviceConfig},
 };
 use crate::llm::{GenerationConfig, LlmModelType};
+use crane_core::device::{DeviceAssignment, GpuBudget};
 use crane_core::generation::based::ModelForCausalLM;
 use crane_core::generation::streamer::{AsyncTextStreamer, StreamerMessage};
 
@@ -122,9 +123,13 @@ impl LlmClient {
                 )
                 .map_err(|e| CraneError::TokenizationError(e.to_string()))?;
 
-                let mut model =
-                    crane_core::models::qwen3::Model::new(&config.model_path, &device, &dtype)
-                        .map_err(|e| CraneError::ModelError(e.to_string()))?;
+                let mut model = crane_core::models::qwen3::Model::new(
+                    &config.model_path,
+                    &DeviceAssignment::uniform(&device),
+                    &dtype,
+                    &GpuBudget::for_device(&device),
+                )
+                .map_err(|e| CraneError::ModelError(e.to_string()))?;
                 model.warmup();
                 LoadedModel::Qwen3 { model, tokenizer }
             },

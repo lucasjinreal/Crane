@@ -1,0 +1,107 @@
+# Podman/Compose Specification file for the ROCm crane-serve image (see
+# Containerfile and CONTAINER.md). Usage:
+#
+#   MODELS_DIR=/path/to/models MODEL_PATH=/models/llm/Qwen3.5-4B-GGUF/Qwen3.5-4B-Q5_K_M.gguf \
+#     podman compose up -d --build     # or: podman-compose up -d --build
+#   podman compose logs -f
+#   podman compose down
+#
+# MODELS_DIR points at a host directory laid out the way
+# data/crane-model-download produces (e.g. containing llm/Qwen3.5-4B-GGUF/,
+# llm/Qwen3.5-9B-GGUF/, ...); it's mounted read-only to /models so any
+# downloaded model can be selected without rebuilding the image. MODEL_PATH
+# picks which file/dir inside that mount to load; MODEL_TYPE/FORMAT default
+# to crane-serve's own "auto" detection and only need setting if that picks
+# the wrong architecture.
+
+services:
+  crane-serve:
+    build:
+      context: .
+      dockerfile: Containerfile
+    image: crane-serve-rocm
+    ports:
+      - "8080:8080"
+    # ROCm device nodes, passed through from the host. On rootless Podman
+    # these also need render/video group access -- `group_add: keep-groups`
+    # (verified against podman-compose's source: it forwards each
+    # group_add entry straight through as `--group-add <item>` with no
+    # transformation) tells podman to keep the invoking user's
+    # supplementary groups, which is usually enough. If it isn't on your
+    # host, replace it with the actual gid of the `render`/`video` group
+    # instead.
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    group_add:
+      - keep-groups
+    environment:
+      - MODEL_PATH=${MODEL_PATH:?set MODEL_PATH to the model file/dir under /models, e.g. /models/llm/Qwen3.5-4B-GGUF/Qwen3.5-4B-Q5_K_M.gguf}
+      - MODEL_TYPE=${MODEL_TYPE:-auto}
+      - FORMAT=${FORMAT:-auto}
+      # The Containerfile sets no default (see its comment); this is the
+      # single source of truth for it under compose. Override on the host
+      # e.g. RUST_LOG=crane_serve=trace,crane_core=debug to also see the
+      # per-token `trace!` logs in engine/mod.rs (token id + whether it
+      # matched eos_token_id), used to confirm a decode-loop report is/isn't
+      # an EOS-detection bug.
+      - RUST_LOG=${RUST_LOG:-crane_serve=debug,crane_core=debug}
+      # Qwen 3.5 prefill chunk size in tokens (crane-core/src/models/qwen3_5/prefill.rs);
+      # 0 disables chunking. Read at process startup, so this needs a container
+      # restart to take effect, not an image rebuild.
+      - CRANE_PREFILL_CHUNK=${CRANE_PREFILL_CHUNK:-512}
+      # Extra crane-serve CLI flags (e.g. "--dtype f32"), space-separated;
+      # see entrypoint.sh. Compose has no clean way to append arbitrary
+      # arguments otherwise (unlike `podman run <image> --extra --flags`).
+      - EXTRA_ARGS=${EXTRA_ARGS:-}
+      # crane-core/src/ops/gdn/backend.rs checks *presence*, not value: any
+      # value (even empty) forces the portable op-by-op GDN recurrence
+      # instead of the fused ROCm/CUDA kernel. Bare name (no `=`) passes it
+      # through only when you actually set it on the host; unlike the
+      # `KEY=${VAR:-default}` entries above, giving it an explicit `:-`
+      # default here would set an empty-but-present env var by default and
+      # silently flip everyone onto the portable path.
+      - CRANE_GDN_PORTABLE
+      # crane-core/src/ops/fused_ops/rocm_impl.rs: `CRANE_TOPK_HOST=1` bypasses
+      # Crane's custom ROCm top-k selection kernel entirely (falls back to a
+      # host sort), for cross-checking numerics. Same bare-name passthrough
+      # rationale as CRANE_GDN_PORTABLE above.
+      - CRANE_TOPK_HOST
+      # crane-core/src/models/qwen3_5/model.rs: any value (even empty) turns
+      # on per-layer hidden-state and final-logits stats on stderr for every
+      # forward call. Very verbose (once per layer per token) -- pair with a
+      # short prompt and --max-tokens 1 to keep output readable.
+      - CRANE_QWEN35_DEBUG
+      # crane-serve/src/handlers/openai.rs: set to a directory path (e.g.
+      # /prompt-logs, bind-mounted below) to capture every chat-completion
+      # request's raw messages + sampling params + rendered prompt to
+      # <dir>/<request_id>.json. Lets a bad/incoherent output be replayed
+      # byte-for-byte later instead of reconstructed from memory. Same bare
+      # passthrough rationale as CRANE_GDN_PORTABLE above -- unset by
+      # default since prompts may contain sensitive data.
+      - CRANE_LOG_PROMPTS
+      # crane-core/src/ops/nan_check.rs: any value (even empty) scans every
+      # decoder layer's attention/MLP output and the final logits for the
+      # first non-finite (NaN/Inf) value and logs which layer + stage found
+      # it. Requires a host sync per checked tensor, so it's off by default;
+      # same bare passthrough rationale as CRANE_GDN_PORTABLE above.
+      - CRANE_NAN_CHECK
+      - CRANE_QUANT_ATTN_FUSED
+      - HIP_LAUNCH_BLOCKING
+      - AMD_SERIALIZE_KERNEL
+      - CRANE_VRAM_TRACE
+      - CANDLE_ROCM_CACHE_LIMIT_MB
+      - CRANE_GRAMMAR_TRACE
+    volumes:
+      - ${MODELS_DIR:?set MODELS_DIR to the host directory containing your downloaded models}:/models:ro
+      # Kernels JIT-compile on first use and are cached on disk (see
+      # CONTAINER.md); a named volume here means a container recreate
+      # doesn't pay the compile cost again.
+      - crane-rocm-kernel-cache:/cache/candle-rocm
+      # Bind mount so CRANE_LOG_PROMPTS=/prompt-logs captures survive
+      # container restarts/recreates and are directly browsable on the host.
+      - ${PROMPT_LOG_DIR:-./prompt-logs}:/prompt-logs
+    restart: unless-stopped
+
+volumes:
+  crane-rocm-kernel-cache:

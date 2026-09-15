@@ -121,6 +121,24 @@ impl EmbeddingLayer {
         }
     }
 
+    /// [`Self::tied_output`], pre-converted to F32 when `dtype` is F16.
+    ///
+    /// Raw logits over a 100k+ vocab routinely exceed F16's 65504 max, so a
+    /// tied F16 checkpoint pre-stores the projection in F32 to avoid
+    /// overflow, matching `LinearLayer::forward_logits`'s untied `Quantized`
+    /// path, which already computes in F32 internally. BF16/F32 share F32's
+    /// exponent range and can't overflow, so they stay native — BF16 in
+    /// particular must stay BF16 for the CUDA `gpu_argmax` sampling fast
+    /// path, which only accepts BF16 logits.
+    pub fn tied_output_upcast_f16(&self, dtype: DType) -> Result<LinearLayer> {
+        Ok(match self.tied_output()? {
+            LinearLayer::Standard(l) if dtype == DType::F16 => LinearLayer::Standard(
+                candle_nn::Linear::new(l.weight().to_dtype(DType::F32)?, None),
+            ),
+            other => other,
+        })
+    }
+
     /// The dense weight, when this table is dense.
     pub fn dense_weight(&self) -> Option<&Tensor> {
         match self {
@@ -265,6 +283,58 @@ mod tests {
         // a tied lm_head needs.
         let x = Tensor::zeros((1, hidden), DType::F32, &dev)?;
         assert_eq!(layer.tied_output()?.forward(&x)?.dims(), &[1, vocab]);
+        Ok(())
+    }
+
+    /// A tied F16 checkpoint must upcast the projection to F32 to avoid
+    /// overflowing F16's 65504 max on vocab-sized logits.
+    #[test]
+    fn tied_output_upcast_f16_promotes_dense_f16_to_f32() -> Result<()> {
+        let dev = Device::Cpu;
+        let (vocab, hidden) = (16usize, 32usize);
+        let w = Tensor::zeros((vocab, hidden), DType::F16, &dev)?;
+        let layer = EmbeddingLayer::dense_from_tensor(w, hidden);
+
+        match layer.tied_output_upcast_f16(DType::F16)? {
+            LinearLayer::Standard(l) => assert_eq!(l.weight().dtype(), DType::F32),
+            LinearLayer::Quantized(_) => panic!("dense table must not become quantized"),
+        }
+        Ok(())
+    }
+
+    /// A tied BF16 checkpoint must stay BF16 -- CUDA's `gpu_argmax` sampling
+    /// fast path only accepts BF16 logits.
+    #[test]
+    fn tied_output_upcast_f16_leaves_bf16_untouched() -> Result<()> {
+        let dev = Device::Cpu;
+        let (vocab, hidden) = (16usize, 32usize);
+        let w = Tensor::zeros((vocab, hidden), DType::BF16, &dev)?;
+        let layer = EmbeddingLayer::dense_from_tensor(w, hidden);
+
+        match layer.tied_output_upcast_f16(DType::BF16)? {
+            LinearLayer::Standard(l) => assert_eq!(l.weight().dtype(), DType::BF16),
+            LinearLayer::Quantized(_) => panic!("dense table must not become quantized"),
+        }
+        Ok(())
+    }
+
+    /// A quantized tied table stays quantized even under F16 compute -- the
+    /// `Quantized` `LinearLayer` variant already computes in F32 internally.
+    #[test]
+    fn tied_output_upcast_f16_leaves_quantized_table_quantized() -> Result<()> {
+        let dev = Device::Cpu;
+        let (vocab, hidden) = (64usize, 256usize);
+        let w = Tensor::zeros((vocab, hidden), DType::F32, &dev)?;
+        let layer = EmbeddingLayer::from_qtensor(
+            QTensor::quantize(&w, GgmlDType::Q4K)?,
+            hidden,
+            DType::F16,
+        )?;
+
+        assert!(matches!(
+            layer.tied_output_upcast_f16(DType::F16)?,
+            LinearLayer::Quantized(QMatMul::QTensor(_))
+        ));
         Ok(())
     }
 

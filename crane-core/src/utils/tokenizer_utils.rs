@@ -1,7 +1,8 @@
 use ahash::AHashMap;
 use anyhow::{Context, Result};
 use candle_core::quantized::gguf_file::Content;
-use std::path::Path;
+use ribo::utils::log;
+use std::path::{Path, PathBuf};
 use tokenizers::models::bpe::BPE;
 use tokenizers::pre_tokenizers::byte_level::ByteLevel as ByteLevelPreTokenizer;
 use tokenizers::{AddedToken, Tokenizer};
@@ -334,6 +335,78 @@ pub fn build_tokenizer_from_gguf_path<P: AsRef<Path>>(path: P) -> Result<Option<
     Ok(Some(build_tokenizer_from_gguf(&ct)?))
 }
 
+/// Find a sibling `tokenizer.json` for a GGUF file.
+///
+/// Checks `gguf_path`'s own directory first, then its parent directory
+/// (e.g. `models/quant/model.gguf` next to `models/tokenizer.json`). All
+/// GGUF-backed models share this same two-level search, including Qwen 3.5,
+/// which previously only checked the immediate directory; the wider search
+/// was adopted here for consistency across models.
+///
+/// # Errors
+///
+/// Returns an error if no `tokenizer.json` is found in either location.
+fn find_sibling_tokenizer(gguf_path: &Path) -> Result<PathBuf> {
+    let parent = gguf_path.parent().unwrap_or(gguf_path);
+    let same_dir = parent.join("tokenizer.json");
+    if same_dir.exists() {
+        return Ok(same_dir);
+    }
+    let grandparent = parent.parent().unwrap_or(parent).join("tokenizer.json");
+    if grandparent.exists() {
+        return Ok(grandparent);
+    }
+    anyhow::bail!(
+        "no tokenizer.json was found near {} (checked same directory and parent)",
+        gguf_path.display()
+    );
+}
+
+/// Resolve the tokenizer for a GGUF model.
+///
+/// Tries the embedded `tokenizer.ggml.*` metadata first. If the keys are
+/// present but parsing fails, falls through to a sibling `tokenizer.json`
+/// instead of erroring out. The file search checks the same directory as
+/// `gguf_path`, then its parent directory (see [`find_sibling_tokenizer`]).
+///
+/// # Errors
+///
+/// Returns an error if the GGUF has no embedded tokenizer metadata (or it
+/// failed to parse) and no sibling `tokenizer.json` is found, or if a
+/// sibling `tokenizer.json` is found but fails to parse.
+pub fn resolve_gguf_tokenizer(ct: &Content, gguf_path: &Path) -> Result<Tokenizer> {
+    let mut embedded_parse_error = None;
+    if gguf_has_embedded_tokenizer(ct) {
+        match build_tokenizer_from_gguf(ct) {
+            Ok(tokenizer) => return Ok(tokenizer),
+            Err(e) => {
+                log::warn!(
+                    "GGUF has embedded tokenizer metadata but parsing failed ({e}); \
+                     falling back to sibling tokenizer.json"
+                );
+                embedded_parse_error = Some(e);
+            },
+        }
+    }
+
+    let tokenizer_path = find_sibling_tokenizer(gguf_path).map_err(|e| match embedded_parse_error {
+        Some(parse_err) => anyhow::anyhow!(
+            "embedded tokenizer metadata was present but failed to parse ({parse_err}), and {e}. \
+             Re-export the model with a current llama.cpp to embed a valid tokenizer, or place \
+             a tokenizer.json next to the GGUF file."
+        ),
+        None => anyhow::anyhow!(
+            "GGUF lacks a usable embedded tokenizer and {e}. Place tokenizer.json next to the \
+             GGUF file, or re-export with a current llama.cpp to embed the tokenizer."
+        ),
+    })?;
+    log::warn!(
+        "GGUF has no embedded tokenizer; falling back to {}",
+        tokenizer_path.display()
+    );
+    Tokenizer::from_file(&tokenizer_path).map_err(anyhow::Error::msg)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,5 +439,42 @@ mod tests {
             );
             assert!(!is_gguf_special_token(t), "type {t} should not be special");
         }
+    }
+
+    /// A `tokenizer.json` next to the GGUF file itself is found first.
+    #[test]
+    fn find_sibling_tokenizer_same_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let tokenizer_path = dir.path().join("tokenizer.json");
+        std::fs::write(&tokenizer_path, "{}").unwrap();
+        let gguf_path = dir.path().join("model.gguf");
+
+        let found = find_sibling_tokenizer(&gguf_path).unwrap();
+        assert_eq!(found, tokenizer_path);
+    }
+
+    /// A `tokenizer.json` one directory above the GGUF file (e.g.
+    /// `models/quant/model.gguf` next to `models/tokenizer.json`) is found
+    /// when the GGUF's own directory has none.
+    #[test]
+    fn find_sibling_tokenizer_parent_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let tokenizer_path = dir.path().join("tokenizer.json");
+        std::fs::write(&tokenizer_path, "{}").unwrap();
+        let quant_dir = dir.path().join("quant");
+        std::fs::create_dir(&quant_dir).unwrap();
+        let gguf_path = quant_dir.join("model.gguf");
+
+        let found = find_sibling_tokenizer(&gguf_path).unwrap();
+        assert_eq!(found, tokenizer_path);
+    }
+
+    /// No `tokenizer.json` anywhere near the GGUF file is a hard error.
+    #[test]
+    fn find_sibling_tokenizer_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let gguf_path = dir.path().join("model.gguf");
+
+        assert!(find_sibling_tokenizer(&gguf_path).is_err());
     }
 }

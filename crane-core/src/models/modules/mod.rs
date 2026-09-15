@@ -5,6 +5,8 @@ pub mod ffn;
 pub mod flash_attn;
 pub(crate) mod kv_cache;
 pub mod mel;
+pub mod moe;
+pub mod quant_kv_cache;
 pub mod rotary;
 pub mod siglip2;
 pub mod transformer;

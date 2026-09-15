@@ -48,10 +48,30 @@ pub fn device_ptr(
     dtype: DType,
     what: &str,
 ) -> Result<*mut c_void> {
-    let slice = rocm_slice(storage, what)?;
     if !layout.is_contiguous() {
         candle_core::bail!("{what} must be contiguous");
     }
+    device_ptr_strided(storage, layout, dtype, what)
+}
+
+/// Like [`device_ptr`], but for a tensor that is only non-contiguous in a
+/// buffer-with-headroom way (e.g. `KvCache`'s `narrow`'d append view, gapped
+/// only past the valid length on dim 2) — for a kernel that takes the
+/// allocation's real stride as an explicit parameter instead of assuming
+/// dense packing. Most kernels don't do this; prefer [`device_ptr`] unless
+/// the kernel is specifically written to handle the gap.
+///
+/// # Errors
+///
+/// Returns an error if `storage` is not ROCm storage, or if the slice's dtype
+/// is not `dtype`.
+pub fn device_ptr_strided(
+    storage: &Storage,
+    layout: &Layout,
+    dtype: DType,
+    what: &str,
+) -> Result<*mut c_void> {
+    let slice = rocm_slice(storage, what)?;
     if slice.dtype() != dtype {
         candle_core::bail!("{what} must be {dtype:?}, got {:?}", slice.dtype());
     }

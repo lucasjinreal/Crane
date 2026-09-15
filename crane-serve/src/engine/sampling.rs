@@ -17,6 +17,7 @@ use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 use tracing::debug;
 
+use super::grammar::{TokenMask, apply_grammar_mask, suppress_eos_inplace};
 use super::sequence::Sequence;
 
 /// Whether `device` has `crane_core::ops::topk_indices` / `gpu_argmax` backed
@@ -192,6 +193,9 @@ pub fn sample(
             && seq.repetition_penalty == 1.0
             && seq.frequency_penalty == 0.0
             && seq.presence_penalty == 0.0
+            && seq.grammar.as_ref().is_none_or(|g| {
+                matches!(g.token_mask(), TokenMask::Unconstrained) && g.allows_eos()
+            })
             && has_gpu_sampling(logits.device())
         {
             let flat = logits.squeeze(0)?.squeeze(0)?;
@@ -225,6 +229,45 @@ pub fn sample(
     )
     .map_err(anyhow::Error::from)?;
     let t_penalty_applied = Instant::now();
+
+    // ── Grammar constraint (e.g. the tool-call XML skeleton) ───────────
+    // `token_mask()` never includes EOS ids on its own (a grammar holds no
+    // request-specific EOS state): for `AllowOnly`, it's added to the
+    // allow-list when permitted and left out (so `apply_grammar_mask`
+    // blanks it) when not; for `Unconstrained`, there's no allow-list to
+    // exclude it from, so it's suppressed separately when not permitted.
+    let logits = if let Some(g) = seq.grammar.as_ref() {
+        match g.token_mask() {
+            TokenMask::Unconstrained => {
+                if !g.allows_eos() {
+                    suppress_eos_inplace(&logits, &seq.eos_token_id)
+                        .map_err(anyhow::Error::from)?;
+                }
+                logits
+            },
+            TokenMask::AllowOnly(mut ids) => {
+                if g.allows_eos() {
+                    ids.extend_from_slice(&seq.eos_token_id);
+                }
+                if super::grammar_trace_enabled() {
+                    let idx = Tensor::new(ids.as_slice(), logits.device())?;
+                    let vals = logits
+                        .gather(&idx, candle_core::D::Minus1)?
+                        .to_vec1::<f32>()?;
+                    let pairs: Vec<String> = ids
+                        .iter()
+                        .zip(vals.iter())
+                        .map(|(id, v)| format!("{id}={v:.3}"))
+                        .collect();
+                    debug!(id = %seq_id, logits = %pairs.join(","), "CRANE_GRAMMAR_TRACE pre-mask logits");
+                }
+                apply_grammar_mask(&logits, &TokenMask::AllowOnly(ids))
+                    .map_err(anyhow::Error::from)?
+            },
+        }
+    } else {
+        logits
+    };
 
     if greedy {
         return Ok(logits.argmax(0)?.to_scalar::<u32>()?);

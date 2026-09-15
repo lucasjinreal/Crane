@@ -16,6 +16,7 @@
 //! | [`bins`] | Model loading helpers used by CLI entry-points |
 //! | [`quantized`] | Shared GGUF file loading (mmap, typed tensor access) |
 //! | [`utils`] | Misc tensor / device utilities |
+//! | [`device`] | `DeviceAssignment` (main/MoE-expert devices) and `GpuBudget` (VRAM budget for expert placement) |
 //!
 //! ## Feature flags
 //!
@@ -26,6 +27,7 @@
 //! | `accelerate` | Link against Apple Accelerate for CPU BLAS |
 //! | `mkl` | Link against Intel MKL for CPU BLAS |
 
+pub mod device;
 pub mod generation;
 pub mod models;
 pub mod ops;

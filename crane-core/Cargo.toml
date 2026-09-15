@@ -85,7 +85,11 @@ cuda = [
 cudnn = ["candle-core/cudnn"]
 # AMD ROCm/HIP backend (experimental). candle 0.11 on crates.io has no `rocm`
 # feature, so this can't forward to `candle-core/rocm` yet.
-rocm = []
+rocm = [
+    "candle-core/rocm",
+    "candle-nn/rocm",
+    "candle-transformers/rocm",
+]
 mkl = [
     "dep:intel-mkl-src",
     "candle-core/mkl",

@@ -117,6 +117,12 @@ impl TextConfig {
             // EOS handling lives at the top-level `Config` (`Vec<u32>`, since
             // ASR checkpoints have multiple EOS ids), not per-decoder.
             eos_token_id: None,
+            // The ASR text decoder is dense, never MoE.
+            num_experts: None,
+            num_experts_per_tok: None,
+            moe_intermediate_size: None,
+            norm_topk_prob: None,
+            decoder_sparse_step: None,
         }
     }
 }
