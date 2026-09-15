@@ -1,0 +1,131 @@
+From ce149eea5c98afda1f45665565914f57ce4fde53 Mon Sep 17 00:00:00 2001
+From: hahihula <hahihula@gmail.com>
+Date: Fri, 28 Aug 2026 20:02:17 +0200
+Subject: [PATCH] sycl: densify non-contiguous matmul operands instead of
+ bailing
+
+The oneMKL gemm_batch path only accepted a tightly-packed batch of
+row-major / plain-transpose tiles. Grouped-query attention feeds a
+doubly-strided narrow view of the KV cache, which candle's CPU/CUDA/Metal
+matmul copy to contiguous internally; the SYCL backend bailed with
+"not a contiguous batch of N-element matrices".
+
+mm_operand now returns None for any layout gemm_batch can't express
+directly, and matmul's prep closure materialises those operands into a
+dense row-major copy (the path already used for broadcast operands).
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+---
+ candle-core/src/sycl_backend/mod.rs | 63 ++++++++++++++++++-----------
+ 1 file changed, 39 insertions(+), 24 deletions(-)
+
+diff --git a/candle-core/src/sycl_backend/mod.rs b/candle-core/src/sycl_backend/mod.rs
+index fd64495a..2899e041 100644
+--- a/candle-core/src/sycl_backend/mod.rs
++++ b/candle-core/src/sycl_backend/mod.rs
+@@ -953,15 +953,25 @@ impl BackendStorage for SyclStorage {
+         rhs_l: &Layout,
+     ) -> Result<Self> {
+         let dt = self.sd()?;
+-        // oneMKL's strided `gemm_batch` does not honour a zero batch stride, so a
+-        // broadcast operand is materialised into a contiguous `b`-copy first.
++        // oneMKL's strided `gemm_batch` wants one uniform batch stride and a
++        // row-major / plain-transpose 2-D tile. Anything it can't express
++        // directly (a broadcast/zero batch stride, a ragged batch nesting, or a
++        // 2-D tile that is neither row-major nor a plain transpose — e.g. a
++        // doubly-strided narrow view of a KV cache) is first materialised into a
++        // dense row-major `b*rows*cols` copy. `mm_operand` returns `None` for
++        // the stride in exactly those cases.
+         let prep = |buf: &DeviceBuffer,
+                     l: &Layout,
+                     rows: usize,
+                     cols: usize|
+          -> Result<(Option<SyclStorage>, bool, usize)> {
+             let (trans, stride) = mm_operand(l, rows, cols)?;
+-            if stride == 0 && b > 1 {
++            let need_dense = match stride {
++                None => true,
++                Some(0) => b > 1,
++                Some(_) => false,
++            };
++            if need_dense {
+                 let dense = self.device.alloc(self.dtype, b * rows * cols)?;
+                 wrap(k::copy_strided(
+                     &self.device.queue,
+@@ -974,7 +984,7 @@ impl BackendStorage for SyclStorage {
+                 ))?;
+                 Ok((Some(dense), false, rows * cols))
+             } else {
+-                Ok((None, trans, stride))
++                Ok((None, trans, stride.unwrap_or(rows * cols)))
+             }
+         };
+         let (lhs_owned, transa, stride_a) = prep(&self.buffer, lhs_l, m, kk)?;
+@@ -1229,7 +1239,14 @@ impl SyclStorage {
+ 
+ /// Classify a matmul operand: is it stored transposed relative to row-major, and
+ /// what is its batch stride. `rows`/`cols` are the logical (non-transposed) dims.
+-fn mm_operand(l: &Layout, rows: usize, cols: usize) -> Result<(bool, usize)> {
++/// Describes how a matmul operand's layout maps onto oneMKL `gemm_batch`.
++///
++/// Returns `(trans, Some(batch_stride))` when the layout is usable directly:
++/// `batch_stride == 0` marks a broadcast operand (the caller densifies it when
++/// `b > 1`). Returns `(_, None)` when the layout cannot be expressed as a
++/// row-major / plain-transpose tile with a uniform batch stride and the caller
++/// must materialise a dense row-major copy first.
++fn mm_operand(l: &Layout, rows: usize, cols: usize) -> Result<(bool, Option<usize>)> {
+     let stride = l.stride();
+     let rank = stride.len();
+     if rank < 2 {
+@@ -1244,31 +1261,29 @@ fn mm_operand(l: &Layout, rows: usize, cols: usize) -> Result<(bool, usize)> {
+     } else if (rs == 1 || rows == 1) && (cs == rows || cols == 1) {
+         true
+     } else {
+-        sycl_bail!(
+-            "matmul operand with strides {stride:?} (dims {dims:?}) is neither row-major nor a \
+-             plain transpose"
+-        )
++        // Neither row-major nor a plain transpose (e.g. a doubly-strided narrow
++        // view): caller densifies.
++        return Ok((false, None));
+     };
+     let batch_dims = &dims[..rank - 2];
+     let batch_strides = &stride[..rank - 2];
+     let batch: usize = batch_dims.iter().product();
+     let inner = rows * cols;
+-    let batch_stride = if batch <= 1 || batch_strides.iter().all(|&s| s == 0) {
+-        0 // scalar batch, or a broadcast operand
+-    } else {
+-        let mut expect = inner;
+-        for i in (0..batch_dims.len()).rev() {
+-            if batch_dims[i] != 1 && batch_strides[i] != expect {
+-                sycl_bail!(
+-                    "matmul batch strides {stride:?} (dims {dims:?}) are not a contiguous batch \
+-                     of {inner}-element matrices"
+-                );
+-            }
+-            expect *= batch_dims[i];
++    if batch <= 1 {
++        return Ok((trans, Some(inner)));
++    }
++    if batch_strides.iter().all(|&s| s == 0) {
++        return Ok((trans, Some(0))); // broadcast operand
++    }
++    let mut expect = inner;
++    for i in (0..batch_dims.len()).rev() {
++        if batch_dims[i] != 1 && batch_strides[i] != expect {
++            // Ragged batch nesting: caller densifies.
++            return Ok((false, None));
+         }
+-        inner
+-    };
+-    Ok((trans, batch_stride))
++        expect *= batch_dims[i];
++    }
++    Ok((trans, Some(inner)))
+ }
+ 
+ impl BackendDevice for SyclDevice {
+-- 
+2.47.3
+

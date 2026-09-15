@@ -55,6 +55,14 @@ accelerate = [
 onnx = ["crane-core/onnx", "crane/onnx"]
 cuda = ["crane-core/cuda", "crane/cuda"]
 rocm = ["crane-core/rocm", "crane/rocm"]
+# Intel SYCL / oneAPI backend (proof-of-concept).
+sycl = [
+    "crane-core/sycl",
+    "crane/sycl",
+    "candle-core/sycl",
+    "candle-nn/sycl",
+    "candle-transformers/sycl",
+]
 cudnn = ["crane-core/cudnn", "crane/cudnn"]
 mkl = ["crane-core/mkl", "crane/mkl"]
 

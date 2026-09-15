@@ -80,7 +80,16 @@ fn pick_device_dtype() -> (DeviceConfig, DataType) {
     {
         return (DeviceConfig::Rocm(0), DataType::F16);
     }
-    #[cfg(all(not(feature = "cuda"), not(feature = "rocm"), target_os = "macos"))]
+    #[cfg(all(not(feature = "cuda"), not(feature = "rocm"), feature = "sycl"))]
+    {
+        return (DeviceConfig::Sycl(0), DataType::F16);
+    }
+    #[cfg(all(
+        not(feature = "cuda"),
+        not(feature = "rocm"),
+        not(feature = "sycl"),
+        target_os = "macos"
+    ))]
     {
         return (DeviceConfig::Metal, DataType::F16);
     }

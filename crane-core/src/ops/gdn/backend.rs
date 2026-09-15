@@ -11,7 +11,7 @@ use candle_core::{D, DType, IndexOp, Result, Tensor};
 
 use super::cache::GdnLayerCache;
 use super::config::GdnDims;
-#[cfg(any(feature = "cuda", feature = "rocm"))]
+#[cfg(any(feature = "cuda", feature = "rocm", feature = "sycl"))]
 use crate::utils::DeviceExt;
 
 // ─────────────────────────────────────────────────────────────────────
@@ -235,14 +235,14 @@ pub fn apply_recurrence(
     cache: &mut GdnLayerCache,
     dtype: DType,
 ) -> Result<Tensor> {
-    #[cfg(any(feature = "cuda", feature = "rocm"))]
-    if (q.device().is_cuda() || q.device().is_rocm())
+    #[cfg(any(feature = "cuda", feature = "rocm", feature = "sycl"))]
+    if (q.device().is_cuda() || q.device().is_rocm() || q.device().is_sycl())
         && std::env::var("CRANE_GDN_PORTABLE").is_err()
     {
         return fused_recurrence(q, k, v, g, beta, dims, batch_size, seq_len, cache, dtype);
     }
 
-    // Device-portable reference (runs on CPU/CUDA/Metal/ROCm).
+    // Device-portable reference (runs on CPU/CUDA/Metal/ROCm/SYCL).
     gated_delta_rule_recurrence(q, k, v, g, beta, &mut cache.recurrent_state)
 }
 
@@ -252,9 +252,9 @@ pub fn apply_recurrence(
 /// applies the `1/sqrt(K)` query scale here (the kernel takes plain q), then
 /// reshapes the result back to the portable path's `[B, S, num_v_heads, V]`.
 ///
-/// The layout work is identical for both backends; only the launch differs,
-/// and `cuda` and `rocm` never coexist in a working build.
-#[cfg(any(feature = "cuda", feature = "rocm"))]
+/// The layout work is identical for every backend; only the launch differs, and
+/// `cuda` / `rocm` / `sycl` never coexist in a working build.
+#[cfg(any(feature = "cuda", feature = "rocm", feature = "sycl"))]
 #[allow(clippy::too_many_arguments)]
 fn fused_recurrence(
     q: &Tensor,
@@ -318,6 +318,10 @@ fn fused_recurrence(
         #[cfg(all(feature = "rocm", not(feature = "cuda")))]
         {
             super::rocm_backend::gdn_recurrence_rocm(&q3, &k3, &v3, &g2, &beta2, &state3)
+        }
+        #[cfg(all(feature = "sycl", not(feature = "cuda"), not(feature = "rocm")))]
+        {
+            super::sycl_backend::gdn_recurrence_sycl(&q3, &k3, &v3, &g2, &beta2, &state3)
         }
     })?;
 

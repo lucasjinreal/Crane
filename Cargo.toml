@@ -14,3 +14,29 @@ candle-nn = "0.11"
 candle-transformers = "0.11"
 tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 fst = "0.4"
+
+# SYCL (Intel oneAPI) backend — proof-of-concept.
+#
+# candle 0.11 on crates.io has no `sycl` feature, so the `sycl` Cargo feature in
+# `crane-core`/`crane`/`crane-serve` needs a candle build that provides one. This
+# fork is candle 0.11.0 plus an off-by-default `sycl` feature (adds the
+# `candle-sycl-kernels` crate, excluded from the workspace like the CUDA kernels,
+# so a plain build never needs the oneAPI compiler).
+#
+# The patch is global — it can't be gated on the `sycl` feature — but with `sycl`
+# off the fork is stock candle 0.11.0, so CPU/CUDA/Metal builds are unaffected.
+# This is temporary POC wiring and is not meant to land on `main`; drop it once
+# the SYCL backend is upstreamed.
+#
+# rev c91b22a = "candle SYCL support": candle 0.11.0 + the off-by-default `sycl`
+# feature + (a) the matmul densify fix for grouped-query attention and (b) the
+# out-of-tree launch surface (`SyclStorage::{buf,elems,from_buffer}`,
+# `SyclDevice::alloc_bytes`, `Queue::native_ptr`) + native `sigmoid`.
+# For local candle iteration, swap to a path dep:
+#   candle-core        = { path = "../candle/candle-core" }
+#   candle-nn          = { path = "../candle/candle-nn" }
+#   candle-transformers = { path = "../candle/candle-transformers" }
+[patch.crates-io]
+candle-core = { git = "https://github.com/Hahihula/candle", rev = "c91b22a54b8d2a9046db81061836dee08140328c" }
+candle-nn = { git = "https://github.com/Hahihula/candle", rev = "c91b22a54b8d2a9046db81061836dee08140328c" }
+candle-transformers = { git = "https://github.com/Hahihula/candle", rev = "c91b22a54b8d2a9046db81061836dee08140328c" }
