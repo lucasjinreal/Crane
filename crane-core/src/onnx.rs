@@ -24,6 +24,11 @@ pub mod eval;
 #[path = "onnx/session.rs"]
 mod session;
 
+/// Resolves ONNX's "external data" mechanism (tensor bytes stored in a
+/// sidecar file next to the `.onnx` protobuf), used by [`read_file`].
+#[path = "onnx/external_data.rs"]
+mod external_data;
+
 /// Cross-cutting evaluator bookkeeping not tied to any single op (e.g.
 /// "If"-branch value capture/eviction), shared by `eval.rs`'s main loop.
 #[path = "onnx/utils.rs"]
@@ -42,10 +47,21 @@ pub(crate) use optimizer::optimize;
 pub use optimizer::{OptimizationReport, SessionOptions};
 pub use session::Session;
 
-/// Decodes an ONNX protobuf model from disk.
+/// Decodes an ONNX protobuf model from disk, inlining any tensor data
+/// stored via the ONNX "external data" mechanism from sidecar files
+/// resolved relative to `path`'s directory (see [`external_data`]).
+///
+/// # Errors
+///
+/// Returns an error if `path` can't be read, its contents aren't a valid
+/// ONNX protobuf, or [`external_data::inline`] fails.
 pub fn read_file<P: AsRef<Path>>(path: P) -> CandleResult<proto::ModelProto> {
+    let path = path.as_ref();
     let bytes = std::fs::read(path)?;
-    proto::ModelProto::decode(bytes.as_slice()).map_err(candle_core::Error::wrap)
+    let mut model =
+        proto::ModelProto::decode(bytes.as_slice()).map_err(candle_core::Error::wrap)?;
+    external_data::inline(&mut model, path)?;
+    Ok(model)
 }
 
 use proto::tensor_proto::DataType;

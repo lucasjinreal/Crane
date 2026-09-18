@@ -6,6 +6,8 @@ mod asr_client;
 mod asr_qwen3;
 mod pcm;
 pub mod tts;
+#[cfg(feature = "onnx")]
+mod tts_audio8;
 mod tts_client;
 #[cfg(feature = "onnx")]
 mod tts_kokoro;

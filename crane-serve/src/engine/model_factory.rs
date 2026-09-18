@@ -38,6 +38,7 @@ pub enum ModelType {
     VoxtralTTS,
     Kokoro,
     VoxCpm2,
+    Audio8TTS,
     PaddleOcrVl,
     Qwen3ASR,
 }
@@ -74,6 +75,7 @@ impl ModelType {
             "voxtral_tts" | "voxtral-tts" | "voxtral" | "voxtral_4b" => Self::VoxtralTTS,
             "kokoro" | "kokoro_tts" | "kokoro-tts" | "kokoro-82m" => Self::Kokoro,
             "voxcpm2" | "voxcpm-2" | "voxcpm_2" | "voxcpm" => Self::VoxCpm2,
+            "audio8_tts" | "audio8-tts" | "audio8tts" | "audio8" => Self::Audio8TTS,
             "paddleocr_vl" | "paddleocrv" | "paddleocr" | "paddle_ocr_vl" | "paddleocrvl" => {
                 Self::PaddleOcrVl
             },
@@ -100,6 +102,7 @@ impl ModelType {
             Self::VoxtralTTS => "voxtral_tts",
             Self::Kokoro => "kokoro_tts",
             Self::VoxCpm2 => "voxcpm2",
+            Self::Audio8TTS => "audio8_tts",
             Self::PaddleOcrVl => "paddleocr_vl",
             Self::Qwen3ASR => "qwen3_asr",
         }
@@ -119,7 +122,7 @@ impl ModelType {
     pub fn is_tts(&self) -> bool {
         matches!(
             self,
-            Self::Qwen3TTS | Self::VoxtralTTS | Self::Kokoro | Self::VoxCpm2
+            Self::Qwen3TTS | Self::VoxtralTTS | Self::Kokoro | Self::VoxCpm2 | Self::Audio8TTS
         )
     }
 
@@ -319,6 +322,19 @@ pub fn detect_model_type(model_path: &str) -> ModelType {
         return ModelType::VoxtralTTS;
     }
 
+    // 3b. Check runtime_manifest.json (Audio8-TTS ONNX packages). No other
+    // model in Crane uses this filename, so its mere presence is sufficient.
+    let manifest_path = if path.is_file() {
+        path.parent().map(|p| p.join("runtime_manifest.json"))
+    } else {
+        Some(path.join("runtime_manifest.json"))
+    };
+    if let Some(manifest_path) = manifest_path
+        && manifest_path.exists()
+    {
+        return ModelType::Audio8TTS;
+    }
+
     // 4. GGUF files: the architecture is recorded in the header — far more
     // reliable than the path name.
     if let Some(mt) = detect_from_gguf_header(path) {
@@ -333,6 +349,8 @@ pub fn detect_model_type(model_path: &str) -> ModelType {
         ModelType::Kokoro
     } else if path_lower.contains("voxcpm") {
         ModelType::VoxCpm2
+    } else if path_lower.contains("audio8") {
+        ModelType::Audio8TTS
     } else if path_lower.contains("paddleocr") {
         ModelType::PaddleOcrVl
     } else if path_lower.contains("gemma4") || path_lower.contains("gemma-4") {
@@ -571,6 +589,11 @@ pub fn create_backend(
         ModelType::VoxCpm2 => {
             anyhow::bail!("VoxCPM2 is a TTS model — use create_tts() instead of create_backend()")
         },
+        ModelType::Audio8TTS => {
+            anyhow::bail!(
+                "Audio8-TTS is a TTS model — use create_tts() instead of create_backend()"
+            )
+        },
         ModelType::Qwen3ASR => {
             anyhow::bail!(
                 "Qwen3-ASR is an ASR model — use create_asr() instead of create_backend()"
@@ -683,6 +706,13 @@ pub fn create_tts(
             let model = crane_core::models::voxcpm2::VoxCpm2Model::new(model_path, device, dtype)?;
             Ok(Box::new(model))
         },
+        #[cfg(feature = "onnx")]
+        ModelType::Audio8TTS => {
+            let model = crane_core::models::audio8_tts::Model::new(model_path)?;
+            Ok(Box::new(model))
+        },
+        #[cfg(not(feature = "onnx"))]
+        ModelType::Audio8TTS => anyhow::bail!("Audio8-TTS requires the 'onnx' feature"),
         other => anyhow::bail!("{other:?} is not a TTS model type"),
     }
 }
@@ -903,6 +933,35 @@ mod tests {
     #[test]
     fn model_type_is_tts_includes_voxcpm2() {
         assert!(ModelType::VoxCpm2.is_tts());
+    }
+
+    #[test]
+    fn model_type_from_str_audio8_tts_variants() {
+        assert_eq!(ModelType::from_str("audio8_tts"), ModelType::Audio8TTS);
+        assert_eq!(ModelType::from_str("audio8-tts"), ModelType::Audio8TTS);
+        assert_eq!(ModelType::from_str("audio8tts"), ModelType::Audio8TTS);
+        assert_eq!(ModelType::from_str("audio8"), ModelType::Audio8TTS);
+        assert_eq!(ModelType::from_str("AUDIO8"), ModelType::Audio8TTS);
+    }
+
+    #[test]
+    fn model_type_is_tts_includes_audio8() {
+        assert!(ModelType::Audio8TTS.is_tts());
+    }
+
+    #[test]
+    fn detect_from_runtime_manifest_audio8() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("runtime_manifest.json");
+        std::fs::write(&manifest, "{}").unwrap();
+        let result = detect_model_type(dir.path().to_str().unwrap());
+        assert_eq!(result, ModelType::Audio8TTS);
+    }
+
+    #[test]
+    fn detect_path_heuristic_audio8() {
+        let result = detect_model_type("/models/Audio8-TTS-0.1B-ONNX-INT8");
+        assert_eq!(result, ModelType::Audio8TTS);
     }
 
     #[test]

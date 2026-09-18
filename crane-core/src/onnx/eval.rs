@@ -18,6 +18,11 @@ pub fn dtype(dt: DataType) -> Option<DType> {
         DataType::Uint32 => Some(DType::U32),
         DataType::Int64 => Some(DType::I64),
         DataType::Float16 => Some(DType::F16),
+        // Crane Added 20260827: candle's `from_raw_buffer` already decodes
+        // `DType::BF16` via `half::bf16`, matching ONNX's raw byte layout
+        // exactly; only the dtype mapping itself was missing. Audio8-TTS's
+        // fast/slow AR graphs have bf16 `Constant` nodes.
+        DataType::Bfloat16 => Some(DType::BF16),
         DataType::Float => Some(DType::F32),
         DataType::Double => Some(DType::F64),
         DataType::Bool => Some(DType::U8),
@@ -240,6 +245,24 @@ fn same_upper_conv_pads(
 pub fn get_tensor(t: &onnx::TensorProto, name: &str) -> Result<Tensor> {
     let dims: Vec<usize> = t.dims.iter().map(|&x| x as usize).collect();
     match DataType::try_from(t.data_type) {
+        // Crane Added 20260827: candle has no `I8` dtype, so decode ONNX
+        // `Int8` (used by Audio8-TTS's `MatMulInteger` weight operands) into
+        // the narrowest signed dtype candle does have, widening losslessly.
+        Ok(DataType::Int8) => {
+            if t.int32_data.is_empty() {
+                let data = t
+                    .raw_data
+                    .iter()
+                    .map(|&b| i16::from(b.cast_signed()))
+                    .collect::<Vec<_>>();
+                Tensor::from_vec(data, dims.as_slice(), &Device::Cpu)
+            } else {
+                // Values are ONNX int8, packed one per `int32_data` entry.
+                #[allow(clippy::cast_possible_truncation)]
+                let data = t.int32_data.iter().map(|&v| v as i16).collect::<Vec<_>>();
+                Tensor::from_vec(data, dims.as_slice(), &Device::Cpu)
+            }
+        },
         Ok(DataType::Int32) => {
             if t.int32_data.is_empty() {
                 let len = t.raw_data.len() / 4;
@@ -498,6 +521,14 @@ pub(crate) fn simple_eval_(
                 let input0 = get(&node.input[0])?;
                 let input1 = get(&node.input[1])?;
                 let output = input0.broadcast_matmul(input1)?;
+                values.insert(node.output[0].clone(), output);
+            },
+            // Crane Added 20260827: implementation lives in ops/einsum.rs.
+            "Einsum" => {
+                let equation = get_attr::<str>(node, "equation")?;
+                let input0 = get(&node.input[0])?;
+                let input1 = get(&node.input[1])?;
+                let output = ops::einsum::einsum(equation, input0, input1)?;
                 values.insert(node.output[0].clone(), output);
             },
             "Reshape" => {
@@ -867,7 +898,15 @@ pub(crate) fn simple_eval_(
                 for idx in start..=end {
                     dims.push(xs.dim(idx)? as i64)
                 }
-                let dims = Tensor::from_vec(dims, xs.rank(), xs.device())?;
+                // Crane Changed 20260827: the output tensor's length is
+                // `dims.len()` (the number of dims actually collected by the
+                // `start..=end` loop above), not `xs.rank()` — those only
+                // coincide when `start`/`end` default to the full range.
+                // With explicit `start`/`end` attributes selecting a shorter
+                // slice, the old code passed `xs.rank()` as the shape,
+                // mismatching `dims`'s actual element count.
+                let dims_len = dims.len();
+                let dims = Tensor::from_vec(dims, dims_len, xs.device())?;
                 values.insert(node.output[0].clone(), dims);
             },
             // https://github.com/onnx/onnx/blob/main/docs/Operators.md#Size
@@ -1255,6 +1294,12 @@ pub(crate) fn simple_eval_(
                 let output = input.gelu_erf()?;
                 values.insert(node.output[0].clone(), output);
             },
+            // Crane Added 20260827: implementation lives in ops/softplus.rs.
+            "Softplus" => {
+                let input = get(&node.input[0])?;
+                let output = ops::softplus::softplus(input)?;
+                values.insert(node.output[0].clone(), output);
+            },
             "Relu" => {
                 let input = get(&node.input[0])?;
                 let output = input.relu()?;
@@ -1424,14 +1469,15 @@ pub(crate) fn simple_eval_(
                 let mode = get_attr_opt(node, "mode")?.unwrap_or("constant");
                 let data = get(&node.input[0])?;
                 let pads = get(&node.input[1])?;
-                if node.input.len() > 2 {
-                    bail!(
-                        "unsupported number of inputs {} for Pad node {:?}, expected 2",
-                        node.input.len(),
-                        node.name
-                    );
-                }
-                let output = ops::pad::pad(node, data, pads, mode)?;
+                // Crane Changed 20260827: this arm used to bail on a 3rd
+                // input at all. `constant_value` (input 2) is optional per
+                // the ONNX spec and only meaningful for `mode="constant"`;
+                // `get_opt` already treats an empty input name (the standard
+                // "omitted" marker) as absent, so a 3-input node with an
+                // omitted `constant_value` (as Audio8-TTS's codec decoder
+                // emits) no longer needs to be rejected.
+                let constant_value = get_opt(2).transpose()?;
+                let output = ops::pad::pad(node, data, pads, mode, constant_value)?;
                 values.insert(node.output[0].clone(), output);
             },
             // https://github.com/onnx/onnx/blob/main/docs/Operators.md#slice
@@ -2784,12 +2830,18 @@ pub(crate) fn simple_eval_(
                         flat_idx += (norm_idx as usize) * strides[dim];
                     }
 
-                    // Extract current update
-                    let update_slice = if update_element_shape.is_empty() {
-                        flat_updates.narrow(0, i, 1)?.squeeze(0)?
-                    } else {
-                        flat_updates.narrow(0, i, 1)?
-                    };
+                    // Extract current update. `flat_updates` is `(num_updates,)`
+                    // when each update is a scalar, or `(num_updates, product)`
+                    // when each update is itself a `product`-sized slice; either
+                    // way, squeezing dim 0 drops the narrowed size-1 leading
+                    // dim so `update_slice`'s rank matches `flat_output`'s
+                    // (rank 0 for a scalar update, rank 1 for a slice update).
+                    // Crane Changed 20260827: this squeeze was missing for the
+                    // slice-update case, leaving `update_slice` at rank 2
+                    // (`(1, product)`) and making every `slice_scatter` below
+                    // fail with a rank mismatch against the rank-1
+                    // `flat_output`.
+                    let update_slice = flat_updates.narrow(0, i, 1)?.squeeze(0)?;
 
                     match reduction {
                         "add" => {
