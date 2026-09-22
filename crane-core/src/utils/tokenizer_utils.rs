@@ -1,11 +1,11 @@
 use ahash::AHashMap;
 use anyhow::{Context, Result};
 use candle_core::quantized::gguf_file::Content;
-use ribo::utils::log;
 use std::path::{Path, PathBuf};
 use tokenizers::models::bpe::BPE;
 use tokenizers::pre_tokenizers::byte_level::ByteLevel as ByteLevelPreTokenizer;
 use tokenizers::{AddedToken, Tokenizer};
+use tracing as log;
 
 #[derive(Debug, serde::Deserialize)]
 struct TokenObj {

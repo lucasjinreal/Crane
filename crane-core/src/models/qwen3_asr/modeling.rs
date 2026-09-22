@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use candle_core::{Module, Result, Tensor};
 use candle_nn::{Activation, VarBuilder};
-use ribo::utils::log;
+use tracing as log;
 
 use super::audio_encoder::AudioEncoder;
 use super::config::{AudioConfig, Config};

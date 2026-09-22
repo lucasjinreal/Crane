@@ -42,7 +42,9 @@ pub struct OcrClient {
 
 impl OcrClient {
     pub fn new(config: CommonConfig) -> CraneResult<Self> {
-        ribo::utils::log::init_log(ribo::utils::log::LogLevel::INFO);
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .try_init();
         let backend = match config.model_type {
             LlmModelType::PaddleOcrV6 => {
                 #[cfg(feature = "onnx")]

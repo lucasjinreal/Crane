@@ -1,6 +1,5 @@
 use candle_core::{Module, Result, Tensor};
 use candle_nn::VarBuilder;
-use ribo::utils::log::tracing;
 
 #[derive(Debug, Clone)]
 pub struct Embedding {

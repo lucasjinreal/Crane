@@ -25,9 +25,6 @@ futures = "0.3"
 async-stream = "0.3"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
-# `env-filter` is already pulled in transitively via `ribo` (a `crane` dependency);
-# declared explicitly here so `init_logging`'s use of `EnvFilter` doesn't depend on
-# that staying true.
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokenizers = { workspace = true }
 candle-core = { workspace = true }

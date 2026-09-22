@@ -14,7 +14,7 @@ use crate::onnx::{self, proto::ModelProto};
 /// Result type used by Candle core.
 pub use candle_core::Result;
 use candle_core::{DType, Device, Error, Tensor, bail, utils};
-use ribo::utils::log;
+use tracing as log;
 
 use crate::utils::select_device;
 

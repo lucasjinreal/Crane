@@ -11,7 +11,7 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 // TODO(candle-transformers-removal): Generation helpers only; see CANDLE_TRANSFORMERS.md.
 use candle_transformers::generation::LogitsProcessor;
-use ribo::utils::log;
+use tracing as log;
 
 use super::config::Config;
 use super::feature_extractor::{
