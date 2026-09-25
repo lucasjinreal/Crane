@@ -16,7 +16,7 @@ use ribo::utils::log;
 use tokenizers::Tokenizer;
 
 use super::modeling::{BatchKvCache, Config, Qwen3Model};
-use crate::device::DeviceAssignment;
+use crate::device::{DeviceAssignment, format_budget};
 use crate::generation::GenerationConfig;
 use crate::generation::based::ModelForCausalLM;
 use crate::utils::token_output_stream::TokenOutputStream;
@@ -354,14 +354,18 @@ impl Model {
         let effective_seq_len = max_seq_len
             .filter(|&n| n > 0)
             .unwrap_or(config.max_position_embeddings) as u64;
-        let kv_storage = max_concurrent as u64
-            * effective_seq_len
-            * 2
-            * config.num_hidden_layers as u64
-            * config.num_key_value_heads as u64
-            * config.head_dim() as u64
-            * self.dtype.size_in_bytes() as u64;
+        let kv_storage = effective_seq_len * config.kv_bytes_per_token(self.dtype.size_in_bytes());
         let runtime_reservation_bytes = crate::device::kv_vram_overhead(kv_storage, max_concurrent);
+        log::trace!(
+            "KV reservation: vram_ceiling={}, max_concurrent={max_concurrent}, \
+             effective_seq_len={effective_seq_len}, kv_storage={} \
+             (batch_factor={}, safety_margin={}), runtime_reservation={}",
+            format_budget(vram_ceiling_bytes),
+            format_budget(kv_storage),
+            crate::device::kv_batch_factor(max_concurrent),
+            format_budget(crate::device::KV_SAFETY_MARGIN_BYTES),
+            format_budget(runtime_reservation_bytes),
+        );
 
         self.inner.promote_experts_to_gpu(
             &self.device,

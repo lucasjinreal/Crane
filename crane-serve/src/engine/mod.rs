@@ -54,8 +54,9 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
 
 use backend::ModelBackend;
+use crane_core::device::{format_budget, query_gpu_memory};
 use crane_core::utils::token_output_stream::TokenOutputStream;
-use memory::{floor_kv_budget, format_bytes_engine, query_gpu_memory_usage};
+use memory::floor_kv_budget;
 use sampling::SamplingBuffers;
 use scheduler::{Scheduler, SchedulerOutput};
 use sequence::{Sequence, SequenceStatus};
@@ -246,15 +247,15 @@ impl InferenceEngine {
                 warn!(
                     "gpu_memory_limit ({}) <= model baseline ({}). \
                      KV-cache budget is 0 — all sequences will be immediately preempted.",
-                    format_bytes_engine(limit),
-                    format_bytes_engine(baseline),
+                    format_budget(limit),
+                    format_budget(baseline),
                 );
             } else {
                 info!(
                     "Memory budget: total_limit={}, model_baseline={}, kv_budget={} (overhead={}x, also checked by cuMemGetInfo)",
-                    format_bytes_engine(limit),
-                    format_bytes_engine(baseline),
-                    format_bytes_engine(kv_budget),
+                    format_budget(limit),
+                    format_budget(baseline),
+                    format_budget(kv_budget),
                     KV_GPU_OVERHEAD_FACTOR,
                 );
             }
@@ -267,8 +268,8 @@ impl InferenceEngine {
                 warn!(
                     "KV budget {} raised to {} to fit one full sequence (max_seq_len={}) \
                      (gpu_memory_limit may be too low for this context length)",
-                    format_bytes_engine(raw_budget),
-                    format_bytes_engine(kv_budget),
+                    format_budget(raw_budget),
+                    format_budget(kv_budget),
                     max_seq_len_str,
                 );
             } else if self.model.kv_bytes_per_token().is_none() {
@@ -379,12 +380,15 @@ impl InferenceEngine {
                         }
 
                         if vram_trace_enabled() {
-                            let (gpu_used, gpu_total) = query_gpu_memory_usage(self.model.device());
+                            let (gpu_used, gpu_total) = query_gpu_memory(self.model.device())
+                                .map_or((0, 0), |(free, total)| {
+                                    (total.saturating_sub(free), total)
+                                });
                             debug!(
                                 step = self.step_counter,
-                                tracked_kv = %format_bytes_engine(self.tracked_kv_bytes),
-                                gpu_used = %format_bytes_engine(gpu_used),
-                                gpu_total = %format_bytes_engine(gpu_total),
+                                tracked_kv = %format_budget(self.tracked_kv_bytes),
+                                gpu_used = %format_budget(gpu_used),
+                                gpu_total = %format_budget(gpu_total),
                                 "CRANE_VRAM_TRACE",
                             );
                         }
@@ -406,10 +410,11 @@ impl InferenceEngine {
     fn log_stats(&self) {
         let snap = self.stats.snapshot();
         let uptime = self.start_time.elapsed().as_secs();
-        let (gpu_used, gpu_total) = query_gpu_memory_usage(self.model.device());
+        let (gpu_used, gpu_total) = query_gpu_memory(self.model.device())
+            .map_or((0, 0), |(free, total)| (total.saturating_sub(free), total));
         let budget = self.kv_budget_bytes();
         let budget_info = if budget < u64::MAX {
-            format!(" kv_budget: {}", format_bytes_engine(budget))
+            format!(" kv_budget: {}", format_budget(budget))
         } else {
             String::new()
         };
@@ -420,13 +425,13 @@ impl InferenceEngine {
                 gpu_used as f64 / (1u64 << 30) as f64,
                 gpu_total as f64 / (1u64 << 30) as f64,
                 gpu_used as f64 / gpu_total as f64 * 100.0,
-                format_bytes_engine(self.tracked_kv_bytes),
+                format_budget(self.tracked_kv_bytes),
                 budget_info,
             )
         } else {
             format!(
                 " | kv_cache: {}{}",
-                format_bytes_engine(self.tracked_kv_bytes),
+                format_budget(self.tracked_kv_bytes),
                 budget_info
             )
         };
@@ -536,10 +541,10 @@ impl InferenceEngine {
                 self.last_mem_warn = now;
                 warn!(
                     "KV budget exceeded: kv_used={} > kv_budget={} (limit={} baseline={} overhead={}x)",
-                    format_bytes_engine(self.tracked_kv_bytes),
-                    format_bytes_engine(budget),
-                    format_bytes_engine(limit),
-                    format_bytes_engine(self.memory_config.baseline_gpu_bytes),
+                    format_budget(self.tracked_kv_bytes),
+                    format_budget(budget),
+                    format_budget(limit),
+                    format_budget(self.memory_config.baseline_gpu_bytes),
                     KV_GPU_OVERHEAD_FACTOR,
                 );
             }
@@ -548,16 +553,17 @@ impl InferenceEngine {
 
         // Check 2: cuMemGetInfo hard safety (skip during cooldown).
         if self.eviction_cooldown == 0 {
-            let (gpu_used, _) = query_gpu_memory_usage(self.model.device());
+            let gpu_used = query_gpu_memory(self.model.device())
+                .map_or(0, |(free, total)| total.saturating_sub(free));
             if gpu_used > 0 && gpu_used > limit {
                 let now = Instant::now();
                 if now.duration_since(self.last_mem_warn).as_secs() >= 5 {
                     self.last_mem_warn = now;
                     warn!(
                         "GPU memory hard limit exceeded: gpu_used={} > limit={} (kv_tracked={})",
-                        format_bytes_engine(gpu_used),
-                        format_bytes_engine(limit),
-                        format_bytes_engine(self.tracked_kv_bytes),
+                        format_budget(gpu_used),
+                        format_budget(limit),
+                        format_budget(self.tracked_kv_bytes),
                     );
                 }
                 return true;
@@ -627,9 +633,9 @@ impl InferenceEngine {
 
             info!(
                 id = %victim_id,
-                freed_bytes = %format_bytes_engine(freed),
-                kv_used = %format_bytes_engine(self.tracked_kv_bytes),
-                kv_budget = %format_bytes_engine(budget),
+                freed_bytes = %format_budget(freed),
+                kv_used = %format_budget(self.tracked_kv_bytes),
+                kv_budget = %format_budget(budget),
                 "Preempting sequence (KV cache eviction) — will re-prefill later",
             );
 

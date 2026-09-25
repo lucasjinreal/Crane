@@ -148,6 +148,14 @@ impl LinearLayer {
     /// final logit projection so downstream sampling always sees finite
     /// values.
     ///
+    /// `Quantized` layers get this for free (`QMatMul` already computes in
+    /// F32 internally). `Standard` layers pay for it: this recasts the
+    /// *entire weight matrix* to F32 on every call, not just the activation.
+    /// A caller that only wants F32 output for accumulation purposes (not
+    /// F16-overflow protection) and may hit `Standard` layers on a hot path
+    /// should prefer `forward` followed by `to_dtype(DType::F32)` on the
+    /// (small) output instead.
+    ///
     /// # Errors
     ///
     /// Returns an error if the dtype cast or underlying matmul fails.

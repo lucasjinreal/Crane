@@ -1,0 +1,183 @@
+# syntax=docker/dockerfile:1
+#
+# crane-serve with the ROCm 7.1 backend, built against Fedora's native ROCm
+# packages rather than a single-GPU-family toolbox image. Fedora's `rocblas`
+# package alone ships Tensile/hipBLASLt kernels for gfx900 through gfx950.
+# `rpm -ql rocblas | grep hsaco` on a Fedora 44 host shows both Strix Halo
+# (gfx1151) and RDNA4 (gfx1201) in the same package, so one image covers
+# both instead of needing a GPU-family-specific build.
+#
+#   podman build -f container/rocm/Containerfile -t localhost/crane-serve:rocm10 .
+#   (or: COMPOSE_PROFILES=rocm podman compose build)
+#
+# Stages:
+#   builder        - toolchain + `crane-serve` build
+#   bench-builder  - optional: ROCm micro-benchmarks (`gdn_bench`, `topk_bench`)
+#   rocm-runtime   - fedora-minimal + Fedora's native ROCm runtime packages
+#   bench          - optional: rocm-runtime + the benchmarks
+#                    (`--target bench`, or compose service `crane-bench-rocm`)
+#   runtime        - rocm-runtime + crane-serve (last stage, the default)
+#
+# The build context is the repository root; the root .dockerignore applies.
+#
+# Fedora's ROCm packages are FHS-native (headers under /usr/include, shared
+# libs under /usr/lib64, `hipcc` at /usr/bin/hipcc), unlike the traditional
+# AMD tarball layout under /opt/rocm. This is confirmed via `hipconfig
+# --rocmpath` reporting `/usr`. No LD_LIBRARY_PATH override or manual
+# ldconfig step is needed as a result; ROCM_PATH/HIP_PATH are still set
+# explicitly below since rocm-rs's build script falls back to the
+# traditional /opt/rocm default when they're unset.
+#
+# candle's ROCm backend loads rocBLAS/MIOpen's prebuilt per-arch kernels
+# (the .hsaco files above) directly, but Crane's own kernels
+# (crane-core/kernels/cuda/*.cu) are compiled from source via `hipcc` on
+# first use, at *runtime*, not just at build time. As a result, the runtime
+# stage installs HIP's headers (`rocm-hip-devel`) alongside the compiler
+# (`hipcc`/`rocm-clang`, both pulled in by the `rocm` meta-package), not
+# just the shared libraries. Compiled code objects are cached in
+# CANDLE_ROCM_CACHE_DIR; mount a volume there to skip recompiling on every
+# container start.
+#
+# That runtime compile step unbundles hipcc's output with
+# clang-offload-bundler, resolved via `$ROCM_PATH/llvm/bin` or `$PATH` (see
+# candle-rocm-kernels/src/compile/hipcc.rs's `offload_bundler()`). rocm-clang
+# installs it to /usr/lib64/rocm/llvm/bin, which is neither `$ROCM_PATH/llvm/
+# bin` (ROCM_PATH=/usr here, matching `hipconfig --rocmpath`) nor on `$PATH`
+# by default, so it's added to PATH explicitly below.
+
+ARG BUILDER_IMAGE=registry.fedoraproject.org/fedora:44
+ARG RUNTIME_IMAGE=registry.fedoraproject.org/fedora-minimal:44
+
+# ---------------------------------------------------------------------------
+FROM ${BUILDER_IMAGE} AS builder
+
+# install_weak_deps=False keeps DNF from pulling in rocm-devel's optional
+# GUI/vision/ML subpackages (migraphx, mivisionx, rocal, ...).
+RUN <<-EOF
+	set -eux
+	dnf --setopt=install_weak_deps=False install -y \
+		rust rust-src cargo clang cmake make gcc-c++ git \
+		rocm-devel hipcc
+	dnf clean all
+EOF
+
+# RUSTC_BOOTSTRAP=1 + rust-src: rocm-rs's `macros` feature runs a nested
+# `cargo build` of an amdgcn-amd-amdhsa kernel crate that sets build-std
+# itself. Do NOT pass `-Z build-std=core` to the top-level build: it rebuilds
+# `core` for the host and collides with the prebuilt `std` (E0152).
+ENV ROCM_PATH=/usr \
+    HIP_PATH=/usr \
+    RUSTC_BOOTSTRAP=1 \
+    CARGO_TARGET_DIR=/build/target \
+    PATH="/usr/lib64/rocm/llvm/bin:${PATH}"
+
+WORKDIR /src
+COPY . .
+
+# Optional CPU codegen flags for this build machine (e.g.
+# `--build-arg RUSTFLAGS="-C target-feature=+avx2,+fma"`), since the right
+# flags are host-CPU-specific -- not baked in as a fixed default. Written
+# into a `[target.x86_64-unknown-linux-gnu]` section in
+# `/root/.cargo/config.toml`, not exported as a global `RUSTFLAGS` env var:
+# cargo only applies a `[target.<triple>]` section's rustflags when
+# compiling for that exact triple, so this can't leak into the nested
+# amdgcn-amd-amdhsa kernel-crate build above (rocm-rs's `macros` feature),
+# unlike a `RUSTFLAGS` env var, which every `cargo`/`rustc` invocation in
+# this stage would inherit regardless of target. Unlocks candle's AVX2 CPU
+# quantized-matmul path (`candle-core/src/quantized/avx.rs`), gated behind
+# `#[cfg(target_feature = "avx2")]`, which otherwise falls back to an
+# unvectorized scalar path regardless of the host CPU's real capabilities.
+ARG RUSTFLAGS=""
+RUN <<-'RUSTFLAGS_EOF'
+	set -eu
+	if [ -n "${RUSTFLAGS:-}" ]; then
+		mkdir -p /root/.cargo
+		{
+			printf '[target.x86_64-unknown-linux-gnu]\n'
+			printf 'rustflags = ['
+			first=1
+			for flag in $RUSTFLAGS; do
+				[ "$first" = 1 ] && first=0 || printf ', '
+				printf '"%s"' "$flag"
+			done
+			printf ']\n'
+		} >> /root/.cargo/config.toml
+	fi
+	RUSTFLAGS_EOF
+
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/build/target <<-EOF
+	set -eux
+	cargo build --release -p crane-serve --bin crane-serve \
+		--no-default-features --features rocm
+	install -Dm755 /build/target/release/crane-serve /out/crane-serve
+EOF
+
+# ---------------------------------------------------------------------------
+# Optional: ROCm micro-benchmarks. Only built for the `bench` target; the
+# shared cargo cache mount means only crane-core's bins compile here.
+FROM builder AS bench-builder
+
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/build/target <<-EOF
+	set -eux
+	cargo build --release -p crane-core --bin gdn_bench --bin topk_bench \
+		--no-default-features --features rocm
+	install -Dm755 -t /out/bench \
+		/build/target/release/gdn_bench /build/target/release/topk_bench
+EOF
+
+# ---------------------------------------------------------------------------
+FROM ${RUNTIME_IMAGE} AS rocm-runtime
+
+# `rocm` pulls in hipcc, rocm-clang, rocblas, rocsolver, rocfft, rocrand,
+# rocsparse, hipblas, miopen, rocm-hip and rocm-runtime. That's the same set
+# the old amdrocm-*-devel10.0 toolbox packages provided by hand, but tracking
+# Fedora's officially-supported architecture list instead of one GPU family.
+# rocm-hip-devel: HIP headers for Crane's own kernels' runtime hipcc compile
+# (see the file header comment above).
+# gcc/libstdc++-devel/glibc-devel: hipcc compiles HIP device code through
+# clang, which still parses the host C/C++ standard headers and locates them
+# via the GCC install dir (/usr/lib/gcc/<triple>/<ver>/crtbegin.o, owned by
+# `gcc`).
+RUN <<-EOF
+	set -eux
+	microdnf --setopt=install_weak_deps=0 install -y \
+		rocm rocm-hip-devel gcc libstdc++-devel glibc-devel ca-certificates
+	microdnf clean all
+EOF
+
+ENV ROCM_PATH=/usr \
+    HIP_PATH=/usr \
+    CANDLE_ROCM_CACHE_DIR=/var/cache/candle-rocm \
+    HSA_ENABLE_SDMA=0 \
+    PATH="/usr/lib64/rocm/llvm/bin:${PATH}"
+
+RUN mkdir -p /var/cache/candle-rocm
+VOLUME ["/var/cache/candle-rocm"]
+
+# ---------------------------------------------------------------------------
+# Optional: `gdn_bench [BH S K V iters]` (fused GDN recurrence kernel) and
+# `topk_bench [N K iters]` (GPU top-k kernel vs host sort). The default
+# command runs both with their built-in defaults.
+FROM rocm-runtime AS bench
+
+COPY --from=bench-builder /out/bench/ /usr/local/bin/
+CMD ["sh", "-c", "gdn_bench && topk_bench"]
+
+# ---------------------------------------------------------------------------
+FROM rocm-runtime AS runtime
+
+# entrypoint.sh/chmod/mkdir rarely change; copying the crane-serve binary
+# last means a source-only rebuild (which invalidates every layer from
+# there on) doesn't also redo these.
+COPY container/rocm/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh && mkdir -p /models
+
+COPY --from=builder /out/crane-serve /usr/local/bin/crane-serve
+
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["--help"]

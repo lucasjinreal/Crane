@@ -10,10 +10,12 @@
 //! enough to blow past cache (see `ONNX_SPEEDUP.md`). `cpu_fwd` is always
 //! compiled; `cuda_fwd` is gated behind the `cuda` feature and dispatches to
 //! the kernel compiled from `kernels/cuda/snake.cu`, following the
-//! `FusedSiluMul` pattern in `cuda_impl.rs`. Callers broadcast `x`/`alpha` to
+//! `FusedSiluMul` pattern in `cuda_impl.rs`. `rocm_fwd` is gated behind the
+//! `rocm` feature and runs the *same* `.cu` source through `hipcc` at
+//! runtime (see [`crate::ops::rocm`]). Callers broadcast `x`/`alpha` to
 //! matching shapes before calling `snake()`.
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 use candle_core::DType;
 #[cfg(feature = "cuda")]
 use candle_core::backend::BackendStorage;
@@ -21,6 +23,8 @@ use candle_core::backend::BackendStorage;
 use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
 #[cfg(feature = "cuda")]
 use candle_core::cuda_backend::{CudaStorage, CudaStorageSlice, WrapErr};
+#[cfg(all(feature = "rocm", not(feature = "cuda")))]
+use candle_core::rocm_backend::RocmStorage;
 use candle_core::{CpuStorage, CustomOp2, Layout, Result, Shape, Tensor, WithDType};
 
 // PTX compiled from kernels/cuda/snake.cu — embedded at build time.
@@ -31,6 +35,11 @@ mod ptx {
 
 #[cfg(feature = "cuda")]
 const MODULE_NAME: &str = "crane_snake";
+
+#[cfg(all(feature = "rocm", not(feature = "cuda")))]
+const ROCM_MODULE_NAME: &str = "crane_snake";
+#[cfg(all(feature = "rocm", not(feature = "cuda")))]
+const ROCM_SOURCE: &str = include_str!("../../../kernels/cuda/snake.cu");
 
 /// Fused Snake activation: `x + sin(alpha * x)^2 / alpha`.
 struct SnakeOp;
@@ -159,6 +168,70 @@ impl CustomOp2 for SnakeOp {
             device: dev.clone(),
         };
         Ok((dst, l_x.shape().clone()))
+    }
+
+    #[cfg(all(feature = "rocm", not(feature = "cuda")))]
+    fn rocm_fwd(
+        &self,
+        s_x: &RocmStorage,
+        l_x: &Layout,
+        s_alpha: &RocmStorage,
+        l_alpha: &Layout,
+    ) -> Result<(RocmStorage, Shape)> {
+        if l_x.shape() != l_alpha.shape() {
+            candle_core::bail!("snake: x and alpha must have the same shape");
+        }
+
+        let dev = s_x.device.clone();
+        let n = l_x.shape().elem_count();
+        let dtype = s_x.slice.dtype();
+        let kernel_name = match dtype {
+            DType::BF16 => "snake_bf16",
+            DType::F16 => "snake_f16",
+            DType::F32 => "snake_f32",
+            dt => candle_core::bail!("snake: unsupported dtype {dt:?}"),
+        };
+
+        let x_ptr = crate::ops::rocm::slice_ptr(&s_x.slice, l_x, dtype, "snake x")?;
+        let alpha_ptr = crate::ops::rocm::slice_ptr(&s_alpha.slice, l_alpha, dtype, "snake alpha")?;
+
+        // SAFETY: kernel_name (found in ROCM_SOURCE) takes (const T*, const
+        // T*, T*, uint32_t) for dtype T, matching launch_binary_elementwise's
+        // contract.
+        let slice = unsafe {
+            match dtype {
+                DType::BF16 => crate::ops::rocm::launch_binary_elementwise::<half::bf16>(
+                    &dev,
+                    ROCM_MODULE_NAME,
+                    kernel_name,
+                    ROCM_SOURCE,
+                    x_ptr,
+                    alpha_ptr,
+                    n,
+                ),
+                DType::F16 => crate::ops::rocm::launch_binary_elementwise::<half::f16>(
+                    &dev,
+                    ROCM_MODULE_NAME,
+                    kernel_name,
+                    ROCM_SOURCE,
+                    x_ptr,
+                    alpha_ptr,
+                    n,
+                ),
+                DType::F32 => crate::ops::rocm::launch_binary_elementwise::<f32>(
+                    &dev,
+                    ROCM_MODULE_NAME,
+                    kernel_name,
+                    ROCM_SOURCE,
+                    x_ptr,
+                    alpha_ptr,
+                    n,
+                ),
+                _ => unreachable!("dtype already validated above"),
+            }
+        }?;
+
+        Ok((RocmStorage { slice, device: dev }, l_x.shape().clone()))
     }
 }
 

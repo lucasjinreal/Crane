@@ -28,7 +28,7 @@ use crane_core::utils::DeviceExt;
 use tracing::{info, warn};
 
 use chat_template::ChatTemplateProcessor;
-use crane_core::device::DeviceAssignment;
+use crane_core::device::{DeviceAssignment, format_budget, query_gpu_memory};
 use engine::backend::ExpertPromotionPolicy;
 use engine::model_factory::{ModelFormat, ModelType};
 use engine::{EngineHandle, InferenceEngine, KV_GPU_OVERHEAD_FACTOR, MemoryConfig};
@@ -288,11 +288,11 @@ fn log_hardware_info(device: &candle_core::Device, device_name: &str) {
     );
 
     if !matches!(device.location(), candle_core::DeviceLocation::Cpu) {
-        let (_, vram_total) = engine::memory::query_gpu_memory_usage(device);
+        let vram_total = query_gpu_memory(device).map_or(0, |(_, total)| total);
         if vram_total > 0 {
             info!(
                 device = %device_name,
-                vram_total = %engine::memory::format_bytes_engine(vram_total),
+                vram_total = %format_budget(vram_total),
                 "hardware: gpu"
             );
         } else {
@@ -946,9 +946,9 @@ async fn shutdown_signal() {
 /// long-running session's own KV cache can grow past physical VRAM with
 /// no runtime protection: eviction (`InferenceEngine::is_over_kv_budget`)
 /// only preempts *other* competing sequences when a new prefill is
-/// scheduled, never a lone session's own growth. The safe headroom is
-/// divided evenly across `max_concurrent`, since every concurrent slot
-/// could independently grow to the derived cap. Returns `None` when
+/// scheduled, never a lone session's own growth. The safe headroom covers
+/// one sequence at the derived cap; the runtime KV pool handles multiple
+/// concurrent sequences dynamically via eviction. Returns `None` when
 /// derivation isn't applicable (an explicit `--max-seq-len` or no
 /// `--gpu-memory-limit`) or isn't safely computable (VRAM query
 /// unsupported for this device, or zero headroom).
@@ -956,7 +956,6 @@ fn derive_safe_max_seq_len(
     memory_config: &MemoryConfig,
     physical_total_bytes: u64,
     kv_bytes_per_token: u64,
-    max_concurrent: usize,
 ) -> Option<usize> {
     if memory_config.max_seq_len != 0 || memory_config.gpu_memory_limit_bytes == 0 {
         return None;
@@ -977,8 +976,7 @@ fn derive_safe_max_seq_len(
     // was ~6x too generous and let a single session's own prefill blow
     // past physical VRAM in production.
     let safe_headroom = headroom / KV_GPU_OVERHEAD_FACTOR;
-    let per_seq_budget = safe_headroom / max_concurrent.max(1) as u64;
-    let derived = per_seq_budget / kv_bytes_per_token;
+    let derived = safe_headroom / kv_bytes_per_token;
     if derived == 0 {
         return None;
     }
@@ -1697,31 +1695,26 @@ pub async fn run(mut args: Args) -> Result<()> {
         // intentionally, so that function stays independently callable (and
         // testable) without relying on the caller to have already checked.
         if memory_config.max_seq_len == 0 && memory_config.gpu_memory_limit_bytes > 0 {
-            let physical_total = MemoryConfig::query_total_gpu_memory(&device);
+            let physical_total = query_gpu_memory(&device).map_or(0, |(_, total)| total);
             // The engine caps max_concurrent to 1 when the backend doesn't
             // support KV-cache swapping (see InferenceEngine::new). Use the
-            // same effective value here so the derivation divides the VRAM
-            // budget by the concurrency the engine will actually allow,
-            // rather than the (potentially higher) CLI value.
+            // same effective value for expert re-promotion below, rather
+            // than the (potentially higher) CLI value.
             let effective_concurrent = if backend.supports_kv_swap() {
                 args.max_concurrent
             } else {
                 1
             };
-            match backend.kv_bytes_per_token().and_then(|kv_bpt| {
-                derive_safe_max_seq_len(
-                    &memory_config,
-                    physical_total,
-                    kv_bpt,
-                    effective_concurrent,
-                )
-            }) {
+            match backend
+                .kv_bytes_per_token()
+                .and_then(|kv_bpt| derive_safe_max_seq_len(&memory_config, physical_total, kv_bpt))
+            {
                 Some(derived) => {
                     info!(
                         "max_seq_len unset with gpu_memory_limit set; auto-derived {derived} \
                          tokens from physical_vram={}, baseline={}",
-                        engine::memory::format_bytes_engine(physical_total),
-                        engine::memory::format_bytes_engine(memory_config.baseline_gpu_bytes),
+                        format_budget(physical_total),
+                        format_budget(memory_config.baseline_gpu_bytes),
                     );
                     memory_config.max_seq_len = derived;
                     args.max_seq_len = derived;
@@ -1768,9 +1761,9 @@ pub async fn run(mut args: Args) -> Result<()> {
             if memory_config.gpu_memory_limit_bytes == 0 {
                 "unlimited".to_string()
             } else {
-                engine::memory::format_bytes_engine(memory_config.gpu_memory_limit_bytes)
+                format_budget(memory_config.gpu_memory_limit_bytes)
             },
-            engine::memory::format_bytes_engine(baseline_gpu)
+            format_budget(baseline_gpu)
         );
         let (engine, handle) = InferenceEngine::new(
             backend,
@@ -2489,14 +2482,14 @@ mod dtype_tests {
     fn derive_max_seq_len_none_when_already_set() {
         // An explicit --max-seq-len must never be silently overridden.
         let cfg = memory_config_for_test(4096, 10 << 30, 1 << 30);
-        assert!(derive_safe_max_seq_len(&cfg, 16 << 30, 1024, 1).is_none());
+        assert!(derive_safe_max_seq_len(&cfg, 16 << 30, 1024).is_none());
     }
 
     #[test]
     fn derive_max_seq_len_none_when_no_gpu_limit() {
         // No --gpu-memory-limit means genuinely unlimited — nothing to derive.
         let cfg = memory_config_for_test(0, 0, 1 << 30);
-        assert!(derive_safe_max_seq_len(&cfg, 16 << 30, 1024, 1).is_none());
+        assert!(derive_safe_max_seq_len(&cfg, 16 << 30, 1024).is_none());
     }
 
     #[test]
@@ -2504,28 +2497,28 @@ mod dtype_tests {
         // physical_total_bytes == 0 signals an unsupported device query
         // (e.g. Metal) — can't safely compute a bound.
         let cfg = memory_config_for_test(0, 10 << 30, 1 << 30);
-        assert!(derive_safe_max_seq_len(&cfg, 0, 1024, 1).is_none());
+        assert!(derive_safe_max_seq_len(&cfg, 0, 1024).is_none());
     }
 
     #[test]
     fn derive_max_seq_len_none_when_backend_has_no_kv_cost() {
         let cfg = memory_config_for_test(0, 10 << 30, 1 << 30);
-        assert!(derive_safe_max_seq_len(&cfg, 16 << 30, 0, 1).is_none());
+        assert!(derive_safe_max_seq_len(&cfg, 16 << 30, 0).is_none());
     }
 
     #[test]
     fn derive_max_seq_len_none_when_no_headroom() {
         // Baseline already consumes the entire limit — zero room for KV.
         let cfg = memory_config_for_test(0, 10 << 30, 10 << 30);
-        assert!(derive_safe_max_seq_len(&cfg, 16 << 30, 1024, 1).is_none());
+        assert!(derive_safe_max_seq_len(&cfg, 16 << 30, 1024).is_none());
     }
 
     #[test]
     fn derive_max_seq_len_computes_expected_value() {
         // Mirrors this session's real numbers: 16 GiB card, 10 GiB limit,
-        // 4 GiB baseline, 96 KiB/token, max_concurrent=1,
-        // KV_GPU_OVERHEAD_FACTOR=6. headroom=6 GiB, /6 -> 1 GiB safe budget
-        // -> 1 GiB / 96 KiB = 10922 tokens (integer division).
+        // 4 GiB baseline, 96 KiB/token, KV_GPU_OVERHEAD_FACTOR=6.
+        // headroom=6 GiB, /6 -> 1 GiB safe budget -> 1 GiB / 96 KiB = 10922
+        // tokens (integer division).
         //
         // Notably this is well *below* the 47080-token real workload this
         // session debugged — with the correct overhead factor applied,
@@ -2536,24 +2529,8 @@ mod dtype_tests {
         // 49152 — 4.5x too generous — and that value OOM'd in production.
         let cfg = memory_config_for_test(0, 10 << 30, 4 << 30);
         let kv_bytes_per_token = 96 * 1024;
-        let derived =
-            derive_safe_max_seq_len(&cfg, 16 << 30, kv_bytes_per_token, 1).expect("derived");
+        let derived = derive_safe_max_seq_len(&cfg, 16 << 30, kv_bytes_per_token).expect("derived");
         assert_eq!(derived, 10_922);
-    }
-
-    #[test]
-    fn derive_max_seq_len_divides_budget_across_max_concurrent() {
-        // Non-power-of-two kv_bytes_per_token exercises floor division, and
-        // absolute golden values catch regressions that a relational
-        // assertion (single/4 == quad) cannot — that identity is a
-        // mathematical tautology for integer division regardless of the
-        // implementation, since floor(floor(a/b)/c) == floor(a/(b*c)) for
-        // all positive integers.
-        let cfg = memory_config_for_test(0, 10 << 30, 1 << 30);
-        let single = derive_safe_max_seq_len(&cfg, 16 << 30, 100_000, 1).expect("derived");
-        let quad = derive_safe_max_seq_len(&cfg, 16 << 30, 100_000, 4).expect("derived");
-        assert_eq!(single, 16_106);
-        assert_eq!(quad, 4_026);
     }
 
     #[test]
@@ -2563,8 +2540,8 @@ mod dtype_tests {
         // headroom calculation use the inflated configured limit.
         let cfg_inflated = memory_config_for_test(0, 20 << 30, 1 << 30);
         let cfg_matching = memory_config_for_test(0, 10 << 30, 1 << 30);
-        let clamped = derive_safe_max_seq_len(&cfg_inflated, 10 << 30, 1024, 1).expect("derived");
-        let unclamped = derive_safe_max_seq_len(&cfg_matching, 10 << 30, 1024, 1).expect("derived");
+        let clamped = derive_safe_max_seq_len(&cfg_inflated, 10 << 30, 1024).expect("derived");
+        let unclamped = derive_safe_max_seq_len(&cfg_matching, 10 << 30, 1024).expect("derived");
         assert_eq!(clamped, unclamped);
     }
 }

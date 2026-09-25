@@ -327,8 +327,11 @@ impl CodePredictor {
                 model_vb.pp("layers").pp(i),
             )?);
         }
-        let norm =
-            candle_nn::rms_norm(config.hidden_size, config.rms_norm_eps, model_vb.pp("norm"))?;
+        let norm = crate::models::with_tracing::rms_norm(
+            config.hidden_size,
+            config.rms_norm_eps,
+            model_vb.pp("norm"),
+        )?;
 
         let mut lm_heads = Vec::with_capacity(n);
         for i in 0..n {
@@ -548,8 +551,11 @@ impl TalkerModel {
                 model_vb.pp("layers").pp(i),
             )?);
         }
-        let norm =
-            candle_nn::rms_norm(config.hidden_size, config.rms_norm_eps, model_vb.pp("norm"))?;
+        let norm = crate::models::with_tracing::rms_norm(
+            config.hidden_size,
+            config.rms_norm_eps,
+            model_vb.pp("norm"),
+        )?;
 
         let codec_head =
             linear_no_bias(config.hidden_size, config.vocab_size, vb.pp("codec_head"))?;

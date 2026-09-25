@@ -15,9 +15,9 @@ use axum::{
 
 use tracing::info;
 
-use crate::engine::memory::format_bytes_engine;
 use crate::openai_api::TranscriptionResponse;
 use crate::{AppState, make_error};
+use crane_core::device::format_budget;
 
 // ─────────────────────────────────────────────────────────────
 //  ASR Request Channel Structure
@@ -135,7 +135,7 @@ pub async fn transcriptions(
     };
 
     info!(
-        audio_bytes = %format_bytes_engine(audio_bytes.len() as u64),
+        audio_bytes = %format_budget(audio_bytes.len() as u64),
         language = ?language,
         "ASR request accepted",
     );

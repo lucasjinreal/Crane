@@ -16,6 +16,10 @@ use candle_core::Device;
 /// single constant instead of drifting copies.
 pub const KV_SAFETY_MARGIN_BYTES: u64 = 256 * (1 << 20);
 
+/// Fallback sequence length used for KV budgeting when `max_seq_len` is
+/// unset or `0` (unlimited).
+pub const DEFAULT_KV_SEQ_LEN: usize = 4096;
+
 /// Multiplier applied to raw per-sequence KV storage to account for the
 /// transient overlap during batched-decode setup, where old per-sequence
 /// KV caches and the newly built padded batch buffer coexist in VRAM
@@ -102,10 +106,6 @@ impl From<&DeviceAssignment> for DeviceAssignment {
 ///
 /// `None` for CPU, or for a GPU backend with no query support here (e.g.
 /// Metal) — callers should fall back to a static estimate in that case.
-/// Mirrors `crane-serve/src/engine/memory.rs`'s `query_gpu_memory_usage`,
-/// duplicated rather than reused: `crane-core` cannot depend on
-/// `crane-serve` (`crane-serve` → `crane` → `crane-core` is the only
-/// allowed direction).
 #[must_use]
 pub fn query_gpu_memory(_device: &Device) -> Option<(u64, u64)> {
     #[cfg(feature = "cuda")]
@@ -148,7 +148,7 @@ pub fn greedy_fit_layers(layer_costs: &[u64], budget: u64) -> Vec<usize> {
 }
 
 /// Formats a byte count for log messages (e.g. `"8.5G"`, `"512M"`, `"1024B"`).
-pub(crate) fn format_budget(bytes: u64) -> String {
+pub fn format_budget(bytes: u64) -> String {
     if bytes >= 1 << 30 {
         // Byte counts are far below f64's 52-bit mantissa limit.
         #[allow(clippy::cast_precision_loss)]

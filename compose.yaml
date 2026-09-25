@@ -1,18 +1,29 @@
 # crane-serve containers, one service per GPU backend, selected by profile.
+# Examples below use `podman`; swap in `docker` if that's what you have
+# installed, both read this file the same way.
 #
-#   COMPOSE_PROFILES=rocm MODEL_DIR=~/models MODEL=Qwen3-4B docker compose up -d
+#   COMPOSE_PROFILES=rocm MODEL_DIR=~/models MODEL=Qwen3-4B podman compose up -d
 #
 # Or put the variables in a `.env` file next to this one and just run
-# `docker compose up -d`. With no profile selected, nothing starts.
+# `podman compose up -d`. With no profile selected, nothing starts.
 #
 # MODEL is a model directory (or single .gguf file) relative to MODEL_DIR.
 # CRANE_PORT overrides the published host port (default 8080).
 #
 # ROCm micro-benchmarks (profile `rocm-bench`, not started by `up` under `rocm`):
 #
-#   docker compose run --rm crane-bench-rocm                      # both, defaults
-#   docker compose run --rm crane-bench-rocm gdn_bench 16 512 128 128 100
-#   docker compose run --rm crane-bench-rocm topk_bench 248320 40 200
+#   podman compose run --rm crane-bench-rocm                      # both, defaults
+#   podman compose run --rm crane-bench-rocm gdn_bench 16 512 128 128 100
+#   podman compose run --rm crane-bench-rocm topk_bench 248320 40 200
+#
+# `rocm-strixhalo`/`rocm-strixhalo-bench` build against the community
+# `kyuz0/amd-strix-halo-toolboxes` image instead
+# (container/rocm/Containerfile.strix-halo). It's a Strix-Halo-only
+# alternative to the general `rocm`/`rocm-bench` build above, kept in case
+# that toolbox ships newer or better-tuned gfx1151 kernels than Fedora's
+# own ROCm packages at any given time. Same usage, different profile:
+#
+#   COMPOSE_PROFILES=rocm-strixhalo MODEL_DIR=~/models MODEL=Qwen3-4B podman compose up -d
 #
 # `<<:` merges keys, not lists or nested maps: a service that sets its own
 # `volumes` or `environment` must repeat the anchor's entries.
@@ -29,12 +40,16 @@ x-crane-serve: &crane-serve
     - ${MODEL_DIR:?set MODEL_DIR to the host model directory}:/models:ro
   restart: unless-stopped
 
-# AMD ROCm GPU access, Strix Halo (gfx1151). See docker/rocm/Dockerfile.
-# Do NOT set HSA_OVERRIDE_GFX_VERSION: gfx1151 is supported natively.
+# AMD ROCm GPU access. See container/rocm/Containerfile. It's built on
+# Fedora's native ROCm packages, which ship kernels for the
+# officially-supported architecture list (confirmed to include both Strix
+# Halo/gfx1151 and RDNA4/gfx1201), not one GPU family. Do NOT set
+# HSA_OVERRIDE_GFX_VERSION; your GPU's real architecture is supported
+# natively.
 x-rocm: &rocm
   build:
     context: .
-    dockerfile: docker/rocm/Dockerfile
+    dockerfile: container/rocm/Containerfile
   devices:
     - /dev/dri:/dev/dri
     - /dev/kfd:/dev/kfd
@@ -54,18 +69,41 @@ services:
     profiles: [rocm]
     build:
       context: .
-      dockerfile: docker/rocm/Dockerfile
+      dockerfile: container/rocm/Containerfile
       target: runtime
+      args:
+        # Build-time only (see the Containerfile) -- host-CPU-specific codegen
+        # flags, e.g. RUSTFLAGS="-C target-feature=+avx2,+fma". Setting this
+        # under `environment:` instead would do nothing: that only reaches the
+        # already-built binary at container start, not the `cargo build` step.
+        RUSTFLAGS:
     image: localhost/crane-serve:rocm10
     environment:
       HSA_ENABLE_SDMA: "0"
       # rocBLAS profile logging (dumps a GEMM-shape summary to stderr on
       # exit). Diagnostic only; drop it for quieter logs.
       ROCBLAS_LAYER: "4"
-      # Passed through from the shell / .env when set:
+      # MODEL_TYPE/FORMAT default to crane-serve's own "auto" detection in
+      # entrypoint.sh; only need setting here if that picks the wrong
+      # architecture. EXTRA_ARGS is a space-separated string of additional
+      # crane-serve flags (e.g. "--dtype f32"). Compose has no clean way to
+      # append arbitrary arguments otherwise.
+      MODEL_TYPE:
+      FORMAT:
+      EXTRA_ARGS:
+      # Passed through from the shell / .env when set. crane-serve defaults
+      # to "info" (crane-serve/src/lib.rs) when RUST_LOG is unset.
+      RUST_LOG:
       CRANE_PROF:          # forward-pass submission vs GPU time, to stderr
+      CRANE_PROF_EVERY:    # only log every Nth CRANE_PROF sample
       CRANE_TOPK_HOST:     # 1 = host sort instead of the GPU top-k kernel
       CRANE_GDN_PORTABLE:  # 1 = op-by-op GDN recurrence instead of the fused kernel
+      CRANE_GRAMMAR_TRACE: # 1 = log tool-call grammar mask decisions
+      CRANE_VRAM_TRACE:    # 1 = log VRAM budget/reservation decisions
+      # Generic HIP debugging knobs (not crane-specific): serialize kernel
+      # launches to get an accurate stack on a GPU crash.
+      HIP_LAUNCH_BLOCKING:
+      AMD_SERIALIZE_KERNEL:
     volumes:
       - ${MODEL_DIR:?set MODEL_DIR to the host model directory}:/models:ro
       # hipcc-compiled kernel cache; the first start compiles for minutes.
@@ -80,8 +118,10 @@ services:
     profiles: [rocm-bench]
     build:
       context: .
-      dockerfile: docker/rocm/Dockerfile
+      dockerfile: container/rocm/Containerfile
       target: bench
+      args:
+        RUSTFLAGS: # see crane-serve-rocm's build.args.RUSTFLAGS above
     image: localhost/crane-bench:rocm10
     environment:
       HSA_ENABLE_SDMA: "0"
@@ -92,5 +132,53 @@ services:
     volumes:
       - candle-rocm-cache:/var/cache/candle-rocm
 
+  # Strix-Halo-toolbox variant of crane-serve-rocm above. See the
+  # `rocm-strixhalo`/container/rocm/Containerfile.strix-halo note near the
+  # top of this file. Same environment knobs; not repeated here since only
+  # the image differs.
+  crane-serve-rocm-strixhalo:
+    <<: [*crane-serve, *rocm]
+    profiles: [rocm-strixhalo]
+    build:
+      context: .
+      dockerfile: container/rocm/Containerfile.strix-halo
+      target: runtime
+    image: localhost/crane-serve:rocm10-strixhalo
+    environment:
+      HSA_ENABLE_SDMA: "0"
+      ROCBLAS_LAYER: "4"
+      MODEL_TYPE:
+      FORMAT:
+      EXTRA_ARGS:
+      RUST_LOG:
+      CRANE_PROF:
+      CRANE_PROF_EVERY:
+      CRANE_TOPK_HOST:
+      CRANE_GDN_PORTABLE:
+      CRANE_GRAMMAR_TRACE:
+      CRANE_VRAM_TRACE:
+      HIP_LAUNCH_BLOCKING:
+      AMD_SERIALIZE_KERNEL:
+    volumes:
+      - ${MODEL_DIR:?set MODEL_DIR to the host model directory}:/models:ro
+      # Separate from candle-rocm-cache: a different toolchain/ROCm build
+      # compiled these code objects, so they aren't interchangeable.
+      - candle-rocm-cache-strixhalo:/var/cache/candle-rocm
+
+  crane-bench-rocm-strixhalo:
+    <<: *rocm
+    profiles: [rocm-strixhalo-bench]
+    build:
+      context: .
+      dockerfile: container/rocm/Containerfile.strix-halo
+      target: bench
+    image: localhost/crane-bench:rocm10-strixhalo
+    environment:
+      HSA_ENABLE_SDMA: "0"
+      CRANE_TOPK_HOST:
+    volumes:
+      - candle-rocm-cache-strixhalo:/var/cache/candle-rocm
+
 volumes:
   candle-rocm-cache:
+  candle-rocm-cache-strixhalo:

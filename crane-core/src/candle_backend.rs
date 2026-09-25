@@ -52,28 +52,3 @@ pub use candle_core::utils::{cuda_is_available, metal_is_available};
 pub use candle_core::{D, DType, Device, Error, Result, Tensor, bail};
 pub use candle_nn::ops::softmax_last_dim;
 pub use candle_transformers::generation::LogitsProcessor;
-
-/// (free, total) GPU memory in bytes for CUDA/ROCm devices; `None` for CPU,
-/// Metal, or if the backend query fails. Kept here rather than in
-/// downstream crates so they never need to reach into
-/// `candle_core::cuda_backend` / `candle_core::rocm_backend` directly.
-#[must_use]
-pub fn device_memory_info(_device: &Device) -> Option<(u64, u64)> {
-    #[cfg(feature = "cuda")]
-    {
-        if let Device::Cuda(_) = _device
-            && let Ok((free, total)) = candle_core::cuda_backend::cudarc::driver::result::mem_get_info()
-        {
-            return Some((free as u64, total as u64));
-        }
-    }
-    #[cfg(feature = "rocm")]
-    {
-        if let Device::Rocm(_) = _device
-            && let Ok(info) = candle_core::rocm_backend::rocm_rs::hip::memory_info()
-        {
-            return Some((info.free as u64, info.total as u64));
-        }
-    }
-    None
-}

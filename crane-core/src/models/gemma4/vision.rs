@@ -312,8 +312,10 @@ impl VisionAttention {
         let v_proj = ClippedLinear::new(config.hidden_size, nkv * hd, vb.pp("v_proj"))?;
         let o_proj = ClippedLinear::new(nh * hd, config.hidden_size, vb.pp("o_proj"))?;
 
-        let q_norm = candle_nn::rms_norm(hd, config.rms_norm_eps, vb.pp("q_norm"))?;
-        let k_norm = candle_nn::rms_norm(hd, config.rms_norm_eps, vb.pp("k_norm"))?;
+        let q_norm =
+            crate::models::with_tracing::rms_norm(hd, config.rms_norm_eps, vb.pp("q_norm"))?;
+        let k_norm =
+            crate::models::with_tracing::rms_norm(hd, config.rms_norm_eps, vb.pp("k_norm"))?;
 
         Ok(Self {
             q_proj,
@@ -452,18 +454,22 @@ impl VisionEncoderLayer {
         Ok(Self {
             self_attn,
             mlp,
-            input_layernorm: candle_nn::rms_norm(hs, eps, vb.pp("input_layernorm"))?,
-            post_attention_layernorm: candle_nn::rms_norm(
+            input_layernorm: crate::models::with_tracing::rms_norm(
+                hs,
+                eps,
+                vb.pp("input_layernorm"),
+            )?,
+            post_attention_layernorm: crate::models::with_tracing::rms_norm(
                 hs,
                 eps,
                 vb.pp("post_attention_layernorm"),
             )?,
-            pre_feedforward_layernorm: candle_nn::rms_norm(
+            pre_feedforward_layernorm: crate::models::with_tracing::rms_norm(
                 hs,
                 eps,
                 vb.pp("pre_feedforward_layernorm"),
             )?,
-            post_feedforward_layernorm: candle_nn::rms_norm(
+            post_feedforward_layernorm: crate::models::with_tracing::rms_norm(
                 hs,
                 eps,
                 vb.pp("post_feedforward_layernorm"),

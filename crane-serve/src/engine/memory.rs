@@ -5,6 +5,7 @@
 //! `InferenceEngine` itself, so it lifts out cleanly.
 
 use crane_core::Device;
+use crane_core::device::query_gpu_memory;
 
 // ─────────────────────────────────────────────────────────────
 //  Memory configuration
@@ -46,10 +47,10 @@ impl MemoryConfig {
 
     /// Suffixes accepted by [`Self::parse_memory_limit`], longest first so a
     /// suffix like "GIB" isn't shadowed by a same-letter prefix like "G".
-    /// `format_bytes_engine` below renders sizes with binary-prefix math under
-    /// decimal-looking labels ("G" = 2^30), so every suffix here — decimal
-    /// spelling ("GB") included — is treated as power-of-two too, to match
-    /// what operators see reflected back in our own logs.
+    /// `crane_core::device::format_budget` renders sizes with binary-prefix
+    /// math under decimal-looking labels ("G" = 2^30), so every suffix here
+    /// — decimal spelling ("GB") included — is treated as power-of-two too,
+    /// to match what operators see reflected back in our own logs.
     const SIZE_SUFFIXES: [(&'static str, u32); 6] = [
         ("GIB", 30),
         ("GB", 30),
@@ -83,7 +84,7 @@ impl MemoryConfig {
         // Try as a fraction (0.0 - 1.0)
         if let Ok(frac) = s.parse::<f64>() {
             if (0.0..=1.0).contains(&frac) {
-                let total = Self::query_total_gpu_memory(device);
+                let total = query_gpu_memory(device).map_or(0, |(_, t)| t);
                 if total > 0 {
                     #[allow(
                         clippy::cast_possible_truncation,
@@ -106,20 +107,9 @@ impl MemoryConfig {
 
     /// Record baseline GPU memory (call after model load + warmup).
     pub fn record_baseline(&mut self, device: &Device) {
-        let (used, _total) = query_gpu_memory_usage(device);
-        self.baseline_gpu_bytes = used;
+        self.baseline_gpu_bytes =
+            query_gpu_memory(device).map_or(0, |(free, total)| total.saturating_sub(free));
     }
-
-    /// Query total GPU memory (bytes). Returns 0 if unavailable.
-    pub(crate) fn query_total_gpu_memory(device: &Device) -> u64 {
-        crane_core::device_memory_info(device).map_or(0, |(_free, total)| total)
-    }
-}
-
-/// Query current GPU memory usage. Returns (`used_bytes`, `total_bytes`).
-/// Returns (0, 0) if the device is neither CUDA nor ROCm (or the query fails).
-pub(crate) fn query_gpu_memory_usage(device: &Device) -> (u64, u64) {
-    crane_core::device_memory_info(device).map_or((0, 0), |(free, total)| (total - free, total))
 }
 
 /// Raise a KV budget to fit at least one full `max_seq_len` sequence.
@@ -133,38 +123,23 @@ pub(crate) fn query_gpu_memory_usage(device: &Device) -> (u64, u64) {
 ///
 /// Returns `budget` unchanged when `kv_bytes_per_token` is `None` (the
 /// backend's cache layout doesn't support a simple per-token rate).
-/// `max_seq_len == 0` (unlimited) falls back to `DEFAULT_SEQ_LEN`, mirroring
-/// `GpuBudget::runtime_reservation_bytes`'s default.
+/// `max_seq_len == 0` (unlimited) falls back to
+/// `crane_core::device::DEFAULT_KV_SEQ_LEN`.
 pub(super) fn floor_kv_budget(
     budget: u64,
     kv_bytes_per_token: Option<u64>,
     max_seq_len: usize,
 ) -> u64 {
-    const DEFAULT_SEQ_LEN: u64 = 4096;
-
     let Some(kv_bytes_per_token) = kv_bytes_per_token else {
         return budget;
     };
     let seq_len = if max_seq_len > 0 {
         max_seq_len as u64
     } else {
-        DEFAULT_SEQ_LEN
+        crane_core::device::DEFAULT_KV_SEQ_LEN as u64
     };
     let min_required = kv_bytes_per_token.saturating_mul(seq_len);
     budget.max(min_required)
-}
-
-/// Format a byte count as a human-readable string (used in engine log messages).
-pub(crate) fn format_bytes_engine(bytes: u64) -> String {
-    if bytes >= 1 << 30 {
-        #[allow(clippy::cast_precision_loss)]
-        return format!("{:.1}G", bytes as f64 / (1u64 << 30) as f64);
-    }
-    if bytes >= 1 << 20 {
-        #[allow(clippy::cast_precision_loss)]
-        return format!("{:.0}M", bytes as f64 / (1u64 << 20) as f64);
-    }
-    format!("{bytes}B")
 }
 
 #[cfg(test)]
@@ -255,13 +230,6 @@ mod tests {
     #[test]
     fn rejects_garbage_and_warns() {
         assert_eq!(MemoryConfig::parse_memory_limit("not-a-size", &cpu()), 0);
-    }
-
-    #[test]
-    fn format_bytes_engine_rounds_to_binary_units() {
-        assert_eq!(format_bytes_engine(1u64 << 30), "1.0G");
-        assert_eq!(format_bytes_engine(1u64 << 20), "1M");
-        assert_eq!(format_bytes_engine(512), "512B");
     }
 
     #[test]

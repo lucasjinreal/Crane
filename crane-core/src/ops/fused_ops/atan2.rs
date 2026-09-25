@@ -7,13 +7,15 @@
 //! `cpu_fwd` is always compiled; `cuda_fwd` is gated behind the `cuda`
 //! feature and dispatches to the kernel compiled from
 //! `kernels/cuda/atan2.cu`, following the `snake` op's pattern in this same
-//! module. Upstream candle has an open PR adding `atan`/`atan2`
+//! module. `rocm_fwd` is gated behind the `rocm` feature and runs the
+//! *same* `.cu` source through `hipcc` at runtime (see [`crate::ops::rocm`]).
+//! Upstream candle has an open PR adding `atan`/`atan2`
 //! (<https://github.com/huggingface/candle/pull/3338>); once that ships in a
 //! released version this crate upgrades to, `cpu_fwd` can be replaced with a
 //! direct tensor method call. Callers broadcast `y`/`x` to matching shapes
 //! before calling `atan2()`.
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 use candle_core::DType;
 #[cfg(feature = "cuda")]
 use candle_core::backend::BackendStorage;
@@ -21,6 +23,8 @@ use candle_core::backend::BackendStorage;
 use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
 #[cfg(feature = "cuda")]
 use candle_core::cuda_backend::{CudaStorage, CudaStorageSlice, WrapErr};
+#[cfg(all(feature = "rocm", not(feature = "cuda")))]
+use candle_core::rocm_backend::RocmStorage;
 use candle_core::{CpuStorage, CustomOp2, Layout, Result, Shape, Tensor, WithDType};
 
 // PTX compiled from kernels/cuda/atan2.cu — embedded at build time.
@@ -31,6 +35,11 @@ mod ptx {
 
 #[cfg(feature = "cuda")]
 const MODULE_NAME: &str = "crane_atan2";
+
+#[cfg(all(feature = "rocm", not(feature = "cuda")))]
+const ROCM_MODULE_NAME: &str = "crane_atan2";
+#[cfg(all(feature = "rocm", not(feature = "cuda")))]
+const ROCM_SOURCE: &str = include_str!("../../../kernels/cuda/atan2.cu");
 
 /// Element-wise `atan2(y, x)`. IEEE 754 compliant: `atan2(0, 0) = 0`,
 /// handling the zero-magnitude case without a special branch.
@@ -156,6 +165,70 @@ impl CustomOp2 for Atan2Op {
             device: dev.clone(),
         };
         Ok((dst, l_y.shape().clone()))
+    }
+
+    #[cfg(all(feature = "rocm", not(feature = "cuda")))]
+    fn rocm_fwd(
+        &self,
+        s_y: &RocmStorage,
+        l_y: &Layout,
+        s_x: &RocmStorage,
+        l_x: &Layout,
+    ) -> Result<(RocmStorage, Shape)> {
+        if l_y.shape() != l_x.shape() {
+            candle_core::bail!("atan2: y and x must have the same shape");
+        }
+
+        let dev = s_y.device.clone();
+        let n = l_y.shape().elem_count();
+        let dtype = s_y.slice.dtype();
+        let kernel_name = match dtype {
+            DType::BF16 => "atan2_bf16",
+            DType::F16 => "atan2_f16",
+            DType::F32 => "atan2_f32",
+            dt => candle_core::bail!("atan2: unsupported dtype {dt:?}"),
+        };
+
+        let y_ptr = crate::ops::rocm::slice_ptr(&s_y.slice, l_y, dtype, "atan2 y")?;
+        let x_ptr = crate::ops::rocm::slice_ptr(&s_x.slice, l_x, dtype, "atan2 x")?;
+
+        // SAFETY: kernel_name (found in ROCM_SOURCE) takes (const T*, const
+        // T*, T*, uint32_t) for dtype T, matching launch_binary_elementwise's
+        // contract.
+        let slice = unsafe {
+            match dtype {
+                DType::BF16 => crate::ops::rocm::launch_binary_elementwise::<half::bf16>(
+                    &dev,
+                    ROCM_MODULE_NAME,
+                    kernel_name,
+                    ROCM_SOURCE,
+                    y_ptr,
+                    x_ptr,
+                    n,
+                ),
+                DType::F16 => crate::ops::rocm::launch_binary_elementwise::<half::f16>(
+                    &dev,
+                    ROCM_MODULE_NAME,
+                    kernel_name,
+                    ROCM_SOURCE,
+                    y_ptr,
+                    x_ptr,
+                    n,
+                ),
+                DType::F32 => crate::ops::rocm::launch_binary_elementwise::<f32>(
+                    &dev,
+                    ROCM_MODULE_NAME,
+                    kernel_name,
+                    ROCM_SOURCE,
+                    y_ptr,
+                    x_ptr,
+                    n,
+                ),
+                _ => unreachable!("dtype already validated above"),
+            }
+        }?;
+
+        Ok((RocmStorage { slice, device: dev }, l_y.shape().clone()))
     }
 }
 
