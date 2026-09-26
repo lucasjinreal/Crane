@@ -326,74 +326,13 @@ Current limitations:
   prompt lengths from one process makes exhaustion likelier, because the caching allocator
   retains a bucket set per shape it has seen.
 
-#### AMD ROCm in Docker (Strix Halo / gfx1151)
+#### Container images
 
-`docker/rocm/Dockerfile` builds `crane-serve --features rocm` against AMD's ROCm 10
-packages (builder: `kyuz0/amd-strix-halo-toolboxes:rocm-10.0`) and ships it on
-`fedora-minimal:44`. The root `compose.yaml` has one service per GPU backend, each
-behind a [profile](https://docs.docker.com/compose/how-tos/profiles/);
-`crane-serve-rocm` (profile `rocm`) maps `/dev/kfd` and `/dev/dri`:
-
-```bash
-# MODEL is a model directory or single .gguf file under MODEL_DIR;
-# CRANE_PORT sets the host port (default 8080).
-COMPOSE_PROFILES=rocm MODEL_DIR=~/models MODEL=Qwen3-4B/Qwen3-4B-Q6_K.gguf \
-    docker compose up -d --build
-curl localhost:8080/v1/models
-```
-
-Put those variables in a `.env` file next to `compose.yaml` (git-ignored) and a plain
-`docker compose up -d` does the same. `.env` values can reference your environment,
-so no home directory is hard-coded:
-
-```bash
-# .env
-COMPOSE_PROFILES=rocm
-MODEL_DIR=${HOME}/.cache/huggingface/hub
-MODEL=models--unsloth--Qwen3-4B-128K-GGUF/snapshots/<rev>/Qwen3-4B-128K-UD-Q6_K_XL.gguf
-CRANE_PORT=8080
-```
-
-With no profile selected, nothing starts. To build only the image:
-`docker build -f docker/rocm/Dockerfile -t localhost/crane-serve:rocm10 .` (the
-context is the repo root).
-
-**ROCm micro-benchmarks in Docker.** The Dockerfile's optional `bench` target builds
-`gdn_bench` and `topk_bench` (see *Other toggles* below); compose runs them as
-`crane-bench-rocm` under their own `rocm-bench` profile, so `docker compose up` with
-`rocm` never starts them:
-
-```bash
-docker compose run --rm crane-bench-rocm                    # both, default args
-docker compose run --rm crane-bench-rocm gdn_bench 16 512 128 128 100  # BH S K V iters
-docker compose run --rm crane-bench-rocm topk_bench 248320 40 200      # N K iters
-CRANE_TOPK_HOST=1 docker compose run --rm crane-bench-rocm topk_bench  # A/B: both arms host sort
-```
-
-`CRANE_PROF`, `CRANE_TOPK_HOST` and `CRANE_GDN_PORTABLE` are passed through to
-`crane-serve-rocm` when set in the shell or `.env`. `gdn_bench` calls the fused kernel
-directly, so `CRANE_GDN_PORTABLE` and `CRANE_PROF` do not change its numbers.
-
-Notes:
-
-- `group_add` uses numeric host GIDs (render=105, video=39 here); check yours with
-  `getent group render video`. Do not set `HSA_OVERRIDE_GFX_VERSION` on gfx1151.
-- The runtime image (~2.9 GB) carries `hipcc` and the ROCm LLVM toolchain, because
-  kernels are compiled on first use. They are cached in `/var/cache/candle-rocm`
-  (a named volume in the compose file), so only the first start pays that cost.
-- `ROCBLAS_LAYER=4` in the compose file is rocBLAS profile logging. Drop it for
-  quieter logs.
-- Do not build with `-Z build-std=core`: it collides with the prebuilt `std` (E0152).
-  `RUSTC_BOOTSTRAP=1` and `rust-src` are enough for `rocm-rs`'s nested amdgcn build.
-- Works with podman too (`podman build …`, `podman compose …`). On SELinux hosts,
-  keep `label=disable`.
-- The compose file passes `--host [::]` so the server also listens on IPv6. With the
-  default `0.0.0.0`, `http://localhost:…` fails under rootless podman (pasta forwards
-  `::1` as IPv6) while `127.0.0.1` works.
-- A Hugging Face cache works as `MODEL_DIR` (`MODEL_DIR=~/.cache/huggingface/hub
-  MODEL=models--<org>--<repo>/snapshots/<rev>/<file>.gguf`). Mount the whole `hub/`
-  directory: snapshot files are symlinks into `../../blobs`.
-- More detail: [crane-serve/docs/gpu.md](crane-serve/docs/gpu.md).
+`crane-serve` also ships as a container image, built from Containerfiles
+under [`container/`](container/), one directory per backend
+(currently AMD ROCm; more may follow, e.g. CUDA). See
+[container/README.md](container/README.md) for the available variants,
+build/run instructions, benchmarks, and environment knobs.
 
 #### Intel GPU / SYCL (proof-of-concept)
 

@@ -1,16 +1,25 @@
 # syntax=docker/dockerfile:1
 #
-# crane-serve with the ROCm 10 backend, targeting AMD Strix Halo (gfx1151).
+# crane-serve with the ROCm 10 backend, built against the community
+# `kyuz0/amd-strix-halo-toolboxes` image instead of Fedora's native ROCm
+# packages. See container/rocm/Containerfile, the default/recommended build.
 #
-#   docker build -f docker/rocm/Dockerfile -t localhost/crane-serve:rocm10 .
-#   (or: COMPOSE_PROFILES=rocm docker compose build)
+# This variant exists for comparison against or as a fallback from the
+# general build. The toolbox image is maintained specifically for Strix
+# Halo (gfx1151) and may ship newer or better-tuned kernels for that one
+# chip than Fedora's own ROCm packages do at any given time, at the cost of
+# not supporting any other GPU architecture (no gfx1201/RDNA4 Tensile
+# kernels, for example). See container/rocm/Containerfile's header comment.
+#
+#   podman build -f container/rocm/Containerfile.strix-halo -t localhost/crane-serve:rocm10-strixhalo .
+#   (or: COMPOSE_PROFILES=rocm-strixhalo podman compose build)
 #
 # Stages:
 #   builder        - toolchain + `crane-serve` build
 #   bench-builder  - optional: ROCm micro-benchmarks (`gdn_bench`, `topk_bench`)
 #   rocm-runtime   - fedora-minimal + trimmed ROCm tree, shared by the two below
 #   bench          - optional: rocm-runtime + the benchmarks
-#                    (`--target bench`, or compose service `crane-bench-rocm`)
+#                    (`--target bench`, or compose service `crane-bench-rocm-strixhalo`)
 #   runtime        - rocm-runtime + crane-serve (last stage, the default)
 #
 # The build context is the repository root; the root .dockerignore applies.
@@ -142,9 +151,14 @@ CMD ["sh", "-c", "gdn_bench && topk_bench"]
 # ---------------------------------------------------------------------------
 FROM rocm-runtime AS runtime
 
+# entrypoint.sh/chmod/mkdir rarely change; copying the crane-serve binary
+# last means a source-only rebuild (which invalidates every layer from
+# there on) doesn't also redo these.
+COPY container/rocm/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh && mkdir -p /models
+
 COPY --from=builder /out/crane-serve /usr/local/bin/crane-serve
-RUN mkdir -p /models
 
 EXPOSE 8080
-ENTRYPOINT ["/usr/local/bin/crane-serve"]
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["--help"]

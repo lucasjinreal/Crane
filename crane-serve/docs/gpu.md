@@ -84,16 +84,20 @@ requires the Safetensors format.
 crane-serve runs on a single CUDA device (device 0). Multi-GPU tensor
 parallelism is not yet supported.
 
-## AMD ROCm in Docker (Strix Halo / gfx1151)
+## AMD ROCm in Container
 
-`docker/rocm/Dockerfile` builds `crane-serve --features rocm` against AMD's
-ROCm 10 packages and ships it on `fedora-minimal:44`. The root `compose.yaml`
-runs it as service `crane-serve-rocm` under the `rocm` profile, with the GPU
-devices mapped:
+`container/rocm/Containerfile` builds `crane-serve --features rocm` against
+Fedora's native ROCm 7.1 packages (builder: `fedora:44`) and ships it on
+`fedora-minimal:44`. Fedora's `rocblas` package ships kernels for gfx900
+through gfx950, covering AMD's officially-supported architecture list (e.g.
+Strix Halo/gfx1151, RDNA4/gfx1201) rather than one GPU family. The root
+`compose.yaml` runs it as service `crane-serve-rocm` under the `rocm`
+profile, with the GPU devices mapped. Examples below use `podman`; swap in
+`docker` if that's what you have installed:
 
 ```bash
 COMPOSE_PROFILES=rocm MODEL_DIR=/path/to/models MODEL=Qwen3-4B \
-    docker compose up --build
+    podman compose up --build
 ```
 
 - The ROCm backend compiles its HIP kernels with `hipcc` on first use, so the
@@ -102,13 +106,14 @@ COMPOSE_PROFILES=rocm MODEL_DIR=/path/to/models MODEL=Qwen3-4B \
   file keeps it in a named volume so restarts skip recompilation.
 - The container needs `/dev/kfd` and `/dev/dri`, plus the host's `render` and
   `video` GIDs (`getent group render video`); set them in `group_add`.
-- Do not set `HSA_OVERRIDE_GFX_VERSION`; gfx1151 is supported natively.
+- Do not set `HSA_OVERRIDE_GFX_VERSION`; your GPU's real architecture is
+  supported natively.
 - Build without `-Z build-std=core`: it collides with the prebuilt `std`
   (E0152). The builder sets `RUSTC_BOOTSTRAP=1` and installs `rust-src` for
   the nested amdgcn kernel build that `rocm-rs` runs itself.
-- Kernel micro-benchmarks: the Dockerfile's optional `bench` target ships
+- Kernel micro-benchmarks: the Containerfile's optional `bench` target ships
   `gdn_bench [BH S K V iters]` and `topk_bench [N K iters]`; run them with
-  `docker compose run --rm crane-bench-rocm [gdn_bench|topk_bench ARGS]`
+  `podman compose run --rm crane-bench-rocm [gdn_bench|topk_bench ARGS]`
   (profile `rocm-bench`). With no arguments it runs both at their defaults.
 
 ## Environment variables
