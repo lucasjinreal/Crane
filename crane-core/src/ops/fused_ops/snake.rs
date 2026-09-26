@@ -10,7 +10,9 @@
 //! enough to blow past cache (see `ONNX_SPEEDUP.md`). `cpu_fwd` is always
 //! compiled; `cuda_fwd` is gated behind the `cuda` feature and dispatches to
 //! the kernel compiled from `kernels/cuda/snake.cu`, following the
-//! `FusedSiluMul` pattern in `cuda_impl.rs`. Callers broadcast `x`/`alpha` to
+//! `FusedSiluMul` pattern in `cuda_impl.rs`. `rocm_fwd` is gated behind the
+//! `rocm` feature and runs the *same* `.cu` source through `hipcc` at
+//! runtime (see [`crate::ops::rocm`]). Callers broadcast `x`/`alpha` to
 //! matching shapes before calling `snake()`.
 
 #[cfg(feature = "cuda")]
@@ -21,6 +23,8 @@ use candle_core::backend::BackendStorage;
 use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
 #[cfg(feature = "cuda")]
 use candle_core::cuda_backend::{CudaStorage, CudaStorageSlice, WrapErr};
+#[cfg(all(feature = "rocm", not(feature = "cuda")))]
+use candle_core::rocm_backend::RocmStorage;
 use candle_core::{CpuStorage, CustomOp2, Layout, Result, Shape, Tensor, WithDType};
 
 // PTX compiled from kernels/cuda/snake.cu — embedded at build time.
@@ -31,6 +35,11 @@ mod ptx {
 
 #[cfg(feature = "cuda")]
 const MODULE_NAME: &str = "crane_snake";
+
+#[cfg(all(feature = "rocm", not(feature = "cuda")))]
+const ROCM_MODULE_NAME: &str = "crane_snake";
+#[cfg(all(feature = "rocm", not(feature = "cuda")))]
+const ROCM_SOURCE: &str = include_str!("../../../kernels/cuda/snake.cu");
 
 /// Fused Snake activation: `x + sin(alpha * x)^2 / alpha`.
 struct SnakeOp;
@@ -159,6 +168,30 @@ impl CustomOp2 for SnakeOp {
             device: dev.clone(),
         };
         Ok((dst, l_x.shape().clone()))
+    }
+
+    #[cfg(all(feature = "rocm", not(feature = "cuda")))]
+    fn rocm_fwd(
+        &self,
+        s_x: &RocmStorage,
+        l_x: &Layout,
+        s_alpha: &RocmStorage,
+        l_alpha: &Layout,
+    ) -> Result<(RocmStorage, Shape)> {
+        // SAFETY: snake_{bf16,f16,f32} in ROCM_SOURCE take (const T*, const
+        // T*, T*, uint32_t) for dtype T, matching binary_elementwise_fwd's
+        // contract.
+        unsafe {
+            crate::ops::rocm::binary_elementwise_fwd(
+                s_x,
+                l_x,
+                s_alpha,
+                l_alpha,
+                ROCM_MODULE_NAME,
+                "snake",
+                ROCM_SOURCE,
+            )
+        }
     }
 }
 
