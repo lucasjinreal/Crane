@@ -1,22 +1,23 @@
 # Audio: Text-to-Speech and Speech Recognition
 
-Crane supports two text-to-speech (TTS) model families and one speech
-recognition (ASR) model. All three share the server's OpenAI-compatible
+Crane supports several text-to-speech (TTS) model families and one speech
+recognition (ASR) model. They share the server's OpenAI-compatible
 endpoints, so any OpenAI SDK or `curl` client works without modification.
 
 ## Choosing a TTS model
 
-| | Voxtral TTS | Qwen3-TTS |
-|---|---|---|
-| Languages | English, German, French, Spanish, Italian, Portuguese, Dutch, Hindi, Arabic | Chinese, English, Japanese, and more (auto-detected) |
-| Voice cloning | No | Yes (Base model) |
-| Predefined voices | Yes (20 embeddings) | Yes (CustomVoice model) |
-| Decoding | Greedy only | Sampling (temperature, top_p) |
-| Speed on CPU | Slow (~14 passes per audio frame) | Faster |
+| | VoxCPM2 | Voxtral TTS | Qwen3-TTS |
+|---|---|---|---|
+| Languages | Multilingual, including Chinese and English | English, German, French, Spanish, Italian, Portuguese, Dutch, Hindi, Arabic | Chinese, English, Japanese, and more (auto-detected) |
+| Voice cloning | Yes | No | Yes (Base model) |
+| Predefined voices | Reference audio cached at startup | Yes (20 embeddings) | Yes (CustomVoice model) |
+| Streaming | PCM16, including cached voices | PCM16 | PCM16 |
+| Decoding | CFM (`cfm_steps`, `cfg_scale`) | Greedy only | Sampling (`temperature`, `top_p`) |
 
 Pick Voxtral TTS for a broad set of predefined voices without cloning. Pick
 Qwen3-TTS if you need to clone a voice from a reference clip, or want
-sampling control over prosody.
+sampling control over prosody. Pick VoxCPM2 for multilingual synthesis with
+reusable reference-audio voices and fixed-voice streaming.
 
 ## Qwen3-TTS
 
@@ -105,6 +106,206 @@ curl http://localhost:8080/v1/audio/speech \
 Setting `reference_audio` switches the request to voice-clone mode
 regardless of the `voice` field. `reference_audio` must be a WAV file, and
 `language` should match the target text.
+
+## VoxCPM2
+
+### Setup and built-in voices
+
+Place the checkpoint under `checkpoints/VoxCPM2/`. It must include the model
+files required by `VoxCpm2Model`, including the converted
+`audiovae.safetensors`.
+
+Put reusable reference clips in `data/voices/`:
+
+```text
+data/voices/
+├── voice_preview_adam.wav
+└── voice_preview_clyde.wav
+```
+
+Start the server with:
+
+```bash
+cargo build -p crane-serve --release
+
+./target/release/crane-serve \
+  --model-path checkpoints/VoxCPM2/ \
+  --model-type voxcpm2 \
+  --voice-dir data/voices \
+  --port 8080
+```
+
+`--model-type voxcpm2` is optional when auto-detection succeeds.
+`--voice-dir` defaults to `data/voices`.
+
+On startup, Crane encodes every supported audio file in the voice directory
+and saves its conditioning tensor under:
+
+```text
+data/voices/.voxcpm2-cache/<source-filename>.safetensors
+```
+
+Subsequent starts load the cached tensor. A cache is rebuilt automatically
+when its source audio or relevant model files are newer. Supported source
+formats are WAV, MP3, FLAC, OGG, M4A, and AAC; WAV is recommended.
+
+The API voice name is the filename without its extension. For example,
+`voice_preview_adam.wav` is selected with `"voice": "voice_preview_adam"`.
+Restart the server after adding or replacing a voice file.
+
+### Generate with a fixed voice
+
+```bash
+curl http://127.0.0.1:8080/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "voxcpm2",
+    "input": "你好，这是 VoxCPM2 的固定音色测试。",
+    "voice": "voice_preview_adam",
+    "response_format": "wav",
+    "cfm_steps": 10,
+    "cfg_scale": 2.0,
+    "max_tokens": 200
+  }' \
+  --output voxcpm2.wav
+
+afplay voxcpm2.wav
+```
+
+If `voice` is omitted, VoxCPM2 uses zero-shot conditioning; the speaker
+identity is then not guaranteed to remain fixed between requests.
+
+### Stream with a fixed voice
+
+Streaming requires `response_format: "pcm"`. The response body is headerless,
+mono, signed PCM16 little-endian audio. The sample rate is returned in the
+`X-Sample-Rate` header and is currently 48 kHz for VoxCPM2.
+
+```bash
+curl --no-buffer http://127.0.0.1:8080/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "voxcpm2",
+    "input": "你好，这是固定音色的流式语音测试。",
+    "voice": "voice_preview_adam",
+    "response_format": "pcm",
+    "stream": true,
+    "cfm_steps": 10,
+    "cfg_scale": 2.0,
+    "max_tokens": 200
+  }' \
+  --output voxcpm2.pcm
+```
+
+To convert the raw response to a WAV file:
+
+```bash
+ffmpeg -f s16le -ar 48000 -ac 1 -i voxcpm2.pcm voxcpm2-stream.wav
+afplay voxcpm2-stream.wav
+```
+
+Cached built-in voices support streaming. Request-time cloning through
+`reference_audio` cannot be combined with `stream: true`; add the reference
+clip to `--voice-dir` when that voice must be reused by streaming requests.
+
+### Streaming test client
+
+Install the optional playback dependency in the Python environment used to
+run the client:
+
+```bash
+python -m pip install -r tests/requirements-voxcpm2-stream.txt
+```
+
+Save the streamed response as a valid WAV file:
+
+```bash
+python tests/test_voxcpm2_stream.py \
+  --voice voice_preview_adam \
+  --text '你好，这是固定音色的流式测试。' \
+  --output voxcpm2-stream.wav
+```
+
+Play through `sounddevice` while receiving, with a jitter buffer separating
+network reads from playback:
+
+```bash
+python tests/test_voxcpm2_stream.py \
+  --play \
+  --voice voice_preview_adam \
+  --play-buffer-ms 1000 \
+  --output voxcpm2-stream.wav
+```
+
+On macOS, list CoreAudio devices and select one explicitly if the default
+device reports PortAudio error `-9986`:
+
+```bash
+python tests/test_voxcpm2_stream.py --list-devices
+python tests/test_voxcpm2_stream.py \
+  --play --device 3 --play-buffer-ms 1000 \
+  --voice voice_preview_adam
+```
+
+Important client options:
+
+| Option | Default | Description |
+|---|---:|---|
+| `--url` | `http://127.0.0.1:8080/v1/audio/speech` | Speech endpoint |
+| `--voice` | `voice_preview_adam` | Voice filename without extension |
+| `--cfm-steps` | `10` | CFM steps; very small values reduce quality |
+| `--cfg-scale` | `2.0` | Classifier-free guidance scale |
+| `--max-tokens` | `200` | Maximum generation length |
+| `--play` | off | Enable live playback |
+| `--device` | system default | sounddevice output name or index |
+| `--play-buffer-ms` | `500` | Audio queued before playback begins |
+| `--output` | `voxcpm2-stream.wav` | Saved WAV path |
+
+The client prints HTTP readiness, chunk arrival intervals, buffered audio,
+underflow count, time to first audio, and the final generation realtime ratio.
+Increasing `underflows` means playback is consuming audio faster than the
+model produces it. A larger buffer smooths short gaps, but continuous playback
+ultimately requires generation near or above `1.0x` realtime.
+
+### Request-time cloning
+
+Non-streaming requests can clone a WAV reference directly:
+
+```bash
+curl http://127.0.0.1:8080/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "voxcpm2",
+    "input": "这是使用参考音频克隆出来的新句子。",
+    "reference_audio": "/absolute/path/to/reference.wav",
+    "reference_text": "参考音频中实际说出的文字",
+    "response_format": "wav",
+    "cfm_steps": 10,
+    "cfg_scale": 2.0,
+    "max_tokens": 200
+  }' \
+  --output voxcpm2-clone.wav
+```
+
+`reference_audio` takes precedence over `voice` and recomputes conditioning
+for each request. Use the built-in voice cache for repeated requests.
+
+### VoxCPM2 model tests
+
+The model integration tests are ignored by default because they require a
+local checkpoint:
+
+```bash
+CRANE_VOXCPM2_DIR=checkpoints/VoxCPM2 \
+  cargo test -p crane-core --test voxcpm2_generate -- --ignored --nocapture
+
+CRANE_VOXCPM2_DIR=checkpoints/VoxCPM2 \
+CRANE_VOXCPM2_REF_WAV=data/voices/voice_preview_adam.wav \
+  cargo test -p crane-core --test voxcpm2_conditioning -- --ignored --nocapture
+```
+
+These cover waveform validity, reference conditioning, prompt-cache round
+trips, and streaming/one-shot equivalence for a fixed random seed.
 
 ## Voxtral TTS
 
