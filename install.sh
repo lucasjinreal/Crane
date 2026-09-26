@@ -60,6 +60,13 @@ elif [[ "$(uname -s)" == "Linux" ]]; then
     say "${YELLOW}${BOLD}Detected platform:${NC} Linux with AMD ROCm"
     say "${YELLOW}Enabled Cargo features:${NC} rocm (--no-default-features)"
     say "${YELLOW}ROCM_PATH:${NC} ${ROCM_PATH}"
+  elif have_cmd icpx || have_cmd sycl-ls; then
+    # Intel oneAPI / SYCL (proof-of-concept). Uses the candle fork wired in via
+    # [patch.crates-io] in the root Cargo.toml.
+    PLATFORM="linux-sycl"
+    BUILD_FEATURES+=("sycl")
+    say "${YELLOW}${BOLD}Detected platform:${NC} Linux with Intel oneAPI / SYCL"
+    say "${YELLOW}Enabled Cargo features:${NC} sycl"
   else
     PLATFORM="linux"
     say "${YELLOW}${BOLD}Detected platform:${NC} Linux (CPU build)"

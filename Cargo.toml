@@ -19,6 +19,13 @@ candle-core = { version = "0.11" }
 candle-nn = { version = "0.11" }
 candle-transformers = { version = "0.11" }
 
+# Renamed copies of the plain/stock candle packages above, used by
+# `crane-core` instead of the bare names — see the comment on
+# `candle-core-default` in `crane-core/Cargo.toml` for why.
+candle-core-default = { package = "candle-core", version = "0.11" }
+candle-nn-default = { package = "candle-nn", version = "0.11" }
+candle-transformers-default = { package = "candle-transformers", version = "0.11" }
+
 # Intel oneAPI/SYCL backend fork (adds a `sycl` candle feature). Remove once
 # SYCL support merges into candle main.
 candle-core-sycl = { package = "candle-core", git = "https://github.com/Hahihula/candle", branch = "sycle-support" }

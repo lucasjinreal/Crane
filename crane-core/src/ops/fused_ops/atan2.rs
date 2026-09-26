@@ -7,7 +7,9 @@
 //! `cpu_fwd` is always compiled; `cuda_fwd` is gated behind the `cuda`
 //! feature and dispatches to the kernel compiled from
 //! `kernels/cuda/atan2.cu`, following the `snake` op's pattern in this same
-//! module. Upstream candle has an open PR adding `atan`/`atan2`
+//! module. `rocm_fwd` is gated behind the `rocm` feature and runs the
+//! *same* `.cu` source through `hipcc` at runtime (see [`crate::ops::rocm`]).
+//! Upstream candle has an open PR adding `atan`/`atan2`
 //! (<https://github.com/huggingface/candle/pull/3338>); once that ships in a
 //! released version this crate upgrades to, `cpu_fwd` can be replaced with a
 //! direct tensor method call. Callers broadcast `y`/`x` to matching shapes
@@ -21,6 +23,8 @@ use candle_core::backend::BackendStorage;
 use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
 #[cfg(feature = "cuda")]
 use candle_core::cuda_backend::{CudaStorage, CudaStorageSlice, WrapErr};
+#[cfg(all(feature = "rocm", not(feature = "cuda")))]
+use candle_core::rocm_backend::RocmStorage;
 use candle_core::{CpuStorage, CustomOp2, Layout, Result, Shape, Tensor, WithDType};
 
 // PTX compiled from kernels/cuda/atan2.cu — embedded at build time.
@@ -31,6 +35,11 @@ mod ptx {
 
 #[cfg(feature = "cuda")]
 const MODULE_NAME: &str = "crane_atan2";
+
+#[cfg(all(feature = "rocm", not(feature = "cuda")))]
+const ROCM_MODULE_NAME: &str = "crane_atan2";
+#[cfg(all(feature = "rocm", not(feature = "cuda")))]
+const ROCM_SOURCE: &str = include_str!("../../../kernels/cuda/atan2.cu");
 
 /// Element-wise `atan2(y, x)`. IEEE 754 compliant: `atan2(0, 0) = 0`,
 /// handling the zero-magnitude case without a special branch.
@@ -156,6 +165,30 @@ impl CustomOp2 for Atan2Op {
             device: dev.clone(),
         };
         Ok((dst, l_y.shape().clone()))
+    }
+
+    #[cfg(all(feature = "rocm", not(feature = "cuda")))]
+    fn rocm_fwd(
+        &self,
+        s_y: &RocmStorage,
+        l_y: &Layout,
+        s_x: &RocmStorage,
+        l_x: &Layout,
+    ) -> Result<(RocmStorage, Shape)> {
+        // SAFETY: atan2_{bf16,f16,f32} in ROCM_SOURCE take (const T*, const
+        // T*, T*, uint32_t) for dtype T, matching binary_elementwise_fwd's
+        // contract.
+        unsafe {
+            crate::ops::rocm::binary_elementwise_fwd(
+                s_y,
+                l_y,
+                s_x,
+                l_x,
+                ROCM_MODULE_NAME,
+                "atan2",
+                ROCM_SOURCE,
+            )
+        }
     }
 }
 

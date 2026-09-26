@@ -13,6 +13,8 @@ fn main() -> anyhow::Result<()> {
 #[cfg(feature = "cuda")]
 use candle_core::{DType, Device, Tensor};
 #[cfg(feature = "cuda")]
+use crane_core::candle_core;
+#[cfg(feature = "cuda")]
 use crane_core::quantized::ternary::{HadamardMode, TernaryEncoding, TernaryLinear, TernaryWeight};
 #[cfg(feature = "cuda")]
 use std::sync::Arc;

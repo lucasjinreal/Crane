@@ -19,17 +19,43 @@ use candle_core::{DType, Device, Tensor};
 
 use super::model::Qwen3_5TextModel;
 
-/// Prefill chunk size in tokens when `CRANE_PREFILL_CHUNK` is unset.
+/// Prefill chunk size in tokens when nothing else selects one.
 pub const DEFAULT_CHUNK: usize = 512;
 
-/// Chunk size from `CRANE_PREFILL_CHUNK`, or [`DEFAULT_CHUNK`]. An explicit
-/// `0` (or an unparseable value) disables chunking, restoring the single-pass
-/// behaviour for A/B comparisons.
+/// Set by [`set_default_chunk`]; `0` means "not set".
+static DEFAULT_CHUNK_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Choose the chunk size to use when `CRANE_PREFILL_CHUNK` is unset.
+///
+/// For an embedder that already feeds prefill in chunks of its own, re-chunking
+/// underneath is pure loss: each pass dequantizes every weight in the model, so
+/// splitting a 2048-token chunk into four 512-token ones does that four times
+/// instead of once. `CRANE_PREFILL_CHUNK` still overrides this.
+pub fn set_default_chunk(tokens: usize) {
+    DEFAULT_CHUNK_OVERRIDE.store(tokens, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Chunk size: `CRANE_PREFILL_CHUNK` if set, else [`set_default_chunk`]'s
+/// value, else [`DEFAULT_CHUNK`]. An explicit `0` (or an unparseable value)
+/// disables chunking, restoring the single-pass behaviour for A/B comparisons.
 #[must_use]
 pub fn chunk_size() -> usize {
-    match std::env::var("CRANE_PREFILL_CHUNK") {
-        Ok(v) => v.trim().parse().unwrap_or(0),
-        Err(_) => DEFAULT_CHUNK,
+    resolve_chunk(
+        std::env::var("CRANE_PREFILL_CHUNK").ok().as_deref(),
+        DEFAULT_CHUNK_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// The precedence rule, free of process-global state so it can be tested
+/// without racing the other tests here that set `CRANE_PREFILL_CHUNK`.
+fn resolve_chunk(env: Option<&str>, embedder_default: usize) -> usize {
+    if let Some(v) = env {
+        return v.trim().parse().unwrap_or(0);
+    }
+    match embedder_default {
+        0 => DEFAULT_CHUNK,
+        n => n,
     }
 }
 
@@ -46,7 +72,7 @@ pub(super) fn forward(
     start_pos: usize,
     attention_mask: Option<&Tensor>,
 ) -> Result<Tensor> {
-    let timer = crate::utils::prof::pass(input_ids.dim(1)?);
+    let timer = crate::utils::prof::pass(input_ids.dim(1)?, model.device());
     let out = forward_inner(model, input_ids, start_pos, attention_mask);
     if let Some(timer) = timer {
         timer.finish(model.device());
@@ -276,6 +302,27 @@ mod tests {
         let min = single.iter().cloned().fold(f32::MAX, f32::min);
         assert!(max - min > 1e-3, "logits are flat ({min}..{max})");
         assert!(single.iter().all(|v| v.is_finite()), "non-finite logits");
+    }
+
+    #[test]
+    fn chunk_size_precedence() {
+        assert_eq!(resolve_chunk(None, 0), DEFAULT_CHUNK, "nothing set");
+        assert_eq!(resolve_chunk(None, 2048), 2048, "embedder default applies");
+        assert_eq!(
+            resolve_chunk(Some("512"), 2048),
+            512,
+            "env outranks the embedder default"
+        );
+        assert_eq!(
+            resolve_chunk(Some("0"), 2048),
+            0,
+            "explicit 0 disables chunking"
+        );
+        assert_eq!(
+            resolve_chunk(Some("nonsense"), 2048),
+            0,
+            "unparseable behaves as 0, as documented"
+        );
     }
 
     /// Row `i` of the mask must be the causal row for absolute position

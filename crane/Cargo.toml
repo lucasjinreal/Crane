@@ -26,16 +26,18 @@ ribo = "0.1.3"
 tokenizers = { workspace = true }
 
 [features]
-# See `crane-core/Cargo.toml`'s `candle-default` comment: `crane-core`'s own
+# See `crane-core/Cargo.toml`'s `default-backend` comment: `crane-core`'s own
 # default is disabled above so `rocm` (built with `--no-default-features`)
 # doesn't drag in crane-core's plain candle backend alongside the fork.
-default = ["crane-core/candle-default"]
+default = ["crane-core/default-backend"]
 onnx = ["crane-core/onnx"]
 metal = ["crane-core/metal"]
 accelerate = ["crane-core/accelerate"]
 cuda = ["crane-core/cuda", "dep:nvml-wrapper"]
 # ROCm does not pull `nvml-wrapper` (NVIDIA-only telemetry, cuda-gated).
 rocm = ["crane-core/rocm"]
+# Intel SYCL / oneAPI backend (proof-of-concept).
+sycl = ["crane-core/sycl"]
 cudnn = ["crane-core/cudnn"]
 mkl = ["crane-core/mkl"]
 

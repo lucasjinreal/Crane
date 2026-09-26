@@ -224,11 +224,15 @@ fn repeat_kv_heads(q: &Tensor, k: &Tensor, dims: &GdnDims) -> Result<(Tensor, Te
     if dims.v_per_group == 1 {
         return Ok((q.clone(), k.clone()));
     }
+    // `expand` + one `contiguous` copy rather than `Tensor::repeat`, which
+    // lowers to a `cat` of `v_per_group` copies — one launch instead of
+    // `v_per_group`, per tensor per GDN layer per token.
     let expand = |t: &Tensor| -> Result<Tensor> {
-        let (b, s) = (t.dim(0)?, t.dim(1)?);
+        let (b, s, h, d) = t.dims4()?;
+        let v = dims.v_per_group;
         let repeated = match dims.v_head_order {
-            VHeadOrder::Interleaved => t.unsqueeze(3)?.repeat((1, 1, 1, dims.v_per_group, 1))?,
-            VHeadOrder::Chunked => t.unsqueeze(2)?.repeat((1, 1, dims.v_per_group, 1, 1))?,
+            VHeadOrder::Interleaved => t.unsqueeze(3)?.expand((b, s, h, v, d))?,
+            VHeadOrder::Chunked => t.unsqueeze(2)?.expand((b, s, v, h, d))?,
         };
         repeated
             .contiguous()?

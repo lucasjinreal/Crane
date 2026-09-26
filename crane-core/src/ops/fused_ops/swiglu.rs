@@ -9,7 +9,7 @@
 //! `rocm_fwd` is gated behind the `rocm` feature and runs the *same*
 //! `.cu` source through `hipcc` at runtime (see [`crate::ops::rocm`]).
 
-#[cfg(any(feature = "cuda", feature = "rocm"))]
+#[cfg(feature = "cuda")]
 use candle_core::DType;
 #[cfg(feature = "cuda")]
 use candle_core::backend::BackendStorage;
@@ -166,57 +166,20 @@ impl CustomOp2 for SwigluOp {
         s_up: &RocmStorage,
         l_up: &Layout,
     ) -> Result<(RocmStorage, Shape)> {
-        let dev = s_gate.device.clone();
-        let n = l_gate.shape().elem_count();
-        let dtype = s_gate.slice.dtype();
-        let kernel_name = match dtype {
-            DType::BF16 => "swiglu_bf16",
-            DType::F16 => "swiglu_f16",
-            DType::F32 => "swiglu_f32",
-            dt => candle_core::bail!("swiglu: unsupported dtype {dt:?}"),
-        };
-
-        let gate_ptr = crate::ops::rocm::slice_ptr(&s_gate.slice, l_gate, dtype, "swiglu gate")?;
-        let up_ptr = crate::ops::rocm::slice_ptr(&s_up.slice, l_up, dtype, "swiglu up")?;
-
-        // SAFETY: kernel_name (found in ROCM_SOURCE) takes (const T*, const
-        // T*, T*, uint32_t) for dtype T, matching launch_binary_elementwise's
-        // contract. gate_ptr/up_ptr stay valid for the launch's duration
-        // because s_gate/s_up are borrowed for the whole rocm_fwd call.
-        let slice = unsafe {
-            match dtype {
-                DType::BF16 => crate::ops::rocm::launch_binary_elementwise::<half::bf16>(
-                    &dev,
-                    ROCM_MODULE_NAME,
-                    kernel_name,
-                    ROCM_SOURCE,
-                    gate_ptr,
-                    up_ptr,
-                    n,
-                ),
-                DType::F16 => crate::ops::rocm::launch_binary_elementwise::<half::f16>(
-                    &dev,
-                    ROCM_MODULE_NAME,
-                    kernel_name,
-                    ROCM_SOURCE,
-                    gate_ptr,
-                    up_ptr,
-                    n,
-                ),
-                DType::F32 => crate::ops::rocm::launch_binary_elementwise::<f32>(
-                    &dev,
-                    ROCM_MODULE_NAME,
-                    kernel_name,
-                    ROCM_SOURCE,
-                    gate_ptr,
-                    up_ptr,
-                    n,
-                ),
-                _ => unreachable!("dtype already validated above"),
-            }
-        }?;
-
-        Ok((RocmStorage { slice, device: dev }, l_gate.shape().clone()))
+        // SAFETY: swiglu_{bf16,f16,f32} in ROCM_SOURCE take (const T*, const
+        // T*, T*, uint32_t) for dtype T, matching binary_elementwise_fwd's
+        // contract.
+        unsafe {
+            crate::ops::rocm::binary_elementwise_fwd(
+                s_gate,
+                l_gate,
+                s_up,
+                l_up,
+                ROCM_MODULE_NAME,
+                "swiglu",
+                ROCM_SOURCE,
+            )
+        }
     }
 }
 

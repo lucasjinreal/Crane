@@ -136,6 +136,10 @@ impl GdnInputProjection {
 /// - `v, z`: `[B, S, num_v_heads, head_v_dim]`
 /// - `b, a`: `[B, S, num_v_heads]`
 pub struct GdnProjection {
+    /// The `[B, S, conv_dim]` Q|K|V tensor, when a projection already produced
+    /// it in conv order (`Split`'s `in_proj_qkv`) — [`Self::conv_input`] then
+    /// reuses it rather than re-concatenating the views it was split into.
+    pub mixed_qkv: Option<Tensor>,
     pub q: Tensor,
     pub k: Tensor,
     pub v: Tensor,
@@ -171,6 +175,7 @@ impl GdnProjection {
         let a = mixed_ba.narrow(D::Minus1, dims.v_per_group, dims.v_per_group)?;
 
         Ok(Self {
+            mixed_qkv: None,
             q,
             k,
             v: v.reshape((batch_size, seq_len, dims.num_v_heads, dims.head_v_dim))?,
@@ -194,6 +199,7 @@ impl GdnProjection {
         let v = mixed_qkv.narrow(D::Minus1, dims.key_dim * 2, dims.value_dim)?;
 
         Ok(Self {
+            mixed_qkv: Some(mixed_qkv.reshape((batch_size, seq_len, dims.conv_dim))?),
             q: q.reshape((batch_size, seq_len, dims.num_k_heads, dims.head_k_dim))?,
             k: k.reshape((batch_size, seq_len, dims.num_k_heads, dims.head_k_dim))?,
             v: v.reshape((batch_size, seq_len, dims.num_v_heads, dims.head_v_dim))?,
@@ -211,6 +217,9 @@ impl GdnProjection {
         batch_size: usize,
         seq_len: usize,
     ) -> Result<Tensor> {
+        if let Some(qkv) = &self.mixed_qkv {
+            return Ok(qkv.clone());
+        }
         let q = self.q.reshape((batch_size, seq_len, dims.key_dim))?;
         let k = self.k.reshape((batch_size, seq_len, dims.key_dim))?;
         let v = self.v.reshape((batch_size, seq_len, dims.value_dim))?;

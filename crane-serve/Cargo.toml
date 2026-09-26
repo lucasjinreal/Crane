@@ -37,11 +37,11 @@ base64 = "0.23"
 subtle = "2"
 
 [features]
-# See `crane-core/Cargo.toml`'s `candle-default` comment: both `crane-core`
+# See `crane-core/Cargo.toml`'s `default-backend` comment: both `crane-core`
 # and `crane`'s own defaults are disabled above so `rocm` (built with
 # `--no-default-features`) doesn't drag in the plain candle backend
 # alongside the fork.
-default = ["crane-core/candle-default"]
+default = ["crane-core/default-backend"]
 metal = [
     "crane-core/metal",
     "crane/metal",
@@ -53,6 +53,11 @@ accelerate = [
 onnx = ["crane-core/onnx", "crane/onnx"]
 cuda = ["crane-core/cuda", "crane/cuda"]
 rocm = ["crane-core/rocm", "crane/rocm"]
+# Intel SYCL / oneAPI backend (proof-of-concept).
+sycl = [
+    "crane-core/sycl",
+    "crane/sycl",
+]
 cudnn = ["crane-core/cudnn", "crane/cudnn"]
 mkl = ["crane-core/mkl", "crane/mkl"]
 

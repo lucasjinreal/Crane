@@ -659,9 +659,9 @@ impl Mlp {
 
                 // Use the fused GPU kernel when available: eliminates
                 // narrow + silu + mul (3 kernel launches → 1).
-                #[cfg(any(feature = "cuda", feature = "rocm"))]
+                #[cfg(any(feature = "cuda", feature = "rocm", feature = "sycl"))]
                 {
-                    if gu.device().is_cuda() || gu.device().is_rocm() {
+                    if gu.device().is_cuda() || gu.device().is_rocm() || gu.device().is_sycl() {
                         let activated =
                             crate::ops::fused_silu_mul(&gu.contiguous()?, *intermediate_size)?;
                         return self.down_proj.forward(&activated);
@@ -1065,7 +1065,7 @@ impl Qwen3Model {
         let device = &devices.main;
         let dtype = if device.is_cuda() {
             DType::BF16
-        } else if device.is_metal() || device.is_rocm() {
+        } else if device.is_metal() || device.is_rocm() || device.is_sycl() {
             DType::F16
         } else {
             DType::F32
@@ -1370,7 +1370,7 @@ impl Qwen3Model {
         // Outermost pass boundary for `CRANE_PROF=1`: covers the whole
         // forward (embedding lookup through `decode`), mirroring
         // `qwen3_5::prefill::forward`'s use of the same timer.
-        let timer = crate::utils::prof::pass(seq_len);
+        let timer = crate::utils::prof::pass(seq_len, input_ids.device());
         let hidden_states = self.embed_tokens.forward(input_ids)?.to_dtype(self.dtype)?;
         let out = self.decode(hidden_states, seq_len, start_pos, input_ids.device());
         if let Some(timer) = timer {
@@ -1400,7 +1400,7 @@ impl Qwen3Model {
         #[cfg(feature = "cuda")]
         let _event_guard = EventTrackingGuard::disable(inputs_embeds.device());
 
-        let timer = crate::utils::prof::pass(seq_len);
+        let timer = crate::utils::prof::pass(seq_len, inputs_embeds.device());
         let hidden_states = inputs_embeds.to_dtype(self.dtype)?;
         let out = self.decode(hidden_states, seq_len, start_pos, inputs_embeds.device());
         if let Some(timer) = timer {

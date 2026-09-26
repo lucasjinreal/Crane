@@ -169,10 +169,9 @@ impl RocmElem for f32 {
 /// T*, uint32_t n)`, allocating the `T`-typed output buffer and wrapping it
 /// into a [`RocmStorageSlice`].
 ///
-/// Currently used by `swiglu`'s `rocm_fwd`; other binary elementwise ops
-/// (`snake`, `atan2`) can adopt it when they gain ROCm support, since each
-/// only differs by dtype, kernel/module name, source and operand pointers,
-/// all supplied here.
+/// Called by [`binary_elementwise_fwd`], which adds shape validation and
+/// dtype dispatch on top. Individual `CustomOp2::rocm_fwd` implementations
+/// should prefer that higher-level helper.
 ///
 /// # Safety
 ///
@@ -208,6 +207,91 @@ pub unsafe fn launch_binary_elementwise<T: RocmElem>(
     // SAFETY: forwarded from this function's own safety contract.
     unsafe { launch(dev, module, kernel, source, grid, block, 0, &mut args) }?;
     Ok(T::wrap_slice(dst))
+}
+
+/// Full ROCm forward pass for a binary elementwise `CustomOp2`.
+///
+/// Handles shape validation, dtype dispatch, pointer extraction, kernel
+/// launch and result wrapping — the entire `rocm_fwd` body that every binary
+/// elementwise fused op (`snake`, `atan2`, `swiglu`) would otherwise
+/// duplicate. Each op calls this from its `CustomOp2::rocm_fwd`, passing its
+/// own module name, kernel prefix and `.cu` source; the launched kernel name
+/// is `{kernel_prefix}_{bf16,f16,f32}` depending on the operands' dtype.
+///
+/// # Safety
+///
+/// For dtype `T` in `{BF16, F16, F32}`, the kernel named
+/// `{kernel_prefix}_{bf16,f16,f32}` in `source` must have exactly the
+/// signature `(const T*, const T*, T*, uint32_t n)` — the same contract
+/// [`launch_binary_elementwise`] requires, forwarded here.
+///
+/// # Errors
+///
+/// Returns an error if `l_lhs`/`l_rhs` have different shapes, if either
+/// operand is not contiguous, if the dtype is not `BF16`/`F16`/`F32`, or if
+/// the kernel launch fails.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn binary_elementwise_fwd(
+    s_lhs: &RocmStorage,
+    l_lhs: &Layout,
+    s_rhs: &RocmStorage,
+    l_rhs: &Layout,
+    module: &str,
+    kernel_prefix: &str,
+    source: &str,
+) -> Result<(RocmStorage, Shape)> {
+    if l_lhs.shape() != l_rhs.shape() {
+        candle_core::bail!("{kernel_prefix}: lhs and rhs must have the same shape");
+    }
+
+    let dev = s_lhs.device.clone();
+    let n = l_lhs.shape().elem_count();
+    let dtype = s_lhs.slice.dtype();
+    let kernel_name = match dtype {
+        DType::BF16 => format!("{kernel_prefix}_bf16"),
+        DType::F16 => format!("{kernel_prefix}_f16"),
+        DType::F32 => format!("{kernel_prefix}_f32"),
+        dt => candle_core::bail!("{kernel_prefix}: unsupported dtype {dt:?}"),
+    };
+
+    let lhs_ptr = slice_ptr(&s_lhs.slice, l_lhs, dtype, &format!("{kernel_prefix} lhs"))?;
+    let rhs_ptr = slice_ptr(&s_rhs.slice, l_rhs, dtype, &format!("{kernel_prefix} rhs"))?;
+
+    // SAFETY: forwarded from this function's own safety contract.
+    let slice = unsafe {
+        match dtype {
+            DType::BF16 => launch_binary_elementwise::<half::bf16>(
+                &dev,
+                module,
+                &kernel_name,
+                source,
+                lhs_ptr,
+                rhs_ptr,
+                n,
+            ),
+            DType::F16 => launch_binary_elementwise::<half::f16>(
+                &dev,
+                module,
+                &kernel_name,
+                source,
+                lhs_ptr,
+                rhs_ptr,
+                n,
+            ),
+            DType::F32 => launch_binary_elementwise::<f32>(
+                &dev,
+                module,
+                &kernel_name,
+                source,
+                lhs_ptr,
+                rhs_ptr,
+                n,
+            ),
+            _ => unreachable!("dtype already validated above"),
+        }
+    }?;
+
+    Ok((RocmStorage { slice, device: dev }, l_lhs.shape().clone()))
 }
 
 /// Hand an f32 output buffer back as a `Tensor` of `shape`, without a copy.

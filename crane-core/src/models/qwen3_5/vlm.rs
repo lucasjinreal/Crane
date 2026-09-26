@@ -340,12 +340,12 @@ impl Qwen3_5VLModel {
         self.text.forward_embeds(&hidden, &pos, start_pos, None)
     }
 
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if resetting the GDN recurrent caches fails, which cannot
-    /// happen because it only clears in-memory state.
-    pub fn clear_kv_cache(&mut self) {
-        self.text.reset_gdn_caches().expect("GDN reset failed");
+    /// Returns an error if a cache could not be reset: the reset issues device
+    /// memsets, so it is not infallible in-memory bookkeeping.
+    pub fn clear_kv_cache(&mut self) -> Result<()> {
+        self.text.reset_gdn_caches()
     }
 
     /// Build the `input_ids` for one user turn, expanding the single
@@ -434,7 +434,7 @@ impl Qwen3_5VLModel {
         let input_tensor =
             Tensor::from_vec(input_ids.clone(), (1usize, input_ids.len()), &self.device)?;
 
-        self.clear_kv_cache();
+        self.clear_kv_cache()?;
         let mut logits = self.forward(&input_tensor, pixel_values, grid_tensor.as_ref(), 0)?;
 
         let mut generated: Vec<u32> = Vec::with_capacity(cfg.max_new_tokens);

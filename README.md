@@ -395,6 +395,43 @@ Notes:
   directory: snapshot files are symlinks into `../../blobs`.
 - More detail: [crane-serve/docs/gpu.md](crane-serve/docs/gpu.md).
 
+#### Intel GPU / SYCL (proof-of-concept)
+
+SYCL/oneAPI support targets Intel GPUs. candle 0.11 on crates.io has no `sycl`
+feature, so `--features sycl` swaps `crane-core`'s candle dependency (see
+`crane-core/src/candle_backend.rs`) for `candle-core-sycl`/`candle-nn-sycl`/
+`candle-transformers-sycl` — workspace deps in the root `Cargo.toml` pointing at
+the `sycle-support` branch of
+[`Hahihula/candle`](https://github.com/Hahihula/candle): candle 0.11.0 plus an
+**off-by-default** `sycl` feature (native rms_norm / softmax / rope / sigmoid
+kernels, a quantized mat-vec, and a small `pub` launch surface). With `sycl` off
+this build stays on stock candle, so CPU/CUDA/Metal/ROCm builds are unaffected.
+
+Needs the Intel oneAPI toolchain (`icpx`, oneMKL) and the Level-Zero GPU runtime;
+the `intel/oneapi-basekit` image bundles both, and `--device /dev/dri` exposes an
+Intel GPU (`sycl-ls` should list a `level_zero:gpu` entry). `--features sycl`
+selects `DeviceConfig::Sycl(0)` in the examples / `crane-serve` device ladder
+(`Device::new_sycl`) and builds `crane-core/kernels/sycl/` into
+`libcrane_gdn_sycl.so` — a **fused Gated Delta Net recurrence** kernel (the SYCL
+counterpart of `kernels/cuda/gdn.cu`) plus a fused `SiLU(gate) * up`.
+
+```bash
+source /opt/intel/oneapi/setvars.sh          # skip inside the oneAPI container
+cargo build --release --features sycl
+cargo run  --release --features sycl -p crane-examples --bin chat_cli -- \
+    -m /path/to/Qwen3.5-0.8B
+```
+
+Setup details, a containerised build/run/test recipe and the driver gotchas
+(Level-Zero V2, Resizable BAR) are in [`docker/sycl/`](docker/sycl/).
+
+Verified on an Intel Arc iGPU (Meteor Lake) and a discrete Arc Pro B70
+(Battlemage): `Qwen3-0.6B`, `Qwen3.5-0.8B` and `Qwen3.8-27B` (GGUF Q4_K_M, ~11.5
+tok/s decode) generate coherent text. The fused GDN kernel matches the portable
+reference (`cos = 1.0`, `--test sycl_kernels`) and is ~15% faster at decode;
+`CRANE_GDN_PORTABLE=1` forces the op-by-op path. It's a naive v0 (no
+shared-memory staging), so there is headroom.
+
 ### OpenAI API Server
 
 Start a server compatible with OpenAI SDK and SGLang client:
@@ -597,6 +634,11 @@ decode steps take exactly the single-pass path. Measured on an RX 7800 XT
   device sync, plus a per-stage breakdown. When the two are close the pass is
   dispatch-bound and no kernel change will help; `rocm-smi`'s busy counter
   cannot distinguish the two cases. Output goes to stderr, no `RUST_LOG` needed.
+- `CRANE_PROF_SYNC=1` — with `CRANE_PROF`, sync the device around every stage so
+  the per-stage numbers become *GPU* time instead of submission time. It removes
+  all CPU/GPU overlap, so read it as a breakdown of where the GPU time goes, not
+  as throughput. Without it a stage that happens to block (a host round-trip, a
+  kernel that waits) charges the whole drained queue to itself.
 - `CRANE_TOPK_HOST=1` — force the host sort for top-k sampling on ROCm
   instead of the GPU kernel (A/B the kernel against the path it replaces).
 - `cargo run -p crane-core --release --features cuda --bin gdn_bench`
@@ -779,6 +821,7 @@ above for context):
 | `CRANE_PREFILL_CHUNK` | `512` | Prefill chunk size in tokens. Prompts longer than this are fed through the KV/GDN caches in chunks, so peak VRAM grows linearly with context instead of quadratically. `0` disables chunking (single-pass prefill) |
 | `CRANE_PROF` | unset | Profile the forward pass: submission time vs. wall time after a device sync, with a per-stage breakdown. Separates dispatch-bound from GPU-bound. Prints to stderr |
 | `CRANE_PROF_EVERY` | `64` | Passes per `CRANE_PROF` summary line |
+| `CRANE_PROF_SYNC` | unset | With `CRANE_PROF`, sync around every stage so stage times are GPU time, not submission time (kills overlap — use to attribute, not to measure) |
 
 ## ⚡️ Speed
 

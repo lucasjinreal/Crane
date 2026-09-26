@@ -4,8 +4,50 @@ use candle_core::quantized::gguf_file::Content;
 use ribo::utils::log;
 use std::path::{Path, PathBuf};
 use tokenizers::models::bpe::BPE;
+use tokenizers::pre_tokenizers::PreTokenizerWrapper;
 use tokenizers::pre_tokenizers::byte_level::ByteLevel as ByteLevelPreTokenizer;
-use tokenizers::{AddedToken, Tokenizer};
+use tokenizers::pre_tokenizers::sequence::Sequence as PreTokenizerSequence;
+use tokenizers::pre_tokenizers::split::Split;
+use tokenizers::{AddedToken, SplitDelimiterBehavior, Tokenizer};
+
+/// Qwen's pre-tokenizer split pattern, as it appears in HuggingFace's
+/// `tokenizer.json` for every Qwen 2/2.5/3/3.5 checkpoint (and as llama.cpp's
+/// `qwen2` pre-tokenizer implements it).
+///
+/// It differs from the GPT-2 default `ByteLevel` carries: one leading
+/// non-letter, non-digit character attaches to the following run of letters,
+/// and digits split one at a time. BPE merges cannot cross a pre-token
+/// boundary, so the two produce different token sequences for paths,
+/// identifiers and code (`/a_b` → `/a` + `_b` vs. `/` + `a` + `_` + `b`).
+const QWEN_PRE_TOKENIZER_SPLIT: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^
+\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[
+]*|\s*[
+]+|\s+(?!\S)|\s+";
+
+/// The `Sequence[Split, ByteLevel]` pre-tokenizer Qwen checkpoints ship.
+/// `ByteLevel` here only maps bytes to its printable alphabet: the regex split
+/// is done by the `Split` stage, so `use_regex` is off, and Qwen sets
+/// `add_prefix_space: false`.
+fn qwen_pre_tokenizer() -> Result<PreTokenizerWrapper> {
+    let split = Split::new(
+        tokenizers::pre_tokenizers::split::SplitPattern::Regex(
+            QWEN_PRE_TOKENIZER_SPLIT.to_string(),
+        ),
+        SplitDelimiterBehavior::Isolated,
+        false,
+    )
+    .map_err(anyhow::Error::msg)
+    .context("failed to build Qwen pre-tokenizer regex")?;
+    let byte_level = ByteLevelPreTokenizer::new(false, false, false);
+    Ok(PreTokenizerWrapper::Sequence(PreTokenizerSequence::new(
+        vec![split.into(), byte_level.into()],
+    )))
+}
+
+/// Whether `tokenizer.ggml.pre` names a Qwen-family pre-tokenizer.
+fn is_qwen_pre(pre: &str) -> bool {
+    pre.starts_with("qwen")
+}
 
 #[derive(Debug, serde::Deserialize)]
 struct TokenObj {
@@ -275,7 +317,21 @@ pub fn build_tokenizer_from_gguf(ct: &Content) -> Result<Tokenizer> {
         .map_err(anyhow::Error::msg)
         .context("Failed to build BPE tokenizer from GGUF metadata")?;
     let mut tokenizer = Tokenizer::new(model);
-    tokenizer.with_pre_tokenizer(Some(ByteLevelPreTokenizer::default()));
+    // `tokenizer.ggml.pre` names the pre-tokenizer the checkpoint was trained
+    // with. Always using the `ByteLevel` (GPT-2) default instead mis-tokenizes
+    // anything that is not plain prose: a Qwen model asked to echo
+    // `/a_b/c_d.txt` answers `/a_ b/c_ d.txt`, breaking tool calls that carry
+    // file paths or snake_case identifiers.
+    let pre = ct
+        .metadata
+        .get("tokenizer.ggml.pre")
+        .and_then(|v| v.to_string().ok().cloned())
+        .unwrap_or_default();
+    if is_qwen_pre(&pre) {
+        tokenizer.with_pre_tokenizer(Some(qwen_pre_tokenizer()?));
+    } else {
+        tokenizer.with_pre_tokenizer(Some(ByteLevelPreTokenizer::default()));
+    }
     tokenizer.with_decoder(Some(tokenizers::decoders::byte_level::ByteLevel::default()));
 
     // Register special / added tokens. The HF tokenizer.json uses
@@ -476,5 +532,48 @@ mod tests {
         let gguf_path = dir.path().join("model.gguf");
 
         assert!(find_sibling_tokenizer(&gguf_path).is_err());
+    }
+}
+
+#[cfg(test)]
+mod pre_tokenizer_tests {
+    use super::*;
+    use tokenizers::PreTokenizedString;
+    use tokenizers::tokenizer::PreTokenizer;
+
+    fn pieces(pre: &PreTokenizerWrapper, text: &str) -> Vec<String> {
+        let mut s = PreTokenizedString::from(text);
+        pre.pre_tokenize(&mut s).unwrap();
+        s.get_splits(
+            tokenizers::OffsetReferential::Original,
+            tokenizers::OffsetType::Char,
+        )
+        .into_iter()
+        .map(|(t, _, _)| t.to_string())
+        .collect()
+    }
+
+    /// With GPT-2's `ByteLevel` default `/a_b` splits to `/`, `a`, `_`, `b`,
+    /// which is not how any Qwen checkpoint was trained.
+    #[test]
+    fn qwen_pre_tokenizer_keeps_paths_and_identifiers_together() {
+        let qwen = qwen_pre_tokenizer().unwrap();
+        assert_eq!(pieces(&qwen, "/a_b"), vec!["/a", "_b"]);
+        assert_eq!(
+            pieces(&qwen, "snake_case_name"),
+            vec!["snake", "_case", "_name"]
+        );
+
+        // The GPT-2 default disagrees.
+        let gpt2 = PreTokenizerWrapper::ByteLevel(ByteLevelPreTokenizer::default());
+        assert_ne!(pieces(&gpt2, "/a_b"), pieces(&qwen, "/a_b"));
+    }
+
+    #[test]
+    fn only_qwen_checkpoints_take_the_qwen_pre_tokenizer() {
+        assert!(is_qwen_pre("qwen2"));
+        assert!(is_qwen_pre("qwen35"));
+        assert!(!is_qwen_pre("llama-bpe"));
+        assert!(!is_qwen_pre(""));
     }
 }

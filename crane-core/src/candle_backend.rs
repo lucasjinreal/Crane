@@ -10,6 +10,15 @@
 // The extern-prelude effect above is local to this crate, so a downstream
 // module still needs its own `use crane_core::candle_core;` (etc.) to use
 // the unqualified `candle_core::` path.
+//
+// Every branch below rebinds a *renamed* dependency (`candle_core_default`,
+// `candle_core_rocm`, `candle_core_sycl`, ...), never the bare `candle-core`
+// package — including the plain/stock branch. rustc refuses to let a
+// macro/`include!`-expanded `extern crate` shadow a name Cargo already wired
+// in via `--extern`, so if `crane-core/Cargo.toml` ever depended on the
+// unrenamed `candle-core` directly, this rebinding would fail to compile the
+// moment `rocm`/`sycl` was enabled (Cargo still passes `--extern candle_core`
+// for it — see `default-backend` in `crane-core/Cargo.toml`).
 
 // Intel oneAPI/SYCL fork. Delete this block (and the `candle-*-sycl`
 // workspace deps) once SYCL support merges into candle main — at that
@@ -33,11 +42,11 @@ pub extern crate candle_nn_rocm as candle_nn;
 pub extern crate candle_transformers_rocm as candle_transformers;
 
 #[cfg(not(any(feature = "sycl", feature = "rocm")))]
-pub extern crate candle_core;
+pub extern crate candle_core_default as candle_core;
 #[cfg(not(any(feature = "sycl", feature = "rocm")))]
-pub extern crate candle_nn;
+pub extern crate candle_nn_default as candle_nn;
 #[cfg(not(any(feature = "sycl", feature = "rocm")))]
-pub extern crate candle_transformers;
+pub extern crate candle_transformers_default as candle_transformers;
 
 // Flat re-exports of candle's foundational, backend-agnostic types, so
 // outside crates (crane-serve, crane, tests) can write `crane_core::Tensor`

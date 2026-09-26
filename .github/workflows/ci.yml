@@ -77,6 +77,44 @@ jobs:
           # call nvidia-smi to auto-detect the compute capability.
           CUDA_COMPUTE_CAP: "80"
 
+  build-sycl:
+    # Intel's oneAPI apt repo (same one docker/sycl/Dockerfile.dev's base
+    # image installs from). This runner has no Intel GPU, so this only
+    # proves crane-core/kernels/sycl/*.cpp and the candle-*-sycl fork build
+    # with icpx, not that they run — see README's "Intel GPU / SYCL"
+    # section and docker/sycl/ for the driver/runtime side.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install protoc and ALSA dev headers
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libasound2-dev
+      - name: Install Intel oneAPI basekit (icpx, oneMKL, Level-Zero headers)
+        run: |
+          wget -qO- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
+            | gpg --dearmor | sudo tee /usr/share/keyrings/oneapi-archive-keyring.gpg > /dev/null
+          echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" \
+            | sudo tee /etc/apt/sources.list.d/oneAPI.list
+          sudo apt-get update
+          sudo apt-get install -y intel-basekit
+      - name: Source oneAPI environment
+        # setvars.sh computes MKLROOT/CPATH/LIBRARY_PATH/etc. dynamically, so
+        # they're captured here and passed to the next step via $GITHUB_ENV
+        # rather than hardcoded (each `run:` step is a fresh shell).
+        run: |
+          source /opt/intel/oneapi/setvars.sh
+          {
+            echo "PATH=$PATH"
+            echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
+            echo "LIBRARY_PATH=$LIBRARY_PATH"
+            echo "CPATH=$CPATH"
+            echo "MKLROOT=$MKLROOT"
+            echo "ONEAPI_ROOT=$ONEAPI_ROOT"
+          } >> "$GITHUB_ENV"
+      - name: Build (SYCL)
+        run: cargo build --release --no-default-features --features "sycl,onnx"
+
   build-rocm:
     # ROCm's apt repo only ships packages for jammy/noble; jammy is the
     # combination documented and exercised in practice (see README's

@@ -42,7 +42,31 @@ pub trait ModelBackend: Send + 'static {
     fn forward_step(&mut self, input_ids: &[u32], start_pos: usize) -> Result<Tensor>;
 
     /// Clear all KV caches.
-    fn clear_kv_cache(&mut self);
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a cache could not be reset: on an accelerator this
+    /// issues device memsets, so it fails for the same reasons any other
+    /// device op does.
+    fn clear_kv_cache(&mut self) -> Result<()>;
+
+    /// Capture the layer state so a later request sharing this token prefix
+    /// can resume from it. `None` when the backend cannot (the default).
+    ///
+    /// The capture is only valid until something resets the caches.
+    fn snapshot_state(&self) -> Option<crane_core::models::qwen3_5::StateSnapshot> {
+        None
+    }
+
+    /// Restore a [`snapshot_state`](Self::snapshot_state) capture.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend cannot restore, or the snapshot does
+    /// not describe this model.
+    fn restore_state(&mut self, _snap: &crane_core::models::qwen3_5::StateSnapshot) -> Result<()> {
+        anyhow::bail!("this backend does not support state snapshots")
+    }
 
     /// Number of transformer layers (for KV cache vector sizing).
     fn num_layers(&self) -> usize;
@@ -199,8 +223,9 @@ impl ModelBackend for Gemma4Backend {
             .map_err(Into::into)
     }
 
-    fn clear_kv_cache(&mut self) {
+    fn clear_kv_cache(&mut self) -> Result<()> {
         self.model.clear_kv_cache();
+        Ok(())
     }
 
     fn num_layers(&self) -> usize {
@@ -275,8 +300,9 @@ impl ModelBackend for HunyuanBackend {
             .map_err(Into::into)
     }
 
-    fn clear_kv_cache(&mut self) {
+    fn clear_kv_cache(&mut self) -> Result<()> {
         self.model.clear_kv_cache();
+        Ok(())
     }
 
     fn num_layers(&self) -> usize {
@@ -405,8 +431,9 @@ impl ModelBackend for Qwen25Backend {
             .map_err(Into::into)
     }
 
-    fn clear_kv_cache(&mut self) {
+    fn clear_kv_cache(&mut self) -> Result<()> {
         self.model.clear_kv_cache();
+        Ok(())
     }
 
     fn num_layers(&self) -> usize {
@@ -479,8 +506,9 @@ impl ModelBackend for Minicpm5Backend {
             .map_err(Into::into)
     }
 
-    fn clear_kv_cache(&mut self) {
+    fn clear_kv_cache(&mut self) -> Result<()> {
         self.model.clear_kv_cache();
+        Ok(())
     }
 
     fn num_layers(&self) -> usize {
@@ -578,8 +606,16 @@ impl ModelBackend for Qwen3_5Backend {
         self.model.forward_step(input_ids, start_pos)
     }
 
-    fn clear_kv_cache(&mut self) {
-        self.model.clear_kv_cache();
+    fn clear_kv_cache(&mut self) -> Result<()> {
+        self.model.clear_kv_cache()
+    }
+
+    fn snapshot_state(&self) -> Option<crane_core::models::qwen3_5::StateSnapshot> {
+        Some(self.model.snapshot_state())
+    }
+
+    fn restore_state(&mut self, snap: &crane_core::models::qwen3_5::StateSnapshot) -> Result<()> {
+        self.model.restore_state(snap)
     }
 
     fn num_layers(&self) -> usize {
@@ -685,8 +721,9 @@ impl ModelBackend for Qwen3Backend {
             .map_err(Into::into)
     }
 
-    fn clear_kv_cache(&mut self) {
+    fn clear_kv_cache(&mut self) -> Result<()> {
         self.model.clear_kv_cache();
+        Ok(())
     }
 
     fn num_layers(&self) -> usize {
