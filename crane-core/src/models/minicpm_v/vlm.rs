@@ -238,8 +238,12 @@ impl MinicpmV46VLModel {
         self.text.forward_embeds(&hidden, &pos, start_pos, None)
     }
 
-    pub fn clear_kv_cache(&mut self) {
-        self.text.reset_gdn_caches().expect("GDN reset failed");
+    /// # Errors
+    ///
+    /// Returns an error if a cache could not be reset: the reset issues device
+    /// memsets, so it is not infallible in-memory bookkeeping.
+    pub fn clear_kv_cache(&mut self) -> Result<()> {
+        self.text.reset_gdn_caches()
     }
 
     /// Preprocess `image` and build the `input_ids` for one user turn,
@@ -302,7 +306,7 @@ impl MinicpmV46VLModel {
             None => (None, None),
         };
 
-        self.clear_kv_cache();
+        self.clear_kv_cache()?;
         let mut logits = self.forward(
             &input_tensor,
             pixel_values.as_ref(),

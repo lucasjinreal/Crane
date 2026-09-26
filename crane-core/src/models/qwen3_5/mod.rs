@@ -23,11 +23,15 @@ pub mod vlm;
 
 pub use config::{Config, LayerType, TextConfig, VisionConfig, load_config};
 pub use kv_cache::{KvCache, KvCacheBackend, KvCacheKind};
+pub use model::StateSnapshot;
 pub use model::{Model, ModelFormat, Qwen3_5TextModel};
 pub use modeling::{
     DecoderLayer, FullAttention, MRotaryEmbedding, Mlp, Qwen35RmsNorm, RopeSlice, apply_mrope,
 };
-pub use prefill::{DEFAULT_CHUNK as DEFAULT_PREFILL_CHUNK, chunk_size as prefill_chunk_size};
+pub use prefill::{
+    DEFAULT_CHUNK as DEFAULT_PREFILL_CHUNK, chunk_size as prefill_chunk_size,
+    set_default_chunk as set_default_prefill_chunk,
+};
 pub use processor::{PreprocessorConfig, ProcessedImage, load_preprocessor_config};
 pub use vision::Qwen3_5VisionModel;
 pub use vlm::{Qwen3_5VLModel, VlGenerationConfig};

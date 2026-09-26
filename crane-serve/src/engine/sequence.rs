@@ -42,6 +42,15 @@ pub struct Sequence {
     pub tokens: Vec<u32>,
     /// Length of the original prompt (tokens before generation started).
     pub prompt_len: usize,
+    /// Leading prompt tokens whose model state is already loaded, so prefill
+    /// can start partway in. Set by the engine's prefix cache when this
+    /// request's prompt extends what the model already holds; `0` otherwise.
+    ///
+    /// Only ever an *exact* prefix length. The hybrid layers carry a recurrent
+    /// state that summarises everything fed so far, so it can be resumed only
+    /// at the position it actually reached — unlike an attention KV cache,
+    /// there is no truncating it to an arbitrary shorter prefix.
+    pub cached_prefix_len: usize,
 
     // ── KV cache (one entry per transformer layer) ──
     /// Saved KV caches when this sequence is not the one loaded in the model.
@@ -208,7 +217,7 @@ impl Sequence {
         // During decode each step adds one token, so the cache covers
         // tokens.len() - 1 positions (the new token hasn't been cached yet).
         if self.status == SequenceStatus::Waiting {
-            0
+            self.cached_prefix_len
         } else {
             self.tokens.len().saturating_sub(1)
         }
@@ -218,8 +227,8 @@ impl Sequence {
     #[must_use]
     pub fn next_input_ids(&self) -> &[u32] {
         if self.status == SequenceStatus::Waiting {
-            // Prefill: feed all prompt tokens.
-            &self.tokens[..self.prompt_len]
+            // Prefill: feed the prompt tokens the model does not already hold.
+            &self.tokens[self.cached_prefix_len..self.prompt_len]
         } else {
             // Decode: feed only the last generated token.
             &self.tokens[self.tokens.len() - 1..]
@@ -293,6 +302,7 @@ mod tests {
         let mut tokens = prompt.to_vec();
         tokens.extend_from_slice(generated);
         Sequence {
+            cached_prefix_len: 0,
             id: "test-seq".into(),
             status,
             tokens,
@@ -372,6 +382,25 @@ mod tests {
         // Just moved to Running but no token generated yet
         let seq = make_seq(&[1, 2, 3], &[], 10, 0, SequenceStatus::Running);
         assert_eq!(seq.start_pos(), 2); // tokens.len() - 1 = 3 - 1
+    }
+
+    #[test]
+    fn cached_prefix_shifts_prefill_start_and_input() {
+        // The engine found the model already holds tokens [1, 2]; prefill must
+        // feed only the remainder and start at the absolute position 2 so RoPE
+        // and the KV cache line up with what is already there.
+        let mut seq = make_seq(&[1, 2, 3, 4], &[], 10, 0, SequenceStatus::Waiting);
+        seq.cached_prefix_len = 2;
+        assert_eq!(seq.start_pos(), 2);
+        assert_eq!(seq.next_input_ids(), &[3, 4]);
+    }
+
+    #[test]
+    fn cached_prefix_does_not_affect_decode() {
+        let mut seq = make_seq(&[1, 2, 3], &[10, 11], 10, 0, SequenceStatus::Running);
+        seq.cached_prefix_len = 2;
+        assert_eq!(seq.next_input_ids(), &[11]);
+        assert_eq!(seq.start_pos(), 4);
     }
 
     #[test]

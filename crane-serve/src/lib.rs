@@ -224,6 +224,8 @@ fn format_device_name(device: &candle_core::Device) -> String {
         candle_core::DeviceLocation::Metal { gpu_id } => format!("metal:{gpu_id}"),
         #[cfg(feature = "rocm")]
         candle_core::DeviceLocation::Rocm { gpu_id } => format!("rocm:{gpu_id}"),
+        #[cfg(feature = "sycl")]
+        candle_core::DeviceLocation::Sycl { gpu_id } => format!("sycl:{gpu_id}"),
     }
 }
 
@@ -399,6 +401,9 @@ pub fn init_logging(log_level: Option<&str>) -> Result<()> {
 }
 
 pub async fn cli_main() -> Result<()> {
+    // Must run before anything touches SYCL; a no-op off `--features sycl`.
+    crane_core::utils::sycl_env::ensure_sycl_runtime_env();
+
     let args = Args::parse();
     init_logging(args.log_level.as_deref())?;
     run(args).await
@@ -728,7 +733,7 @@ fn run_duplex_loop(
 /// silently forces CPU on ROCm builds (the bug this replaced in the
 /// TTS/ASR/duplex/VLM device-selection code below).
 pub(crate) fn is_gpu_device(device: &crane_core::models::Device) -> bool {
-    device.is_cuda() || device.is_rocm()
+    device.is_cuda() || device.is_rocm() || device.is_sycl()
 }
 
 /// Resolve the compute dtype. An explicit `--dtype` always wins; otherwise
@@ -769,6 +774,10 @@ fn resolve_dtype(
     // default for this family until it's been checked against F16 output
     // quality on this backend.
     if device.is_rocm() && model_type != ModelType::Qwen3ASR {
+        return Ok(DType::F16);
+    }
+    // F16/BF16/F32 all work on SYCL; default to F16, as on ROCm/Metal.
+    if device.is_sycl() {
         return Ok(DType::F16);
     }
     // TODO: Qwen3-ASR hasn't been verified on Metal; it may hit the same
@@ -1030,7 +1039,13 @@ pub async fn run(mut args: Args) -> Result<()> {
             // Fall back to CPU when no AMD GPU is present, mirroring the metal idiom.
             crane_core::models::Device::new_rocm(0).unwrap_or(crane_core::models::Device::Cpu)
         }
-        #[cfg(all(not(feature = "cuda"), not(feature = "rocm")))]
+        #[cfg(all(not(feature = "cuda"), not(feature = "rocm"), feature = "sycl"))]
+        {
+            // Intel oneAPI / SYCL (proof-of-concept). Fall back to CPU when no
+            // usable SYCL device is found.
+            crane_core::models::Device::new_sycl(0).unwrap_or(crane_core::models::Device::Cpu)
+        }
+        #[cfg(all(not(feature = "cuda"), not(feature = "rocm"), not(feature = "sycl")))]
         {
             #[cfg(target_os = "macos")]
             {

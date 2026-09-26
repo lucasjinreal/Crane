@@ -1,0 +1,57 @@
+# Crane SYCL (Intel oneAPI) build + run environment — proof-of-concept.
+#
+# This is the *dev* container: it does not bake a binary in. `docker/sycl/run.sh`
+# mounts the repo into it and runs `cargo build`/`cargo run`/`cargo test` inside
+# on each invocation, so the compiled binary stays in sync with the mounted
+# source. For a deployable image with `crane-serve` baked in, see `Dockerfile`
+# in this same directory.
+#
+#   docker build -t crane-sycl:dev -f docker/sycl/Dockerfile.dev docker/sycl
+#
+# Base image ships the icpx SYCL compiler, oneMKL, and a Level-Zero GPU
+# runtime — usable out of the box (`sycl-ls` lists a `level_zero:gpu` entry)
+# on hardware old enough for that bundled driver to recognize. It does NOT
+# recognize Battlemage (Arc B-series, incl. Arc Pro B70): see the pinned
+# driver upgrade below.
+FROM docker.io/intel/oneapi-basekit:2025.1.0-0-devel-ubuntu24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl ca-certificates build-essential pkg-config git \
+        libssl-dev cmake libasound2-dev wget \
+    && rm -rf /var/lib/apt/lists/*
+
+# Rust (edition 2024 needs >= 1.85; pin to match the host stable toolchain).
+ENV RUSTUP_HOME=/opt/rustup \
+    CARGO_HOME=/opt/cargo \
+    PATH=/opt/cargo/bin:$PATH
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --profile minimal --default-toolchain 1.93.0 \
+    && rustc --version
+
+# Replace the basekit's bundled Level-Zero/compute-runtime/IGC with a newer
+# matched set from GitHub releases — see docker/sycl/Dockerfile's runtime
+# stage for why (Battlemage device recognition needs compute-runtime 25.27+;
+# Intel's apt repo tops out at 25.18) and why these four versions move
+# together, not independently. `libigc2`/`libigdfcl2` are purged first: the
+# basekit's apt packages and the newer `intel-igc-core-2`/`intel-igc-opencl-2`
+# GitHub-release packages use different names for the same files, so without
+# this dpkg refuses the install as a file conflict.
+ARG COMPUTE_RUNTIME_VERSION=26.35.39758.10
+ARG IGC_VERSION=2.41.5
+ARG IGC_BUILD=22716
+ARG LEVEL_ZERO_VERSION=1.33.1
+RUN apt-get remove -y --purge libigc2 libigdfcl2 && \
+    cd /tmp && \
+    for pkg in \
+        "https://github.com/oneapi-src/level-zero/releases/download/v${LEVEL_ZERO_VERSION}/libze1_${LEVEL_ZERO_VERSION}+u24.04_amd64.deb" \
+        "https://github.com/intel/intel-graphics-compiler/releases/download/v${IGC_VERSION}/intel-igc-core-2_${IGC_VERSION}+${IGC_BUILD}_amd64.deb" \
+        "https://github.com/intel/intel-graphics-compiler/releases/download/v${IGC_VERSION}/intel-igc-opencl-2_${IGC_VERSION}+${IGC_BUILD}_amd64.deb" \
+        "https://github.com/intel/compute-runtime/releases/download/${COMPUTE_RUNTIME_VERSION}/libigdgmm12_22.10.0_amd64.deb" \
+        "https://github.com/intel/compute-runtime/releases/download/${COMPUTE_RUNTIME_VERSION}/libze-intel-gpu1_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb" \
+        "https://github.com/intel/compute-runtime/releases/download/${COMPUTE_RUNTIME_VERSION}/intel-opencl-icd_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb" \
+        ; do wget -q "$pkg"; done && \
+    dpkg -i ./*.deb && \
+    rm -rf /tmp/*.deb
+
+WORKDIR /src

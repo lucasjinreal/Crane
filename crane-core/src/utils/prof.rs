@@ -14,8 +14,12 @@
 //!
 //! Span timings are CPU-side only and take no syncs, so they measure submission
 //! cost without perturbing it — which is exactly the quantity of interest when
-//! the answer is "dispatch-bound". They do *not* attribute GPU time; use
-//! `rocprof` for that.
+//! the answer is "dispatch-bound". They do *not* attribute GPU time unless
+//! `CRANE_PROF_SYNC=1` is set, which syncs the device around every span and so
+//! turns each into GPU time (at the cost of all CPU/GPU overlap — read those
+//! numbers as a breakdown, never as throughput). Without it a span that ends up
+//! blocking (a host round-trip, a kernel that waits) charges the whole drained
+//! queue to itself, which is how the GDN `qkv` span once read ~10-19 ms.
 //!
 //! Everything here compiles to a predictable-branch no-op when the variable is
 //! unset: [`timed`] calls the closure directly and [`pass`] returns `None`.
@@ -107,6 +111,30 @@ pub fn enabled() -> bool {
     })
 }
 
+/// `CRANE_PROF_SYNC=1`: synchronize the device around every span, so span
+/// times become *GPU* time rather than submission time. Perturbs the pass (no
+/// CPU/GPU pipelining), so use it to attribute, not to measure throughput.
+fn sync_spans() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        enabled() && std::env::var("CRANE_PROF_SYNC").is_ok_and(|v| !matches!(v.trim(), "" | "0"))
+    })
+}
+
+/// The device of the pass in progress, for [`sync_spans`].
+static SYNC_DEVICE: Mutex<Option<Device>> = Mutex::new(None);
+
+fn sync_span_device() {
+    if !sync_spans() {
+        return;
+    }
+    if let Ok(dev) = SYNC_DEVICE.lock()
+        && let Some(dev) = dev.as_ref()
+    {
+        let _ = dev.synchronize();
+    }
+}
+
 /// Passes per summary line; `CRANE_PROF_EVERY`, default 64.
 fn report_every() -> u64 {
     static N: OnceLock<u64> = OnceLock::new();
@@ -129,8 +157,10 @@ pub fn timed<T>(span: Span, f: impl FnOnce() -> T) -> T {
     if !enabled() {
         return f();
     }
+    sync_span_device();
     let t0 = Instant::now();
     let out = f();
+    sync_span_device();
     #[allow(clippy::cast_possible_truncation)]
     SPAN_NS[span as usize].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
     out
@@ -174,9 +204,15 @@ pub struct PassTimer {
 /// Begin timing a forward pass over `seq_len` tokens, or `None` when profiling
 /// is off.
 #[must_use]
-pub fn pass(seq_len: usize) -> Option<PassTimer> {
+pub fn pass(seq_len: usize, device: &Device) -> Option<PassTimer> {
     if !enabled() {
         return None;
+    }
+    if sync_spans() {
+        if let Ok(mut dev) = SYNC_DEVICE.lock() {
+            *dev = Some(device.clone());
+        }
+        let _ = device.synchronize();
     }
     Some(PassTimer {
         start: Instant::now(),
@@ -287,7 +323,7 @@ mod tests {
             "CRANE_PROF must be unset in the test environment"
         );
         assert_eq!(timed(Span::Embed, || 7), 7);
-        assert!(pass(1).is_none());
+        assert!(pass(1, &candle_core::Device::Cpu).is_none());
         assert_eq!(SPAN_NS[Span::Embed as usize].load(Ordering::Relaxed), 0);
     }
 

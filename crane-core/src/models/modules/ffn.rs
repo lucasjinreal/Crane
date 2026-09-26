@@ -2,7 +2,7 @@ use candle_core::{D, Result, Tensor};
 use candle_nn::{Activation, Module, VarBuilder};
 
 use crate::models::with_tracing::{Linear, linear_no_bias};
-#[cfg(any(feature = "cuda", feature = "rocm"))]
+#[cfg(any(feature = "cuda", feature = "rocm", feature = "sycl"))]
 use crate::utils::DeviceExt;
 
 /// `SwiGLU` feed-forward network with merged gate/up projection.
@@ -65,9 +65,9 @@ impl Module for SwiGluFfn {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let gu = x.apply(&self.gate_up_proj)?;
 
-        #[cfg(any(feature = "cuda", feature = "rocm"))]
+        #[cfg(any(feature = "cuda", feature = "rocm", feature = "sycl"))]
         if matches!(self.activation, Activation::Silu)
-            && (gu.device().is_cuda() || gu.device().is_rocm())
+            && (gu.device().is_cuda() || gu.device().is_rocm() || gu.device().is_sycl())
         {
             let activated = crate::ops::fused_silu_mul(&gu.contiguous()?, self.intermediate_size)?;
             return self.down_proj.forward(&activated);

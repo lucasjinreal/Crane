@@ -39,6 +39,13 @@ pub trait KvCacheBackend {
     fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)>;
     /// Drop all cached state (between unrelated requests).
     fn reset(&mut self);
+    /// Forget everything past `len`, keeping positions `0..len`.
+    ///
+    /// The cache is an append-only buffer plus a fill level, so this is just
+    /// lowering the fill level: positions `0..len` stay valid and the next
+    /// append overwrites the discarded tail. Used to rewind to a prompt
+    /// boundary when a later request reuses that prefix.
+    fn truncate(&mut self, len: usize);
     /// Number of cached positions.
     fn len(&self) -> usize;
     fn is_empty(&self) -> bool {
@@ -107,6 +114,14 @@ impl KvCache {
         match self {
             Self::Fp(c) => c.reset(),
             Self::Quant(c) => c.reset(),
+        }
+    }
+
+    /// Keep only positions `0..len`; see [`KvCacheBackend::truncate`].
+    pub fn truncate(&mut self, len: usize) {
+        match self {
+            Self::Fp(c) => c.truncate(len),
+            Self::Quant(c) => c.truncate(len),
         }
     }
 
@@ -205,6 +220,10 @@ impl KvCacheBackend for FpKvCache {
         self.k = None;
         self.v = None;
         self.seq_len = 0;
+    }
+
+    fn truncate(&mut self, len: usize) {
+        self.seq_len = self.seq_len.min(len);
     }
 
     fn len(&self) -> usize {
@@ -332,6 +351,10 @@ impl KvCacheBackend for QuantKvCache {
         let k_full = dequantize_per_token(&kc_full, &ks_full, self.bits, dtype)?;
         let v_full = dequantize_per_token(&vc_full, &vs_full, self.bits, dtype)?;
         Ok((k_full, v_full))
+    }
+
+    fn truncate(&mut self, len: usize) {
+        self.seq_len = self.seq_len.min(len);
     }
 
     fn reset(&mut self) {

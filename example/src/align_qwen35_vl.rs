@@ -161,7 +161,7 @@ fn main() -> Result<()> {
 
     // ===== 2. prefill logits alignment =====
     // Warm up so Metal shader compilation is not counted in the timed pass.
-    model.clear_kv_cache();
+    model.clear_kv_cache()?;
     let mut warm_logits = model.forward(&ids_t, Some(&pv_t), Some(&grid_t), 0)?;
     let mut warm_pos = s;
     for _ in 0..4 {
@@ -173,7 +173,7 @@ fn main() -> Result<()> {
         warm_logits = model.decode_step(nx, warm_pos)?;
         warm_pos += 1;
     }
-    model.clear_kv_cache();
+    model.clear_kv_cache()?;
 
     // Isolate vision-tower cost.
     let t_vision = std::time::Instant::now();
@@ -184,7 +184,7 @@ fn main() -> Result<()> {
     let mut best_prefill_ms = f64::INFINITY;
     let mut prefill_logits = model.forward(&ids_t, Some(&pv_t), Some(&grid_t), 0)?;
     for _ in 0..3 {
-        model.clear_kv_cache();
+        model.clear_kv_cache()?;
         let t0 = std::time::Instant::now();
         prefill_logits = model.forward(&ids_t, Some(&pv_t), Some(&grid_t), 0)?;
         let ms = t0.elapsed().as_millis() as f64;

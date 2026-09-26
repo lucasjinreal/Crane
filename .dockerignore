@@ -1,11 +1,23 @@
-target/
+# Keeps the build context small for docker/*/Dockerfile. Anything a
+# contributor's local `cargo build`/`npm install` produces, or that's too
+# large/irrelevant to ship into a build container.
 .git/
-*.onnx
-*.bin
-*.pt
+target/
+vendor/
+# NOT ui/dist/: crane-serve/src/ui.rs `include_str!`s it unconditionally at
+# compile time (README: rebuild it with `npm run build --prefix crane-serve/ui`
+# after editing crane-serve/ui/ — it must exist and be current before a build).
+crane-serve/ui/node_modules/
 checkpoints/
 outputs/
 output/
+docs/
 data/images/
 data/audio/
+__pycache__/
+.vscode/
+*.onnx
+*.bin
+*.pt
 .env
+.DS_Store

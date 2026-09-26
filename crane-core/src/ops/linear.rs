@@ -40,6 +40,19 @@ impl QuantizedLinear {
     /// (residual adds, etc.).
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let input_dtype = xs.dtype();
+        // SYCL's quantized matmul takes an F16 activation directly and returns
+        // the same dtype, so both casts are wasted kernel launches. Only when
+        // the weight is still quantized: a dequantized `QMatMul` is a plain F32
+        // `matmul` and does need the cast. `QMatMul::is_quantized` only exists
+        // on the SYCL candle fork, hence the feature gate.
+        #[cfg(feature = "sycl")]
+        if xs.device().is_sycl() && input_dtype == DType::F16 && self.matmul.is_quantized() {
+            let out = self.matmul.forward(xs)?;
+            return match &self.bias {
+                Some(b) => out.broadcast_add(&b.to_dtype(DType::F16)?),
+                None => Ok(out),
+            };
+        }
         let xs_f32 = if input_dtype != DType::F32 {
             xs.to_dtype(DType::F32)?
         } else {
