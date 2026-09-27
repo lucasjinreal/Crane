@@ -11,7 +11,11 @@ use candle_core::quantized::k_quants::{
     BlockQ2K, BlockQ3K, BlockQ4_0, BlockQ4_1, BlockQ4K, BlockQ5_0, BlockQ5_1, BlockQ5K, BlockQ6K,
     BlockQ8_0, BlockQ8_1, BlockQ8K,
 };
+#[cfg(feature = "rocm")]
+use candle_core::quantized::rocm as quantized_rocm;
 use candle_core::quantized::{GgmlDType, GgmlType, QMatMul, QTensor, ggml_file::qtensor_from_ggml};
+#[cfg(feature = "rocm")]
+use candle_core::rocm_backend::{PinnedBuffer, RocmDevice};
 use candle_core::utils::barrier_pool;
 use candle_core::{D, DType, Device, Module, Result, Tensor};
 #[cfg(test)]
@@ -20,6 +24,8 @@ use candle_nn::{Linear, VarBuilder, linear_no_bias};
 use half::{bf16, f16};
 use ribo::utils::log;
 use std::io::{Read, Seek};
+#[cfg(feature = "rocm")]
+use std::sync::PoisonError;
 use std::sync::{Arc, Mutex};
 
 /// Below this many (token, expert) pairs per expert, the CUDA k-quant `MoE`
@@ -348,6 +354,20 @@ pub struct SparseMoeBlock {
     /// Packed i-quant (or k-quant) experts run by expert id on the
     /// device; when set, `experts` is empty. See [`PackedIQuantExperts`].
     iquant_experts: Option<PackedIQuantExperts>,
+    /// Persistent pinned host staging buffer for the packed gate+up expert
+    /// tensor's raw bytes, used by
+    /// [`Self::gpu_offload_forward_rocm_async`] to issue `hipMemcpyAsync`
+    /// uploads without a per-call `hipHostRegister`/`hipHostUnregister`
+    /// pair. Allocated lazily on first use (the constructor has no
+    /// [`RocmDevice`] to call `hipHostMalloc` with), `None` until then and
+    /// reused on every later call. `Mutex` for the same reason as
+    /// [`Self::routing`]: [`Module::forward`] takes `&self`.
+    #[cfg(feature = "rocm")]
+    pinned_gate_up: Mutex<Option<PinnedBuffer<u8>>>,
+    /// Persistent pinned host staging buffer for the packed down expert
+    /// tensor's raw bytes. See [`Self::pinned_gate_up`].
+    #[cfg(feature = "rocm")]
+    pinned_down: Mutex<Option<PinnedBuffer<u8>>>,
 }
 
 /// Every expert's gate, up and down projections kept in their packed
@@ -514,6 +534,10 @@ impl SparseMoeBlock {
             routing: Mutex::new(MoeRouting::new()),
             shared_expert,
             iquant_experts: None,
+            #[cfg(feature = "rocm")]
+            pinned_gate_up: Mutex::new(None),
+            #[cfg(feature = "rocm")]
+            pinned_down: Mutex::new(None),
         };
         block.log_dispatch_decision();
         Ok(block)
@@ -610,6 +634,10 @@ impl SparseMoeBlock {
             routing: Mutex::new(MoeRouting::new()),
             shared_expert,
             iquant_experts,
+            #[cfg(feature = "rocm")]
+            pinned_gate_up: Mutex::new(None),
+            #[cfg(feature = "rocm")]
+            pinned_down: Mutex::new(None),
         };
         block.fold_shared_gate_into_router()?;
         block.log_dispatch_decision();
@@ -832,6 +860,8 @@ impl SparseMoeBlock {
             self.packed_gate_up_exps = promoted.1;
             self.packed_down_exps = promoted.2;
             self.expert_device = device.clone();
+            #[cfg(feature = "rocm")]
+            self.clear_pinned_buffers();
             self.log_dispatch_decision();
             return Ok(());
         }
@@ -839,6 +869,8 @@ impl SparseMoeBlock {
             Ok(Some(moved)) => {
                 self.experts = moved;
                 self.expert_device = device.clone();
+                #[cfg(feature = "rocm")]
+                self.clear_pinned_buffers();
                 self.log_dispatch_decision();
                 return Ok(());
             },
@@ -883,6 +915,8 @@ impl SparseMoeBlock {
         }
         self.experts = moved;
         self.expert_device = device.clone();
+        #[cfg(feature = "rocm")]
+        self.clear_pinned_buffers();
         self.log_dispatch_decision();
         Ok(())
     }
@@ -955,6 +989,23 @@ impl SparseMoeBlock {
             intermediate_size,
             hidden_size,
         ))
+    }
+
+    /// Frees [`Self::pinned_gate_up`]/[`Self::pinned_down`]'s `hipHostMalloc`
+    /// allocations. Called whenever [`Self::promote_experts_to`] moves
+    /// experts onto a GPU device, since [`Self::gpu_offload_forward_rocm_async`]
+    /// (the only user of these buffers) is unreachable once experts are no
+    /// longer CPU-resident.
+    #[cfg(feature = "rocm")]
+    fn clear_pinned_buffers(&mut self) {
+        *self
+            .pinned_gate_up
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+        *self
+            .pinned_down
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
     }
 
     /// Fused GPU `MoE` dispatch via `indexed_moe_forward` (Phase 8a/10): two
@@ -1314,12 +1365,17 @@ impl SparseMoeBlock {
     /// back to `xs_f32`'s original device before returning, matching
     /// `cpu_batched_forward`'s device contract.
     ///
+    /// On a `ROCm` `device` this delegates to
+    /// [`Self::gpu_offload_forward_rocm_async`], which uploads both packed
+    /// tensors with `hipMemcpyAsync` instead of the synchronous path below.
+    ///
     /// # Errors
     ///
     /// Returns an error if either upload, any device transfer, or
     /// `fused_forward` fails.
     #[allow(clippy::too_many_arguments)]
     fn gpu_offload_forward(
+        &self,
         xs_f32: &Tensor,
         topk_ids: &Tensor,
         topk_weights: &Tensor,
@@ -1334,6 +1390,27 @@ impl SparseMoeBlock {
             "gpu_offload_forward expects CPU-resident packed experts"
         );
         let input_device = xs_f32.device().clone();
+
+        // ROCm gets the async pinned-upload path below; CUDA does not,
+        // because candle's CUDA backend has no equivalent public API for
+        // pinning host memory and issuing an async upload against it (only
+        // the ROCm backend exposes `PinnedBuffer` and `load_quantized_async`).
+        #[cfg(feature = "rocm")]
+        if let Device::Rocm(rocm_dev) = device {
+            return self.gpu_offload_forward_rocm_async(
+                xs_f32,
+                topk_ids,
+                topk_weights,
+                gate_up_exps,
+                down_exps,
+                device,
+                rocm_dev,
+                &input_device,
+                original_dtype,
+                original_dims,
+            );
+        }
+
         let (gate_up_gpu, down_gpu) = prof::timed(Span::MoeToDevice, || -> Result<_> {
             let gate_up_gpu = upload_qtensor(gate_up_exps, device)?;
             let down_gpu = upload_qtensor(down_exps, device)?;
@@ -1357,6 +1434,131 @@ impl SparseMoeBlock {
         })?;
 
         prof::timed(Span::MoeToDevice, || out.to_device(&input_device))
+    }
+
+    /// `ROCm`-only fast path for [`Self::gpu_offload_forward`]: copies both
+    /// packed expert tensors' raw bytes into this block's persistent
+    /// `hipHostMalloc`'d staging buffers ([`Self::pinned_gate_up`],
+    /// [`Self::pinned_down`]) and uploads them with `hipMemcpyAsync` instead
+    /// of blocking on a synchronous `hipMemcpy` for each.
+    ///
+    /// The staging buffers are allocated lazily on the first call (the
+    /// constructor has no [`RocmDevice`] to call `hipHostMalloc` with) and
+    /// reused on every later call, so only the first call pays the
+    /// allocation cost; [`Self::promote_experts_to`] drops them once
+    /// experts move to GPU and this path is no longer reachable.
+    ///
+    /// Because [`PinnedBuffer::drop`] does not drain the device stream
+    /// (unlike the closure-scoped pinning API it replaces, which drained on
+    /// drop), this function calls [`RocmDevice::synchronize`] itself before
+    /// returning. The result transfer (`out.to_device`) already
+    /// synchronizes the stream in practice, but the explicit call makes the
+    /// guarantee — that no upload is still in flight against a staging
+    /// buffer this function is about to let the next call overwrite — hold
+    /// regardless of that implementation detail.
+    ///
+    /// [`Span::MoeOffloadUpload`] measures only the async-upload enqueue;
+    /// the host-side copy into the staging buffers and the final
+    /// `synchronize` are not separately attributed, so they show up only as
+    /// the gap between a pass's total time and the sum of its measured
+    /// spans.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if staging-buffer allocation, either upload, any
+    /// device transfer, synchronization, or `fused_forward` fails.
+    #[cfg(feature = "rocm")]
+    #[allow(clippy::too_many_arguments)]
+    fn gpu_offload_forward_rocm_async(
+        &self,
+        xs_f32: &Tensor,
+        topk_ids: &Tensor,
+        topk_weights: &Tensor,
+        gate_up_exps: &QTensor,
+        down_exps: &QTensor,
+        device: &Device,
+        rocm_dev: &RocmDevice,
+        input_device: &Device,
+        original_dtype: DType,
+        original_dims: &[usize],
+    ) -> Result<Tensor> {
+        let gate_up_raw = gate_up_exps.data()?;
+        let down_raw = down_exps.data()?;
+
+        // The pinned buffers below only grow, never shrink, and
+        // `load_quantized_async` uploads the buffer's full allocated
+        // length, not just the freshly-copied prefix. That's sound only
+        // because every call for a given `SparseMoeBlock` passes the same
+        // fixed-size packed CPU tensor, so `gate_up_raw`/`down_raw` never
+        // shrink across calls on the same block either. If that ever
+        // changes, this needs an explicit length check or a sliced view
+        // passed to `load_quantized_async` instead.
+        let mut gate_up_guard = self
+            .pinned_gate_up
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if gate_up_guard
+            .as_ref()
+            .is_none_or(|buf| buf.len() < gate_up_raw.len())
+        {
+            *gate_up_guard = Some(rocm_dev.new_pinned_buffer::<u8>(gate_up_raw.len())?);
+        }
+        let gate_up_pin = gate_up_guard.as_mut().expect("just allocated above");
+        gate_up_pin.as_mut_slice()[..gate_up_raw.len()].copy_from_slice(&gate_up_raw);
+
+        let mut down_guard = self
+            .pinned_down
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if down_guard
+            .as_ref()
+            .is_none_or(|buf| buf.len() < down_raw.len())
+        {
+            *down_guard = Some(rocm_dev.new_pinned_buffer::<u8>(down_raw.len())?);
+        }
+        let down_pin = down_guard.as_mut().expect("just allocated above");
+        down_pin.as_mut_slice()[..down_raw.len()].copy_from_slice(&down_raw);
+
+        let (gate_up_storage, down_storage) =
+            prof::timed(Span::MoeOffloadUpload, || -> Result<_> {
+                let gate_up_storage = quantized_rocm::load_quantized_async(
+                    rocm_dev,
+                    gate_up_pin,
+                    gate_up_exps.dtype(),
+                )?;
+                let down_storage =
+                    quantized_rocm::load_quantized_async(rocm_dev, down_pin, down_exps.dtype())?;
+                Ok((gate_up_storage, down_storage))
+            })?;
+
+        let gate_up_gpu = QTensor::new(gate_up_storage, gate_up_exps.shape().dims().to_vec())?;
+        let down_gpu = QTensor::new(down_storage, down_exps.shape().dims().to_vec())?;
+
+        let xs_gpu = prof::timed(Span::MoeToDevice, || xs_f32.to_device(device))?;
+        let topk_ids_gpu = prof::timed(Span::MoeToDevice, || topk_ids.to_device(device))?;
+        let topk_weights_gpu = prof::timed(Span::MoeToDevice, || topk_weights.to_device(device))?;
+
+        let out = prof::timed(Span::MoeFused, || {
+            Self::fused_forward(
+                &xs_gpu,
+                &topk_ids_gpu,
+                &topk_weights_gpu,
+                &gate_up_gpu,
+                &down_gpu,
+                original_dtype,
+                original_dims,
+            )
+        })?;
+
+        let result = prof::timed(Span::MoeToDevice, || out.to_device(input_device))?;
+
+        // `PinnedBuffer::drop` doesn't drain the stream, so make the
+        // "no upload still in flight against these staging buffers"
+        // guarantee explicit rather than relying on `to_device` above
+        // happening to synchronize.
+        rocm_dev.synchronize()?;
+
+        Ok(result)
     }
 
     /// Dispatches to the packed-tensor batched `MoE` path when this block
@@ -1448,7 +1650,7 @@ impl SparseMoeBlock {
             let (has_room, free) = query_gpu_memory(input_device)
                 .map_or((false, 0), |(free, _)| (free >= required, free));
             if has_room {
-                return Some(Self::gpu_offload_forward(
+                return Some(self.gpu_offload_forward(
                     xs_f32,
                     topk_ids,
                     topk_weights,
@@ -4142,6 +4344,10 @@ mod tests {
             routing: Mutex::new(MoeRouting::new()),
             shared_expert: None,
             iquant_experts: None,
+            #[cfg(feature = "rocm")]
+            pinned_gate_up: Mutex::new(None),
+            #[cfg(feature = "rocm")]
+            pinned_down: Mutex::new(None),
         }
     }
 
@@ -4250,12 +4456,16 @@ mod tests {
     // Verifies `SparseMoeBlock::gpu_offload_forward` (uploading a
     // CPU-resident packed expert pair to a GPU device and dispatching
     // through `fused_forward`) produces the same output as
-    // `cpu_batched_forward`, given identical weight data and routing.
+    // `cpu_batched_forward`, given identical weight data and routing. On a
+    // ROCm device this exercises `gpu_offload_forward_rocm_async` too, since
+    // `gpu_offload_forward` dispatches to it internally for `Device::Rocm`.
     // Requires a real CUDA/ROCm device (the underlying `indexed_moe_forward`
     // has no CPU implementation), so this is only compiled with one of those
     // features enabled and `#[ignore]`d by default; run with:
     //   cargo test -p crane-core --features cuda \
     //     gpu_offload_forward_matches_cpu_batched -- --ignored --nocapture
+    // Covers correctness only; the async path's timing was separately
+    // verified with `CRANE_PROF` on real ROCm hardware (see commit history).
     #[cfg(any(feature = "cuda", feature = "rocm"))]
     #[test]
     #[ignore]
@@ -4357,21 +4567,22 @@ mod tests {
         )
         .expect("quantize down q8_0");
 
-        let got = SparseMoeBlock::gpu_offload_forward(
-            &xs_f32,
-            &topk_ids,
-            &topk_weights,
-            &gate_up_q8,
-            &down_q8,
-            &device,
-            DType::F32,
-            &[2, N],
-        )
-        .expect("gpu_offload_forward")
-        .flatten_all()
-        .unwrap()
-        .to_vec1::<f32>()
-        .unwrap();
+        let got = moe
+            .gpu_offload_forward(
+                &xs_f32,
+                &topk_ids,
+                &topk_weights,
+                &gate_up_q8,
+                &down_q8,
+                &device,
+                DType::F32,
+                &[2, N],
+            )
+            .expect("gpu_offload_forward")
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
 
         // Q8_0 introduces real quantization error, unlike the lossless F32
         // comparisons elsewhere in this file, so this needs a wider
