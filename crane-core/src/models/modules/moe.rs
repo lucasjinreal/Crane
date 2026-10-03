@@ -24,9 +24,7 @@ use candle_nn::{Linear, VarBuilder, linear_no_bias};
 use half::{bf16, f16};
 use ribo::utils::log;
 use std::io::{Read, Seek};
-#[cfg(feature = "rocm")]
-use std::sync::PoisonError;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 /// Below this many (token, expert) pairs per expert, the CUDA k-quant `MoE`
 /// path stays on the grouped matvec rather than switching to the dequantize +
@@ -354,6 +352,14 @@ pub struct SparseMoeBlock {
     /// Packed i-quant (or k-quant) experts run by expert id on the
     /// device; when set, `experts` is empty. See [`PackedIQuantExperts`].
     iquant_experts: Option<PackedIQuantExperts>,
+    /// Per-expert routing hit counter, `Some` only while live-traffic
+    /// profiling (see [`Self::enable_profiling`]) is active; `None` is a
+    /// single branch on the hot path, so normal inference pays nothing for
+    /// this. `Mutex` for the same reason as [`Self::routing`]:
+    /// [`Module::forward`] takes `&self`. Boxed (like [`Self::shared_expert`])
+    /// to keep this profiling-only field from inflating every block's base
+    /// size.
+    profile_counts: Option<Box<Mutex<Vec<u64>>>>,
     /// Persistent pinned host staging buffer for the packed gate+up expert
     /// tensor's raw bytes, used by
     /// [`Self::gpu_offload_forward_rocm_async`] to issue `hipMemcpyAsync`
@@ -534,6 +540,7 @@ impl SparseMoeBlock {
             routing: Mutex::new(MoeRouting::new()),
             shared_expert,
             iquant_experts: None,
+            profile_counts: None,
             #[cfg(feature = "rocm")]
             pinned_gate_up: Mutex::new(None),
             #[cfg(feature = "rocm")]
@@ -634,6 +641,7 @@ impl SparseMoeBlock {
             routing: Mutex::new(MoeRouting::new()),
             shared_expert,
             iquant_experts,
+            profile_counts: None,
             #[cfg(feature = "rocm")]
             pinned_gate_up: Mutex::new(None),
             #[cfg(feature = "rocm")]
@@ -989,6 +997,27 @@ impl SparseMoeBlock {
             intermediate_size,
             hidden_size,
         ))
+    }
+
+    /// Start accumulating per-expert routing hit counts. Feeds a future
+    /// `ExpertCache`'s live-traffic placement decisions — see
+    /// [`Self::take_profile_counts`].
+    pub fn enable_profiling(&mut self, num_experts: usize) {
+        self.profile_counts = Some(Box::new(Mutex::new(vec![0u64; num_experts])));
+    }
+
+    /// Stop profiling and return the accumulated per-expert hit counts, or
+    /// `None` if [`Self::enable_profiling`] was never called (or profiling
+    /// was already taken).
+    ///
+    /// If the internal counter mutex was poisoned by a prior panic while
+    /// holding the lock (e.g. a panic inside [`Self::forward`] during
+    /// calibration), the counts accumulated up to that point are still
+    /// recovered rather than panicking again here.
+    pub fn take_profile_counts(&mut self) -> Option<Vec<u64>> {
+        self.profile_counts
+            .take()
+            .map(|m| (*m).into_inner().unwrap_or_else(PoisonError::into_inner))
     }
 
     /// Frees [`Self::pinned_gate_up`]/[`Self::pinned_down`]'s `hipHostMalloc`
@@ -2936,6 +2965,23 @@ impl SparseMoeBlock {
                 )
             })?;
 
+        if let Some(ref counts_mutex) = self.profile_counts {
+            // Device-to-host sync + allocation, deliberate: only paid while
+            // profiling is on, see the `profile_counts` field doc comment.
+            let ids = topk_ids.flatten_all()?.to_vec1::<u32>()?;
+            let Ok(mut counts) = counts_mutex.lock() else {
+                candle_core::bail!("SparseMoeBlock::profile_counts mutex poisoned");
+            };
+            for &id in &ids {
+                // `enable_profiling`'s `num_experts` may not match the
+                // router's actual expert dimension; drop out-of-range ids
+                // instead of panicking on every request.
+                if let Some(count) = counts.get_mut(id as usize) {
+                    *count += 1;
+                }
+            }
+        }
+
         if let Some(packed) = &self.iquant_experts {
             return prof::timed(Span::MoeFused, || {
                 packed
@@ -4344,6 +4390,7 @@ mod tests {
             routing: Mutex::new(MoeRouting::new()),
             shared_expert: None,
             iquant_experts: None,
+            profile_counts: None,
             #[cfg(feature = "rocm")]
             pinned_gate_up: Mutex::new(None),
             #[cfg(feature = "rocm")]
@@ -4400,6 +4447,72 @@ mod tests {
         let x = Tensor::zeros((1, 8), DType::F32, &Device::Cpu).expect("zeros");
         let y = moe.forward(&x).expect("forward");
         assert_eq!(y.dims(), &[1, 8]);
+    }
+
+    // Verifies profiling defaults to off, that enabling it accumulates hits
+    // on forward, and that taking the counts disables profiling again.
+    #[test]
+    fn profiling_lifecycle() {
+        let mut moe = zeros_sparse_moe(8, 4, 4, 2);
+        assert!(moe.take_profile_counts().is_none());
+
+        moe.enable_profiling(4);
+        let x = Tensor::zeros((3, 8), DType::F32, &Device::Cpu).expect("zeros");
+        moe.forward(&x).expect("forward");
+
+        let counts = moe.take_profile_counts().expect("profiling was enabled");
+        assert_eq!(counts.len(), 4);
+        // 3 tokens * top_k=2 routed decisions recorded in total.
+        assert_eq!(counts.iter().sum::<u64>(), 6);
+
+        // Taking again returns None: profiling was disabled by the take.
+        assert!(moe.take_profile_counts().is_none());
+    }
+
+    // Verifies forward passes work (and profiling stays off) when profiling
+    // was never enabled, matching production's default path.
+    #[test]
+    fn profiling_disabled_by_default() {
+        let mut moe = zeros_sparse_moe(8, 4, 4, 2);
+        let x = Tensor::zeros((2, 8), DType::F32, &Device::Cpu).expect("zeros");
+        moe.forward(&x).expect("forward");
+        assert!(moe.take_profile_counts().is_none());
+    }
+
+    // Verifies accumulated hit counts match the router's actual top-k choice
+    // per token, using a gate layout with no logit ties so each token's
+    // top-2 experts are unambiguous.
+    #[test]
+    fn profiling_counts_match_topk() {
+        let (hidden, experts, k) = (2, 4, 2);
+        // Row i is expert i's gate weight vector.
+        let gate_data = vec![
+            10.0, 0.0, // expert 0
+            0.0, 10.0, // expert 1
+            4.0, 4.0, // expert 2
+            -10.0, -10.0, // expert 3
+        ];
+        let expert_data: Vec<(Vec<f32>, Vec<f32>, Vec<f32>)> = (0..experts)
+            .map(|_| {
+                (
+                    vec![0.0f32; hidden],
+                    vec![0.0f32; hidden],
+                    vec![0.0f32; hidden],
+                )
+            })
+            .collect();
+        let mut moe = make_sparse_moe(hidden, 1, experts, k, false, gate_data, &expert_data);
+        moe.enable_profiling(experts);
+
+        // t0=[1,0] -> logits [10,0,4,-10]   -> top2 {0,2}
+        // t1=[0,1] -> logits [0,10,4,-10]   -> top2 {1,2}
+        // t2=[1,1.1] -> logits [10,11,8.4,-21] -> top2 {1,0}
+        let x: Vec<f32> = vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.1];
+        let x = Tensor::from_vec(x, (3, hidden), &Device::Cpu).expect("input");
+        moe.forward(&x).expect("forward");
+
+        let counts = moe.take_profile_counts().expect("profiling enabled");
+        assert_eq!(counts, vec![2, 2, 2, 0]);
     }
 
     // Verifies `SparseMoeBlock::cpu_batched_forward` (the packed-CPU
