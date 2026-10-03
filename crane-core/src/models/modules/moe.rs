@@ -2,6 +2,9 @@
 
 use crate::device::{format_budget, query_gpu_memory};
 use crate::models::hunyuan_dense::modeling::Gguf;
+#[cfg(test)]
+use crate::models::modules::expert_cache::ExpertCacheBudget;
+use crate::models::modules::expert_cache::{ExpertCache, Residency};
 use crate::ops::linear::LinearLayer;
 use crate::quantized::iquant::IQuantExperts;
 #[cfg(not(feature = "rocm"))]
@@ -360,6 +363,12 @@ pub struct SparseMoeBlock {
     /// to keep this profiling-only field from inflating every block's base
     /// size.
     profile_counts: Option<Box<Mutex<Vec<u64>>>>,
+    /// Per-expert GPU residency cache. When `Some`, `dispatch_packed`
+    /// routes through [`Self::cached_forward`] instead of the all-GPU-fused
+    /// or all-CPU-batched path, splitting routed experts by residency and
+    /// dispatching each group through its native kernel. `None` is a single
+    /// branch on the hot path.
+    expert_cache: Option<Arc<ExpertCache>>,
     /// Persistent pinned host staging buffer for the packed gate+up expert
     /// tensor's raw bytes, used by
     /// [`Self::gpu_offload_forward_rocm_async`] to issue `hipMemcpyAsync`
@@ -479,6 +488,37 @@ impl PackedIQuantExperts {
     }
 }
 
+/// Result of [`SparseMoeBlock::partition_by_residency`]: every routed
+/// `(token, expert)` pair classified as GPU- or CPU-resident.
+struct ResidencyPartition {
+    /// `true` when every pair was GPU-resident -- only `remapped_ids` is
+    /// meaningful in that case, and the `gpu_*`/`cpu_*` group vectors are
+    /// empty.
+    all_gpu: bool,
+    /// Expert ids rewritten to pool slot indices, flattened `[tokens *
+    /// topk]` in the same order as the source `topk_ids`. Only valid when
+    /// `all_gpu` is `true`.
+    remapped_ids: Vec<u32>,
+    /// Token index of each GPU-routed pair. Valid only when `all_gpu` is
+    /// `false`.
+    gpu_token_indices: Vec<u32>,
+    /// Pool slot index of each GPU-routed pair, parallel to
+    /// `gpu_token_indices`.
+    gpu_slot_ids: Vec<u32>,
+    /// Routing weight of each GPU-routed pair, parallel to
+    /// `gpu_token_indices`.
+    gpu_weights: Vec<f32>,
+    /// Token index of each CPU-routed pair. Valid only when `all_gpu` is
+    /// `false`.
+    cpu_token_indices: Vec<u32>,
+    /// Original expert id of each CPU-routed pair, parallel to
+    /// `cpu_token_indices`.
+    cpu_expert_ids: Vec<u32>,
+    /// Routing weight of each CPU-routed pair, parallel to
+    /// `cpu_token_indices`.
+    cpu_weights: Vec<f32>,
+}
+
 impl SparseMoeBlock {
     /// Create a `MoE` block from a safetensors checkpoint.
     ///
@@ -541,6 +581,7 @@ impl SparseMoeBlock {
             shared_expert,
             iquant_experts: None,
             profile_counts: None,
+            expert_cache: None,
             #[cfg(feature = "rocm")]
             pinned_gate_up: Mutex::new(None),
             #[cfg(feature = "rocm")]
@@ -642,6 +683,7 @@ impl SparseMoeBlock {
             shared_expert,
             iquant_experts,
             profile_counts: None,
+            expert_cache: None,
             #[cfg(feature = "rocm")]
             pinned_gate_up: Mutex::new(None),
             #[cfg(feature = "rocm")]
@@ -1020,6 +1062,18 @@ impl SparseMoeBlock {
             .map(|m| (*m).into_inner().unwrap_or_else(PoisonError::into_inner))
     }
 
+    /// Installs a shared [`ExpertCache`] for mixed GPU/CPU dispatch.
+    ///
+    /// Once set, [`Self::dispatch_packed`] routes through
+    /// [`Self::cached_forward`] on every forward call (decode and small
+    /// prefill), splitting routed experts by their per-expert residency
+    /// and dispatching each group through its native kernel. Large-batch
+    /// prefill (`>= moe_offload_min_batch`) still takes the
+    /// `gpu_offload_forward` path unchanged.
+    pub fn set_expert_cache(&mut self, cache: Arc<ExpertCache>) {
+        self.expert_cache = Some(cache);
+    }
+
     /// Frees [`Self::pinned_gate_up`]/[`Self::pinned_down`]'s `hipHostMalloc`
     /// allocations. Called whenever [`Self::promote_experts_to`] moves
     /// experts onto a GPU device, since [`Self::gpu_offload_forward_rocm_async`]
@@ -1375,6 +1429,300 @@ impl SparseMoeBlock {
         })
     }
 
+    /// Classifies every routed `(token, expert)` pair in `topk_ids_cpu` by
+    /// [`ExpertCache`] residency, records a routing hit for each one, and
+    /// records the call's outcome via [`ExpertCache::record_fast_path`]/
+    /// [`ExpertCache::record_mixed_path`] -- the fast-path hit rate this
+    /// feeds is what decides whether per-expert residency can speed up
+    /// decode at all, not the swap/decay mechanics alone.
+    ///
+    /// When every pair is GPU-resident, only `remapped_ids` (expert ids
+    /// rewritten to pool slot indices, same `[tokens, topk]` flattened
+    /// layout as `topk_ids_cpu`) is populated and `all_gpu` is `true` --
+    /// the caller can dispatch the whole batch through the all-GPU fast
+    /// path with no further partitioning. Otherwise `all_gpu` is `false`
+    /// and the `gpu_*`/`cpu_*` group vectors hold the mixed-path inputs;
+    /// `remapped_ids` is left in a partially-filled, unused state in that
+    /// case (CPU-routed slots are placeholder zeros).
+    ///
+    /// Pulled out of [`Self::cached_forward`] as its own associated function
+    /// so the classification logic is unit-testable without a GPU device --
+    /// `cached_forward`'s own dispatch calls (`indexed_moe_forward`,
+    /// `cpu_indexed_moe_forward`) are not.
+    fn partition_by_residency(
+        topk_ids_cpu: &[Vec<u32>],
+        topk_weights_cpu: &[Vec<f32>],
+        topk: usize,
+        cache: &ExpertCache,
+        layer_idx: usize,
+    ) -> ResidencyPartition {
+        let tokens = topk_ids_cpu.len();
+        let mut remapped_ids: Vec<u32> = Vec::with_capacity(tokens * topk);
+        let mut all_gpu = true;
+
+        // Left empty on the all-GPU fast path (the common case once the
+        // cache has converged): only populated once a CPU-resident expert
+        // is actually encountered, via the `reserve`/backfill below.
+        let mut gpu_token_indices: Vec<u32> = Vec::new();
+        let mut gpu_slot_ids: Vec<u32> = Vec::new();
+        let mut gpu_weights: Vec<f32> = Vec::new();
+        let mut cpu_token_indices: Vec<u32> = Vec::new();
+        let mut cpu_expert_ids: Vec<u32> = Vec::new();
+        let mut cpu_weights: Vec<f32> = Vec::new();
+
+        for (tok, (experts, weights)) in
+            topk_ids_cpu.iter().zip(topk_weights_cpu.iter()).enumerate()
+        {
+            for (&expert_id, &weight) in experts.iter().zip(weights.iter()) {
+                let eid = expert_id as usize;
+                cache.record_hit(layer_idx, eid);
+                match cache.residency(layer_idx, eid) {
+                    Residency::Gpu(slot) => {
+                        remapped_ids.push(slot.as_u32());
+                        if !all_gpu {
+                            // Already known-mixed: accumulate the GPU group
+                            // incrementally instead of backfilling again.
+                            // Token counts never approach u32::MAX.
+                            #[allow(clippy::cast_possible_truncation)]
+                            let tok_u32 = tok as u32;
+                            gpu_token_indices.push(tok_u32);
+                            gpu_slot_ids.push(slot.as_u32());
+                            gpu_weights.push(weight);
+                        }
+                    },
+                    Residency::Cpu => {
+                        if all_gpu {
+                            // First CPU miss: the all-GPU fast path is no
+                            // longer reachable. Retroactively populate the
+                            // GPU group from every slot collected into
+                            // `remapped_ids` so far.
+                            all_gpu = false;
+                            gpu_token_indices.reserve(remapped_ids.len());
+                            gpu_slot_ids.reserve(remapped_ids.len());
+                            gpu_weights.reserve(remapped_ids.len());
+                            for (flat_idx, &slot_id) in remapped_ids.iter().enumerate() {
+                                let token_idx = flat_idx / topk;
+                                let k = flat_idx % topk;
+                                // Token counts never approach u32::MAX.
+                                #[allow(clippy::cast_possible_truncation)]
+                                let token_idx_u32 = token_idx as u32;
+                                gpu_token_indices.push(token_idx_u32);
+                                gpu_slot_ids.push(slot_id);
+                                gpu_weights.push(topk_weights_cpu[token_idx][k]);
+                            }
+                        }
+                        // Token counts never approach u32::MAX.
+                        #[allow(clippy::cast_possible_truncation)]
+                        let tok_u32 = tok as u32;
+                        cpu_token_indices.push(tok_u32);
+                        cpu_expert_ids.push(expert_id);
+                        cpu_weights.push(weight);
+                        // Placeholder: never read once `all_gpu` is false,
+                        // since the fast path is skipped in that case.
+                        remapped_ids.push(0);
+                    },
+                }
+            }
+        }
+
+        if all_gpu {
+            cache.record_fast_path();
+        } else {
+            cache.record_mixed_path();
+        }
+
+        ResidencyPartition {
+            all_gpu,
+            remapped_ids,
+            gpu_token_indices,
+            gpu_slot_ids,
+            gpu_weights,
+            cpu_token_indices,
+            cpu_expert_ids,
+            cpu_weights,
+        }
+    }
+
+    /// Cache-aware mixed GPU/CPU dispatch: partitions routed experts by
+    /// [`ExpertCache`] residency (GPU slot vs. CPU), dispatches each group
+    /// through its native kernel, and merges results via weighted
+    /// scatter-add. `gate_up_exps`/`down_exps` are the original
+    /// CPU-resident packed tensors (used for the CPU group); the GPU group
+    /// dispatches against `cache`'s per-layer pool tensors instead.
+    ///
+    /// Records a routing hit for every `(layer, expert)` pair in the
+    /// partition loop below, since `topk_ids` is already on the CPU there
+    /// (via `to_vec2`) -- this is the only place `ExpertCache::record_hit`
+    /// is called, feeding `cache`'s decay/swap correction.
+    ///
+    /// # All-GPU fast path
+    ///
+    /// When every routed expert in this call is GPU-resident (the common
+    /// steady-state case once the cache's swap mechanism has converged),
+    /// remaps expert ids to pool slot indices and delegates to
+    /// [`Self::fused_forward`] directly on the pool tensors -- no CPU
+    /// dispatch, no scatter-add merge.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any tensor op, `indexed_moe_forward`/
+    /// `cpu_indexed_moe_forward` call, or device transfer fails, or if the
+    /// routing mutex is poisoned.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn cached_forward(
+        &self,
+        xs_f32: &Tensor,
+        topk_ids: &Tensor,
+        topk_weights: &Tensor,
+        gate_up_exps: &QTensor,
+        down_exps: &QTensor,
+        cache: &ExpertCache,
+        original_dtype: DType,
+        original_dims: &[usize],
+    ) -> Result<Tensor> {
+        let (tokens, topk) = topk_ids.dims2()?;
+        let hidden = xs_f32.dims()[1];
+        let input_device = xs_f32.device();
+
+        // Pull ids/weights to CPU for partitioning and hit recording; the
+        // all-GPU fast path below still avoids any further CPU round trip
+        // for the actual dispatch. This is still a blocking GPU->host sync
+        // on every layer/step even in the steady state (all experts
+        // resident), unlike the dispatch itself — a known tradeoff, not a
+        // free fast path. It's strictly smaller than the whole-activation
+        // sync `cpu_batched_forward` paid before this cache existed
+        // (`tokens * topk` ids/weights vs. the full activation tensor), so
+        // it's not a regression, but a GPU-resident classification/gather
+        // kernel would be needed to remove it entirely.
+        let topk_ids_cpu = prof::timed(Span::MoeMisc, || topk_ids.to_vec2::<u32>())?;
+        let topk_weights_cpu = prof::timed(Span::MoeMisc, || topk_weights.to_vec2::<f32>())?;
+
+        let partition = prof::timed(Span::MoeMisc, || {
+            Self::partition_by_residency(
+                &topk_ids_cpu,
+                &topk_weights_cpu,
+                topk,
+                cache,
+                self.layer_idx,
+            )
+        });
+
+        if partition.all_gpu {
+            let slot_ids = Tensor::from_vec(partition.remapped_ids, (tokens, topk), input_device)?;
+            let pool_gate_up = cache.gate_up_pool(self.layer_idx);
+            let pool_down = cache.down_pool(self.layer_idx);
+            return prof::timed(Span::MoeFused, || {
+                Self::fused_forward(
+                    xs_f32,
+                    &slot_ids,
+                    topk_weights,
+                    &pool_gate_up,
+                    &pool_down,
+                    original_dtype,
+                    original_dims,
+                )
+            });
+        }
+
+        let ResidencyPartition {
+            gpu_token_indices,
+            gpu_slot_ids,
+            gpu_weights,
+            cpu_token_indices,
+            cpu_expert_ids,
+            cpu_weights,
+            ..
+        } = partition;
+
+        let pool_gate_up = cache.gate_up_pool(self.layer_idx);
+        let pool_down = cache.down_pool(self.layer_idx);
+        let gpu_intermediate_size = pool_gate_up.shape().dims()[1] / 2;
+
+        let mut output = Tensor::zeros((tokens, hidden), DType::F32, input_device)?;
+
+        if !gpu_token_indices.is_empty() {
+            let n_gpu = gpu_token_indices.len();
+            let tok_ids_tensor = Tensor::new(gpu_token_indices.as_slice(), input_device)?;
+            let selected = xs_f32.index_select(&tok_ids_tensor, 0)?;
+            // [n_gpu, 1, hidden]: each GPU-routed pair is its own
+            // single-expert batch row for `indexed_moe_forward`.
+            let xs_3d = selected.unsqueeze(1)?.contiguous()?;
+            let slot_tensor = Tensor::from_vec(gpu_slot_ids, (n_gpu, 1), input_device)?;
+
+            let gate_up_out = prof::timed(Span::MoeGateUp, || {
+                pool_gate_up.indexed_moe_forward(&xs_3d, &slot_tensor)
+            })?;
+            let gate = gate_up_out.narrow(D::Minus1, 0, gpu_intermediate_size)?;
+            let up = gate_up_out.narrow(D::Minus1, gpu_intermediate_size, gpu_intermediate_size)?;
+            let hidden_act = prof::timed(Span::MoeActivation, || {
+                crate::ops::fused_ops::swiglu::swiglu(&gate, &up)
+            })?;
+            let down_out = prof::timed(Span::MoeDownProj, || {
+                pool_down.indexed_moe_forward(&hidden_act, &slot_tensor)
+            })?;
+            // [n_gpu, 1, hidden] -> [n_gpu, hidden]
+            let gpu_result = down_out.squeeze(1)?;
+
+            let w_tensor =
+                Tensor::new(gpu_weights.as_slice(), input_device)?.reshape((n_gpu, 1))?;
+            let scaled = gpu_result.broadcast_mul(&w_tensor)?;
+            output = prof::timed(Span::MoeCombine, || {
+                output.index_add(&tok_ids_tensor, &scaled, 0)
+            })?;
+        }
+
+        if !cpu_token_indices.is_empty() {
+            let n_cpu = cpu_token_indices.len();
+            let cpu_tok_tensor = Tensor::new(cpu_token_indices.as_slice(), input_device)?;
+            let selected = xs_f32.index_select(&cpu_tok_tensor, 0)?;
+            let selected_cpu = prof::timed(Span::MoeToDevice, || selected.to_device(&Device::Cpu))?;
+
+            // [n_cpu, 1]: one CPU-routed pair per row, same convention as
+            // the GPU group's slot tensor above.
+            let cpu_ids_tensor =
+                Tensor::new(cpu_expert_ids.as_slice(), &Device::Cpu)?.reshape((n_cpu, 1))?;
+
+            let num_experts = gate_up_exps.shape().dims()[0];
+            let Ok(mut routing) = self.routing.lock() else {
+                candle_core::bail!("SparseMoeBlock::routing mutex poisoned");
+            };
+            prof::timed(Span::MoeMisc, || {
+                routing.compute(&cpu_ids_tensor, num_experts)
+            })?;
+
+            let xs_3d = selected_cpu.unsqueeze(1)?.contiguous()?;
+            let gate_up_out = prof::timed(Span::MoeExpert, || {
+                cpu_indexed_moe_forward(gate_up_exps, &xs_3d, &routing)
+            })?;
+            let cpu_intermediate_size = gate_up_exps.shape().dims()[1] / 2;
+            let gate = gate_up_out.narrow(D::Minus1, 0, cpu_intermediate_size)?;
+            let up = gate_up_out.narrow(D::Minus1, cpu_intermediate_size, cpu_intermediate_size)?;
+            let hidden_act = prof::timed(Span::MoeActivation, || {
+                crate::ops::fused_ops::swiglu::swiglu(&gate, &up)
+            })?;
+            let down_out = prof::timed(Span::MoeExpert, || {
+                cpu_indexed_moe_forward(down_exps, &hidden_act, &routing)
+            })?;
+            drop(routing);
+
+            // [n_cpu, 1, hidden] -> [n_cpu, hidden]
+            let cpu_result = down_out.squeeze(1)?;
+            let cpu_result_gpu =
+                prof::timed(Span::MoeToDevice, || cpu_result.to_device(input_device))?;
+
+            let w_tensor =
+                Tensor::new(cpu_weights.as_slice(), input_device)?.reshape((n_cpu, 1))?;
+            let scaled = cpu_result_gpu.broadcast_mul(&w_tensor)?;
+            output = prof::timed(Span::MoeCombine, || {
+                output.index_add(&cpu_tok_tensor, &scaled, 0)
+            })?;
+        }
+
+        prof::timed(Span::MoeMisc, || {
+            output.to_dtype(original_dtype)?.reshape(original_dims)
+        })
+    }
+
     /// GPU-offloaded equivalent of [`Self::cpu_batched_forward`], for a
     /// CPU-resident packed expert pair whose caller has decided the batch is
     /// large enough that a one-time upload to `device` is worth paying to run
@@ -1697,6 +2045,29 @@ impl SparseMoeBlock {
                 format_budget(free),
                 format_budget(required),
             );
+        }
+        // Cache-aware mixed dispatch: GPU-resident experts through the
+        // fused kernel on pool tensors, CPU-resident experts through the
+        // CPU batched kernel on original packed tensors, merged via
+        // weighted scatter-add. Only fires when the input device supports
+        // the fused path (same prereqs as the offload branch above). Large
+        // batches (prefill) already took the gpu_offload path above; this
+        // handles the decode/small-batch case.
+        if let Some(cache) = &self.expert_cache
+            && (input_device.is_cuda() || input_device.is_rocm())
+            && supports_fused_moe(input_device, gate_up_exps.dtype())
+            && supports_fused_moe(input_device, down_exps.dtype())
+        {
+            return Some(self.cached_forward(
+                xs_f32,
+                topk_ids,
+                topk_weights,
+                gate_up_exps,
+                down_exps,
+                cache,
+                original_dtype,
+                original_dims,
+            ));
         }
         // CPU batched dispatch: routing is pulled to host (unavoidable,
         // the kernel runs on CPU), but the per-expert loop's up to 336
@@ -4391,6 +4762,7 @@ mod tests {
             shared_expert: None,
             iquant_experts: None,
             profile_counts: None,
+            expert_cache: None,
             #[cfg(feature = "rocm")]
             pinned_gate_up: Mutex::new(None),
             #[cfg(feature = "rocm")]
@@ -6340,5 +6712,175 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    /// Builds a single-layer `ExpertCache` with `n_experts` total and the
+    /// first `slots_per_layer` (by index) GPU-resident, matching
+    /// `ExpertCache::new`'s seed-by-index placement. F32 `GgmlDType`
+    /// (block_size=1) so byte-cost math stays exact.
+    fn make_test_expert_cache(
+        n_experts: usize,
+        hidden: usize,
+        moe_intermediate_size: usize,
+        slots_per_layer: usize,
+    ) -> ExpertCache {
+        let gate_up_exps = vec![Arc::new(
+            QTensor::quantize(
+                &Tensor::zeros(
+                    (n_experts, 2 * moe_intermediate_size, hidden),
+                    DType::F32,
+                    &Device::Cpu,
+                )
+                .expect("zeros gate_up"),
+                GgmlDType::F32,
+            )
+            .expect("quantize gate_up"),
+        )];
+        let down_exps = vec![Arc::new(
+            QTensor::quantize(
+                &Tensor::zeros(
+                    (n_experts, hidden, moe_intermediate_size),
+                    DType::F32,
+                    &Device::Cpu,
+                )
+                .expect("zeros down"),
+                GgmlDType::F32,
+            )
+            .expect("quantize down"),
+        )];
+        let gu_blob = 2 * moe_intermediate_size * hidden * GgmlDType::F32.type_size()
+            / GgmlDType::F32.block_size();
+        let dn_blob = hidden * moe_intermediate_size * GgmlDType::F32.type_size()
+            / GgmlDType::F32.block_size();
+        let budget = ExpertCacheBudget {
+            raw_budget_slots: slots_per_layer,
+            slots_per_layer,
+            gate_up_blob_bytes: gu_blob,
+            down_blob_bytes: dn_blob,
+            n_layers: 1,
+            n_experts,
+        };
+        ExpertCache::new(budget, gate_up_exps, down_exps, &Device::Cpu).expect("ExpertCache::new")
+    }
+
+    // When every routed expert is GPU-resident, partition_by_residency
+    // reports all_gpu=true and remapped_ids holds pool slot indices (equal
+    // to the original expert id here, since every expert got its own slot
+    // by index).
+    #[test]
+    fn test_partition_by_residency_all_gpu() {
+        let cache = make_test_expert_cache(4, 8, 16, 4);
+        let topk_ids_cpu = vec![vec![0u32, 2u32], vec![1u32, 3u32]];
+        let topk_weights_cpu = vec![vec![0.6f32, 0.4f32], vec![0.7f32, 0.3f32]];
+
+        let partition =
+            SparseMoeBlock::partition_by_residency(&topk_ids_cpu, &topk_weights_cpu, 2, &cache, 0);
+
+        assert!(partition.all_gpu);
+        assert_eq!(partition.remapped_ids, vec![0, 2, 1, 3]);
+        assert!(partition.gpu_token_indices.is_empty());
+        assert!(partition.cpu_token_indices.is_empty());
+
+        let Residency::Gpu(slot) = cache.residency(0, 0) else {
+            panic!("expert 0 should be GPU-resident after seeding");
+        };
+        assert_eq!(slot.as_u32(), 0);
+    }
+
+    // With fewer slots than experts, routed pairs split into GPU and CPU
+    // groups; every routed (token, expert) pair still gets a hit recorded
+    // regardless of which group it lands in.
+    #[test]
+    fn test_partition_by_residency_mixed() {
+        let cache = make_test_expert_cache(4, 8, 16, 2); // experts 0,1 GPU; 2,3 CPU
+        let topk_ids_cpu = vec![vec![0u32, 2u32], vec![1u32, 3u32]];
+        let topk_weights_cpu = vec![vec![0.6f32, 0.4f32], vec![0.7f32, 0.3f32]];
+
+        let partition =
+            SparseMoeBlock::partition_by_residency(&topk_ids_cpu, &topk_weights_cpu, 2, &cache, 0);
+
+        assert!(!partition.all_gpu);
+        assert_eq!(partition.gpu_token_indices, vec![0, 1]);
+        assert_eq!(partition.gpu_slot_ids, vec![0, 1]);
+        assert_eq!(partition.gpu_weights, vec![0.6, 0.7]);
+        assert_eq!(partition.cpu_token_indices, vec![0, 1]);
+        assert_eq!(partition.cpu_expert_ids, vec![2, 3]);
+        assert_eq!(partition.cpu_weights, vec![0.4, 0.3]);
+    }
+
+    // The GPU-miss backfill path (first CPU-resident expert seen after one
+    // or more GPU-resident ones) must reconstruct the same GPU group as if
+    // every pair had been known-mixed from the start.
+    #[test]
+    fn test_partition_by_residency_backfill_matches_incremental() {
+        let cache = make_test_expert_cache(4, 8, 16, 2); // experts 0,1 GPU; 2,3 CPU
+        // expert 0 (GPU) appears before the first CPU miss (expert 2);
+        // expert 1 (GPU) appears after, via the incremental branch.
+        let topk_ids_cpu = vec![vec![0u32, 2u32, 1u32]];
+        let topk_weights_cpu = vec![vec![0.5f32, 0.3f32, 0.2f32]];
+
+        let partition =
+            SparseMoeBlock::partition_by_residency(&topk_ids_cpu, &topk_weights_cpu, 3, &cache, 0);
+
+        assert!(!partition.all_gpu);
+        assert_eq!(partition.gpu_token_indices, vec![0, 0]);
+        assert_eq!(partition.gpu_slot_ids, vec![0, 1]);
+        assert_eq!(partition.gpu_weights, vec![0.5, 0.2]);
+        assert_eq!(partition.cpu_token_indices, vec![0]);
+        assert_eq!(partition.cpu_expert_ids, vec![2]);
+        assert_eq!(partition.cpu_weights, vec![0.3]);
+    }
+
+    // record_hit fires for every routed pair regardless of residency group
+    // (GPU or CPU), feeding ExpertCache's decay/swap mechanism even on the
+    // mixed path. Verified indirectly through decay_and_swap, since
+    // ExpertCache exposes no direct hit-count getter: decay_and_swap halves
+    // every count before comparing, and a swap additionally requires the
+    // hot count to clear SwapTuning::min_hot_count (4 by default), so a
+    // CPU-resident expert needs at least 8 raw hits to still register as
+    // "hot" (4, post-halving) against an untouched (zero-hit) GPU-resident
+    // expert's coldest count of 0, clearing both the floor and
+    // SwapTuning::swap_margin and triggering a swap.
+    #[test]
+    fn test_partition_by_residency_records_every_hit() {
+        let cache = make_test_expert_cache(4, 8, 16, 2); // experts 0,1 GPU; 2,3 CPU
+        // Eight tokens, all routed to CPU-resident expert 2.
+        let topk_ids_cpu: Vec<Vec<u32>> = (0..8).map(|_| vec![2u32]).collect();
+        let topk_weights_cpu: Vec<Vec<f32>> = (0..8).map(|_| vec![1.0f32]).collect();
+
+        SparseMoeBlock::partition_by_residency(&topk_ids_cpu, &topk_weights_cpu, 1, &cache, 0);
+
+        let swaps = cache.decay_and_swap().expect("decay_and_swap");
+        assert_eq!(swaps, 1);
+        assert!(matches!(cache.residency(0, 2), Residency::Gpu(_)));
+    }
+
+    // partition_by_residency must record a fast-path hit (not just report
+    // all_gpu=true) when every routed expert is GPU-resident -- this is
+    // the counter that decides whether per-expert residency can speed up
+    // decode at all.
+    #[test]
+    fn test_partition_by_residency_records_fast_path() {
+        let cache = make_test_expert_cache(4, 8, 16, 4); // every expert GPU-resident
+        let topk_ids_cpu = vec![vec![0u32, 2u32]];
+        let topk_weights_cpu = vec![vec![0.6f32, 0.4f32]];
+
+        SparseMoeBlock::partition_by_residency(&topk_ids_cpu, &topk_weights_cpu, 2, &cache, 0);
+
+        assert_eq!(cache.take_fast_path_stats(), (1, 0));
+    }
+
+    // partition_by_residency must record a mixed-path hit when at least
+    // one routed expert is CPU-resident, even if most of the batch is
+    // GPU-resident.
+    #[test]
+    fn test_partition_by_residency_records_mixed_path() {
+        let cache = make_test_expert_cache(4, 8, 16, 2); // experts 0,1 GPU; 2,3 CPU
+        let topk_ids_cpu = vec![vec![0u32, 2u32]];
+        let topk_weights_cpu = vec![vec![0.6f32, 0.4f32]];
+
+        SparseMoeBlock::partition_by_residency(&topk_ids_cpu, &topk_weights_cpu, 2, &cache, 0);
+
+        assert_eq!(cache.take_fast_path_stats(), (0, 1));
     }
 }

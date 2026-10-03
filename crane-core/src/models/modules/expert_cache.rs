@@ -101,11 +101,27 @@ impl SwapTuning {
 /// valid [`LayerPool`] index.
 const CPU_SENTINEL: u32 = u32::MAX;
 
-/// Index into a [`LayerPool`]'s per-slot GPU storage. Scoped to one pool —
-/// the same numeric value in `gate_up_pool` and `down_pool` refers to the
-/// two weight halves of the same cached expert.
+/// Index into a layer's slot within a [`LayerPool`]'s per-layer packed
+/// `QTensor` (shape `[slots_per_layer, rows, cols]`) — dimension 0 of that
+/// tensor, not a global offset across layers. The same numeric value in
+/// `gate_up_pool` and `down_pool` refers to the two weight halves of the
+/// same cached expert, scoped to one layer. This is also the index the
+/// mixed GPU/CPU dispatch path built on top of this cache passes as an
+/// expert id to `QTensor::indexed_moe_forward` on that layer's pool tensor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SlotIdx(u32);
+
+impl SlotIdx {
+    /// Returns the raw slot index as a `u32`.
+    ///
+    /// Used by the mixed GPU/CPU dispatch path to build the `[n_gpu, 1]`
+    /// expert-id tensor passed to `QTensor::indexed_moe_forward` on a pool
+    /// tensor.
+    #[must_use]
+    pub const fn as_u32(self) -> u32 {
+        self.0
+    }
+}
 
 /// Where an expert's weights live for a given `(layer, expert)` pair.
 /// Mutable at runtime: [`ExpertCache::decay_and_swap`] can flip an entry
@@ -172,9 +188,15 @@ pub struct ExpertCacheBudget {
     /// `raw_budget_slots` by `n_layers`, clamped to `n_experts`).
     /// Remainder slots from the division are unused.
     pub slots_per_layer: usize,
-    /// Per-expert byte cost of the `gate_up` projection blob.
+    /// Largest per-expert byte cost of the `gate_up` projection blob across
+    /// all `MoE` layers (layers can use different GGML quantization types,
+    /// e.g. a dynamic-quant GGUF mixing `Q4_K`/`Q5_K` per layer, as long as they
+    /// share the same tensor shape). Used only to conservatively size
+    /// `slots_per_layer` so every layer's quota fits regardless of which
+    /// layer it lands on — not necessarily any individual layer's real cost.
     pub gate_up_blob_bytes: usize,
-    /// Per-expert byte cost of the down projection blob.
+    /// Largest per-expert byte cost of the down projection blob across all
+    /// `MoE` layers. See [`Self::gate_up_blob_bytes`].
     pub down_blob_bytes: usize,
     /// Number of `MoE` layers the cache spans.
     pub n_layers: usize,
@@ -220,116 +242,264 @@ impl ExpertCacheBudget {
     }
 }
 
-/// Byte count a `[rows, cols]` tensor of `dtype` occupies in raw `ggml`
-/// storage: `rows * cols` elements, `dtype.block_size()` elements per
-/// block, `dtype.type_size()` bytes per block.
-fn expected_blob_bytes(dtype: GgmlDType, rows: usize, cols: usize) -> usize {
-    rows * cols / dtype.block_size() * dtype.type_size()
-}
-
-/// One expert projection's GPU-resident slots: a fixed-capacity array of
-/// independently allocated per-slot [`QTensor`]s (not a single contiguous
-/// buffer — candle's `QTensor` has no partial-write or sub-region view, so
-/// each slot is its own quantized tensor, uploaded whole on seed or swap).
+/// One expert projection's GPU-resident slots: one packed `QTensor` per
+/// layer (shape `[slots_per_layer, rows, cols]`), not one `QTensor` per
+/// slot. This lets the mixed GPU/CPU dispatch path pass a layer's pool
+/// tensor straight to `QTensor::indexed_moe_forward` with local slot
+/// indices as expert ids — one kernel launch per layer, not one per routed
+/// expert.
 ///
-/// Each slot has its own [`RwLock`] rather than one lock guarding the whole
-/// pool: [`Self::get_slot`] is the forward-pass hot path, called once per
-/// routed GPU-resident expert per step, and different slots are read by
-/// unrelated experts/sequences concurrently. A per-slot lock means those
-/// reads never contend with each other — only a read and a concurrent write
-/// to the *same* slot would block, and [`ExpertCache::decay_and_swap`]'s
-/// documented quiescence invariant (never called concurrently with a
-/// forward pass) means that never happens in practice either.
+/// Candle's `QTensor` has no partial-write or sub-region view, so a layer's
+/// pool tensor can't be updated in place: [`Self::rebuild_layer`] instead
+/// recomposes the whole layer's bytes in a reusable host `staging` buffer
+/// (copying every still-resident expert's bytes from its CPU source, plus
+/// the newly admitted one) and uploads it as a brand-new `QTensor`, which
+/// [`Self::install_layer`] then swaps in. This is only ever called from the
+/// seed (once per layer) or a rate-limited live swap (at most one per layer
+/// per decay window), so rebuilding the whole layer rather than one slot is
+/// cheap relative to the H2D upload it already requires.
+///
+/// Each layer has its own [`RwLock`] rather than one lock guarding the whole
+/// pool: [`Self::pool_for_layer`] is the forward-pass hot path, called once
+/// per layer per step, and unrelated layers are read concurrently. A
+/// per-layer lock means those reads never contend with each other — only a
+/// read and a concurrent write to the *same* layer would block, and
+/// [`ExpertCache::decay_and_swap`]'s documented quiescence invariant (never
+/// called concurrently with a forward pass) means that never happens in
+/// practice either.
 struct LayerPool {
-    slots: Box<[RwLock<Option<Arc<QTensor>>>]>,
-    blob_bytes: usize,
-    ggml_dtype: GgmlDType,
+    per_layer: Box<[RwLock<Option<Arc<QTensor>>>]>,
+    /// Host staging buffer, sized to `slots_per_layer * max(blob_bytes)`
+    /// (the largest per-layer cost, since layers can differ in GGML
+    /// quantization type while sharing the same tensor shape) and reused
+    /// across every [`Self::rebuild_layer`] call (seed and swap alike)
+    /// rather than reallocated per call. A layer with a smaller per-expert
+    /// cost than the max only uses a leading portion of the buffer;
+    /// `qtensor_from_ggml` reads exactly as many bytes as that layer's own
+    /// `blob_bytes`/`ggml_dtype` call for, ignoring the rest.
+    staging: Mutex<AlignedBuf>,
+    /// Per-expert byte cost, one entry per layer (layers can use different
+    /// GGML quantization types, e.g. dynamic-quant GGUFs mixing `Q4_K`/`Q5_K`
+    /// per layer, as long as every layer shares the same `expert_rows`/
+    /// `expert_cols`).
+    blob_bytes: Box<[usize]>,
+    /// GGML quantization type, one entry per layer. See [`Self::blob_bytes`].
+    ggml_dtype: Box<[GgmlDType]>,
     expert_rows: usize,
     expert_cols: usize,
+    slots_per_layer: usize,
+}
+
+/// Byte buffer backed by `u64`-aligned storage. `qtensor_from_ggml` (via
+/// `from_raw_data` in candle's `ggml_file.rs`) reinterprets a raw byte
+/// buffer as `&[T]` for `GgmlDType`'s block type `T` (`f32`, `f16`/`bf16`,
+/// or a quantized block struct), which is sound only if the buffer is
+/// aligned to `align_of::<T>()`; a plain `Vec<u8>` carries no such
+/// guarantee. 8 bytes covers every `T` `qtensor_from_ggml` supports.
+struct AlignedBuf {
+    words: Vec<u64>,
+    byte_len: usize,
+}
+
+impl AlignedBuf {
+    fn zeroed(byte_len: usize) -> Self {
+        Self {
+            words: vec![0u64; byte_len.div_ceil(8)],
+            byte_len,
+        }
+    }
+}
+
+impl std::ops::Deref for AlignedBuf {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        // SAFETY: `words` has no padding bytes, and `byte_len <=
+        // words.len() * 8` by construction in `zeroed`.
+        unsafe { std::slice::from_raw_parts(self.words.as_ptr().cast::<u8>(), self.byte_len) }
+    }
+}
+
+impl std::ops::DerefMut for AlignedBuf {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        // SAFETY: same invariant as `deref`.
+        unsafe {
+            std::slice::from_raw_parts_mut(self.words.as_mut_ptr().cast::<u8>(), self.byte_len)
+        }
+    }
+}
+
+/// Per-expert byte cost of a packed `[n_experts, rows, cols]` quantized
+/// expert tensor, at `t`'s own GGML block encoding. Integer division is
+/// exact: GGUF packing requires element counts to be whole multiples of the
+/// quantization block size. Shared by [`ExpertCache::new`] (computing each
+/// layer's own cost) and its callers (computing the max across layers to
+/// size the VRAM budget) — layers can use different GGML quantization types
+/// (e.g. dynamic-quant GGUFs mixing `Q4_K`/`Q5_K` per layer) as long as they
+/// share the same `rows`/`cols`.
+pub(crate) fn blob_bytes_per_expert(t: &QTensor) -> usize {
+    let dims = t.shape().dims();
+    let elems_per_expert = dims[1] * dims[2];
+    elems_per_expert / t.dtype().block_size() * t.dtype().type_size()
 }
 
 impl LayerPool {
+    /// `blob_bytes`/`ggml_dtype` must each have exactly `n_layers` entries,
+    /// one per layer. Takes them by value: the caller (`ExpertCache::new`)
+    /// builds fresh `Vec`s solely for this call and `LayerPool` owns them
+    /// for its lifetime, so this is a move, not a clone.
     fn new(
-        n_slots: usize,
-        blob_bytes: usize,
-        ggml_dtype: GgmlDType,
+        n_layers: usize,
+        slots_per_layer: usize,
+        blob_bytes: Vec<usize>,
+        ggml_dtype: Vec<GgmlDType>,
         rows: usize,
         cols: usize,
     ) -> Self {
+        debug_assert_eq!(blob_bytes.len(), n_layers);
+        debug_assert_eq!(ggml_dtype.len(), n_layers);
+        let max_blob_bytes = blob_bytes.iter().copied().max().unwrap_or(0);
         Self {
-            slots: (0..n_slots).map(|_| RwLock::new(None)).collect(),
-            blob_bytes,
-            ggml_dtype,
+            per_layer: (0..n_layers).map(|_| RwLock::new(None)).collect(),
+            staging: Mutex::new(AlignedBuf::zeroed(slots_per_layer * max_blob_bytes)),
+            blob_bytes: blob_bytes.into_boxed_slice(),
+            ggml_dtype: ggml_dtype.into_boxed_slice(),
             expert_rows: rows,
             expert_cols: cols,
+            slots_per_layer,
         }
     }
 
-    /// Overwrites slot `slot`'s weights with `raw_bytes` (used for both the
-    /// initial seed and a live swap).
+    /// Recomposes layer `layer`'s packed pool tensor from `source`'s raw
+    /// bytes, placing each `Gpu`-resident expert (per `residency`) at its
+    /// assigned slot in the staging buffer, then uploads the whole buffer as
+    /// a new `QTensor`. Does not install the result — see
+    /// [`Self::install_layer`]. The staging buffer is reused across calls and
+    /// never re-zeroed, so full slot coverage is load-bearing, not
+    /// defensive: every call must write exactly `slots_per_layer` slots, or
+    /// an uncovered slot would silently keep stale bytes left over from a
+    /// previous, unrelated `rebuild_layer` call (possibly for a different
+    /// layer, since the buffer and its mutex are shared across layers). In
+    /// practice this holds because [`ExpertCache::new`]'s seeding loop always
+    /// fills every slot before the first call, and every live swap keeps the
+    /// slot count constant.
+    ///
+    /// Locks `staging` for the duration of the host copy plus the GPU
+    /// upload. Safe because this only ever runs on the single-threaded
+    /// scheduler loop between steps — see [`ExpertCache::decay_and_swap`]'s
+    /// quiescence invariant, this method's only caller alongside
+    /// [`ExpertCache::new`]'s one-time seed. If a previous call panicked
+    /// while holding the lock, the lock is recovered rather than left
+    /// poisoned: the mutex only guards buffer access, not any invariant that
+    /// survives a panic, since every live slot is unconditionally
+    /// overwritten below.
     ///
     /// # Errors
     ///
-    /// Returns an error if `raw_bytes` is shorter than the byte count a
-    /// `[expert_rows, expert_cols]` tensor of `ggml_dtype` requires, or if
-    /// it can't be reinterpreted as such a tensor on `device`. The length
-    /// check matters beyond a clean error message: candle's
-    /// `qtensor_from_ggml` sizes its unsafe raw-pointer reinterpretation
-    /// from `expert_rows`/`expert_cols`/`ggml_dtype` alone, never from
-    /// `raw_bytes.len()` — a too-short slice would otherwise be read out
-    /// of bounds (UB) instead of erroring.
-    fn fill_slot(&self, slot: SlotIdx, raw_bytes: &[u8], device: &Device) -> Result<()> {
-        let expected = expected_blob_bytes(self.ggml_dtype, self.expert_rows, self.expert_cols);
-        if raw_bytes.len() < expected {
-            candle_core::bail!(
-                "fill_slot: raw_bytes len {} < expected {expected} for [{}, {}] {:?}",
-                raw_bytes.len(),
-                self.expert_rows,
-                self.expert_cols,
-                self.ggml_dtype,
-            );
+    /// Returns an error if `source`'s raw bytes can't be read, if an
+    /// expert's byte range is out of bounds in `source`, if a residency slot
+    /// index is out of bounds for the staging buffer, or if the staging
+    /// buffer can't be reinterpreted as a `[slots_per_layer, expert_rows,
+    /// expert_cols]` tensor of `ggml_dtype` on `device`.
+    fn rebuild_layer(
+        &self,
+        source: &QTensor,
+        residency: &[AtomicU32],
+        layer: usize,
+        n_experts: usize,
+        device: &Device,
+    ) -> Result<Arc<QTensor>> {
+        let raw = source.data()?;
+        let mut staging = self
+            .staging
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let blob_bytes = self.blob_bytes[layer];
+        let base = layer * n_experts;
+        let mut slots_written = 0usize;
+        for expert in 0..n_experts {
+            let slot_val = residency[base + expert].load(Ordering::Relaxed);
+            if slot_val == CPU_SENTINEL {
+                continue;
+            }
+            if slot_val as usize >= self.slots_per_layer {
+                candle_core::bail!(
+                    "residency slot {slot_val} for expert {expert} out of range: \
+                     {} slots per layer",
+                    self.slots_per_layer,
+                );
+            }
+            let src = self.expert_slice(&raw, layer, expert)?;
+            let dst_start = slot_val as usize * blob_bytes;
+            let dst_end = dst_start + blob_bytes;
+            if dst_end > staging.len() {
+                candle_core::bail!(
+                    "residency slot {slot_val} for expert {expert} out of range: \
+                     byte range {dst_start}..{dst_end} exceeds staging buffer \
+                     ({} bytes, {} slots)",
+                    staging.len(),
+                    self.slots_per_layer,
+                );
+            }
+            staging[dst_start..dst_end].copy_from_slice(src);
+            slots_written += 1;
         }
+        debug_assert_eq!(
+            slots_written, self.slots_per_layer,
+            "rebuild_layer must fill every slot: the staging buffer is reused \
+             across calls and never re-zeroed, so a skipped slot would keep \
+             stale bytes from an earlier call",
+        );
+
         let tensor = qtensor_from_ggml(
-            self.ggml_dtype,
-            raw_bytes,
-            vec![self.expert_rows, self.expert_cols],
+            self.ggml_dtype[layer],
+            &staging,
+            vec![self.slots_per_layer, self.expert_rows, self.expert_cols],
             device,
         )?;
-        *self.slots[slot.0 as usize]
-            .write()
-            .expect("LayerPool slot lock not poisoned") = Some(Arc::new(tensor));
-        Ok(())
+        Ok(Arc::new(tensor))
     }
 
-    /// Current weights of `slot`.
+    /// Installs `qt` as layer `layer`'s current pool tensor, replacing
+    /// whatever was there before.
+    fn install_layer(&self, layer: usize, qt: Arc<QTensor>) {
+        *self.per_layer[layer]
+            .write()
+            .expect("LayerPool per_layer lock not poisoned") = Some(qt);
+    }
+
+    /// Current packed pool tensor for layer `layer`, shape
+    /// `[slots_per_layer, expert_rows, expert_cols]`.
     ///
     /// # Panics
     ///
-    /// Panics if `slot` hasn't been seeded yet. Every slot the residency
-    /// table can report as [`Residency::Gpu`] was seeded in
-    /// [`ExpertCache::new`] before it could be marked `Gpu`, so this
-    /// never fires for a `slot` reached through [`ExpertCache::residency`].
-    fn get_slot(&self, slot: SlotIdx) -> Arc<QTensor> {
+    /// Panics if `layer` hasn't been seeded yet. [`ExpertCache::new`] seeds
+    /// every layer before any residency entry can report `Gpu`, so this
+    /// never fires for a `layer` reached through [`ExpertCache::residency`].
+    fn pool_for_layer(&self, layer: usize) -> Arc<QTensor> {
         Arc::clone(
-            self.slots[slot.0 as usize]
+            self.per_layer[layer]
                 .read()
-                .expect("LayerPool slot lock not poisoned")
+                .expect("LayerPool per_layer lock not poisoned")
                 .as_ref()
-                .expect("slot must be seeded before it is read"),
+                .expect("layer must be seeded before its pool is read"),
         )
     }
 
-    /// Byte-slices `expert_idx` out of a packed `[num_experts, rows, cols]`
-    /// tensor's raw data. Same formula as `moe.rs`'s `slice_packed_qtensor`,
-    /// with the same out-of-bounds guard.
+    /// Byte-slices `expert_idx` out of layer `layer`'s packed
+    /// `[num_experts, rows, cols]` tensor's raw data, using that layer's own
+    /// `blob_bytes`. Same formula as `moe.rs`'s `slice_packed_qtensor`, with
+    /// the same out-of-bounds guard.
     ///
     /// # Errors
     ///
     /// Returns an error if the computed byte range exceeds `raw`'s length
     /// (a mismatched `blob_bytes`/`expert_idx`/source-tensor combination).
-    fn expert_slice<'a>(&self, raw: &'a [u8], expert_idx: usize) -> Result<&'a [u8]> {
-        let start = expert_idx * self.blob_bytes;
-        let end = start + self.blob_bytes;
+    fn expert_slice<'a>(&self, raw: &'a [u8], layer: usize, expert_idx: usize) -> Result<&'a [u8]> {
+        let blob_bytes = self.blob_bytes[layer];
+        let start = expert_idx * blob_bytes;
+        let end = start + blob_bytes;
         if end > raw.len() {
             candle_core::bail!(
                 "expert {expert_idx} byte range {start}..{end} exceeds raw data ({} bytes)",
@@ -357,13 +527,14 @@ impl LayerPool {
 /// [`Self::residency`]/calls [`Self::record_hit`] from inside model
 /// layers, while the scheduler calls [`Self::on_step`] between steps. All
 /// fields are `Send + Sync` accordingly — lock-free atomics for the
-/// per-token hot path, a per-slot `RwLock` (see [`LayerPool`]) for the
+/// per-token hot path, a per-layer `RwLock` (see [`LayerPool`]) for the
 /// rarely-touched slot storage, and a `Mutex` for phase bookkeeping.
 pub struct ExpertCache {
     gate_up_pool: LayerPool,
     down_pool: LayerPool,
     /// Flat `[n_layers * n_experts]`; [`CPU_SENTINEL`] means `Cpu`,
-    /// otherwise the value is a [`SlotIdx`] valid in both pools.
+    /// otherwise the value is a [`SlotIdx`] valid in both pools, scoped to
+    /// the expert's layer.
     residency: Box<[AtomicU32]>,
     /// Flat `[n_layers * n_experts]` decaying routing-hit counters.
     hit_counts: Box<[AtomicU64]>,
@@ -388,6 +559,39 @@ pub struct ExpertCache {
     device: Device,
 }
 
+/// Restores two `residency` entries to given pre-swap values on `Drop`
+/// unless [`Self::disarm`] was called first. Guards [`ExpertCache::try_swap`]
+/// against both an `Err` return and a panic unwind from either pool's
+/// `rebuild_layer` call: in either case, Rust runs `Drop` impls of
+/// in-scope locals while unwinding, so the rollback fires exactly when the
+/// swap didn't complete, with no duplicated rollback logic in a `match`
+/// arm.
+struct ResidencyRollback<'a> {
+    residency: &'a [AtomicU32],
+    hot_idx: usize,
+    evicted_idx: usize,
+    pre_hot: u32,
+    pre_evicted: u32,
+    armed: bool,
+}
+
+impl ResidencyRollback<'_> {
+    /// Marks the swap as having completed successfully, so `Drop` leaves
+    /// the (now-correct) post-swap residency values in place.
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ResidencyRollback<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.residency[self.hot_idx].store(self.pre_hot, Ordering::Relaxed);
+            self.residency[self.evicted_idx].store(self.pre_evicted, Ordering::Relaxed);
+        }
+    }
+}
+
 impl ExpertCache {
     /// Allocates both slot pools and seeds an arbitrary initial placement:
     /// each layer's first `slots_per_layer` experts by index, not ranked
@@ -402,10 +606,12 @@ impl ExpertCache {
     ///
     /// Returns an error if `gate_up_exps`/`down_exps` don't have exactly
     /// `budget.n_layers` entries, if either source tensor's shape isn't
-    /// 3-dimensional, if `budget`'s blob-byte sizes are smaller than the
-    /// source tensors' actual per-expert byte size, if reading a source
-    /// tensor's raw bytes fails, or if a byte range can't be reinterpreted
-    /// as a valid per-expert `QTensor` on `device`.
+    /// 3-dimensional, if any layer's shape diverges from layer 0's (`MoE`
+    /// GGML quantization type may still vary per layer, e.g. a dynamic-quant
+    /// GGUF mixing `Q4_K`/`Q5_K` across layers — only shape must be uniform), if
+    /// reading a source tensor's raw bytes fails, or if a byte range can't
+    /// be reinterpreted as a valid per-expert `QTensor` on `device`.
+    #[allow(clippy::too_many_lines)] // validate, build pools, seed, construct
     pub fn new(
         budget: ExpertCacheBudget,
         gate_up_exps: Vec<Arc<QTensor>>,
@@ -414,8 +620,6 @@ impl ExpertCache {
     ) -> Result<Self> {
         let ExpertCacheBudget {
             slots_per_layer,
-            gate_up_blob_bytes,
-            down_blob_bytes,
             n_layers,
             n_experts,
             ..
@@ -429,37 +633,51 @@ impl ExpertCache {
             );
         }
 
-        let gate_up_dtype = gate_up_exps[0].dtype();
         let gate_up_dims = gate_up_exps[0].shape().dims().to_vec();
-        let down_dtype = down_exps[0].dtype();
         let down_dims = down_exps[0].shape().dims().to_vec();
         if gate_up_dims.len() != 3 || down_dims.len() != 3 {
             candle_core::bail!(
                 "ExpertCache::new: expected 3D [n_experts, rows, cols] source tensors, got gate_up shape {gate_up_dims:?}, down shape {down_dims:?}",
             );
         }
-
-        let expected_gate_up_blob =
-            expected_blob_bytes(gate_up_dtype, gate_up_dims[1], gate_up_dims[2]);
-        let expected_down_blob = expected_blob_bytes(down_dtype, down_dims[1], down_dims[2]);
-        if gate_up_blob_bytes < expected_gate_up_blob || down_blob_bytes < expected_down_blob {
+        if let Some(i) = gate_up_exps
+            .iter()
+            .position(|t| t.shape().dims() != gate_up_dims)
+        {
             candle_core::bail!(
-                "ExpertCache::new: budget blob sizes (gate_up={gate_up_blob_bytes}, down={down_blob_bytes}) too small for source shapes (gate_up needs {expected_gate_up_blob}, down needs {expected_down_blob})",
+                "ExpertCache::new: layer {i}'s gate_up shape {:?} diverges from layer 0's {gate_up_dims:?}",
+                gate_up_exps[i].shape().dims(),
+            );
+        }
+        if let Some(i) = down_exps.iter().position(|t| t.shape().dims() != down_dims) {
+            candle_core::bail!(
+                "ExpertCache::new: layer {i}'s down shape {:?} diverges from layer 0's {down_dims:?}",
+                down_exps[i].shape().dims(),
             );
         }
 
-        let n_slots = n_layers * slots_per_layer;
+        let gate_up_dtypes: Vec<GgmlDType> = gate_up_exps.iter().map(|t| t.dtype()).collect();
+        let gate_up_blob_bytes: Vec<usize> = gate_up_exps
+            .iter()
+            .map(|t| blob_bytes_per_expert(t))
+            .collect();
+        let down_dtypes: Vec<GgmlDType> = down_exps.iter().map(|t| t.dtype()).collect();
+        let down_blob_bytes: Vec<usize> =
+            down_exps.iter().map(|t| blob_bytes_per_expert(t)).collect();
+
         let gate_up_pool = LayerPool::new(
-            n_slots,
+            n_layers,
+            slots_per_layer,
             gate_up_blob_bytes,
-            gate_up_dtype,
+            gate_up_dtypes,
             gate_up_dims[1],
             gate_up_dims[2],
         );
         let down_pool = LayerPool::new(
-            n_slots,
+            n_layers,
+            slots_per_layer,
             down_blob_bytes,
-            down_dtype,
+            down_dtypes,
             down_dims[1],
             down_dims[2],
         );
@@ -472,27 +690,27 @@ impl ExpertCache {
             .collect();
 
         for layer in 0..n_layers {
-            // Fetched once per layer: on GPU-backed sources `data()` would
-            // be a full device-to-host copy, so a per-expert call inside
-            // the loop below would redundantly repeat it `slots_per_layer`
-            // times. Sources are expected to be CPU-resident (the offload
-            // case this cache exists for), so this is a cheap borrow.
-            let gu_raw = gate_up_exps[layer].data()?;
-            let dn_raw = down_exps[layer].data()?;
-
+            let base = layer * n_experts;
             for local_idx in 0..slots_per_layer {
-                let gu_slice = gate_up_pool.expert_slice(&gu_raw, local_idx)?;
-                let dn_slice = down_pool.expert_slice(&dn_raw, local_idx)?;
-
                 #[allow(clippy::cast_possible_truncation)]
                 // Slot counts are bounded by VRAM capacity divided by a
                 // ~1 MB-scale blob size — far below u32::MAX.
-                let slot = SlotIdx((layer * slots_per_layer + local_idx) as u32);
-                gate_up_pool.fill_slot(slot, gu_slice, device)?;
-                down_pool.fill_slot(slot, dn_slice, device)?;
-
-                residency[layer * n_experts + local_idx].store(slot.0, Ordering::Relaxed);
+                let slot = SlotIdx(local_idx as u32);
+                residency[base + local_idx].store(slot.0, Ordering::Relaxed);
             }
+
+            let gu_tensor = gate_up_pool.rebuild_layer(
+                &gate_up_exps[layer],
+                &residency,
+                layer,
+                n_experts,
+                device,
+            )?;
+            gate_up_pool.install_layer(layer, gu_tensor);
+
+            let dn_tensor =
+                down_pool.rebuild_layer(&down_exps[layer], &residency, layer, n_experts, device)?;
+            down_pool.install_layer(layer, dn_tensor);
         }
 
         Ok(Self {
@@ -555,23 +773,32 @@ impl ExpertCache {
     /// last call (or since construction), then resets both counters to 0.
     /// Used once per decay/swap window by [`Self::on_step`] so the logged
     /// rate reflects recent traffic, not a lifetime-diluted average.
-    fn take_fast_path_stats(&self) -> (u64, u64) {
+    /// `pub(crate)` rather than private so `moe.rs`'s tests can verify
+    /// [`Self::record_fast_path`]/[`Self::record_mixed_path`] are actually
+    /// invoked by the dispatch classifier, not just unit-testable in
+    /// isolation.
+    pub(crate) fn take_fast_path_stats(&self) -> (u64, u64) {
         (
             self.fast_path_calls.swap(0, Ordering::Relaxed),
             self.mixed_path_calls.swap(0, Ordering::Relaxed),
         )
     }
 
-    /// GPU-resident `gate_up` weights for `slot`.
+    /// GPU-resident `gate_up` packed pool tensor for `layer`, shape
+    /// `[slots_per_layer, rows, cols]`. Callers (the mixed GPU/CPU dispatch
+    /// path) pass `Residency::Gpu(SlotIdx)` values from this layer as expert ids
+    /// to `QTensor::indexed_moe_forward` on the returned tensor — never an
+    /// original expert index, and never a `SlotIdx` from a different layer.
     #[must_use]
-    pub fn gate_up_slot(&self, slot: SlotIdx) -> Arc<QTensor> {
-        self.gate_up_pool.get_slot(slot)
+    pub fn gate_up_pool(&self, layer: usize) -> Arc<QTensor> {
+        self.gate_up_pool.pool_for_layer(layer)
     }
 
-    /// GPU-resident down weights for `slot`.
+    /// GPU-resident down packed pool tensor for `layer`. Same shape and
+    /// `SlotIdx` scoping rules as [`Self::gate_up_pool`].
     #[must_use]
-    pub fn down_slot(&self, slot: SlotIdx) -> Arc<QTensor> {
-        self.down_pool.get_slot(slot)
+    pub fn down_pool(&self, layer: usize) -> Arc<QTensor> {
+        self.down_pool.pool_for_layer(layer)
     }
 
     /// Number of GPU-resident slots per layer.
@@ -710,12 +937,12 @@ impl ExpertCache {
     ///
     /// Must be called between scheduler steps, never concurrent with a
     /// forward pass reading [`Self::residency`] or calling
-    /// [`Self::gate_up_slot`]/[`Self::down_slot`]: [`Self::try_swap`]
-    /// updates the two slot pools and the residency table as separate,
-    /// non-atomic steps, so a concurrent reader could observe a slot mid-swap
-    /// (e.g. a new `gate_up` paired with a stale `down`). The scheduler's
-    /// step boundary provides this quiescence guarantee — see
-    /// [`Self::on_step`]'s doc comment.
+    /// [`Self::gate_up_pool`]/[`Self::down_pool`]: [`Self::try_swap`]
+    /// rebuilds both layer pool tensors and updates the residency table as
+    /// separate steps, so a concurrent reader could observe a layer
+    /// mid-swap (e.g. a rebuilt `gate_up` pool paired with a stale `down`
+    /// pool). The scheduler's step boundary provides this quiescence
+    /// guarantee — see [`Self::on_step`]'s doc comment.
     ///
     /// # Errors
     ///
@@ -761,26 +988,27 @@ impl ExpertCache {
         Ok(total_swaps)
     }
 
-    /// Uploads `hot_expert`'s weights into `cold_slot`, then marks
-    /// `hot_expert` `Gpu(cold_slot)` and `evicted_expert` `Cpu`.
+    /// Rebuilds layer `layer`'s two pool tensors with `hot_expert` occupying
+    /// `cold_slot` in place of `evicted_expert`, then installs both and
+    /// marks `hot_expert` `Gpu(cold_slot)`, `evicted_expert` `Cpu`.
     ///
     /// # Correctness
     ///
     /// Same quiescence requirement as [`Self::decay_and_swap`], its only
-    /// caller: the `gate_up_pool`/`down_pool`/`residency` updates below are
-    /// non-atomic, so this must never run concurrently with a forward pass.
+    /// caller: `try_swap` rebuilds both layer pool tensors and the
+    /// residency table as separate steps, so this must never run
+    /// concurrently with a forward pass.
     ///
     /// # Errors
     ///
-    /// Returns an error if either upload fails. If the `gate_up` upload
-    /// succeeds but the down upload fails, `evicted_expert` is marked
-    /// `Cpu` so the now-mixed slot (new `gate_up`, stale down) is never
-    /// dispatched; the slot is permanently lost for the lifetime of the
-    /// cache (no reclamation path exists — no residency entry points at
-    /// it, so [`Self::decay_and_swap`] never selects it as a future swap
-    /// target). Acceptable because the failure path is rare (a transient
-    /// GPU upload error) and the cost is bounded to one slot's worth of
-    /// VRAM per failure.
+    /// Returns an error if either pool's rebuild fails (a bad byte range or
+    /// a failed GPU upload). Residency is tentatively flipped before the
+    /// rebuilds run (so [`LayerPool::rebuild_layer`] picks up the new
+    /// mapping) and rolled back to its pre-swap state before either pool
+    /// tensor is installed, whether a rebuild returns `Err` or panics — a
+    /// failed or aborted swap leaves both pools and the residency table
+    /// exactly as they were, no dead or mixed slot possible. See
+    /// [`ResidencyRollback`].
     fn try_swap(
         &self,
         layer: usize,
@@ -789,21 +1017,41 @@ impl ExpertCache {
         evicted_expert: usize,
     ) -> Result<()> {
         let base = layer * self.n_experts;
+        let hot_idx = base + hot_expert;
+        let evicted_idx = base + evicted_expert;
 
-        let gu_raw = self.gate_up_sources[layer].data()?;
-        let gu_slice = self.gate_up_pool.expert_slice(&gu_raw, hot_expert)?;
-        self.gate_up_pool
-            .fill_slot(cold_slot, gu_slice, &self.device)?;
+        let pre_hot = self.residency[hot_idx].load(Ordering::Relaxed);
+        let pre_evicted = self.residency[evicted_idx].load(Ordering::Relaxed);
 
-        let dn_raw = self.down_sources[layer].data()?;
-        let dn_slice = self.down_pool.expert_slice(&dn_raw, hot_expert)?;
-        if let Err(err) = self.down_pool.fill_slot(cold_slot, dn_slice, &self.device) {
-            self.residency[base + evicted_expert].store(CPU_SENTINEL, Ordering::Relaxed);
-            return Err(err);
-        }
+        self.residency[hot_idx].store(cold_slot.0, Ordering::Relaxed);
+        self.residency[evicted_idx].store(CPU_SENTINEL, Ordering::Relaxed);
+        let rollback = ResidencyRollback {
+            residency: &self.residency,
+            hot_idx,
+            evicted_idx,
+            pre_hot,
+            pre_evicted,
+            armed: true,
+        };
 
-        self.residency[base + hot_expert].store(cold_slot.0, Ordering::Relaxed);
-        self.residency[base + evicted_expert].store(CPU_SENTINEL, Ordering::Relaxed);
+        let new_gu = self.gate_up_pool.rebuild_layer(
+            &self.gate_up_sources[layer],
+            &self.residency,
+            layer,
+            self.n_experts,
+            &self.device,
+        )?;
+        let new_dn = self.down_pool.rebuild_layer(
+            &self.down_sources[layer],
+            &self.residency,
+            layer,
+            self.n_experts,
+            &self.device,
+        )?;
+        rollback.disarm();
+
+        self.gate_up_pool.install_layer(layer, new_gu);
+        self.down_pool.install_layer(layer, new_dn);
         log::debug!(
             "expert cache: layer {layer}: slot {} now expert {hot_expert} (evicted expert {evicted_expert})",
             cold_slot.0
@@ -830,11 +1078,23 @@ mod tests {
     /// element of expert `i` is `(i + 1) as f32`, quantized losslessly
     /// (`GgmlDType::F32`, block_size=1) so values round-trip exactly.
     fn make_packed_experts(n_experts: usize, rows: usize, cols: usize) -> Arc<QTensor> {
+        make_packed_experts_as(n_experts, rows, cols, GgmlDType::F32)
+    }
+
+    /// Like [`make_packed_experts`], but quantized to an explicit `dtype`
+    /// instead of always `F32`. Used to build test fixtures with
+    /// per-layer-varying `GgmlDType` (e.g. mimicking a dynamic-quant GGUF).
+    fn make_packed_experts_as(
+        n_experts: usize,
+        rows: usize,
+        cols: usize,
+        dtype: GgmlDType,
+    ) -> Arc<QTensor> {
         let data: Vec<f32> = (0..n_experts * rows * cols)
             .map(|idx| ((idx / (rows * cols)) + 1) as f32)
             .collect();
         let tensor = Tensor::from_vec(data, (n_experts, rows, cols), &Device::Cpu).expect("tensor");
-        Arc::new(QTensor::quantize(&tensor, GgmlDType::F32).expect("quantize"))
+        Arc::new(QTensor::quantize(&tensor, dtype).expect("quantize"))
     }
 
     /// Per-expert byte cost of a `[rows, cols]` F32 blob (block_size=1, so
@@ -944,36 +1204,33 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // Verifies ExpertCache::new returns an error (not UB) when the budget's
-    // declared blob byte size is smaller than what the source tensors'
-    // actual shape requires.
+    // Verifies ExpertCache::new rejects a layer whose tensor shape diverges
+    // from layer 0's, even though per-layer GGML dtype is allowed to vary
+    // (see test_seed_with_per_layer_varying_dtype) -- shape must still be
+    // uniform across layers.
     #[test]
-    fn test_new_rejects_blob_size_mismatch() {
+    fn test_new_rejects_shape_mismatch_across_layers() {
         let n_experts = 4;
         let rows = 4;
         let cols = 8;
-        let gate_up_exps = vec![make_packed_experts(n_experts, rows, 2 * cols)];
-        let down_exps = vec![make_packed_experts(n_experts, cols, rows)];
+        let slots_per_layer = 2;
+        let gate_up_exps = vec![
+            make_packed_experts(n_experts, rows, 2 * cols),
+            make_packed_experts(n_experts, rows + 1, 2 * cols), // shape mismatch
+        ];
+        let down_exps = vec![
+            make_packed_experts(n_experts, cols, rows),
+            make_packed_experts(n_experts, cols, rows),
+        ];
         let budget = ExpertCacheBudget {
-            raw_budget_slots: 2,
-            slots_per_layer: 2,
-            // Understates the true gate_up blob size (rows * 2*cols * 4 bytes).
-            gate_up_blob_bytes: 4,
+            raw_budget_slots: 2 * slots_per_layer,
+            slots_per_layer,
+            gate_up_blob_bytes: blob_bytes(n_experts, rows, 2 * cols),
             down_blob_bytes: blob_bytes(n_experts, cols, rows),
-            n_layers: 1,
+            n_layers: 2,
             n_experts,
         };
         let result = ExpertCache::new(budget, gate_up_exps, down_exps, &Device::Cpu);
-        assert!(result.is_err());
-    }
-
-    // Verifies LayerPool::fill_slot returns an error (not UB) when raw_bytes
-    // is shorter than the slot's expected blob size.
-    #[test]
-    fn test_fill_slot_rejects_short_blob() {
-        let pool = LayerPool::new(1, 100, GgmlDType::F32, 4, 8);
-        let raw = vec![0u8; 50]; // needs 4 * 8 * 4 = 128 bytes
-        let result = pool.fill_slot(SlotIdx(0), &raw, &Device::Cpu);
         assert!(result.is_err());
     }
 
@@ -981,9 +1238,9 @@ mod tests {
     // when the computed byte range exceeds the raw data's length.
     #[test]
     fn test_expert_slice_rejects_out_of_bounds() {
-        let pool = LayerPool::new(1, 100, GgmlDType::F32, 4, 8);
+        let pool = LayerPool::new(1, 1, vec![100], vec![GgmlDType::F32], 4, 8);
         let raw = vec![0u8; 50];
-        assert!(pool.expert_slice(&raw, 0).is_err());
+        assert!(pool.expert_slice(&raw, 0, 0).is_err());
     }
 
     // Verifies the initial seed marks the first `slots_per_layer` experts
@@ -1001,15 +1258,16 @@ mod tests {
         }
     }
 
-    // Verifies seeded slot indices are contiguous per layer:
-    // layer * slots_per_layer + local_idx.
+    // Verifies seeded slot indices are layer-local (0..slots_per_layer
+    // within each layer's own pool tensor), not a global offset across
+    // layers.
     #[test]
     fn test_seed_slot_assignment() {
         let cache = make_cache(2, 4, 4, 8, 2);
         assert_eq!(cache.residency(0, 0), Residency::Gpu(SlotIdx(0)));
         assert_eq!(cache.residency(0, 1), Residency::Gpu(SlotIdx(1)));
-        assert_eq!(cache.residency(1, 0), Residency::Gpu(SlotIdx(2)));
-        assert_eq!(cache.residency(1, 1), Residency::Gpu(SlotIdx(3)));
+        assert_eq!(cache.residency(1, 0), Residency::Gpu(SlotIdx(0)));
+        assert_eq!(cache.residency(1, 1), Residency::Gpu(SlotIdx(1)));
     }
 
     // Verifies record_hit increments the correct counter.
@@ -1186,7 +1444,8 @@ mod tests {
         );
     }
 
-    // Verifies a cached slot's dequantized data matches its source expert.
+    // Verifies a seeded slot's dequantized data matches its source expert,
+    // sliced out of the per-layer pool tensor at the slot's row.
     #[test]
     fn test_slot_data_correctness() {
         let cache = make_cache(1, 4, 4, 8, 2);
@@ -1194,13 +1453,225 @@ mod tests {
             panic!("expected expert 1 to be Gpu-resident");
         };
         let vals = cache
-            .gate_up_slot(slot)
+            .gate_up_pool(0)
             .dequantize(&Device::Cpu)
             .expect("dequantize")
+            .narrow(0, slot.0 as usize, 1)
+            .expect("narrow")
             .flatten_all()
             .expect("flatten")
             .to_vec1::<f32>()
             .expect("to_vec1");
         assert!(vals.iter().all(|&v| (v - 2.0).abs() < 1e-6));
+    }
+
+    // Verifies a seeded slot's raw bytes exactly match its source expert's
+    // bytes (byte-for-byte, not just dequantized values) -- the Step 4
+    // "Verify" bar: upload a known expert, read back, byte-compare.
+    #[test]
+    fn test_seed_byte_exact() {
+        let n_experts = 4;
+        let rows = 4;
+        let cols = 8;
+        let cache = make_cache(1, n_experts, rows, cols, 2);
+        let Residency::Gpu(slot) = cache.residency(0, 1) else {
+            panic!("expected expert 1 to be Gpu-resident");
+        };
+        let gu_blob = blob_bytes(n_experts, rows, 2 * cols);
+
+        let pool = cache.gate_up_pool(0);
+        let pool_raw = pool.data().expect("pool data");
+        let slot_start = slot.0 as usize * gu_blob;
+        let actual = &pool_raw[slot_start..slot_start + gu_blob];
+
+        let source_raw = cache.gate_up_sources[0].data().expect("source data");
+        let expected = &source_raw[gu_blob..2 * gu_blob]; // expert 1
+
+        assert_eq!(actual, expected);
+    }
+
+    // Verifies a live swap's rebuilt slot byte-matches the newly swapped-in
+    // expert's source bytes, not the evicted expert's stale data -- the
+    // Step 4 "Verify" bar's second half: the same check, for one live swap.
+    #[test]
+    fn test_swap_byte_exact() {
+        let n_experts = 4;
+        let rows = 4;
+        let cols = 8;
+        let cache = make_cache(1, n_experts, rows, cols, 1);
+        // Expert 0 is Gpu-seeded; 1,2,3 are Cpu.
+        for _ in 0..100 {
+            cache.record_hit(0, 3); // hottest cpu
+        }
+        cache.decay_and_swap().expect("decay_and_swap");
+        let Residency::Gpu(slot) = cache.residency(0, 3) else {
+            panic!("expected expert 3 to be Gpu-resident after swap");
+        };
+        let gu_blob = blob_bytes(n_experts, rows, 2 * cols);
+
+        let pool = cache.gate_up_pool(0);
+        let pool_raw = pool.data().expect("pool data");
+        let slot_start = slot.0 as usize * gu_blob;
+        let actual = &pool_raw[slot_start..slot_start + gu_blob];
+
+        let source_raw = cache.gate_up_sources[0].data().expect("source data");
+        let expected = &source_raw[3 * gu_blob..4 * gu_blob]; // expert 3
+
+        assert_eq!(actual, expected);
+    }
+
+    // Verifies ExpertCache::new accepts layers with different GGML
+    // quantization types (e.g. a dynamic-quant GGUF mixing Q4_K/Q5_K per
+    // layer) as long as shape is uniform, and seeds each layer's pool bytes
+    // from that layer's own dtype -- not layer 0's.
+    #[test]
+    fn test_seed_with_per_layer_varying_dtype() {
+        let n_experts = 4;
+        let rows = 4;
+        let cols = 8;
+        let slots_per_layer = 2;
+
+        let gate_up_exps = vec![
+            make_packed_experts_as(n_experts, rows, 2 * cols, GgmlDType::F32),
+            make_packed_experts_as(n_experts, rows, 2 * cols, GgmlDType::F16),
+        ];
+        let down_exps = vec![
+            make_packed_experts_as(n_experts, cols, rows, GgmlDType::F32),
+            make_packed_experts_as(n_experts, cols, rows, GgmlDType::F16),
+        ];
+        let gu_blob_max =
+            blob_bytes_per_expert(&gate_up_exps[0]).max(blob_bytes_per_expert(&gate_up_exps[1]));
+        let dn_blob_max =
+            blob_bytes_per_expert(&down_exps[0]).max(blob_bytes_per_expert(&down_exps[1]));
+        let budget = ExpertCacheBudget {
+            raw_budget_slots: 2 * slots_per_layer,
+            slots_per_layer,
+            gate_up_blob_bytes: gu_blob_max,
+            down_blob_bytes: dn_blob_max,
+            n_layers: 2,
+            n_experts,
+        };
+        let cache = ExpertCache::new(budget, gate_up_exps, down_exps, &Device::Cpu)
+            .expect("ExpertCache::new must accept per-layer-varying dtype");
+
+        // Seeding fills slot `local_idx` with expert `local_idx` for
+        // `local_idx < slots_per_layer` (see ExpertCache::new's seed loop).
+        for layer in 0..2 {
+            let blob = blob_bytes_per_expert(&cache.gate_up_sources[layer]);
+            let pool = cache.gate_up_pool(layer);
+            let pool_raw = pool.data().expect("pool data");
+            let source_raw = cache.gate_up_sources[layer].data().expect("source data");
+            for local_idx in 0..slots_per_layer {
+                let actual = &pool_raw[local_idx * blob..(local_idx + 1) * blob];
+                let expected = &source_raw[local_idx * blob..(local_idx + 1) * blob];
+                assert_eq!(
+                    actual, expected,
+                    "layer {layer} slot {local_idx} bytes mismatch"
+                );
+            }
+        }
+    }
+
+    // Live-swap counterpart to test_seed_with_per_layer_varying_dtype:
+    // verifies a swap on a non-layer-0 dtype (F16) correctly rebuilds using
+    // that layer's own dtype/blob_bytes, not layer 0's (F32).
+    #[test]
+    fn test_swap_preserves_per_layer_dtype() {
+        let n_experts = 4;
+        let rows = 4;
+        let cols = 8;
+        let slots_per_layer = 1;
+
+        let gate_up_exps = vec![
+            make_packed_experts_as(n_experts, rows, 2 * cols, GgmlDType::F32),
+            make_packed_experts_as(n_experts, rows, 2 * cols, GgmlDType::F16),
+        ];
+        let down_exps = vec![
+            make_packed_experts_as(n_experts, cols, rows, GgmlDType::F32),
+            make_packed_experts_as(n_experts, cols, rows, GgmlDType::F16),
+        ];
+        let gu_blob_max =
+            blob_bytes_per_expert(&gate_up_exps[0]).max(blob_bytes_per_expert(&gate_up_exps[1]));
+        let dn_blob_max =
+            blob_bytes_per_expert(&down_exps[0]).max(blob_bytes_per_expert(&down_exps[1]));
+        let budget = ExpertCacheBudget {
+            raw_budget_slots: 2 * slots_per_layer,
+            slots_per_layer,
+            gate_up_blob_bytes: gu_blob_max,
+            down_blob_bytes: dn_blob_max,
+            n_layers: 2,
+            n_experts,
+        };
+        let cache = ExpertCache::new(budget, gate_up_exps, down_exps, &Device::Cpu)
+            .expect("ExpertCache::new");
+
+        // Layer 1 (F16): expert 0 is Gpu-seeded; 1,2,3 are Cpu. Force expert 3 hot.
+        for _ in 0..100 {
+            cache.record_hit(1, 3);
+        }
+        cache.decay_and_swap().expect("decay_and_swap");
+        let Residency::Gpu(slot) = cache.residency(1, 3) else {
+            panic!("expected expert 3 to be Gpu-resident on layer 1 after swap");
+        };
+
+        let gu_blob = blob_bytes_per_expert(&cache.gate_up_sources[1]);
+        let pool = cache.gate_up_pool(1);
+        let pool_raw = pool.data().expect("pool data");
+        let slot_start = slot.0 as usize * gu_blob;
+        let actual = &pool_raw[slot_start..slot_start + gu_blob];
+
+        let source_raw = cache.gate_up_sources[1].data().expect("source data");
+        let expected = &source_raw[3 * gu_blob..4 * gu_blob]; // expert 3
+
+        assert_eq!(actual, expected);
+    }
+
+    // Verifies try_swap rolls residency back to its pre-swap state if the
+    // down pool's rebuild fails after the gate_up pool's rebuild already
+    // succeeded -- no dead slot, no silently-mismatched pools.
+    #[test]
+    fn test_swap_rollback_on_partial_failure() {
+        let n_experts = 4;
+        let rows = 4;
+        let cols = 8;
+        let mut cache = make_cache(1, n_experts, rows, cols, 1);
+        // Corrupt the down source to one expert short, so expert 3's byte
+        // range is out of bounds and rebuild_layer fails for the down pool
+        // only (gate_up's source is untouched and rebuilds fine).
+        cache.down_sources[0] = make_packed_experts(n_experts - 1, cols, rows);
+
+        // Expert 0 is Gpu-seeded; 1,2,3 are Cpu.
+        for _ in 0..100 {
+            cache.record_hit(0, 3); // would otherwise evict expert 0
+        }
+        assert!(cache.decay_and_swap().is_err());
+        assert!(matches!(cache.residency(0, 0), Residency::Gpu(_)));
+        assert_eq!(cache.residency(0, 3), Residency::Cpu);
+    }
+
+    // Verifies the staging buffer is reused (same allocation) across the
+    // seed and a subsequent live swap, not reallocated per rebuild.
+    #[test]
+    fn test_staging_buffer_reused() {
+        let cache = make_cache(1, 4, 4, 8, 2);
+        let ptr_before = cache
+            .gate_up_pool
+            .staging
+            .lock()
+            .expect("staging lock")
+            .as_ptr();
+
+        for _ in 0..100 {
+            cache.record_hit(0, 3);
+        }
+        cache.decay_and_swap().expect("decay_and_swap");
+
+        let ptr_after = cache
+            .gate_up_pool
+            .staging
+            .lock()
+            .expect("staging lock")
+            .as_ptr();
+        assert_eq!(ptr_before, ptr_after);
     }
 }
