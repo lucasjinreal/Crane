@@ -790,6 +790,16 @@ impl IQuantExperts {
         self.rows
     }
 
+    /// Total raw byte size of the packed GGUF data across all experts. This
+    /// is what's actually uploaded/stored, not an
+    /// element-count-times-compute-dtype estimate. `cols` is validated in
+    /// [`Self::new`] to be a multiple of `ty.block_size()`, so the division
+    /// is exact.
+    #[must_use]
+    pub fn packed_byte_size(&self) -> usize {
+        self.experts * self.rows * (self.cols / self.ty.block_size()) * self.ty.block_bytes()
+    }
+
     #[must_use]
     pub fn device(&self) -> &Device {
         self.packed.device()
@@ -1392,6 +1402,24 @@ mod tests {
                     diff / scale
                 );
             }
+        }
+        Ok(())
+    }
+
+    // Verifies `IQuantExperts::packed_byte_size` matches the same
+    // `experts * rows * (cols / block_size) * block_bytes` formula `new`
+    // uses to validate the packed buffer's length, across every i-quant
+    // type `expert_cases` covers (including Q2_0's flat, non-K-quant
+    // layout).
+    #[test]
+    fn packed_byte_size_matches_new_validation_formula() -> Result<()> {
+        let experts = 5usize;
+        for (ty, rows, cols) in expert_cases() {
+            let packed = random_blocks(ty, experts * rows * cols / ty.block_size(), rows as u32);
+            let expected = experts * rows * (cols / ty.block_size()) * ty.block_bytes();
+            assert_eq!(packed.len(), expected);
+            let set = IQuantExperts::new(ty, packed, [experts, rows, cols], &Device::Cpu)?;
+            assert_eq!(set.packed_byte_size(), expected);
         }
         Ok(())
     }

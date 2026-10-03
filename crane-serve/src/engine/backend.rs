@@ -117,6 +117,13 @@ pub trait ModelBackend: Send + 'static {
         None
     }
 
+    /// Worst-case transient VRAM one in-flight MoE CPU-offload call needs
+    /// for a `chunk_tokens`-token prefill chunk. 0 for backends without
+    /// CPU-offloaded MoE experts (the default).
+    fn moe_offload_reservation_bytes(&self, _chunk_tokens: usize) -> u64 {
+        0
+    }
+
     /// Re-run expert promotion with an updated policy (e.g. after
     /// `derive_safe_max_seq_len` tightens `max_seq_len`). The default
     /// implementation is a no-op — only `MoE` backends override this.
@@ -739,6 +746,12 @@ pub struct ExpertPromotionPolicy {
     /// KV cache VRAM. `None` or `Some(0)` falls back to a conservative
     /// default.
     pub max_seq_len: Option<usize>,
+    /// Prefill chunk size used to estimate the transient MoE CPU-offload
+    /// VRAM reservation (see `Model::moe_offload_reservation_bytes`).
+    /// Promotion must subtract this same reservation before deciding how
+    /// many layers fit, or the budget it leaves for the KV cache can't
+    /// honor it later.
+    pub chunk_tokens: usize,
 }
 
 pub struct Qwen3Backend {
@@ -767,7 +780,12 @@ impl Qwen3Backend {
             .expert_device(&devices.expert)
             .build()?;
         if let Some(p) = promotion {
-            model.promote_experts_to_gpu(p.vram_ceiling_bytes, p.max_concurrent, p.max_seq_len)?;
+            model.promote_experts_to_gpu(
+                p.vram_ceiling_bytes,
+                p.max_concurrent,
+                p.max_seq_len,
+                p.chunk_tokens,
+            )?;
         }
         Ok(Self {
             model,
@@ -848,11 +866,16 @@ impl ModelBackend for Qwen3Backend {
         Some(self.model.kv_bytes_per_token())
     }
 
+    fn moe_offload_reservation_bytes(&self, chunk_tokens: usize) -> u64 {
+        self.model.moe_offload_reservation_bytes(chunk_tokens)
+    }
+
     fn re_promote_experts(&mut self, policy: &ExpertPromotionPolicy) -> Result<()> {
         self.model.promote_experts_to_gpu(
             policy.vram_ceiling_bytes,
             policy.max_concurrent,
             policy.max_seq_len,
+            policy.chunk_tokens,
         )
     }
 

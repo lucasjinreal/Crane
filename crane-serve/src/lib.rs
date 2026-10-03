@@ -830,6 +830,7 @@ fn resolve_expert_placement(
             vram_ceiling_bytes: raw_limit,
             max_concurrent: Some(max_concurrent),
             max_seq_len: Some(max_seq_len),
+            chunk_tokens: engine::PREFILL_CHUNK_SIZE,
         }),
     )
 }
@@ -976,7 +977,9 @@ fn derive_safe_max_seq_len(
     let ceiling = memory_config
         .gpu_memory_limit_bytes
         .min(physical_total_bytes);
-    let headroom = ceiling.saturating_sub(memory_config.baseline_gpu_bytes);
+    let headroom = ceiling
+        .saturating_sub(memory_config.baseline_gpu_bytes)
+        .saturating_sub(memory_config.moe_offload_reservation_bytes);
     // Raw KV-tensor bytes are only ~15-20% of real GPU growth (padded
     // batch-decode copies, allocator retention, forward-pass intermediates
     // like chunked-prefill attention scores that scale with chunk_size ×
@@ -1720,6 +1723,8 @@ pub async fn run(mut args: Args) -> Result<()> {
         let mut memory_config =
             MemoryConfig::parse(args.max_seq_len, args.gpu_memory_limit.as_deref(), &device);
         memory_config.record_baseline(&device);
+        memory_config.moe_offload_reservation_bytes =
+            backend.moe_offload_reservation_bytes(engine::PREFILL_CHUNK_SIZE);
         // This guard duplicates derive_safe_max_seq_len's own first-line check
         // intentionally, so that function stays independently callable (and
         // testable) without relying on the caller to have already checked.
@@ -1758,6 +1763,7 @@ pub async fn run(mut args: Args) -> Result<()> {
                             vram_ceiling_bytes: promo.vram_ceiling_bytes,
                             max_concurrent: Some(effective_concurrent),
                             max_seq_len: Some(derived),
+                            chunk_tokens: promo.chunk_tokens,
                         };
                         backend.re_promote_experts(&updated)?;
                         // Baseline must be re-recorded: promoting more experts
@@ -1766,6 +1772,11 @@ pub async fn run(mut args: Args) -> Result<()> {
                         // limit. A stale (lower) baseline would over-estimate
                         // the KV budget, risking OOM.
                         memory_config.record_baseline(&device);
+                        // Re-promotion also changes which layers are
+                        // CPU-resident, so the offload reservation (which
+                        // depends on that residency) must be recomputed too.
+                        memory_config.moe_offload_reservation_bytes =
+                            backend.moe_offload_reservation_bytes(engine::PREFILL_CHUNK_SIZE);
                     }
                 },
                 None => {
@@ -2530,6 +2541,7 @@ mod dtype_tests {
             max_seq_len,
             gpu_memory_limit_bytes: limit_bytes,
             baseline_gpu_bytes: baseline_bytes,
+            moe_offload_reservation_bytes: 0,
         }
     }
 
@@ -2586,6 +2598,19 @@ mod dtype_tests {
         let kv_bytes_per_token = 96 * 1024;
         let derived = derive_safe_max_seq_len(&cfg, 16 << 30, kv_bytes_per_token).expect("derived");
         assert_eq!(derived, 10_922);
+    }
+
+    #[test]
+    fn derive_max_seq_len_accounts_for_moe_offload_reservation() {
+        // Same numbers as derive_max_seq_len_computes_expected_value, but
+        // with a 1 GiB MoE-offload reservation carved out of headroom
+        // first: headroom=5 GiB (not 6), /6 -> ~853 MiB safe budget -> /96
+        // KiB = 9102 tokens, below the no-reservation case's 10922.
+        let mut cfg = memory_config_for_test(0, 10 << 30, 4 << 30);
+        cfg.moe_offload_reservation_bytes = 1 << 30;
+        let kv_bytes_per_token = 96 * 1024;
+        let derived = derive_safe_max_seq_len(&cfg, 16 << 30, kv_bytes_per_token).expect("derived");
+        assert_eq!(derived, 9_102);
     }
 
     #[test]

@@ -334,9 +334,12 @@ impl Model {
     /// Runs a probe forward pass, live-queries free VRAM, and promotes
     /// CPU-placed `MoE` expert layers to this model's main device up to
     /// `vram_ceiling_bytes` (minus a KV-cache reservation derived from
-    /// `max_concurrent`/`max_seq_len`). No-op for non-`MoE` checkpoints.
-    /// Caller decides whether to call this at all — that decision (and the
-    /// ceiling itself) is deployment policy, not something the model knows.
+    /// `max_concurrent`/`max_seq_len`, and minus a `MoE` CPU-offload
+    /// reservation sized for a `chunk_tokens`-token prefill chunk — see
+    /// [`Qwen3Model::moe_offload_reservation_bytes`]). No-op for non-`MoE`
+    /// checkpoints. Caller decides whether to call this at all — that
+    /// decision (and the ceiling itself) is deployment policy, not
+    /// something the model knows.
     ///
     /// # Errors
     ///
@@ -348,6 +351,7 @@ impl Model {
         vram_ceiling_bytes: u64,
         max_concurrent: Option<usize>,
         max_seq_len: Option<usize>,
+        chunk_tokens: usize,
     ) -> Result<()> {
         let config = self.inner.config();
         let max_concurrent = max_concurrent.unwrap_or(1);
@@ -371,8 +375,18 @@ impl Model {
             &self.device,
             vram_ceiling_bytes,
             runtime_reservation_bytes,
+            chunk_tokens,
         )?;
         Ok(())
+    }
+
+    /// Worst-case transient VRAM one in-flight `MoE` CPU-offload call needs
+    /// for a `chunk_tokens`-token prefill chunk. See
+    /// [`Qwen3Model::moe_offload_reservation_bytes`].
+    #[must_use]
+    pub fn moe_offload_reservation_bytes(&self, chunk_tokens: usize) -> u64 {
+        self.inner
+            .moe_offload_reservation_bytes(chunk_tokens, &self.device)
     }
 
     pub fn warmup(&mut self) {

@@ -24,6 +24,10 @@ pub struct MemoryConfig {
     /// `(gpu_memory_limit_bytes - baseline)` so that the limit represents
     /// the *total* allowed usage, not just KV-cache growth.
     pub baseline_gpu_bytes: u64,
+    /// Reserved VRAM for one worst-case MoE CPU-offload burst during
+    /// prefill. Subtracted from the limit before computing `kv_budget`. 0
+    /// for non-MoE models or when every MoE layer is GPU-resident.
+    pub moe_offload_reservation_bytes: u64,
 }
 
 impl MemoryConfig {
@@ -42,6 +46,7 @@ impl MemoryConfig {
             max_seq_len,
             gpu_memory_limit_bytes,
             baseline_gpu_bytes: 0,
+            moe_offload_reservation_bytes: 0,
         }
     }
 
@@ -110,6 +115,15 @@ impl MemoryConfig {
         self.baseline_gpu_bytes =
             query_gpu_memory(device).map_or(0, |(free, total)| total.saturating_sub(free));
     }
+}
+
+/// Raw KV byte budget after subtracting the model's baseline usage and any
+/// MoE-offload reservation, before the KV-to-GPU overhead factor is
+/// applied.
+pub(super) fn raw_kv_budget(limit: u64, baseline: u64, moe_offload_reservation: u64) -> u64 {
+    limit
+        .saturating_sub(baseline)
+        .saturating_sub(moe_offload_reservation)
 }
 
 /// Raise a KV budget to fit at least one full `max_seq_len` sequence.
@@ -230,6 +244,21 @@ mod tests {
     #[test]
     fn rejects_garbage_and_warns() {
         assert_eq!(MemoryConfig::parse_memory_limit("not-a-size", &cpu()), 0);
+    }
+
+    #[test]
+    fn raw_kv_budget_subtracts_baseline_and_reservation() {
+        assert_eq!(raw_kv_budget(14 << 30, 8 << 30, 1 << 30), 5 << 30);
+    }
+
+    #[test]
+    fn raw_kv_budget_zero_reservation_matches_baseline_only() {
+        assert_eq!(raw_kv_budget(14 << 30, 8 << 30, 0), 6 << 30);
+    }
+
+    #[test]
+    fn raw_kv_budget_saturates_when_reservation_exceeds_headroom() {
+        assert_eq!(raw_kv_budget(14 << 30, 8 << 30, 10 << 30), 0);
     }
 
     #[test]

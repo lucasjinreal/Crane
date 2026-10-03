@@ -56,7 +56,7 @@ use tracing::{debug, error, info, trace, warn};
 use backend::ModelBackend;
 use crane_core::device::{format_budget, query_gpu_memory};
 use crane_core::utils::token_output_stream::TokenOutputStream;
-use memory::floor_kv_budget;
+use memory::{floor_kv_budget, raw_kv_budget};
 use sampling::SamplingBuffers;
 use scheduler::{Scheduler, SchedulerOutput};
 use sequence::{Sequence, SequenceStatus};
@@ -69,7 +69,7 @@ use sequence::{Sequence, SequenceStatus};
 /// The engine also hands this size to the model so it does not re-chunk each
 /// pass underneath; every pass dequantizes the whole weight set, so a smaller
 /// inner chunk multiplies that work for no benefit.
-const PREFILL_CHUNK_SIZE: usize = 2048;
+pub(crate) const PREFILL_CHUNK_SIZE: usize = 2048;
 
 /// Whether to log every tool-call grammar state transition and the
 /// resulting next-token mask (`CRANE_GRAMMAR_TRACE=1`).
@@ -302,6 +302,7 @@ impl InferenceEngine {
     pub fn run(mut self) {
         // Log effective memory budget.
         let baseline = self.memory_config.baseline_gpu_bytes;
+        let moe_offload_reservation = self.memory_config.moe_offload_reservation_bytes;
         let limit = self.memory_config.gpu_memory_limit_bytes;
         let max_seq_len_str = if self.memory_config.max_seq_len == 0 {
             "unlimited".to_string()
@@ -319,9 +320,10 @@ impl InferenceEngine {
                 );
             } else {
                 info!(
-                    "Memory budget: total_limit={}, model_baseline={}, kv_budget={} (overhead={}x, also checked by cuMemGetInfo)",
+                    "Memory budget: total_limit={}, model_baseline={}, moe_offload_reservation={}, kv_budget={} (overhead={}x, also checked by cuMemGetInfo)",
                     format_budget(limit),
                     format_budget(baseline),
+                    format_budget(moe_offload_reservation),
                     format_budget(kv_budget),
                     KV_GPU_OVERHEAD_FACTOR,
                 );
@@ -330,7 +332,8 @@ impl InferenceEngine {
             // These two warnings are mutually exclusive: floor_kv_budget only
             // raises the budget when kv_bytes_per_token() is Some, so a raise
             // is only observable when the backend does report a rate.
-            let raw_budget = limit.saturating_sub(baseline) / KV_GPU_OVERHEAD_FACTOR;
+            let raw_budget =
+                raw_kv_budget(limit, baseline, moe_offload_reservation) / KV_GPU_OVERHEAD_FACTOR;
             if kv_budget > raw_budget {
                 warn!(
                     "KV budget {} raised to {} to fit one full sequence (max_seq_len={}) \
@@ -584,7 +587,11 @@ impl InferenceEngine {
         if limit == 0 {
             return u64::MAX;
         }
-        let raw = limit.saturating_sub(self.memory_config.baseline_gpu_bytes);
+        let raw = raw_kv_budget(
+            limit,
+            self.memory_config.baseline_gpu_bytes,
+            self.memory_config.moe_offload_reservation_bytes,
+        );
         let budget = raw / KV_GPU_OVERHEAD_FACTOR;
         floor_kv_budget(
             budget,
