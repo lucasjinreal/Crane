@@ -13,8 +13,10 @@
 
 use anyhow::Result;
 use crane_core::device::DeviceAssignment;
+use crane_core::models::modules::expert_cache::ExpertCache;
 use crane_core::{DType, Device, Tensor, bail};
 use std::path::Path;
+use std::sync::Arc;
 
 /// Per-layer KV cache for one sequence: `(K, V)` per layer, or `None` for
 /// layers with no cached state yet.
@@ -131,16 +133,32 @@ pub trait ModelBackend: Send + 'static {
         0
     }
 
-    /// Re-run expert promotion with an updated policy (e.g. after
+    /// Re-run expert-cache seeding with an updated policy (e.g. after
     /// `derive_safe_max_seq_len` tightens `max_seq_len`). The default
     /// implementation is a no-op — only `MoE` backends override this.
     ///
     /// # Errors
     ///
-    /// Returns an error if the underlying promotion fails for reasons
+    /// Returns an error if the underlying seeding fails for reasons
     /// unrelated to out-of-memory (which is caught inside the model).
-    fn re_promote_experts(&mut self, _policy: &ExpertPromotionPolicy) -> Result<()> {
+    fn reseed_expert_cache(&mut self, _policy: &ExpertCachePolicy) -> Result<()> {
         Ok(())
+    }
+
+    /// Advances an active [`ExpertCache`]'s token clock by
+    /// `tokens_this_step`, triggering a periodic decay/swap window when due.
+    /// Called once per engine step, between scheduler steps — never from
+    /// inside a forward pass. The default implementation is a no-op (`0`
+    /// swaps) — only `MoE` backends with an active `ExpertCache` override
+    /// this. `&self` rather than `&mut self`: `ExpertCache` uses interior
+    /// mutability (atomics and an internal mutex) so it can be shared via
+    /// `Arc` with every layer's `SparseMoeBlock`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a triggered swap's weight upload fails.
+    fn expert_cache_on_step(&self, _tokens_this_step: u64) -> Result<usize> {
+        Ok(0)
     }
 
     // ── Batch decode (GPU-efficient concurrent serving) ───────
@@ -768,10 +786,10 @@ impl ModelBackend for Qwen4ExpBackend {
 //  Qwen 3 Backend
 // ─────────────────────────────────────────────────────────────
 
-/// `MoE` expert GPU-promotion policy, resolved from CLI flags in
+/// `MoE` expert-cache sizing policy, resolved from CLI flags in
 /// `crane-serve/src/lib.rs`. Never enters `crane-core` — the model only
-/// sees the resolved scalars via `Model::promote_experts_to_gpu`.
-pub struct ExpertPromotionPolicy {
+/// sees the resolved scalars via `Model::seed_expert_cache`.
+pub struct ExpertCachePolicy {
     /// VRAM ceiling for expert weights, in bytes.
     pub vram_ceiling_bytes: u64,
     /// Maximum concurrent sequences the engine will serve, used to
@@ -783,8 +801,8 @@ pub struct ExpertPromotionPolicy {
     pub max_seq_len: Option<usize>,
     /// Prefill chunk size used to estimate the transient `MoE` CPU-offload
     /// VRAM reservation (see `Model::moe_offload_reservation_bytes`).
-    /// Promotion must subtract this same reservation before deciding how
-    /// many layers fit, or the budget it leaves for the KV cache can't
+    /// Seeding must subtract this same reservation before deciding how
+    /// many slots fit, or the budget it leaves for the KV cache can't
     /// honor it later.
     pub chunk_tokens: usize,
 }
@@ -793,38 +811,45 @@ pub struct Qwen3Backend {
     pub model: crane_core::models::qwen3::Model,
     #[allow(dead_code)]
     dtype: DType,
+    /// Per-expert GPU residency cache, if one was seeded at construction
+    /// (`cache_policy` was `Some` and enough VRAM remained for at least one
+    /// slot per layer). `None` means every expert stays CPU-resident.
+    expert_cache: Option<Arc<ExpertCache>>,
 }
 
 impl Qwen3Backend {
-    /// `promotion` is `Some` only when `devices.expert` starts on CPU and
-    /// the runtime wants the model to attempt promoting experts to GPU
-    /// after construction, once real VRAM headroom is known.
+    /// `cache_policy` is `Some` only when `devices.expert` starts on CPU and
+    /// the runtime wants the model to attempt seeding a per-expert
+    /// [`ExpertCache`] after construction, once real VRAM headroom is known.
     ///
     /// # Errors
     ///
     /// Returns an error if the model fails to load from `model_path`, or if
-    /// expert promotion fails outright (not counting an out-of-memory
-    /// promotion attempt, which is caught and logged inside the model).
+    /// seeding the expert cache fails outright (not counting an
+    /// out-of-memory sizing decision, which is caught and logged inside the
+    /// model as a fallback to all-CPU dispatch).
     pub fn new(
         model_path: &str,
         devices: &DeviceAssignment,
         dtype: &DType,
-        promotion: Option<&ExpertPromotionPolicy>,
+        cache_policy: Option<&ExpertCachePolicy>,
     ) -> Result<Self> {
         let mut model = crane_core::models::qwen3::Model::loader(model_path, &devices.main, dtype)
             .expert_device(&devices.expert)
             .build()?;
-        if let Some(p) = promotion {
-            model.promote_experts_to_gpu(
+        let expert_cache = match cache_policy {
+            Some(p) => model.seed_expert_cache(
                 p.vram_ceiling_bytes,
                 p.max_concurrent,
                 p.max_seq_len,
                 p.chunk_tokens,
-            )?;
-        }
+            )?,
+            None => None,
+        };
         Ok(Self {
             model,
             dtype: *dtype,
+            expert_cache,
         })
     }
 }
@@ -909,13 +934,28 @@ impl ModelBackend for Qwen3Backend {
         self.model.moe_offload_reservation_bytes(chunk_tokens)
     }
 
-    fn re_promote_experts(&mut self, policy: &ExpertPromotionPolicy) -> Result<()> {
-        self.model.promote_experts_to_gpu(
+    fn reseed_expert_cache(&mut self, policy: &ExpertCachePolicy) -> Result<()> {
+        // `ExpertCache`'s own slot budget is fixed at seed time from the
+        // VRAM available then; it never grows on its own (decay_and_swap
+        // only changes *which* experts are cached, not how many). Drop the
+        // old cache first so its GPU tensors are freed before the reseed's
+        // live VRAM query runs, or the freed headroom this call exists to
+        // reclaim would be undercounted.
+        self.model.clear_expert_cache();
+        self.expert_cache = None;
+        self.expert_cache = self.model.seed_expert_cache(
             policy.vram_ceiling_bytes,
             policy.max_concurrent,
             policy.max_seq_len,
             policy.chunk_tokens,
-        )
+        )?;
+        Ok(())
+    }
+
+    fn expert_cache_on_step(&self, tokens_this_step: u64) -> Result<usize> {
+        self.expert_cache
+            .as_ref()
+            .map_or(Ok(0), |c| c.on_step(tokens_this_step).map_err(Into::into))
     }
 
     // ── Batch decode ──

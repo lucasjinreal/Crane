@@ -5,6 +5,7 @@ extern crate intel_mkl_src;
 extern crate accelerate_src;
 
 use std::io::Write;
+use std::sync::Arc;
 
 use anyhow::{Error as E, Result};
 
@@ -19,6 +20,7 @@ use super::modeling::{BatchKvCache, Config, Qwen3Model};
 use crate::device::{DeviceAssignment, format_budget};
 use crate::generation::GenerationConfig;
 use crate::generation::based::ModelForCausalLM;
+use crate::models::modules::expert_cache::ExpertCache;
 use crate::utils::token_output_stream::TokenOutputStream;
 use crate::utils::tokenizer_utils;
 use crate::utils::utils;
@@ -336,28 +338,32 @@ impl Model {
             .extract_batch_kv(kv_lens, original_max_kv, rounds_done)
     }
 
-    /// Runs a probe forward pass, live-queries free VRAM, and promotes
-    /// CPU-placed `MoE` expert layers to this model's main device up to
-    /// `vram_ceiling_bytes` (minus a KV-cache reservation derived from
+    /// Runs a probe forward pass, live-queries free VRAM, and seeds a
+    /// per-expert [`ExpertCache`] sized to fit within `vram_ceiling_bytes`
+    /// (minus a KV-cache reservation derived from
     /// `max_concurrent`/`max_seq_len`, and minus a `MoE` CPU-offload
     /// reservation sized for a `chunk_tokens`-token prefill chunk — see
-    /// [`Qwen3Model::moe_offload_reservation_bytes`]). No-op for non-`MoE`
-    /// checkpoints. Caller decides whether to call this at all — that
-    /// decision (and the ceiling itself) is deployment policy, not
+    /// [`Qwen3Model::moe_offload_reservation_bytes`]). `Ok(None)` for
+    /// non-`MoE` checkpoints. Caller decides whether to call this at all —
+    /// that decision (and the ceiling itself) is deployment policy, not
     /// something the model knows.
+    ///
+    /// The returned cache must still be driven by the caller: advance its
+    /// token clock once per scheduler step via [`ExpertCache::on_step`], or
+    /// placement never improves past the arbitrary initial seed.
     ///
     /// # Errors
     ///
-    /// Returns an error only if a tensor op unrelated to the promotion
-    /// itself fails; an out-of-memory promotion attempt is caught and
-    /// logged instead.
-    pub fn promote_experts_to_gpu(
+    /// Returns an error only if a tensor op unrelated to the probe fails;
+    /// an out-of-memory probe forward pass is caught and logged instead,
+    /// falling back to `Ok(None)`.
+    pub fn seed_expert_cache(
         &mut self,
         vram_ceiling_bytes: u64,
         max_concurrent: Option<usize>,
         max_seq_len: Option<usize>,
         chunk_tokens: usize,
-    ) -> Result<()> {
+    ) -> Result<Option<Arc<ExpertCache>>> {
         let config = self.inner.config();
         let max_concurrent = max_concurrent.unwrap_or(1);
         let effective_seq_len = max_seq_len
@@ -376,13 +382,21 @@ impl Model {
             format_budget(runtime_reservation_bytes),
         );
 
-        self.inner.promote_experts_to_gpu(
+        let cache = self.inner.seed_expert_cache(
             &self.device,
             vram_ceiling_bytes,
             runtime_reservation_bytes,
             chunk_tokens,
         )?;
-        Ok(())
+        Ok(cache)
+    }
+
+    /// Drops every `MoE` layer's [`ExpertCache`] reference, reverting to
+    /// all-CPU expert dispatch. Call before [`Self::seed_expert_cache`] to
+    /// re-run it with an updated policy, so the old cache's GPU memory is
+    /// freed before the new one's live VRAM query runs.
+    pub fn clear_expert_cache(&mut self) {
+        self.inner.clear_expert_cache();
     }
 
     /// Worst-case transient VRAM one in-flight `MoE` CPU-offload call needs

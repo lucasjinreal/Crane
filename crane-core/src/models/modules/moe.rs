@@ -844,7 +844,7 @@ impl SparseMoeBlock {
     /// Moves this block's expert weights to `device`, in `dtype`. No-op if
     /// experts already live on `device`. Used to promote CPU-offloaded `MoE`
     /// experts to GPU once real VRAM headroom is known post-construction
-    /// (see `Qwen3Model::promote_experts_to_gpu`), rather than deciding
+    /// (see `Qwen3Model::seed_expert_cache`), rather than deciding
     /// placement while the model is still loading.
     ///
     /// If this block holds CPU-resident packed tensors (the CPU batched
@@ -977,6 +977,22 @@ impl SparseMoeBlock {
         &self.expert_device
     }
 
+    /// Returns this block's packed `(num_experts, 2 * moe_intermediate,
+    /// hidden)` gate+up source tensor, or `None` if experts aren't stored
+    /// as a packed `QTensor` pair. Used to seed an [`ExpertCache`]'s
+    /// per-expert slot pools from this layer's CPU-resident weights.
+    #[must_use]
+    pub fn packed_gate_up_source(&self) -> Option<&Arc<QTensor>> {
+        self.packed_gate_up_exps.as_ref()
+    }
+
+    /// Returns this block's packed `(num_experts, hidden, moe_intermediate)`
+    /// down-projection source tensor. See [`Self::packed_gate_up_source`].
+    #[must_use]
+    pub fn packed_down_source(&self) -> Option<&Arc<QTensor>> {
+        self.packed_down_exps.as_ref()
+    }
+
     /// Whether this block's experts are stored as a packed `QTensor` pair —
     /// the only storage mode [`Self::dispatch_packed`]'s GPU-offload burst
     /// path handles. `false` for i-quant and dequantized per-expert storage.
@@ -1072,6 +1088,14 @@ impl SparseMoeBlock {
     /// `gpu_offload_forward` path unchanged.
     pub fn set_expert_cache(&mut self, cache: Arc<ExpertCache>) {
         self.expert_cache = Some(cache);
+    }
+
+    /// Drops this block's [`ExpertCache`] reference, reverting to all-CPU
+    /// dispatch. Used before re-seeding a replacement cache, so the old
+    /// cache's GPU tensors are freed (and the VRAM reclaimable) before the
+    /// new cache's sizing query runs.
+    pub(crate) fn clear_expert_cache(&mut self) {
+        self.expert_cache = None;
     }
 
     /// Frees [`Self::pinned_gate_up`]/[`Self::pinned_down`]'s `hipHostMalloc`
@@ -2957,7 +2981,7 @@ fn moe_offload_activation_bytes(
 /// activation buffers, plus the fixed fragmentation margin. Shared by
 /// [`SparseMoeBlock::offload_reservation_bytes`] (post-promotion, sizing the
 /// KV budget for whichever layers end up CPU-resident) and
-/// `Qwen3Model::promote_experts_to_gpu` (pre-promotion, sizing how many
+/// `Qwen3Model::seed_expert_cache` (pre-promotion, sizing how many
 /// layers to promote in the first place) so the two estimates can't drift
 /// apart.
 pub(crate) fn offload_reservation_bytes_for(
@@ -5790,7 +5814,7 @@ mod tests {
     // Verifies `offload_reservation_bytes_for` sums the per-layer weight
     // bytes, `moe_offload_activation_bytes`, and the fixed safety margin —
     // the single formula shared by `SparseMoeBlock::offload_reservation_bytes`
-    // (post-promotion) and `Qwen3Model::promote_experts_to_gpu`
+    // (post-promotion) and `Qwen3Model::seed_expert_cache`
     // (pre-promotion).
     #[test]
     fn test_offload_reservation_bytes_for() {
