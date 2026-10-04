@@ -885,8 +885,13 @@ mod iquant_gguf_tests {
         )?;
         let got = fused.forward(&xs)?;
         assert_eq!(got.dims(), &[3, 24]);
+        // Not bit-identical: candle's CPU quantized matmul can route rows
+        // through different repacked SIMD kernels depending on row count
+        // (see upstream candle#4003/#4000/#3697), so 24 fused rows and
+        // 16+8 separate rows aren't guaranteed the same tiling.
+        let scale = want.abs()?.max_all()?.to_scalar::<f32>()?.max(1e-6);
         let diff = (got - want)?.abs()?.max_all()?.to_scalar::<f32>()?;
-        assert_eq!(diff, 0.0);
+        assert!(diff / scale < 1e-4, "rel diff {}", diff / scale);
 
         assert!(gg.linear_fused(&["a", "c"])?.is_none(), "mixed quant types");
         assert!(gg.linear_fused(&["d", "d"])?.is_none(), "float tensors");
