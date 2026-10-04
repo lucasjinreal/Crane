@@ -421,12 +421,6 @@ impl PackedIQuantExperts {
         Ok(Self { gate, up, down })
     }
 
-    /// Total raw packed byte size across the gate, up and down projections.
-    fn packed_byte_size(&self) -> u64 {
-        (self.gate.packed_byte_size() + self.up.packed_byte_size() + self.down.packed_byte_size())
-            as u64
-    }
-
     /// The routed experts' combined output `(tokens, hidden)` in `out_dtype`
     /// for `xs_f32` `(tokens, hidden)` and the router's `(tokens, top_k)`
     /// `U32` ids and F32 weights.
@@ -999,28 +993,6 @@ impl SparseMoeBlock {
     #[must_use]
     pub(crate) fn has_packed_qtensor_experts(&self) -> bool {
         self.packed_gate_up_exps.is_some() && self.packed_down_exps.is_some()
-    }
-
-    /// Returns the total byte size of this block's packed expert weights
-    /// (`gate_up` + down, or the i-quant gate + up + down projections), or
-    /// `None` if the block holds dequantized per-expert tensors instead.
-    ///
-    /// When `Some`, this reflects the actual quantized byte cost (e.g.
-    /// ~0.5625 bytes/element for Q4K) — callers estimating VRAM cost should
-    /// prefer this over a compute-dtype-based estimate, which overestimates
-    /// for quantized checkpoints. Callers should fall back to their own
-    /// compute-dtype estimate when this returns `None`.
-    #[must_use]
-    pub fn packed_expert_weight_bytes(&self) -> Option<u64> {
-        if let (Some(gate_up), Some(down)) = (
-            self.packed_gate_up_exps.as_ref(),
-            self.packed_down_exps.as_ref(),
-        ) {
-            return Some((qtensor_byte_size(gate_up) + qtensor_byte_size(down)) as u64);
-        }
-        self.iquant_experts
-            .as_ref()
-            .map(PackedIQuantExperts::packed_byte_size)
     }
 
     /// Worst-case transient VRAM this block's `gpu_offload_forward` path
@@ -5855,9 +5827,17 @@ mod tests {
             gate_data.clone(),
             &expert_data,
         );
-        let weight_bytes = packed
-            .packed_expert_weight_bytes()
-            .expect("packed weights present");
+        let weight_bytes = (qtensor_byte_size(
+            packed
+                .packed_gate_up_exps
+                .as_ref()
+                .expect("packed weights present"),
+        ) + qtensor_byte_size(
+            packed
+                .packed_down_exps
+                .as_ref()
+                .expect("packed weights present"),
+        )) as u64;
         let activation_bytes =
             moe_offload_activation_bytes(chunk_tokens, topk, intermediate, hidden);
         assert_eq!(
