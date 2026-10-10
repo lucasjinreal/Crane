@@ -1,4 +1,5 @@
 use crate::models::modules::embedding::EmbeddingLayer;
+use crate::models::modules::kv_cache::{KvCache, KvCacheKind};
 use crate::models::modules::rotary::RotaryEmbedding;
 use crate::quantized::gguf_metadata::GgufMetadata;
 use crate::utils::DeviceExt;
@@ -117,11 +118,7 @@ struct Attention {
     head_dim: usize,
     q_dim: usize,
     kv_dim: usize,
-    /// Pre-allocated KV cache buffer. May be larger than `cache_seq_len` to
-    /// allow in-place `slice_set` writes without reallocation.
-    kv_cache: Option<(Tensor, Tensor)>,
-    /// Number of valid (filled) positions in the KV cache buffer.
-    cache_seq_len: usize,
+    kv_cache: KvCache,
 }
 
 impl Attention {
@@ -238,8 +235,7 @@ impl Attention {
             head_dim,
             q_dim,
             kv_dim,
-            kv_cache: None,
-            cache_seq_len: 0,
+            kv_cache: KvCache::new(KvCacheKind::from_env()),
         })
     }
 
@@ -281,72 +277,8 @@ impl Attention {
             head_dim,
             q_dim: num_heads * head_dim,
             kv_dim: num_kv_heads * head_dim,
-            kv_cache: None,
-            cache_seq_len: 0,
+            kv_cache: KvCache::new(KvCacheKind::from_env()),
         })
-    }
-
-    /// Update the pre-allocated KV cache with new K,V tensors.
-    ///
-    /// Uses `slice_set` for O(1) in-place writes when the buffer has room.
-    /// Falls back to cat + reallocate when the buffer is full.
-    /// Returns (`k_full`, `v_full`) views covering all valid cached data.
-    // b/h/s/d are standard tensor-shape notation (batch, heads, seq_len,
-    // head_dim), matching the BHSD terminology used elsewhere in this file.
-    #[allow(clippy::many_single_char_names)]
-    fn update_kv_cache(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
-        // slice_set requires contiguous tensors; K/V after transpose(1,2) are strided.
-        let k = k.contiguous()?;
-        let v = v.contiguous()?;
-        let new_seq_len = k.dim(2)?;
-        let cache_seq_len = self.cache_seq_len;
-
-        if let Some((buf_k, buf_v)) = self.kv_cache.take() {
-            let buf_len = buf_k.dim(2)?;
-            let new_total = cache_seq_len + new_seq_len;
-
-            if new_total <= buf_len {
-                // In-place write: O(new_seq_len) instead of O(cache_len)
-                buf_k.slice_set(&k, 2, cache_seq_len)?;
-                buf_v.slice_set(&v, 2, cache_seq_len)?;
-                let k_view = buf_k.narrow(2, 0, new_total)?;
-                let v_view = buf_v.narrow(2, 0, new_total)?;
-                self.kv_cache = Some((buf_k, buf_v));
-                self.cache_seq_len = new_total;
-                Ok((k_view, v_view))
-            } else {
-                // Buffer too small: grow with extra room.
-                let cur_k = buf_k.narrow(2, 0, cache_seq_len)?;
-                let cur_v = buf_v.narrow(2, 0, cache_seq_len)?;
-                drop(buf_k);
-                drop(buf_v);
-                let full_k = Tensor::cat(&[&cur_k, &k], 2)?;
-                let full_v = Tensor::cat(&[&cur_v, &v], 2)?;
-                drop(cur_k);
-                drop(cur_v);
-                let total = full_k.dim(2)?;
-                let room = 256; // fixed small room — avoids 2x over-allocation
-                let (b, h, _, d) = full_k.dims4()?;
-                let new_buf_k = Tensor::zeros((b, h, total + room, d), k.dtype(), k.device())?;
-                let new_buf_v = Tensor::zeros((b, h, total + room, d), v.dtype(), v.device())?;
-                new_buf_k.slice_set(&full_k, 2, 0)?;
-                new_buf_v.slice_set(&full_v, 2, 0)?;
-                self.kv_cache = Some((new_buf_k, new_buf_v));
-                self.cache_seq_len = total;
-                Ok((full_k, full_v))
-            }
-        } else {
-            // First use: allocate buffer with extra room.
-            let (b, h, s, d) = k.dims4()?;
-            let room = 256; // fixed small room — avoids 2x over-allocation
-            let buf_k = Tensor::zeros((b, h, s + room, d), k.dtype(), k.device())?;
-            let buf_v = Tensor::zeros((b, h, s + room, d), v.dtype(), v.device())?;
-            buf_k.slice_set(&k, 2, 0)?;
-            buf_v.slice_set(&v, 2, 0)?;
-            self.kv_cache = Some((buf_k, buf_v));
-            self.cache_seq_len = s;
-            Ok((k, v))
-        }
     }
 
     fn forward(
@@ -415,7 +347,7 @@ impl Attention {
             k
         };
 
-        let (k, v) = self.update_kv_cache(&k, &v)?;
+        let (k, v) = self.kv_cache.append(&k, &v)?;
 
         self.compute_attention(&q, k, v, attention_mask, b_sz, seq_len)
     }
@@ -512,8 +444,7 @@ impl Attention {
     }
 
     fn clear_kv_cache(&mut self) {
-        self.kv_cache = None;
-        self.cache_seq_len = 0;
+        self.kv_cache.reset();
     }
 }
 
@@ -875,12 +806,6 @@ impl HunYuanDenseV1 {
         })
     }
 
-    /// # Panics
-    ///
-    /// Panics if narrowing an anchor layer's KV cache to its valid length
-    /// fails, which cannot happen because `cache_seq_len` is always within
-    /// the cache tensor's bounds.
-    ///
     /// # Errors
     ///
     /// Returns an error if the forward pass fails.
@@ -946,10 +871,7 @@ impl HunYuanDenseV1 {
 
             // After an anchor layer, save its KV cache for shared layers.
             if use_cla && cla_factor > 1 && i % cla_factor == 0 {
-                anchor_kv = layer.self_attn.kv_cache.as_ref().map(|(k, v)| {
-                    let len = layer.self_attn.cache_seq_len;
-                    (k.narrow(2, 0, len).unwrap(), v.narrow(2, 0, len).unwrap())
-                });
+                anchor_kv = layer.self_attn.kv_cache.current_kv()?;
             }
         }
 
@@ -973,13 +895,7 @@ impl HunYuanDenseV1 {
     pub fn active_kv_cache_bytes(&self) -> u64 {
         self.layers
             .iter()
-            .map(|l| {
-                l.self_attn.kv_cache.as_ref().map_or(0, |(k, v)| {
-                    let k_bytes = k.elem_count() as u64 * k.dtype().size_in_bytes() as u64;
-                    let v_bytes = v.elem_count() as u64 * v.dtype().size_in_bytes() as u64;
-                    k_bytes + v_bytes
-                })
-            })
+            .map(|l| l.self_attn.kv_cache.byte_size() as u64)
             .sum()
     }
 
@@ -999,29 +915,21 @@ impl HunYuanDenseV1 {
     pub fn get_kv_caches(&self) -> Vec<Option<(Tensor, Tensor)>> {
         self.layers
             .iter()
-            .map(|l| {
-                l.self_attn.kv_cache.as_ref().map(|(k, v)| {
-                    let len = l.self_attn.cache_seq_len;
-                    if len > 0 && len < k.dim(2).unwrap_or(0) {
-                        (
-                            k.narrow(2, 0, len).unwrap_or_else(|_| k.clone()),
-                            v.narrow(2, 0, len).unwrap_or_else(|_| v.clone()),
-                        )
-                    } else {
-                        (k.clone(), v.clone())
-                    }
-                })
-            })
+            .map(|l| l.self_attn.kv_cache.current_kv().ok().flatten())
             .collect()
     }
 
     /// Restore per-layer KV caches (e.g. after swapping sequences).
-    /// The tensors are stored as-is; `cache_seq_len` is set to their dim(2).
+    /// The tensors are stored as-is; the cache's valid length is set to their dim(2).
     pub fn set_kv_caches(&mut self, caches: Vec<Option<(Tensor, Tensor)>>) {
         for (layer, cache) in self.layers.iter_mut().zip(caches) {
-            let seq_len = cache.as_ref().map_or(0, |(k, _)| k.dim(2).unwrap_or(0));
-            layer.self_attn.kv_cache = cache;
-            layer.self_attn.cache_seq_len = seq_len;
+            layer.self_attn.kv_cache = match cache {
+                Some((k, v)) => {
+                    let seq_len = k.dim(2).unwrap_or(0);
+                    KvCache::from_fp(k, v, seq_len)
+                },
+                None => KvCache::new(KvCacheKind::from_env()),
+            };
         }
     }
 
@@ -1090,14 +998,12 @@ impl HunYuanDenseV1 {
                     let buf_v = Tensor::zeros((b, h, s + extra_room, d), v.dtype(), v.device())?;
                     buf_k.slice_set(&k, 2, 0)?;
                     buf_v.slice_set(&v, 2, 0)?;
-                    layer.self_attn.kv_cache = Some((buf_k, buf_v));
+                    layer.self_attn.kv_cache = KvCache::from_fp(buf_k, buf_v, max_kv_len);
                 } else {
-                    layer.self_attn.kv_cache = Some((k, v));
+                    layer.self_attn.kv_cache = KvCache::from_fp(k, v, max_kv_len);
                 }
-                layer.self_attn.cache_seq_len = max_kv_len;
             } else {
-                layer.self_attn.kv_cache = None;
-                layer.self_attn.cache_seq_len = 0;
+                layer.self_attn.kv_cache = KvCache::new(KvCacheKind::from_env());
             }
         }
 
@@ -1185,7 +1091,7 @@ impl HunYuanDenseV1 {
             .collect();
 
         for layer in &mut self.layers {
-            if let Some((ref full_k, ref full_v)) = layer.self_attn.kv_cache {
+            if let Some((full_k, full_v)) = layer.self_attn.kv_cache.current_kv()? {
                 for i in 0..n_seqs {
                     let row_k = full_k.narrow(0, i, 1)?;
                     let row_v = full_v.narrow(0, i, 1)?;
@@ -1208,8 +1114,7 @@ impl HunYuanDenseV1 {
                     row.push(None);
                 }
             }
-            layer.self_attn.kv_cache = None;
-            layer.self_attn.cache_seq_len = 0;
+            layer.self_attn.kv_cache.reset();
         }
 
         Ok(result)

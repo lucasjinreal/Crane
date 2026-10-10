@@ -20,6 +20,12 @@ name = "topk_bench"
 [[bin]]
 name = "ternary_bench"
 
+# Micro-benchmark for the KvCache backends (Fp/Int8/Int4). It uses plain
+# candle tensor ops with no custom kernel. It builds and runs on CPU as well
+# as whichever GPU feature is enabled, so no required-features stub is needed.
+[[bin]]
+name = "kv_cache_bench"
+
 # G2P hot-path performance benchmark (text_to_ipa, IpaNormalizer::normalize).
 [[bench]]
 name = "g2p"

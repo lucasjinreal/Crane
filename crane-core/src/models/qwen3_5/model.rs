@@ -16,11 +16,11 @@ use candle_transformers::generation::LogitsProcessor;
 use tokenizers::Tokenizer;
 
 use super::config::{Config, HiddenAct, LayerType, RopeParameters, TextConfig, load_config};
-use super::kv_cache::{KvCache, KvCacheKind};
 use super::modeling::{DecoderLayer, MRotaryEmbedding, Qwen35RmsNorm, RopeSlice};
 use crate::generation::GenerationConfig;
 use crate::generation::based::ModelForCausalLM;
 use crate::models::modules::embedding::EmbeddingLayer;
+use crate::models::modules::kv_cache::{KvCache, KvCacheKind};
 use crate::quantized::gguf_file::Gguf;
 use crate::utils::token_output_stream::TokenOutputStream;
 use crate::utils::utils;

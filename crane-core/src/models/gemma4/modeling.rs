@@ -29,6 +29,7 @@ use std::io::{Read, Seek};
 // Reuse the polymorphic linear layer and the shared GGUF loader.
 use crate::models::modules::embedding::EmbeddingLayer;
 use crate::models::modules::ffn::SwiGluFfn;
+use crate::models::modules::kv_cache::{KvCache, KvCacheKind};
 pub use crate::ops::linear::LinearLayer;
 pub use crate::quantized::gguf_file::Gguf;
 // `Device::is_rocm` is inherent on the ROCm candle fork; this extension only
@@ -261,8 +262,7 @@ struct Attention {
     num_kv_heads: usize,
     head_dim: usize,
     is_shared: bool,
-    kv_cache: Option<(Tensor, Tensor)>,
-    cache_seq_len: usize,
+    kv_cache: KvCache,
 }
 
 impl Attention {
@@ -323,8 +323,7 @@ impl Attention {
             num_kv_heads,
             head_dim,
             is_shared,
-            kv_cache: None,
-            cache_seq_len: 0,
+            kv_cache: KvCache::new(KvCacheKind::from_env()),
         })
     }
 
@@ -365,63 +364,8 @@ impl Attention {
             num_kv_heads,
             head_dim,
             is_shared,
-            kv_cache: None,
-            cache_seq_len: 0,
+            kv_cache: KvCache::new(KvCacheKind::from_env()),
         })
-    }
-
-    fn update_kv_cache(&mut self, k: Tensor, v: Tensor) -> Result<(Tensor, Tensor)> {
-        let k = k.contiguous()?;
-        let v = v.contiguous()?;
-        let new_seq_len = k.dim(2)?;
-        let cache_seq_len = self.cache_seq_len;
-
-        match self.kv_cache.take() {
-            Some((buf_k, buf_v)) => {
-                let buf_len = buf_k.dim(2)?;
-                let new_total = cache_seq_len + new_seq_len;
-
-                if new_total <= buf_len {
-                    buf_k.slice_set(&k, 2, cache_seq_len)?;
-                    buf_v.slice_set(&v, 2, cache_seq_len)?;
-                    let k_view = buf_k.narrow(2, 0, new_total)?;
-                    let v_view = buf_v.narrow(2, 0, new_total)?;
-                    self.kv_cache = Some((buf_k, buf_v));
-                    self.cache_seq_len = new_total;
-                    Ok((k_view, v_view))
-                } else {
-                    let cur_k = buf_k.narrow(2, 0, cache_seq_len)?;
-                    let cur_v = buf_v.narrow(2, 0, cache_seq_len)?;
-                    drop(buf_k);
-                    drop(buf_v);
-                    let full_k = Tensor::cat(&[&cur_k, &k], 2)?;
-                    let full_v = Tensor::cat(&[&cur_v, &v], 2)?;
-                    drop(cur_k);
-                    drop(cur_v);
-                    let total = full_k.dim(2)?;
-                    let room = 256;
-                    let (b, h, _, d) = full_k.dims4()?;
-                    let new_buf_k = Tensor::zeros((b, h, total + room, d), k.dtype(), k.device())?;
-                    let new_buf_v = Tensor::zeros((b, h, total + room, d), v.dtype(), v.device())?;
-                    new_buf_k.slice_set(&full_k, 2, 0)?;
-                    new_buf_v.slice_set(&full_v, 2, 0)?;
-                    self.kv_cache = Some((new_buf_k, new_buf_v));
-                    self.cache_seq_len = total;
-                    Ok((full_k, full_v))
-                }
-            },
-            None => {
-                let (b, h, s, d) = k.dims4()?;
-                let room = 256;
-                let buf_k = Tensor::zeros((b, h, s + room, d), k.dtype(), k.device())?;
-                let buf_v = Tensor::zeros((b, h, s + room, d), v.dtype(), v.device())?;
-                buf_k.slice_set(&k, 2, 0)?;
-                buf_v.slice_set(&v, 2, 0)?;
-                self.kv_cache = Some((buf_k, buf_v));
-                self.cache_seq_len = s;
-                Ok((k, v))
-            },
-        }
     }
 
     fn forward(
@@ -493,7 +437,7 @@ impl Attention {
         let (k, v) = if self.is_shared {
             (k, v)
         } else {
-            self.update_kv_cache(k, v)?
+            self.kv_cache.append(&k, &v)?
         };
 
         // ── SDPA ──
@@ -559,8 +503,7 @@ impl Attention {
     }
 
     fn clear_kv_cache(&mut self) {
-        self.kv_cache = None;
-        self.cache_seq_len = 0;
+        self.kv_cache.reset();
     }
 }
 
@@ -1359,12 +1302,7 @@ impl Gemma4Model {
 
             // Store KV state from non-shared layers that are referenced by shared layers
             if i < first_shared {
-                if let Some((ref buf_k, ref buf_v)) = self.layers[i].self_attn.kv_cache {
-                    let len = self.layers[i].self_attn.cache_seq_len;
-                    let k_view = buf_k.narrow(2, 0, len)?;
-                    let v_view = buf_v.narrow(2, 0, len)?;
-                    shared_kv_states[i] = Some((k_view, v_view));
-                }
+                shared_kv_states[i] = self.layers[i].self_attn.kv_cache.current_kv()?;
             }
         }
 
@@ -1442,17 +1380,7 @@ impl Gemma4Model {
     pub fn active_kv_cache_bytes(&self) -> u64 {
         self.layers
             .iter()
-            .map(|l| {
-                l.self_attn
-                    .kv_cache
-                    .as_ref()
-                    .map(|(k, v)| {
-                        let k_bytes = k.elem_count() as u64 * k.dtype().size_in_bytes() as u64;
-                        let v_bytes = v.elem_count() as u64 * v.dtype().size_in_bytes() as u64;
-                        k_bytes + v_bytes
-                    })
-                    .unwrap_or(0)
-            })
+            .map(|l| l.self_attn.kv_cache.byte_size() as u64)
             .sum()
     }
 

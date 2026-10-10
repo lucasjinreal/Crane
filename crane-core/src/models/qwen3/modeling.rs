@@ -47,7 +47,7 @@ use std::io::{Read, Seek};
 use crate::device::{DeviceAssignment, format_budget, greedy_fit_layers, query_gpu_memory};
 use crate::models::modules::embedding::EmbeddingLayer;
 use crate::models::modules::flash_attn::dispatch_flash_attn;
-use crate::models::modules::kv_cache;
+use crate::models::modules::kv_cache::{KvCache, KvCacheKind};
 use crate::models::modules::moe::{
     MlpOrMoe, MoeConfig, SparseMoeBlock, offload_reservation_bytes_for,
 };
@@ -194,10 +194,8 @@ struct Attention {
     head_dim: usize,
     q_dim: usize,
     kv_dim: usize,
-    /// Pre-allocated KV cache buffer (may be larger than `cache_seq_len`).
-    kv_cache: Option<(Tensor, Tensor)>,
-    /// Number of valid (filled) positions in the KV cache buffer.
-    cache_seq_len: usize,
+    /// Per-layer KV cache (pre-allocated, with optional quantization).
+    kv_cache: KvCache,
 }
 
 impl Attention {
@@ -281,8 +279,7 @@ impl Attention {
             head_dim,
             q_dim,
             kv_dim,
-            kv_cache: None,
-            cache_seq_len: 0,
+            kv_cache: KvCache::new(KvCacheKind::from_env()),
         })
     }
 
@@ -324,22 +321,8 @@ impl Attention {
             head_dim,
             q_dim: num_heads * head_dim,
             kv_dim: num_kv_heads * head_dim,
-            kv_cache: None,
-            cache_seq_len: 0,
+            kv_cache: KvCache::new(KvCacheKind::from_env()),
         })
-    }
-
-    /// Update the pre-allocated KV cache with new K,V tensors.
-    ///
-    /// Uses `slice_set` for O(1) in-place writes when the buffer has room.
-    /// Falls back to cat + reallocate when the buffer is full.
-    fn update_kv_cache(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
-        let cache = self.kv_cache.take();
-        let prev_seq_len = std::mem::replace(&mut self.cache_seq_len, 0);
-        let update = kv_cache::update_kv_cache(cache, prev_seq_len, k, v)?;
-        self.kv_cache = Some(update.buffer);
-        self.cache_seq_len = update.seq_len;
-        Ok((update.k, update.v))
     }
 
     // q/k/v/b/h/s/d are standard ML tensor-shape notation (query, key,
@@ -411,7 +394,7 @@ impl Attention {
         let k = k.transpose(1, 2)?;
 
         // Update KV cache (pre-allocated with slice_set)
-        let (k, v) = self.update_kv_cache(&k, &v)?;
+        let (k, v) = self.kv_cache.append(&k, &v)?;
 
         // ── SDPA ──
         let n_rep = self.num_heads / self.num_kv_heads;
@@ -484,9 +467,9 @@ impl Attention {
             let k_bshd = k.transpose(1, 2)?;
             let v_bshd = v.transpose(1, 2)?;
 
-            // The layer's KV cache tracks `cache_seq_len` filled positions;
-            // after update_kv_cache, the K/V seq dim equals cache_seq_len,
-            // so kv_offset = cache_seq_len - seq_len recovers start_pos.
+            // The KV cache's `len()` tracks filled positions; after
+            // `append`, the K/V seq dim equals that length, so
+            // kv_offset = len - seq_len recovers start_pos.
             let kv_offset = k_bshd.dim(1)? - seq_len;
             let mask = AttnMask::Causal { kv_offset };
 
@@ -581,8 +564,7 @@ impl Attention {
     }
 
     fn clear_kv_cache(&mut self) {
-        self.kv_cache = None;
-        self.cache_seq_len = 0;
+        self.kv_cache.reset();
     }
 }
 
@@ -1640,7 +1622,9 @@ impl Qwen3Model {
     /// rather than a separately-tracked running position counter.
     #[must_use]
     pub fn kv_cache_len(&self) -> usize {
-        self.layers.first().map_or(0, |l| l.self_attn.cache_seq_len)
+        self.layers
+            .first()
+            .map_or(0, |l| l.self_attn.kv_cache.len())
     }
 
     /// Total bytes held by the model's KV caches (no GPU copies).
@@ -1648,13 +1632,7 @@ impl Qwen3Model {
     pub fn active_kv_cache_bytes(&self) -> u64 {
         self.layers
             .iter()
-            .map(|l| {
-                l.self_attn.kv_cache.as_ref().map_or(0, |(k, v)| {
-                    let k_bytes = k.elem_count() as u64 * k.dtype().size_in_bytes() as u64;
-                    let v_bytes = v.elem_count() as u64 * v.dtype().size_in_bytes() as u64;
-                    k_bytes + v_bytes
-                })
-            })
+            .map(|l| l.self_attn.kv_cache.byte_size() as u64)
             .sum()
     }
 
@@ -1668,28 +1646,20 @@ impl Qwen3Model {
     pub fn get_kv_caches(&self) -> Vec<Option<(Tensor, Tensor)>> {
         self.layers
             .iter()
-            .map(|l| {
-                l.self_attn.kv_cache.as_ref().map(|(k, v)| {
-                    let len = l.self_attn.cache_seq_len;
-                    if len > 0 && len < k.dim(2).unwrap_or(0) {
-                        (
-                            k.narrow(2, 0, len).unwrap_or_else(|_| k.clone()),
-                            v.narrow(2, 0, len).unwrap_or_else(|_| v.clone()),
-                        )
-                    } else {
-                        (k.clone(), v.clone())
-                    }
-                })
-            })
+            .map(|l| l.self_attn.kv_cache.current_kv().ok().flatten())
             .collect()
     }
 
     /// Restore per-layer KV caches.
     pub fn set_kv_caches(&mut self, caches: Vec<Option<(Tensor, Tensor)>>) {
         for (layer, cache) in self.layers.iter_mut().zip(caches) {
-            let seq_len = cache.as_ref().map_or(0, |(k, _)| k.dim(2).unwrap_or(0));
-            layer.self_attn.kv_cache = cache;
-            layer.self_attn.cache_seq_len = seq_len;
+            layer.self_attn.kv_cache = match cache {
+                Some((k, v)) => {
+                    let seq_len = k.dim(2).unwrap_or(0);
+                    KvCache::from_fp(k, v, seq_len)
+                },
+                None => KvCache::new(KvCacheKind::from_env()),
+            };
         }
     }
 
@@ -1748,14 +1718,12 @@ impl Qwen3Model {
                     let buf_v = Tensor::zeros((b, h, s + extra_room, d), v.dtype(), v.device())?;
                     buf_k.slice_set(&k, 2, 0)?;
                     buf_v.slice_set(&v, 2, 0)?;
-                    layer.self_attn.kv_cache = Some((buf_k, buf_v));
+                    layer.self_attn.kv_cache = KvCache::from_fp(buf_k, buf_v, max_kv_len);
                 } else {
-                    layer.self_attn.kv_cache = Some((k, v));
+                    layer.self_attn.kv_cache = KvCache::from_fp(k, v, max_kv_len);
                 }
-                layer.self_attn.cache_seq_len = max_kv_len;
             } else {
-                layer.self_attn.kv_cache = None;
-                layer.self_attn.cache_seq_len = 0;
+                layer.self_attn.kv_cache = KvCache::new(KvCacheKind::from_env());
             }
         }
 
@@ -1822,7 +1790,7 @@ impl Qwen3Model {
             .collect();
 
         for layer in &mut self.layers {
-            if let Some((ref full_k, ref full_v)) = layer.self_attn.kv_cache {
+            if let Some((full_k, full_v)) = layer.self_attn.kv_cache.current_kv()? {
                 for i in 0..n_seqs {
                     let row_k = full_k.narrow(0, i, 1)?;
                     let row_v = full_v.narrow(0, i, 1)?;
@@ -1840,8 +1808,7 @@ impl Qwen3Model {
                     row.push(None);
                 }
             }
-            layer.self_attn.kv_cache = None;
-            layer.self_attn.cache_seq_len = 0;
+            layer.self_attn.kv_cache.reset();
         }
 
         Ok(result)

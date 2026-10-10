@@ -3,7 +3,7 @@ pub mod attention;
 pub mod embedding;
 pub mod ffn;
 pub mod flash_attn;
-pub(crate) mod kv_cache;
+pub mod kv_cache;
 pub mod mel;
 pub mod moe;
 pub mod rotary;

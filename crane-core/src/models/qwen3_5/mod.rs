@@ -13,7 +13,6 @@
 
 mod config;
 mod conv3d_temporal_2;
-mod kv_cache;
 pub(crate) mod model;
 mod modeling;
 mod prefill;
@@ -21,8 +20,8 @@ pub mod processor;
 pub mod vision;
 pub mod vlm;
 
+pub use crate::models::modules::kv_cache::{KvCache, KvCacheBackend, KvCacheKind};
 pub use config::{Config, LayerType, RopeParameters, TextConfig, VisionConfig, load_config};
-pub use kv_cache::{KvCache, KvCacheBackend, KvCacheKind};
 pub use model::StateSnapshot;
 pub use model::{Model, ModelFormat, Qwen3_5TextModel};
 pub(crate) use modeling::attn_query_slice;

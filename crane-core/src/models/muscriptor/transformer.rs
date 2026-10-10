@@ -174,8 +174,8 @@ impl StreamingMultiheadAttention {
         // is O(q_len) and doesn't allocate. (The earlier
         // `Tensor::cat`-per-step version grew the cache without bound
         // and OOM'd at large `max_gen_len`; switching to `slice_set`
-        // mirrors the `models::modules::kv_cache::update_kv_cache`
-        // pattern.)
+        // mirrors the `models::modules::kv_cache::FpKvCache`
+        // pre-allocated buffer pattern.)
         let end = state.seq_len;
         let new_end = end + q_len;
         if new_end > state.max_seq_len {

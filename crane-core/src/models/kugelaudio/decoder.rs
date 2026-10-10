@@ -36,7 +36,7 @@ use candle_nn::{Activation, VarBuilder};
 
 use crate::models::modules::attention::{AttentionConfig, RopeMode};
 use crate::models::modules::embedding::EmbeddingLayer;
-use crate::models::modules::kv_cache;
+use crate::models::modules::kv_cache::{KvCache, KvCacheKind};
 use crate::models::modules::rotary::RotaryEmbedding;
 use crate::models::modules::transformer::TransformerBlock;
 use crate::models::utils::repeat_kv;
@@ -49,7 +49,6 @@ use super::config::DecoderConfig;
 /// [`GqaAttention`] since that holds `with_tracing::Linear`.
 ///
 /// [`GqaAttention`]: crate::models::modules::attention::GqaAttention
-#[derive(Clone)]
 struct QuantizedAttention {
     q_proj: LinearLayer,
     k_proj: LinearLayer,
@@ -59,8 +58,31 @@ struct QuantizedAttention {
     n_kv_heads: usize,
     head_dim: usize,
     n_kv_groups: usize,
-    kv_cache: Option<(Tensor, Tensor)>,
-    cache_seq_len: usize,
+    kv_cache: KvCache,
+}
+
+impl Clone for QuantizedAttention {
+    /// Clone the layer with the KV cache reset to empty.
+    ///
+    /// Projection weights are cloned as-is, but the accumulated KV cache is
+    /// **not** carried over — the clone starts with a fresh cache. This
+    /// prevents an accidental deep-copy of potentially large cached tensors.
+    /// See also [`GqaAttention`]'s `Clone` implementation.
+    ///
+    /// [`GqaAttention`]: crate::models::modules::attention::GqaAttention
+    fn clone(&self) -> Self {
+        Self {
+            q_proj: self.q_proj.clone(),
+            k_proj: self.k_proj.clone(),
+            v_proj: self.v_proj.clone(),
+            o_proj: self.o_proj.clone(),
+            n_heads: self.n_heads,
+            n_kv_heads: self.n_kv_heads,
+            head_dim: self.head_dim,
+            n_kv_groups: self.n_kv_groups,
+            kv_cache: KvCache::new(KvCacheKind::from_env()),
+        }
+    }
 }
 
 impl QuantizedAttention {
@@ -113,8 +135,7 @@ impl QuantizedAttention {
             n_kv_heads: cfg.num_key_value_heads,
             head_dim,
             n_kv_groups: cfg.num_attention_heads / cfg.num_key_value_heads,
-            kv_cache: None,
-            cache_seq_len: 0,
+            kv_cache: KvCache::new(KvCacheKind::from_env()),
         })
     }
 
@@ -147,14 +168,10 @@ impl QuantizedAttention {
         let q = candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
         let k = candle_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
 
-        let cache = self.kv_cache.take();
-        let prev_seq_len = std::mem::replace(&mut self.cache_seq_len, 0);
-        let update = kv_cache::update_kv_cache(cache, prev_seq_len, &k, &v)?;
-        self.kv_cache = Some(update.buffer);
-        self.cache_seq_len = update.seq_len;
+        let (k, v) = self.kv_cache.append(&k, &v)?;
 
-        let k = repeat_kv(update.k, self.n_kv_groups)?.contiguous()?;
-        let v = repeat_kv(update.v, self.n_kv_groups)?.contiguous()?;
+        let k = repeat_kv(k, self.n_kv_groups)?.contiguous()?;
+        let v = repeat_kv(v, self.n_kv_groups)?.contiguous()?;
         let q = q.contiguous()?;
 
         #[allow(clippy::cast_precision_loss)]
@@ -177,8 +194,7 @@ impl QuantizedAttention {
     }
 
     fn clear_kv_cache(&mut self) {
-        self.kv_cache = None;
-        self.cache_seq_len = 0;
+        self.kv_cache.reset();
     }
 }
 

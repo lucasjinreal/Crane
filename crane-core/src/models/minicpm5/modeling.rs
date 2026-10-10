@@ -17,6 +17,7 @@
 //! no KV cache, quantization, or backend plumbing to port, only the
 //! architecture description to confirm against.
 
+use crate::models::modules::kv_cache::{KvCache, KvCacheKind};
 use crate::models::modules::rotary::RotaryEmbedding;
 use crate::quantized::gguf_file::Gguf;
 use crate::quantized::gguf_metadata::GgufMetadata;
@@ -102,11 +103,7 @@ struct Attention {
     head_dim: usize,
     q_dim: usize,
     kv_dim: usize,
-    /// Pre-allocated KV cache buffer. May be larger than `cache_seq_len` to
-    /// allow in-place `slice_set` writes without reallocation.
-    kv_cache: Option<(Tensor, Tensor)>,
-    /// Number of valid (filled) positions in the KV cache buffer.
-    cache_seq_len: usize,
+    kv_cache: KvCache,
 }
 
 impl Attention {
@@ -199,8 +196,7 @@ impl Attention {
             head_dim,
             q_dim,
             kv_dim,
-            kv_cache: None,
-            cache_seq_len: 0,
+            kv_cache: KvCache::new(KvCacheKind::from_env()),
         })
     }
 
@@ -231,72 +227,8 @@ impl Attention {
             head_dim,
             q_dim: num_heads * head_dim,
             kv_dim: num_kv_heads * head_dim,
-            kv_cache: None,
-            cache_seq_len: 0,
+            kv_cache: KvCache::new(KvCacheKind::from_env()),
         })
-    }
-
-    /// Update the pre-allocated KV cache with new K,V tensors.
-    ///
-    /// Uses `slice_set` for O(1) in-place writes when the buffer has room.
-    /// Falls back to cat + reallocate when the buffer is full.
-    /// Returns (`k_full`, `v_full`) views covering all valid cached data.
-    fn update_kv_cache(&mut self, k: Tensor, v: Tensor) -> Result<(Tensor, Tensor)> {
-        // slice_set requires contiguous tensors; K/V after transpose(1,2) are strided.
-        let k = k.contiguous()?;
-        let v = v.contiguous()?;
-        let new_seq_len = k.dim(2)?;
-        let cache_seq_len = self.cache_seq_len;
-
-        match self.kv_cache.take() {
-            Some((buf_k, buf_v)) => {
-                let buf_len = buf_k.dim(2)?;
-                let new_total = cache_seq_len + new_seq_len;
-
-                if new_total <= buf_len {
-                    // In-place write: O(new_seq_len) instead of O(cache_len)
-                    buf_k.slice_set(&k, 2, cache_seq_len)?;
-                    buf_v.slice_set(&v, 2, cache_seq_len)?;
-                    let k_view = buf_k.narrow(2, 0, new_total)?;
-                    let v_view = buf_v.narrow(2, 0, new_total)?;
-                    self.kv_cache = Some((buf_k, buf_v));
-                    self.cache_seq_len = new_total;
-                    Ok((k_view, v_view))
-                } else {
-                    // Buffer too small: grow with extra room.
-                    let cur_k = buf_k.narrow(2, 0, cache_seq_len)?;
-                    let cur_v = buf_v.narrow(2, 0, cache_seq_len)?;
-                    drop(buf_k);
-                    drop(buf_v);
-                    let full_k = Tensor::cat(&[&cur_k, &k], 2)?;
-                    let full_v = Tensor::cat(&[&cur_v, &v], 2)?;
-                    drop(cur_k);
-                    drop(cur_v);
-                    let total = full_k.dim(2)?;
-                    let room = 256; // fixed small room — avoids 2x over-allocation
-                    let (b, h, _, d) = full_k.dims4()?;
-                    let new_buf_k = Tensor::zeros((b, h, total + room, d), k.dtype(), k.device())?;
-                    let new_buf_v = Tensor::zeros((b, h, total + room, d), v.dtype(), v.device())?;
-                    new_buf_k.slice_set(&full_k, 2, 0)?;
-                    new_buf_v.slice_set(&full_v, 2, 0)?;
-                    self.kv_cache = Some((new_buf_k, new_buf_v));
-                    self.cache_seq_len = total;
-                    Ok((full_k, full_v))
-                }
-            },
-            None => {
-                // First use: allocate buffer with extra room.
-                let (b, h, s, d) = k.dims4()?;
-                let room = 256; // fixed small room — avoids 2x over-allocation
-                let buf_k = Tensor::zeros((b, h, s + room, d), k.dtype(), k.device())?;
-                let buf_v = Tensor::zeros((b, h, s + room, d), v.dtype(), v.device())?;
-                buf_k.slice_set(&k, 2, 0)?;
-                buf_v.slice_set(&v, 2, 0)?;
-                self.kv_cache = Some((buf_k, buf_v));
-                self.cache_seq_len = s;
-                Ok((k, v))
-            },
-        }
     }
 
     fn forward(
@@ -337,7 +269,7 @@ impl Attention {
         let q = rope(&q.contiguous()?, cos, sin)?;
         let k = rope(&k.contiguous()?, cos, sin)?;
 
-        let (k, v) = self.update_kv_cache(k, v)?;
+        let (k, v) = self.kv_cache.append(&k, &v)?;
 
         self.compute_attention(q, k, v, attention_mask, b_sz, seq_len)
     }
@@ -426,8 +358,7 @@ impl Attention {
     }
 
     fn clear_kv_cache(&mut self) {
-        self.kv_cache = None;
-        self.cache_seq_len = 0;
+        self.kv_cache.reset();
     }
 }
 

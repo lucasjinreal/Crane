@@ -18,7 +18,7 @@ use candle_nn::VarBuilder;
 use candle_nn::attention::AttnMask;
 
 use super::flash_attn::dispatch_flash_attn;
-use super::kv_cache;
+use super::kv_cache::{KvCache, KvCacheKind};
 use crate::models::utils::repeat_kv;
 use crate::models::with_tracing::{Linear, RmsNorm, linear_b};
 
@@ -84,17 +84,17 @@ pub struct GqaAttention {
     cfg: AttentionConfig,
     /// Precomputed `cfg.n_heads / cfg.n_kv_heads`.
     n_kv_groups: usize,
-    kv_cache: Option<(Tensor, Tensor)>,
-    /// Number of valid (filled) positions in `kv_cache`'s pre-allocated buffer.
-    cache_seq_len: usize,
+    kv_cache: KvCache,
 }
 
 impl Clone for GqaAttention {
     /// Clone the layer with the KV cache reset to empty.
     ///
     /// Projection weights and norms are cloned as-is, but the accumulated KV
-    /// cache is **not** carried over — the clone starts with a fresh cache.
-    /// This prevents an accidental deep-copy of potentially large cached tensors.
+    /// cache is **not** carried over — the clone starts with a fresh cache of
+    /// the same backend (`CRANE_KV_QUANT`), not hardcoded Fp. This prevents
+    /// an accidental deep-copy of potentially large cached tensors while
+    /// still preserving the selected backend across clone.
     fn clone(&self) -> Self {
         Self {
             q_proj: self.q_proj.clone(),
@@ -105,8 +105,7 @@ impl Clone for GqaAttention {
             k_norm: self.k_norm.clone(),
             cfg: self.cfg,
             n_kv_groups: self.n_kv_groups,
-            kv_cache: None,
-            cache_seq_len: 0,
+            kv_cache: KvCache::new(KvCacheKind::from_env()),
         }
     }
 }
@@ -174,8 +173,7 @@ impl GqaAttention {
             k_norm,
             n_kv_groups: cfg.n_heads / cfg.n_kv_heads,
             cfg,
-            kv_cache: None,
-            cache_seq_len: 0,
+            kv_cache: KvCache::new(KvCacheKind::from_env()),
         })
     }
 
@@ -263,7 +261,7 @@ impl GqaAttention {
         };
 
         // 5. KV cache: pre-allocated buffer with in-place `slice_set` writes
-        let (k, v) = self.update_kv_cache(&k, &v)?;
+        let (k, v) = self.kv_cache.append(&k, &v)?;
 
         // 6. Scaled dot-product attention
         let n_rep = self.n_kv_groups;
@@ -346,21 +344,7 @@ impl GqaAttention {
     /// Must be called between independent sequences to avoid stale context
     /// contaminating the next sequence.
     pub fn clear_kv_cache(&mut self) {
-        self.kv_cache = None;
-        self.cache_seq_len = 0;
-    }
-
-    /// Update the pre-allocated KV cache with new K,V tensors.
-    ///
-    /// Uses `slice_set` for O(1) in-place writes when the buffer has room.
-    /// Falls back to cat + reallocate when the buffer is full.
-    fn update_kv_cache(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
-        let cache = self.kv_cache.take();
-        let prev_seq_len = std::mem::replace(&mut self.cache_seq_len, 0);
-        let update = kv_cache::update_kv_cache(cache, prev_seq_len, k, v)?;
-        self.kv_cache = Some(update.buffer);
-        self.cache_seq_len = update.seq_len;
-        Ok((update.k, update.v))
+        self.kv_cache.reset();
     }
 
     /// Fused flash-attention decode path: `q_seq_len == 1`, `b_sz == 1`, CPU only.
@@ -1035,7 +1019,7 @@ mod tests {
 
     #[test]
     fn test_kv_cache_buffer_overflow() {
-        // `update_kv_cache` pre-allocates a buffer with 256 slots of room and
+        // `KvCache` pre-allocates a buffer with 256 slots of room and
         // reallocates (cat + zeros) once that room is exhausted. Decode past
         // that boundary and verify the output still matches a single-shot
         // masked prefill over the same tokens — i.e. the reallocation
