@@ -13,7 +13,7 @@
 //!
 //! These names match the safetensors checkpoint layout for Qwen3-TTS and Qwen2.5.
 
-use candle_core::{D, DType, Module, Result, Tensor};
+use candle_core::{Module, Result, Tensor};
 use candle_nn::VarBuilder;
 use candle_nn::attention::AttnMask;
 
@@ -317,20 +317,15 @@ impl GqaAttention {
         }
 
         // ── Standard SDPA for prefill or when n_rep == 1 ──
-        // Softmax in F32 for numerical stability.
+        // Tiled along kv_len with online softmax to cap GPU memory usage
+        // regardless of context length; falls through to a single-shot,
+        // F32-softmax SDPA internally when the full score matrix already
+        // fits within the tile budget.
         let k = repeat_kv(k, n_rep)?.contiguous()?;
         let v = repeat_kv(v, n_rep)?.contiguous()?;
         // Q may be non-contiguous after transpose(1,2) when RoPE was not applied.
         let q = q.contiguous()?;
-        let attn_weights = (q.matmul(&k.transpose(D::Minus1, D::Minus2)?)? * scale)?;
-        let attn_weights = match attention_mask {
-            Some(mask) => attn_weights.broadcast_add(mask)?,
-            None => attn_weights,
-        };
-        let input_dtype = attn_weights.dtype();
-        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights.to_dtype(DType::F32)?)?
-            .to_dtype(input_dtype)?;
-        let attn_output = attn_weights.matmul(&v)?;
+        let attn_output = super::tiled_sdpa::tiled_sdpa(&q, &k, &v, scale, attention_mask)?;
 
         // 7. Reassemble heads and project back to the hidden dimension
         let attn_output =

@@ -13,8 +13,10 @@
 //!    materialized mask tensor. Falls back to a GQA-grouped matmul SDPA
 //!    on GPU or for batched (B>1) decode, where cuBLAS is already
 //!    compute-bound or an explicit per-sequence mask is required, and to
-//!    a standard SDPA for GPU or batched (B>1) prefill, or when
-//!    `num_heads` == `num_kv_heads` (no GQA grouping needed).
+//!    a tiled SDPA (online softmax over `kv_len` tiles, capping the
+//!    materialized score buffer regardless of context length) for GPU or
+//!    batched (B>1) prefill, or when `num_heads` == `num_kv_heads` (no
+//!    GQA grouping needed).
 //! 3. **Fused `RoPE` kernel** via `candle_nn::rotary_emb::rope_thd()`
 //!    — One CUDA launch per Q/K instead of 5 manual tensor ops.
 //!    — Applied in BSHD layout (before the transpose to BHSD), so the
@@ -562,13 +564,8 @@ impl Attention {
         // num_heads > 1. The CPU flash-attn fast paths above return before
         // reaching this line and never pay this cost.
         let q = q.contiguous()?;
-        let attn_weights = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?)? * scale)?;
-        let attn_weights = match attention_mask {
-            Some(mask) => attn_weights.broadcast_add(mask)?,
-            None => attn_weights,
-        };
-        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-        let attn_output = attn_weights.matmul(&v)?;
+        let attn_output =
+            crate::models::modules::tiled_sdpa::tiled_sdpa(&q, &k, &v, scale, attention_mask)?;
 
         // [B, H, S, D] → [B, S, H*D]
         let attn_output =

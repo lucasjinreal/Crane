@@ -975,6 +975,22 @@ fn clamp_to_native_context(value: usize, native_max_position_embeddings: Option<
     }
 }
 
+/// Computes the real per-process VRAM headroom available for
+/// `tiled_sdpa`'s scratch score-tile allocation: whatever's left under
+/// `ceiling` after the model's own baseline usage and any MoE-offload
+/// reservation.
+///
+/// Unlike [`derive_safe_max_seq_len`]'s KV-growth budget, this is **not**
+/// divided by `KV_GPU_OVERHEAD_FACTOR` — the score tile is a single
+/// transient allocation freed immediately after each attention call, not
+/// sustained growth competing with other sequences' KV caches over a
+/// session's lifetime.
+fn score_tile_headroom(ceiling: u64, baseline: u64, moe_offload_reservation: u64) -> u64 {
+    ceiling
+        .saturating_sub(baseline)
+        .saturating_sub(moe_offload_reservation)
+}
+
 /// Auto-derives a safe `--max-seq-len` when the caller left it at `0`
 /// (unlimited) while `--gpu-memory-limit` is set. Without this, a single
 /// long-running session's own KV cache can grow past physical VRAM with
@@ -1887,6 +1903,34 @@ pub async fn run(mut args: Args) -> Result<()> {
             },
             format_budget(baseline_gpu)
         );
+        // Raise tiled_sdpa's single-shot threshold from its hardcoded safe
+        // default to this process's actual VRAM headroom, when it's
+        // knowable (an explicit --gpu-memory-limit, or physical VRAM on a
+        // supported backend), so it skips tiling entirely whenever an
+        // actual kv_len's score matrix fits — no need to predict the
+        // worst-case shape ahead of time. This does not change the tile
+        // size used when tiling *is* needed (fixed at
+        // tiled_sdpa::TILE_CHUNK_BYTES, benchmarked faster than larger
+        // tiles) — only whether tiling happens at all.
+        let tiling_ceiling = if memory_config.gpu_memory_limit_bytes > 0 {
+            memory_config.gpu_memory_limit_bytes
+        } else {
+            query_gpu_memory(&device).map_or(0, |(_, total)| total)
+        };
+        if tiling_ceiling > 0 {
+            let headroom = score_tile_headroom(
+                tiling_ceiling,
+                baseline_gpu,
+                memory_config.moe_offload_reservation_bytes,
+            );
+            if let Ok(headroom_usize) = usize::try_from(headroom) {
+                info!(
+                    "SDPA single-shot threshold set to {} (VRAM headroom)",
+                    format_budget(headroom)
+                );
+                crane_core::models::modules::tiled_sdpa::set_single_shot_threshold(headroom_usize);
+            }
+        }
         let (engine, handle) = InferenceEngine::new(
             backend,
             args.max_concurrent,
@@ -2647,6 +2691,20 @@ mod dtype_tests {
         // itself the "unlimited" sentinel elsewhere, inverting the cap.
         assert_eq!(clamp_to_native_context(0, Some(0)), 0);
         assert_eq!(clamp_to_native_context(4096, Some(0)), 4096);
+    }
+
+    // ── score_tile_headroom ──
+
+    #[test]
+    fn score_tile_headroom_subtracts_baseline_and_moe_reservation() {
+        assert_eq!(score_tile_headroom(10 << 30, 4 << 30, 1 << 30), 5 << 30);
+    }
+
+    #[test]
+    fn score_tile_headroom_saturates_at_zero() {
+        // Baseline alone already exceeds the ceiling (e.g. a stale/too-low
+        // --gpu-memory-limit) — must not underflow.
+        assert_eq!(score_tile_headroom(4 << 30, 10 << 30, 0), 0);
     }
 
     // ── derive_safe_max_seq_len ──
