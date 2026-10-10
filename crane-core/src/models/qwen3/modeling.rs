@@ -4,17 +4,24 @@
 //!
 //! 1. **Pre-allocated KV cache** with in-place `slice_set` writes
 //!    — `O(new_seq_len)` per decode step instead of `O(cache_len)` `Tensor::cat`.
-//! 2. **Fused flash attention for decode and prefill** (CPU, B=1)
-//!    — Uses `candle_nn::attention::flash_attn`'s online-softmax kernel
-//!    (`O(head_dim)` working set, native GQA) instead of materializing an
-//!    `O(context_len)` scores tensor. Prefill additionally skips the
-//!    GQA K/V expansion (which duplicates `K/V` `n_rep` times) and uses
-//!    `AttnMask::Causal` so masking is done via loop bounds, not a
-//!    materialized mask tensor. Falls back to a GQA-grouped matmul SDPA
-//!    on GPU or for batched (B>1) decode, where cuBLAS is already
-//!    compute-bound or an explicit per-sequence mask is required, and to
-//!    a standard SDPA for GPU or batched (B>1) prefill, or when
-//!    `num_heads` == `num_kv_heads` (no GQA grouping needed).
+//! 2. **Fused flash attention for decode and prefill**, via `attn_dispatch`.
+//!    Decode goes through `attn_dispatch::decode`, prefill through
+//!    `attn_dispatch::causal`. Both try the fused tensor-core/scalar
+//!    flash-attn kernel first, then fall back to a CPU online-softmax
+//!    flash-attn kernel for single-sequence CPU calls (`O(head_dim)`
+//!    working set, native GQA, no materialized scores tensor), then to a
+//!    matmul SDPA (native GQA via `repeat_kv`, native-dtype softmax) for
+//!    everything else. Either way, `decode()` builds the
+//!    shifted-diagonal causal mask once per forward pass (every layer
+//!    shares the same seq_len/kv_len/kv_offset) and every layer reuses it,
+//!    rather than each layer rebuilding (and, on GPU, re-uploading) its own
+//!    copy — confirmed via a real throughput regression when this was first
+//!    wired up with the self-building `causal_without_mask`, not just a
+//!    theoretical concern. An earlier version of this path also upcast
+//!    softmax to F32; that regressed throughput too (the attention-score
+//!    tensor is `H` times larger than the mask), so the mask is cast to the
+//!    score tensor's native dtype instead (lossless: `NEG_INFINITY`/`0.0`
+//!    are exact in every float format).
 //! 3. **Fused `RoPE` kernel** via `candle_nn::rotary_emb::rope_thd()`
 //!    — One CUDA launch per Q/K instead of 5 manual tensor ops.
 //!    — Applied in BSHD layout (before the transpose to BHSD), so the
@@ -38,20 +45,20 @@
 
 use candle_core::quantized::gguf_file;
 use candle_core::{D, DType, Device, Module, Result, Tensor};
-use candle_nn::attention::AttnMask;
 use candle_nn::rotary_emb::rope_thd;
 use candle_nn::{Linear, RmsNorm, VarBuilder, linear_no_bias};
 use serde::Deserialize;
 use std::io::{Read, Seek};
 
 use crate::device::{DeviceAssignment, format_budget, greedy_fit_layers, query_gpu_memory};
+use crate::models::modules::attn_dispatch;
 use crate::models::modules::embedding::EmbeddingLayer;
-use crate::models::modules::flash_attn::dispatch_flash_attn;
 use crate::models::modules::kv_cache;
 use crate::models::modules::moe::{
     MlpOrMoe, MoeConfig, SparseMoeBlock, offload_reservation_bytes_for,
 };
 use crate::models::modules::rotary::RotaryEmbedding;
+use crate::models::utils::CausalMask;
 use crate::quantized::gguf_metadata::GgufMetadata;
 use crate::utils::DeviceExt;
 use crate::utils::prof::{self, Span};
@@ -357,6 +364,7 @@ impl Attention {
         hidden_states: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
+        causal_mask: Option<&CausalMask>,
         attention_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _) = hidden_states.dims3()?;
@@ -414,169 +422,42 @@ impl Attention {
         let (k, v) = self.update_kv_cache(&k, &v)?;
 
         // ── SDPA ──
-        let n_rep = self.num_heads / self.num_kv_heads;
-        // head_dim is a small model hyperparameter (e.g. <= a few hundred),
-        // far below f64's 52-bit mantissa limit.
-        #[allow(clippy::cast_precision_loss)]
-        let scale = 1.0 / (self.head_dim as f64).sqrt();
-        // 1/sqrt(head_dim) is always small and positive; f64->f32 here
-        // only drops precision flash_attn's own f32 accumulator would
-        // discard anyway.
-        #[allow(clippy::cast_possible_truncation)]
-        let scale_f32 = scale as f32;
+        let scale = attn_dispatch::attention_scale(self.head_dim);
 
-        if seq_len == 1 && b_sz == 1 && q.device().is_cpu() {
-            // ── Fused flash attention for decode (seq_len=1), CPU only ──
-            // candle's cpu_flash kernel streams K/V with online softmax
-            // (O(head_dim) working set instead of materializing an O(S)
-            // scores tensor 3 times), and handles GQA natively via integer
-            // division — no Q reshape trick needed. Not available on GPU;
-            // cuBLAS matmuls there are compute-bound, so the plain path
-            // below is used instead.
-            //
-            // b_sz == 1 only: candle's flash_attn hard-errors for B>1 with
-            // an explicit Mask tensor (only Causal/None are allowed), and
-            // crane-serve's continuous-batching decode
-            // (`step_batch_decode` / `build_batch_decode_mask`) passes
-            // exactly that — an explicit per-sequence padding mask with
-            // B>1 — whenever batched sequences have different KV-cache
-            // lengths. Single-sequence decode never hits that mask shape,
-            // so it's the only case safe to fast-path here.
-
-            // BHSD [B, H, S, D] → BSHD [B, S, H, D], as flash_attn expects.
-            // Non-contiguous is fine — the decode kernel indexes by stride.
-            let q_bshd = q.transpose(1, 2)?;
-            let k_bshd = k.transpose(1, 2)?;
-            let v_bshd = v.transpose(1, 2)?;
-
-            let mask = match attention_mask {
-                // AttnMask::Mask takes ownership; Tensor is Arc-backed, so
-                // this is a refcount bump, not a data copy.
-                Some(mask) => AttnMask::Mask(mask.clone()),
-                None => AttnMask::None,
-            };
-
-            let attn_output = dispatch_flash_attn(&q_bshd, &k_bshd, &v_bshd, scale_f32, mask)?;
-            // Cast back from F32 before `o_proj` — see `dispatch_flash_attn`'s doc.
-            let attn_output = attn_output.to_dtype(q.dtype())?;
-
-            // flash_attn output is BHSD [B, H, 1, D] → [B, 1, H*D]
-            let attn_output = attn_output
-                .reshape((b_sz, self.num_heads, self.head_dim))?
-                .reshape((b_sz, 1, self.num_heads * self.head_dim))?;
+        if seq_len == 1 {
+            // ── Decode (seq_len=1) ──
+            // CPU single-sequence decode uses the fused CPU flash-attn
+            // kernel internally. Every other case (GPU, or CPU with more
+            // than one sequence) uses a GQA-grouped reshape that avoids
+            // repeating K/V. See `attn_dispatch::decode`.
+            // `attention_mask` here is continuous-batching padding (see
+            // `step_batch_decode`), not a causal mask — `decode()`'s own
+            // single-sequence decode always passes `None` for it.
+            let attn_output = attn_dispatch::decode(&q, &k, &v, scale, attention_mask)?;
+            let attn_output = attn_dispatch::merge_heads(&attn_output)?;
             return self.o_proj.forward(&attn_output);
         }
 
-        if b_sz == 1 && q.device().is_cpu() && attention_mask.is_none() {
-            // ── Fused flash attention for prefill (seq_len > 1), CPU only ──
-            // Same benefits as the decode fast path above, plus it avoids
-            // the GQA K/V expansion below (unsqueeze/expand/reshape, which
-            // duplicates K and V n_rep times) and never materializes the
-            // O(H * S_q * S_kv) score tensor. The causal kernel masks via
-            // loop bounds (kv_offset), so no mask tensor is built or read.
-            // attention_mask.is_none() guards this: an explicit mask (e.g.
-            // a future non-causal caller) can't be expressed via
-            // AttnMask::Causal, so such callers fall through to the SDPA
-            // path below instead of having their mask silently dropped.
-
-            // BHSD [B, H, S, D] → BSHD [B, S, H, D]
-            let q_bshd = q.transpose(1, 2)?;
-            let k_bshd = k.transpose(1, 2)?;
-            let v_bshd = v.transpose(1, 2)?;
-
-            // The layer's KV cache tracks `cache_seq_len` filled positions;
-            // after update_kv_cache, the K/V seq dim equals cache_seq_len,
-            // so kv_offset = cache_seq_len - seq_len recovers start_pos.
-            let kv_offset = k_bshd.dim(1)? - seq_len;
-            let mask = AttnMask::Causal { kv_offset };
-
-            let attn_output = dispatch_flash_attn(&q_bshd, &k_bshd, &v_bshd, scale_f32, mask)?;
-            // Cast back from F32 before `o_proj` — see `dispatch_flash_attn`'s doc.
-            let attn_output = attn_output.to_dtype(q.dtype())?;
-
-            // flash_attn output is BHSD [B, H, S, D] → [B, S, H*D]
-            let attn_output =
-                attn_output
-                    .transpose(1, 2)?
-                    .contiguous()?
-                    .reshape((b_sz, seq_len, ()))?;
-            return self.o_proj.forward(&attn_output);
-        }
-
-        if n_rep > 1 && seq_len == 1 {
-            // ── GQA-grouped SDPA for decode (seq_len=1), GPU fallback ──
-            // Use 4D tensors throughout so candle's matmul only has to
-            // flatten+contiguous the non-contiguous K narrow-view ONCE
-            // instead of reshape(contiguous) + transpose + contiguous.
-
-            // Q: [B, H, 1, D] → [B, kv_heads, n_rep, D], pre-scaled
-            let q_g = (q.reshape((b_sz, self.num_kv_heads, n_rep, self.head_dim))? * scale)?;
-
-            // K^T: [B, kv_heads, D, S] — just a view (0 copies here;
-            //       matmul will flatten+contiguous in one pass).
-            let k_t = k.transpose(2, 3)?;
-
-            // scores: [B, kv_heads, n_rep, S]
-            let attn_weights = q_g.matmul(&k_t)?;
-
-            let attn_weights = match attention_mask {
-                Some(mask) => {
-                    // mask [B, 1, 1, S] broadcasts over kv_heads & n_rep
-                    attn_weights.broadcast_add(mask)?
-                },
-                None => attn_weights,
-            };
-            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-
-            // V: [B, kv_heads, S, D] — matmul handles non-contiguous
-            let attn_output = attn_weights.matmul(&v)?; // [B, kv_heads, n_rep, D]
-
-            // Reshape back: → [B, H, D] → [B, 1, H*D]
-            let attn_output = attn_output
-                .reshape((b_sz, self.num_heads, self.head_dim))?
-                .reshape((b_sz, 1, self.num_heads * self.head_dim))?;
-            return self.o_proj.forward(&attn_output);
-        }
-
-        // ── Standard SDPA for prefill or when n_rep == 1 ──
-        let k = if n_rep > 1 {
-            let (b, kv_heads, s, d) = k.dims4()?;
-            k.unsqueeze(2)?
-                .expand((b, kv_heads, n_rep, s, d))?
-                .reshape((b, kv_heads * n_rep, s, d))?
-        } else {
-            k
-        };
-        let v = if n_rep > 1 {
-            let (b, kv_heads, s, d) = v.dims4()?;
-            v.unsqueeze(2)?
-                .expand((b, kv_heads, n_rep, s, d))?
-                .reshape((b, kv_heads * n_rep, s, d))?
-        } else {
-            v
-        };
-
-        // cuBLAS's strided-batched matmul needs q's (seq, head_dim) slice to
-        // be plain row/col-major; after the BSHD->BHSD transpose above it
-        // isn't (row stride is num_heads*head_dim, not head_dim) whenever
-        // num_heads > 1. The CPU flash-attn fast paths above return before
-        // reaching this line and never pay this cost.
-        let q = q.contiguous()?;
-        let attn_weights = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?)? * scale)?;
-        let attn_weights = match attention_mask {
-            Some(mask) => attn_weights.broadcast_add(mask)?,
-            None => attn_weights,
-        };
-        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-        let attn_output = attn_weights.matmul(&v)?;
-
-        // [B, H, S, D] → [B, S, H*D]
-        let attn_output =
-            attn_output
-                .transpose(1, 2)?
-                .contiguous()?
-                .reshape((b_sz, seq_len, ()))?;
-
+        // ── GPU prefill, or CPU prefill ──
+        // `decode()` builds `causal_mask` once per forward pass and
+        // shares it across every layer (every layer sees the same
+        // seq_len/kv_len/kv_offset). `attn_dispatch::causal` tries the fused
+        // flash-attn kernel first, reading `mask`'s contents when `Some`
+        // (only its `KV_max` tiling bound comes from `kv_offset` alone).
+        // When `mask` is `None` it instead tries a single-sequence CPU
+        // flash-attn fast path (masks via `kv_offset` only, no mask tensor
+        // read), falling back to a matmul-SDPA otherwise. This gets the
+        // real kernel speedup on supported GPUs
+        // without ever rebuilding the mask per layer, including on
+        // Metal/SYCL builds (no `cuda`/`rocm` feature compiled). `causal_mask`
+        // is `None` here only for CPU single-sequence prefill, where
+        // `decode()` skips building it since `attn_dispatch::causal`'s CPU
+        // flash-attn path doesn't read it, or when a future caller invokes
+        // `Attention::forward` directly without going through `decode()`.
+        // `attn_dispatch::causal` builds its own mask in that case. Every
+        // path handles GQA natively (no repeat_kv needed here).
+        let attn_output = attn_dispatch::causal(&q, &k, &v, scale, causal_mask)?;
+        let attn_output = attn_dispatch::merge_heads(&attn_output)?;
         self.o_proj.forward(&attn_output)
     }
 
@@ -792,9 +673,11 @@ impl DecoderLayer {
         hidden_states: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
+        causal_mask: Option<&CausalMask>,
         attention_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
-        let hidden_states = self.forward_attn(hidden_states, cos, sin, attention_mask)?;
+        let hidden_states =
+            self.forward_attn(hidden_states, cos, sin, causal_mask, attention_mask)?;
         self.forward_mlp(&hidden_states)
     }
 
@@ -812,6 +695,7 @@ impl DecoderLayer {
         hidden_states: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
+        causal_mask: Option<&CausalMask>,
         attention_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         let residual = hidden_states;
@@ -820,7 +704,7 @@ impl DecoderLayer {
         })?;
         let hidden_states = prof::timed(Span::Attn, || {
             self.self_attn
-                .forward(&hidden_states, cos, sin, attention_mask)
+                .forward(&hidden_states, cos, sin, causal_mask, attention_mask)
         })?;
         prof::timed(Span::Resid, || residual + hidden_states)
     }
@@ -1458,7 +1342,7 @@ impl Qwen3Model {
         let timer = prof::pass(seq_len, input_ids.device());
         let hidden_states = prof::timed(Span::Embed, || self.embed_tokens.forward(input_ids))?
             .to_dtype(self.dtype)?;
-        let out = self.decode(hidden_states, seq_len, start_pos, input_ids.device());
+        let out = self.decode(hidden_states, seq_len, start_pos);
         if let Some(timer) = timer {
             timer.finish(input_ids.device());
         }
@@ -1488,7 +1372,7 @@ impl Qwen3Model {
 
         let timer = prof::pass(seq_len, inputs_embeds.device());
         let hidden_states = inputs_embeds.to_dtype(self.dtype)?;
-        let out = self.decode(hidden_states, seq_len, start_pos, inputs_embeds.device());
+        let out = self.decode(hidden_states, seq_len, start_pos);
         if let Some(timer) = timer {
             timer.finish(inputs_embeds.device());
         }
@@ -1504,39 +1388,34 @@ impl Qwen3Model {
         hidden_states: Tensor,
         seq_len: usize,
         start_pos: usize,
-        device: &Device,
     ) -> Result<Tensor> {
-        let total_len = start_pos + seq_len;
         let (cos, sin) = self.rotary_emb.forward(start_pos, seq_len)?;
         let cos = cos.to_dtype(self.dtype)?;
         let sin = sin.to_dtype(self.dtype)?;
 
-        // Causal mask (only during prefill; skipped for single-token decode,
-        // and for CPU/B=1 prefill, where Attention::forward's flash_attn
-        // fast path masks via AttnMask::Causal instead of reading this).
+        // Built once per forward pass and shared across every layer (every
+        // layer sees the same seq_len/total_len/kv_offset here), not
+        // rebuilt per layer: `Attention::forward` passes this straight to
+        // `attn_dispatch::causal`, which reuses it as-is on whichever tier
+        // it dispatches to (fused kernel or matmul-SDPA fallback). Building
+        // a fresh mask once per layer (as each of those tiers' mask-less
+        // variants would) instead would repeat this O(seq_len * total_len) allocation (and,
+        // on GPU, a host->device re-upload) once per layer per forward pass
+        // — see `causal_with_mask`'s doc for why that regresses throughput.
+        // Skipped for single-token decode (seq_len == 1) and CPU/B=1
+        // prefill, where `attn_dispatch::causal`'s flash-attn paths mask
+        // via `kv_offset` internally instead of reading this.
+        let device = hidden_states.device();
         let b_sz = hidden_states.dim(0)?;
-        let attention_mask = if seq_len > 1 && !(device.is_cpu() && b_sz == 1) {
-            let mut mask_data = vec![0f32; seq_len * total_len];
-            for i in 0..seq_len {
-                for j in 0..total_len {
-                    if j <= start_pos + i {
-                        mask_data[i * total_len + j] = 1.0;
-                    }
-                }
-            }
-            let mask = Tensor::from_vec(mask_data, (seq_len, total_len), device)?;
-            // Multiply in F32, cast to `self.dtype` last: candle's affine op
-            // converts the -1e9 scalar to the tensor's own dtype *before*
-            // multiplying, so doing this in F16 turns -1e9 into literal
-            // -Inf and then corrupts every *unmasked* (0.0) position to NaN
-            // via 0.0 * -Inf. F32 keeps -1e9 finite through the multiply;
-            // only the final cast may turn masked positions into -Inf
-            // (which softmax handles correctly via max-subtraction).
-            let mask = mask
-                .broadcast_lt(&Tensor::new(0.5f32, device)?)?
-                .to_dtype(DType::F32)?;
-            let mask = (mask * (-1e9f64))?.to_dtype(self.dtype)?;
-            Some(mask.unsqueeze(0)?.unsqueeze(0)?)
+        let causal_mask = if seq_len > 1 && !(device.is_cpu() && b_sz == 1) {
+            let total_len = start_pos + seq_len;
+            Some(CausalMask::new(
+                seq_len,
+                total_len,
+                start_pos,
+                DType::F32,
+                device,
+            )?)
         } else {
             None
         };
@@ -1557,16 +1436,16 @@ impl Qwen3Model {
         if let Some((last, rest)) = self.layers.split_last_mut() {
             for layer in rest {
                 hidden_states =
-                    layer.forward(&hidden_states, &cos, &sin, attention_mask.as_ref())?;
+                    layer.forward(&hidden_states, &cos, &sin, causal_mask.as_ref(), None)?;
             }
             if prune_last {
                 hidden_states =
-                    last.forward_attn(&hidden_states, &cos, &sin, attention_mask.as_ref())?;
+                    last.forward_attn(&hidden_states, &cos, &sin, causal_mask.as_ref(), None)?;
                 hidden_states = hidden_states.narrow(1, seq_len - 1, 1)?;
                 hidden_states = last.forward_mlp(&hidden_states)?;
             } else {
                 hidden_states =
-                    last.forward(&hidden_states, &cos, &sin, attention_mask.as_ref())?;
+                    last.forward(&hidden_states, &cos, &sin, causal_mask.as_ref(), None)?;
             }
         }
 
@@ -1797,7 +1676,7 @@ impl Qwen3Model {
 
         let mut hidden_states = hidden_states;
         for layer in &mut self.layers {
-            hidden_states = layer.forward(&hidden_states, &cos, &sin, attention_mask)?;
+            hidden_states = layer.forward(&hidden_states, &cos, &sin, None, attention_mask)?;
         }
 
         let hidden_states = self.norm.forward(&hidden_states)?;
@@ -1951,8 +1830,9 @@ fn pad_and_stack_kv_caches(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::modules::flash_attn::dispatch_flash_attn;
     use candle_nn::VarMap;
-    use candle_nn::attention::flash_attn;
+    use candle_nn::attention::{AttnMask, flash_attn};
 
     fn tiny_config() -> Config {
         let json = r#"{
@@ -2462,12 +2342,13 @@ mod tests {
     }
 
     /// Regression test for the causal mask's additive penalty overflowing
-    /// F16: `b_sz > 1` forces `decode()`'s `broadcast_add` mask path (skips
-    /// the CPU/`b_sz==1` flash_attn fast path, which builds its mask via
-    /// `AttnMask::Causal` instead and never hits this code). In F16, naively
-    /// casting the boolean mask to F16 *before* multiplying by -1e9 makes
-    /// candle's affine op convert -1e9 to literal -Inf first, so every
-    /// *unmasked* (0.0) position computes `0.0 * -Inf = NaN`.
+    /// F16 in `decode()`'s old `broadcast_add` mask-building code (removed:
+    /// `decode()` now builds the mask directly in F32 via `NEG_INFINITY`
+    /// via `CausalMask::new`, and `b_sz > 1` CPU
+    /// prefill goes through `attn_dispatch::causal_with_mask`, so it never hits the
+    /// old bug's bool-cast-to-F16-before-multiply code path). Kept as a
+    /// basic finite-output sanity check for CPU multi-sequence F16 prefill
+    /// through the new path.
     #[test]
     fn test_prefill_batch_gt1_f16_mask_stays_finite() {
         let cfg = tiny_config();
@@ -2477,7 +2358,7 @@ mod tests {
         let mut model = Qwen3Model::new(&cfg, vb).expect("new");
 
         // b_sz=2, seq_len=3: not the b_sz==1 CPU fast path, so this hits
-        // decode()'s broadcast_add causal mask in F16.
+        // the attn_dispatch::causal_with_mask path in F16.
         let prefill_ids = Tensor::new(&[[1u32, 2, 3], [4u32, 5, 6]], &device).expect("ids");
         let logits = model.forward(&prefill_ids, 0).expect("prefill");
 
@@ -2492,6 +2373,53 @@ mod tests {
             values.iter().all(|v| v.is_finite()),
             "logits contain a non-finite value: {values:?}"
         );
+    }
+
+    /// `attn_dispatch::causal_with_mask` (fed `decode()`'s shared causal
+    /// mask for GPU/multi-sequence-CPU prefill, outside the CPU/`b_sz==1`
+    /// `flash_attn` fast path) must produce the same per-sequence output as
+    /// running each sequence alone through that CPU `flash_attn` fast path —
+    /// both compute the same causal+GQA attention, just via different
+    /// kernels.
+    #[test]
+    fn test_attn_dispatch_causal_prefill_matches_per_sequence_flash_attn() {
+        let cfg = tiny_config();
+        let device = Device::Cpu;
+
+        // Both models are built from the same VarMap so VarMap::get
+        // returns the already-initialized tensors on the second build,
+        // giving identical weights — see
+        // `test_flash_attn_chunked_prefill_matches_single`'s comment for
+        // why this is needed (each model's own once-per-construction merged
+        // `qkv_proj` can't be retroactively synced via `Var::set`).
+        let varmap = VarMap::new();
+        let mut model_batch =
+            Qwen3Model::new(&cfg, VarBuilder::from_varmap(&varmap, DType::F32, &device))
+                .expect("new batch");
+        let mut model_single =
+            Qwen3Model::new(&cfg, VarBuilder::from_varmap(&varmap, DType::F32, &device))
+                .expect("new single");
+
+        let ids_a = [1u32, 2, 3];
+        let ids_b = [4u32, 5, 6];
+
+        // b_sz=2, seq_len=3: skips the CPU/b_sz==1 flash_attn fast path,
+        // hits the attn_dispatch::causal_with_mask branch instead.
+        let batch_ids = Tensor::new(&[ids_a, ids_b], &device).expect("batch_ids");
+        let logits_batch = model_batch.forward(&batch_ids, 0).expect("batch prefill");
+
+        // Each sequence alone, b_sz=1: hits the CPU flash_attn fast path.
+        let tensor_a = Tensor::new(&[ids_a], &device).expect("ids_a");
+        let logits_a = model_single.forward(&tensor_a, 0).expect("single a");
+        model_single.clear_kv_cache();
+        let tensor_b = Tensor::new(&[ids_b], &device).expect("ids_b");
+        let logits_b = model_single.forward(&tensor_b, 0).expect("single b");
+
+        let logits_batch_a = logits_batch.narrow(0, 0, 1).expect("row a");
+        let logits_batch_b = logits_batch.narrow(0, 1, 1).expect("row b");
+
+        assert!(max_abs_diff(&logits_batch_a, &logits_a) < 1e-4);
+        assert!(max_abs_diff(&logits_batch_b, &logits_b) < 1e-4);
     }
 
     /// Chunked prefill (two smaller prefills) must produce the same decode

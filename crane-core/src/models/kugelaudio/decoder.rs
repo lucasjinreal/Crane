@@ -374,6 +374,7 @@ impl KugelAudioDecoder {
                     rope_mode: RopeMode::HalfSplit,
                     use_qk_norm: false,
                     norm_eps: cfg.rms_norm_eps,
+                    causal: true,
                 };
                 let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
                 for i in 0..cfg.num_hidden_layers {
@@ -448,24 +449,32 @@ impl KugelAudioDecoder {
         seqlen_offset: usize,
     ) -> Result<Tensor> {
         let (b_size, seq_len, _) = inputs_embeds.dims3()?;
-        let attention_mask = if seq_len <= 1 {
-            None
-        } else {
-            Some(self.causal_mask(b_size, seq_len, seqlen_offset)?)
-        };
         let (cos, sin) = self.rotary_emb.forward(seqlen_offset, seq_len)?;
         let cos = cos.to_dtype(self.dtype)?;
         let sin = sin.to_dtype(self.dtype)?;
+        // `QuantizedAttention` is a separate, hand-rolled matmul SDPA (not
+        // `GqaAttention`) where `None` means no masking at all, not "causal
+        // by default" — it still needs this explicit mask. `Standard`
+        // layers pass `None` instead: exactly what `GqaAttention`'s
+        // `causal: true` dispatch already builds internally, letting it
+        // reach the fused kernel rather than hand-building the same mask
+        // here.
+        let quantized_mask = match (&self.layers, seq_len <= 1) {
+            (DecoderLayers::Quantized(_), false) => {
+                Some(self.causal_mask(b_size, seq_len, seqlen_offset)?)
+            },
+            _ => None,
+        };
         let mut xs = inputs_embeds.clone();
         match &mut self.layers {
             DecoderLayers::Standard(layers) => {
                 for layer in layers.iter_mut() {
-                    xs = layer.forward(&xs, Some((&cos, &sin)), attention_mask.as_ref())?;
+                    xs = layer.forward(&xs, Some((&cos, &sin)), None)?;
                 }
             },
             DecoderLayers::Quantized(layers) => {
                 for layer in layers.iter_mut() {
-                    xs = layer.forward(&xs, (&cos, &sin), attention_mask.as_ref())?;
+                    xs = layer.forward(&xs, (&cos, &sin), quantized_mask.as_ref())?;
                 }
             },
         }

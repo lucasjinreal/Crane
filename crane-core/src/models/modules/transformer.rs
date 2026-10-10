@@ -171,6 +171,7 @@ mod tests {
             rope_mode: RopeMode::None,
             use_qk_norm: false,
             norm_eps: 1e-6,
+            causal: true,
         }
     }
 

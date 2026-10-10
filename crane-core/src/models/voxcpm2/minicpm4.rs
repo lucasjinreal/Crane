@@ -17,7 +17,7 @@ use candle_nn::{Activation, Embedding, RmsNorm, VarBuilder, embedding, rms_norm}
 use super::config::MiniCpm4Config;
 use crate::models::modules::attention::{AttentionConfig, GqaAttention, RopeMode};
 use crate::models::modules::ffn::SwiGluFfn;
-use crate::models::utils::release_load_staging;
+use crate::models::utils::{build_additive_causal_mask, release_load_staging};
 
 // ── LongRoPE ─────────────────────────────────────────────────────────────
 
@@ -138,6 +138,12 @@ impl DecoderLayer {
             },
             use_qk_norm: false,
             norm_eps: cfg.rms_norm_eps,
+            // `MiniCpm4Model::forward`'s `is_causal` param controls masking
+            // at runtime: causal sub-networks (base_lm/residual_lm) always
+            // pass an explicit mask when seq_len > 1, bypassing this flag;
+            // bidirectional sub-networks (feat_encoder/feat_decoder) pass
+            // `None` and rely on this flag for `try_full` dispatch.
+            causal: false,
         };
         let self_attn = GqaAttention::new(attn_cfg, vb.pp("self_attn"))?;
         let mlp = SwiGluFfn::new(
@@ -260,10 +266,12 @@ impl MiniCpm4Model {
         let cos_sin_ref = cos_sin.as_ref().map(|(c, s)| (c, s));
 
         let mask = if is_causal && seq_len > 1 {
-            Some(build_causal_mask(
+            Some(build_additive_causal_mask(
                 seq_len,
-                inputs_embeds.device(),
+                seq_len,
+                0,
                 inputs_embeds.dtype(),
+                inputs_embeds.device(),
             )?)
         } else {
             None
@@ -324,15 +332,6 @@ impl MiniCpm4Model {
             layer.clear_kv_cache();
         }
     }
-}
-
-/// Additive causal mask `[1, 1, seq_len, seq_len]` (0 where attend, `-inf`
-/// where masked) — same convention every other Crane model builds locally.
-fn build_causal_mask(seq_len: usize, device: &Device, dtype: DType) -> Result<Tensor> {
-    let mask: Vec<f32> = (0..seq_len)
-        .flat_map(|i| (0..seq_len).map(move |j| if j > i { f32::NEG_INFINITY } else { 0.0 }))
-        .collect();
-    Tensor::from_slice(&mask, (1, 1, seq_len, seq_len), device)?.to_dtype(dtype)
 }
 
 #[cfg(test)]

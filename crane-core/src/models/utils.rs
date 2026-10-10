@@ -1,6 +1,6 @@
 //! Shared utilities: `repeat_kv`, `repeat_penalty`, causal mask.
 
-use candle_core::{Device, Result, Tensor};
+use candle_core::{DType, Device, Result, Tensor};
 
 /// Build a causal attention mask of shape `(seq_len, kv_len)` where
 /// `kv_len = index_pos + seq_len`.
@@ -24,6 +24,79 @@ pub fn build_causal_mask(seq_len: usize, index_pos: usize, device: &Device) -> R
         .flat_map(|i| (0..kv_len).map(move |j| u8::from(j > index_pos + i)))
         .collect();
     Tensor::from_slice(&mask, (seq_len, kv_len), device)
+}
+
+/// Build an additive causal attention mask of shape `[1, 1, q_len, kv_len]`.
+///
+/// Position `(i, j)` is `0.0` when `j <= i + kv_offset` (query `i` may attend
+/// to key `j`) and `f32::NEG_INFINITY` otherwise. The mask is built in F32 and
+/// cast to `dtype`; both sentinels are exactly representable in every float
+/// format, so this cast is lossless.
+///
+/// - Square, no-offset case (prefill from scratch): `q_len == kv_len`,
+///   `kv_offset == 0`.
+/// - Continuation prefill against an existing KV cache:
+///   `kv_offset = kv_len - q_len`.
+///
+/// Allocates and fills a `q_len * kv_len` buffer on every call. A caller
+/// sharing the same mask across multiple layers in one forward pass should
+/// build it once and reuse it rather than calling this per layer.
+///
+/// # Errors
+///
+/// Returns an error if allocating the mask tensor on `device` or casting to
+/// `dtype` fails.
+pub fn build_additive_causal_mask(
+    q_len: usize,
+    kv_len: usize,
+    kv_offset: usize,
+    dtype: DType,
+    device: &Device,
+) -> Result<Tensor> {
+    let mut data = vec![0f32; q_len * kv_len];
+    for i in 0..q_len {
+        for j in 0..kv_len {
+            if j > i + kv_offset {
+                data[i * kv_len + j] = f32::NEG_INFINITY;
+            }
+        }
+    }
+    Tensor::from_vec(data, (1, 1, q_len, kv_len), device)?.to_dtype(dtype)
+}
+
+/// Pre-built additive causal mask encoding exactly the shifted-diagonal
+/// pattern `j <= i + kv_offset`. Only constructible through [`CausalMask::new`],
+/// which enforces that pattern at the type level — a caller can't pass a
+/// padding or sliding-window mask to a causal-only call site by accident,
+/// the exact mistake a plain `&Tensor` mask parameter invites.
+#[derive(Clone)]
+pub struct CausalMask(Tensor);
+
+impl CausalMask {
+    /// Builds the mask for `(q_len, kv_len, kv_offset)`: position `(i, j)` is
+    /// `0` when `j <= i + kv_offset` and `f32::NEG_INFINITY` otherwise, cast
+    /// to `dtype`. See [`build_additive_causal_mask`] for the exact pattern.
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if the underlying tensor construction fails.
+    pub fn new(
+        q_len: usize,
+        kv_len: usize,
+        kv_offset: usize,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Self> {
+        build_additive_causal_mask(q_len, kv_len, kv_offset, dtype, device).map(Self)
+    }
+
+    /// Borrows the inner additive mask tensor. `pub`, not `pub(crate)`: the
+    /// invariant `CausalMask` protects is on construction (the mask's
+    /// pattern), not on reading an already-built one.
+    #[must_use]
+    pub fn as_tensor(&self) -> &Tensor {
+        &self.0
+    }
 }
 
 /// # Errors

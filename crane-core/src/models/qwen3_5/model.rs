@@ -21,6 +21,7 @@ use super::modeling::{DecoderLayer, MRotaryEmbedding, Qwen35RmsNorm, RopeSlice};
 use crate::generation::GenerationConfig;
 use crate::generation::based::ModelForCausalLM;
 use crate::models::modules::embedding::EmbeddingLayer;
+use crate::models::utils::CausalMask;
 use crate::quantized::gguf_file::Gguf;
 use crate::utils::token_output_stream::TokenOutputStream;
 use crate::utils::utils;
@@ -518,7 +519,8 @@ impl Qwen3_5TextModel {
 
     /// Forward pass over `input_ids` of shape `[B, S]`. `start_pos` is the
     /// absolute position of the first token (used for rotary slicing).
-    /// `attention_mask` is broadcastable to `[B, 1, S, S_total]` (or `None`).
+    /// `attention_mask` is a causal mask broadcastable to `[B, 1, S, S_total]`
+    /// (or `None`).
     ///
     /// Returns next-token logits of shape `[B, vocab_size]` — only the last
     /// position is projected through `lm_head`.
@@ -532,7 +534,7 @@ impl Qwen3_5TextModel {
         &mut self,
         input_ids: &Tensor,
         start_pos: usize,
-        attention_mask: Option<&Tensor>,
+        attention_mask: Option<&CausalMask>,
     ) -> Result<Tensor> {
         super::prefill::forward(self, input_ids, start_pos, attention_mask)
     }
@@ -547,7 +549,7 @@ impl Qwen3_5TextModel {
         &mut self,
         input_ids: &Tensor,
         start_pos: usize,
-        attention_mask: Option<&Tensor>,
+        attention_mask: Option<&CausalMask>,
     ) -> Result<Tensor> {
         use crate::utils::prof::{Span, timed};
 
@@ -587,7 +589,7 @@ impl Qwen3_5TextModel {
         hidden_states: &Tensor,
         position_ids: &Tensor,
         start_pos: usize,
-        attention_mask: Option<&Tensor>,
+        attention_mask: Option<&CausalMask>,
     ) -> Result<Tensor> {
         let (_b, seq_len, _h) = hidden_states.dims3()?;
         let is_decode_step = seq_len == 1;
@@ -622,7 +624,7 @@ impl Qwen3_5TextModel {
         &mut self,
         mut xs: Tensor,
         rope: RopeSlice<'_>,
-        attention_mask: Option<&Tensor>,
+        attention_mask: Option<&CausalMask>,
     ) -> Result<Tensor> {
         // Multi-token passes are bound by memory and GEMMs, not launches, so
         // they keep the half-precision activations (see `attn_dtype`).

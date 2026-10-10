@@ -13,13 +13,12 @@
 //!
 //! These names match the safetensors checkpoint layout for Qwen3-TTS and Qwen2.5.
 
-use candle_core::{D, DType, Module, Result, Tensor};
+use candle_core::{Module, Result, Tensor};
 use candle_nn::VarBuilder;
-use candle_nn::attention::AttnMask;
 
-use super::flash_attn::dispatch_flash_attn;
+use super::attn_dispatch;
 use super::kv_cache;
-use crate::models::utils::repeat_kv;
+use crate::models::utils::CausalMask;
 use crate::models::with_tracing::{Linear, RmsNorm, linear_b};
 
 /// Which rotary position embedding convention to apply in [`GqaAttention::forward`].
@@ -38,8 +37,15 @@ pub enum RopeMode {
 /// Configuration for [`GqaAttention`].
 ///
 /// All dimension and feature-flag information needed to construct the layer.
-/// Causality is enforced by the caller via `attention_mask`, not by the
-/// attention layer itself.
+/// When the caller passes an explicit `attention_mask`, causality is
+/// enforced by that mask, not by the attention layer itself. When no mask
+/// is passed, `causal` selects between causal and full (bidirectional)
+/// flash-attention / SDPA dispatch.
+// Independent per-layer toggles, each mirroring a separate checkpoint/model
+// attribute (bias presence, norm variant, mask convention); they don't form
+// meaningful combined states, so grouping them into enums wouldn't clarify
+// anything.
+#[allow(clippy::struct_excessive_bools)]
 #[allow(clippy::module_name_repetitions)]
 #[derive(Debug, Clone, Copy)]
 pub struct AttentionConfig {
@@ -65,6 +71,12 @@ pub struct AttentionConfig {
     /// true`) and by [`TransformerBlock`] for the block's input and
     /// post-attention layer norms.
     pub norm_eps: f64,
+    /// Whether this layer uses causal (autoregressive) masking when no
+    /// explicit `attention_mask` is passed to [`GqaAttention::forward`].
+    /// When `true`, the shifted-diagonal `j <= i + kv_offset` causal mask
+    /// is applied. When `false`, full bidirectional attention is used
+    /// (every query attends to every key).
+    pub causal: bool,
 }
 
 /// Grouped-query attention with an accumulated KV cache.
@@ -82,8 +94,6 @@ pub struct GqaAttention {
     q_norm: Option<RmsNorm>,
     k_norm: Option<RmsNorm>,
     cfg: AttentionConfig,
-    /// Precomputed `cfg.n_heads / cfg.n_kv_heads`.
-    n_kv_groups: usize,
     kv_cache: Option<(Tensor, Tensor)>,
     /// Number of valid (filled) positions in `kv_cache`'s pre-allocated buffer.
     cache_seq_len: usize,
@@ -104,7 +114,6 @@ impl Clone for GqaAttention {
             q_norm: self.q_norm.clone(),
             k_norm: self.k_norm.clone(),
             cfg: self.cfg,
-            n_kv_groups: self.n_kv_groups,
             kv_cache: None,
             cache_seq_len: 0,
         }
@@ -172,7 +181,6 @@ impl GqaAttention {
             o_proj,
             q_norm,
             k_norm,
-            n_kv_groups: cfg.n_heads / cfg.n_kv_heads,
             cfg,
             kv_cache: None,
             cache_seq_len: 0,
@@ -204,6 +212,12 @@ impl GqaAttention {
     ///
     /// Returns a candle error if `cos_sin` is `None` but `rope_mode` is not
     /// `RopeMode::None`, or if any tensor operation fails.
+    ///
+    /// # Panics
+    ///
+    /// Does not panic in practice: the masked-prefill path's internal
+    /// `.expect()` on `attention_mask` is only reached once an earlier
+    /// branch has already returned for `attention_mask.is_none()`.
     pub fn forward(
         &mut self,
         hidden_states: &Tensor,
@@ -266,78 +280,53 @@ impl GqaAttention {
         let (k, v) = self.update_kv_cache(&k, &v)?;
 
         // 6. Scaled dot-product attention
-        let n_rep = self.n_kv_groups;
-        // head_dim is bounded by model config (typically 2-256), well within
-        // f64's exact integer range.
-        #[allow(clippy::cast_precision_loss)]
-        let scale = 1.0 / (self.cfg.head_dim as f64).sqrt();
-        // 1/sqrt(head_dim) is always small and positive; f64->f32 here only
-        // drops precision flash_attn's own f32 accumulator would discard anyway.
-        #[allow(clippy::cast_possible_truncation)]
-        let scale_f32 = scale as f32;
+        let scale = attn_dispatch::attention_scale(self.cfg.head_dim);
 
-        if q_seq_len == 1 && b_sz == 1 && q.device().is_cpu() {
-            // ── Fused flash attention for decode (seq_len=1), CPU only ──
-            // candle's cpu_flash kernel streams K/V with online softmax
-            // (O(head_dim) working set instead of materializing an O(S)
-            // scores tensor 3 times), and handles GQA natively via integer
-            // division — no K/V repeat needed. b_sz == 1 only: candle's
-            // flash_attn hard-errors for B>1 with an explicit Mask tensor
-            // (only Causal/None are allowed).
-            return self.flash_attn_decode(&q, &k, &v, attention_mask, scale_f32, b_sz);
-        }
-
-        // No unconditional flash-attn prefill fast path here: unlike the
-        // qwen3-specific model (always a causal decoder), `GqaAttention` is
-        // documented to leave causality entirely up to the caller's
-        // `attention_mask` — `None` means full (non-causal) attention, as
-        // used by Voxtral's bidirectional `AcousticTransformer`. Guessing
-        // `AttnMask::Causal` whenever the mask is absent would silently
-        // break that contract for any single-sequence CPU caller.
-
-        if n_rep > 1 && q_seq_len == 1 {
-            // ── GQA-grouped SDPA for decode (seq_len=1), GPU fallback ──
-            // Reshape Q to group queries with their KV head instead of
-            // repeating K/V n_rep times.
-            let q_g = (q.reshape((b_sz, self.cfg.n_kv_heads, n_rep, self.cfg.head_dim))? * scale)?;
-            let k_t = k.transpose(2, 3)?;
-            let attn_weights = q_g.matmul(&k_t)?;
-            let attn_weights = match attention_mask {
-                Some(mask) => attn_weights.broadcast_add(mask)?,
-                None => attn_weights,
-            };
-            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-            let attn_output = attn_weights.matmul(&v)?;
-
-            // [B, n_kv_heads, n_rep, D] → [B, 1, H*D]; flattening (n_kv_heads,
-            // n_rep, D) matches (H, D) since H = n_kv_heads * n_rep.
-            let attn_output =
-                attn_output.reshape((b_sz, 1, self.cfg.n_heads * self.cfg.head_dim))?;
+        if q_seq_len == 1 {
+            // ── Decode (seq_len=1) ──
+            // CPU single-sequence decode uses the fused CPU flash-attn
+            // kernel internally. Every other case (GPU, or CPU with more
+            // than one sequence) uses a GQA-grouped reshape that avoids
+            // repeating K/V. See `attn_dispatch::decode`.
+            let attn_output = attn_dispatch::decode(&q, &k, &v, scale, attention_mask)?;
+            let attn_output = attn_dispatch::merge_heads(&attn_output)?;
             return self.o_proj.forward(&attn_output);
         }
 
-        // ── Standard SDPA for prefill or when n_rep == 1 ──
-        // Softmax in F32 for numerical stability.
-        let k = repeat_kv(k, n_rep)?.contiguous()?;
-        let v = repeat_kv(v, n_rep)?.contiguous()?;
-        // Q may be non-contiguous after transpose(1,2) when RoPE was not applied.
-        let q = q.contiguous()?;
-        let attn_weights = (q.matmul(&k.transpose(D::Minus1, D::Minus2)?)? * scale)?;
-        let attn_weights = match attention_mask {
-            Some(mask) => attn_weights.broadcast_add(mask)?,
-            None => attn_weights,
-        };
-        let input_dtype = attn_weights.dtype();
-        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights.to_dtype(DType::F32)?)?
-            .to_dtype(input_dtype)?;
-        let attn_output = attn_weights.matmul(&v)?;
+        // ── Flash-attn / dispatch for prefill when no explicit mask ──
+        // `attn_dispatch::causal`/`full` try the fused GPU kernel first
+        // (via `gpu_flash_attn`) and fall back to matmul SDPA internally —
+        // this layer never needs its own GPU-side fallback.
+        if attention_mask.is_none() {
+            let attn_output = if self.cfg.causal {
+                // Build the causal mask once here and pass it through, same
+                // as Qwen3/Qwen3.5/HunyuanDense/MiniCPM5 already do: the
+                // fused-kernel path reads this mask directly and rebuilds an
+                // `O(q_seq_len * kv_len)` equivalent on every call when given
+                // `None` instead (see `attn_dispatch::causal`'s doc comment).
+                let kv_offset = k.dim(2)?.saturating_sub(q_seq_len);
+                let mask = CausalMask::new(q_seq_len, k.dim(2)?, kv_offset, q.dtype(), q.device())?;
+                attn_dispatch::causal(&q, &k, &v, scale, Some(&mask))?
+            } else {
+                // `attn_dispatch::full` already tries `gpu_flash_attn::try_full`
+                // first and falls back internally — a single call covers both
+                // tiers, mirroring the causal branch above.
+                attn_dispatch::full(&q, &k, &v, scale)?
+            };
+            let attn_output = attn_dispatch::merge_heads(&attn_output)?;
+            return self.o_proj.forward(&attn_output);
+        }
+
+        // ── Masked prefill (continuous-batching padding) ──
+        // `attn_dispatch::prefill_masked` has no kernel-attempt tier (the
+        // fused GPU kernels only support causal/full/windowed patterns, not
+        // arbitrary additive masks) but drops the F32 softmax upcast this
+        // block used to do — see `attn_dispatch`'s module doc comment.
+        let mask = attention_mask.expect("guarded by the is_none check above");
+        let attn_output = attn_dispatch::prefill_masked(&q, &k, &v, scale, mask)?;
 
         // 7. Reassemble heads and project back to the hidden dimension
-        let attn_output =
-            attn_output
-                .transpose(1, 2)?
-                .contiguous()?
-                .reshape((b_sz, q_seq_len, ()))?;
+        let attn_output = attn_dispatch::merge_heads(&attn_output)?;
         self.o_proj.forward(&attn_output)
     }
 
@@ -361,49 +350,6 @@ impl GqaAttention {
         self.kv_cache = Some(update.buffer);
         self.cache_seq_len = update.seq_len;
         Ok((update.k, update.v))
-    }
-
-    /// Fused flash-attention decode path: `q_seq_len == 1`, `b_sz == 1`, CPU only.
-    ///
-    /// `q`, `k`, `v` are in `[batch, heads, seq, head_dim]` layout. See the
-    /// call site in [`Self::forward`] for why this path is gated the way it is.
-    fn flash_attn_decode(
-        &self,
-        q: &Tensor,
-        k: &Tensor,
-        v: &Tensor,
-        attention_mask: Option<&Tensor>,
-        scale_f32: f32,
-        b_sz: usize,
-    ) -> Result<Tensor> {
-        // Non-contiguous is fine — the decode kernel indexes by stride.
-        let q_bshd = q.transpose(1, 2)?;
-        let k_bshd = k.transpose(1, 2)?;
-        let v_bshd = v.transpose(1, 2)?;
-
-        let mask = match attention_mask {
-            Some(mask) => {
-                debug_assert!(
-                    mask.dim(1).is_ok_and(|d| d == 1),
-                    "CPU flash-attn decode broadcasts one mask row across all heads; \
-                     a mask with head dim != 1 would be silently misapplied"
-                );
-                // AttnMask::Mask takes ownership; Tensor is Arc-backed, so
-                // this is a refcount bump, not a data copy.
-                AttnMask::Mask(mask.clone())
-            },
-            None => AttnMask::None,
-        };
-
-        let attn_output = dispatch_flash_attn(&q_bshd, &k_bshd, &v_bshd, scale_f32, mask)?;
-        // Cast back from F32 before `o_proj` — see `dispatch_flash_attn`'s doc.
-        let attn_output = attn_output.to_dtype(q.dtype())?;
-
-        // flash_attn output is BHSD [B, H, 1, D] → [B, 1, H*D].
-        let attn_output = attn_output
-            .reshape((b_sz, self.cfg.n_heads, self.cfg.head_dim))?
-            .reshape((b_sz, 1, self.cfg.n_heads * self.cfg.head_dim))?;
-        self.o_proj.forward(&attn_output)
     }
 }
 
@@ -437,6 +383,7 @@ mod tests {
             rope_mode: RopeMode::Interleaved,
             use_qk_norm: false,
             norm_eps: 1e-6,
+            causal: true,
         };
         let device = Device::Cpu;
         let vb = nonzero_vb_f16(&cfg, 0.02);
@@ -481,6 +428,7 @@ mod tests {
             rope_mode: RopeMode::None,
             use_qk_norm: false,
             norm_eps: 1e-6,
+            causal: true,
         }
     }
 
@@ -932,11 +880,21 @@ mod tests {
         //    rotation and Q @ K^T is unchanged by the orthogonal transform).
         // 2. Q/K must be non-zero (position-varying input ensures different per-token Q/K).
         let device = &Device::Cpu;
+        // causal: false — this test's degenerate, perfectly-structured
+        // weights (nonzero_vb's `(i+1)*scale` pattern) make RoPE's effect
+        // on Q@K^T cancel out exactly under causal masking (verified:
+        // passing an explicit causal mask through the untouched
+        // explicit-mask path gives the same zero diff). Full bidirectional
+        // attention is what actually exercises RoPE's effect here.
         let cfg_rope = AttentionConfig {
             rope_mode: RopeMode::HalfSplit,
+            causal: false,
             ..base_cfg()
         };
-        let cfg_no_rope = base_cfg();
+        let cfg_no_rope = AttentionConfig {
+            causal: false,
+            ..base_cfg()
+        };
         let vb_rope = nonzero_vb(&cfg_rope, 0.05);
         let vb_no_rope = nonzero_vb(&cfg_no_rope, 0.05);
 
@@ -1304,7 +1262,15 @@ mod tests {
 
     #[test]
     fn test_attention_mask_changes_output() {
-        let cfg = base_cfg();
+        // causal: false so the no-mask case dispatches full (bidirectional)
+        // attention, genuinely different from the explicit strict-causal
+        // mask below — with causal: true, no-mask would dispatch the same
+        // causal pattern the explicit mask encodes, collapsing the diff
+        // this test exists to check.
+        let cfg = AttentionConfig {
+            causal: false,
+            ..base_cfg()
+        };
         let vb1 = nonzero_vb(&cfg, 0.01);
         let vb2 = nonzero_vb(&cfg, 0.01);
         let device = &Device::Cpu;

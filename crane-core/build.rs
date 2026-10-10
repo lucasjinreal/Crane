@@ -54,6 +54,7 @@ fn main() {
         let builder = bindgen_cuda::Builder::default()
             .kernel_paths_glob("kernels/cuda/**/*.cu")
             .arg("--expt-relaxed-constexpr")
+            .arg("--extended-lambda")
             .arg("-std=c++17")
             .arg("-O3");
 

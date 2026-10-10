@@ -1,5 +1,7 @@
+use crate::models::modules::attn_dispatch;
 use crate::models::modules::embedding::EmbeddingLayer;
 use crate::models::modules::rotary::RotaryEmbedding;
+use crate::models::utils::CausalMask;
 use crate::quantized::gguf_metadata::GgufMetadata;
 use crate::utils::DeviceExt;
 use candle_core::quantized::gguf_file;
@@ -354,6 +356,7 @@ impl Attention {
         hidden_states: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
+        causal_mask: Option<&CausalMask>,
         attention_mask: Option<&Tensor>,
         shared_kv: Option<(Tensor, Tensor)>,
     ) -> Result<Tensor> {
@@ -371,7 +374,7 @@ impl Attention {
             } else {
                 q
             };
-            return self.compute_attention(&q, k, v, attention_mask, b_sz, seq_len);
+            return self.compute_attention(&q, &k, &v, causal_mask, attention_mask, seq_len);
         }
 
         // ── QKV projection: merged (1 gemv) or separate (3 gemv) ──
@@ -417,96 +420,38 @@ impl Attention {
 
         let (k, v) = self.update_kv_cache(&k, &v)?;
 
-        self.compute_attention(&q, k, v, attention_mask, b_sz, seq_len)
+        self.compute_attention(&q, &k, &v, causal_mask, attention_mask, seq_len)
     }
 
     /// Shared attention computation used by both normal and CLA paths.
-    // b/h/kv_heads/s/d are standard tensor-shape notation (batch, heads,
-    // seq_len, head_dim), matching the BHSD terminology used elsewhere in
-    // this file.
-    #[allow(clippy::many_single_char_names)]
     fn compute_attention(
         &self,
         q: &Tensor,
-        k: Tensor,
-        v: Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        causal_mask: Option<&CausalMask>,
         attention_mask: Option<&Tensor>,
-        b_sz: usize,
         seq_len: usize,
     ) -> Result<Tensor> {
-        let n_rep = self.num_heads / self.num_kv_heads;
-        let _kv_s = k.dim(2)?;
+        let scale = attn_dispatch::attention_scale(self.head_dim);
 
-        if n_rep > 1 && seq_len == 1 {
-            // ── GQA-grouped SDPA for decode (seq_len=1) ──
-            // Keep 4D tensors throughout; candle matmul handles
-            // non-contiguous K internally with a single flatten pass.
-            #[allow(clippy::cast_precision_loss)] // head_dim is small (<=512 in practice)
-            let scale = 1.0 / (self.head_dim as f64).sqrt();
-
-            // Q: [B, H, 1, D] → [B, kv_heads, n_rep, D], pre-scaled
-            let q_g = (q.reshape((b_sz, self.num_kv_heads, n_rep, self.head_dim))? * scale)?;
-
-            // K^T: [B, kv_heads, D, S] — just a view, no copy
-            let k_t = k.transpose(2, 3)?;
-
-            // scores: [B, kv_heads, n_rep, S]
-            let attn_weights = q_g.matmul(&k_t)?;
-
-            let attn_weights = match attention_mask {
-                Some(mask) => {
-                    // mask [B, 1, 1, S] broadcasts over kv_heads & n_rep
-                    attn_weights.broadcast_add(mask)?
-                },
-                None => attn_weights,
-            };
-            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-
-            // V: [B, kv_heads, S, D] — matmul handles non-contiguous
-            let attn_output = attn_weights.matmul(&v)?; // [B, kv_heads, n_rep, D]
-
-            // Reshape back: → [B, H, D] → [B, 1, H*D]
-            let attn_output = attn_output
-                .reshape((b_sz, self.num_heads, self.head_dim))?
-                .reshape((b_sz, 1, self.num_heads * self.head_dim))?;
+        if seq_len == 1 {
+            // ── Decode (seq_len=1) ──
+            // CPU single-sequence decode uses the fused CPU flash-attn
+            // kernel internally. Every other case (GPU, or CPU with more
+            // than one sequence) uses a GQA-grouped reshape that avoids
+            // repeating K/V. See `attn_dispatch::decode`.
+            let attn_output = attn_dispatch::decode(q, k, v, scale, attention_mask)?;
+            let attn_output = attn_dispatch::merge_heads(&attn_output)?;
             return self.o_proj.forward(&attn_output);
         }
 
-        // ── Standard SDPA for prefill or when n_rep == 1 ──
-        let k = if n_rep > 1 {
-            let (b, kv_heads, s, d) = k.dims4()?;
-            k.unsqueeze(2)?
-                .expand((b, kv_heads, n_rep, s, d))?
-                .reshape((b, kv_heads * n_rep, s, d))?
-        } else {
-            k
-        };
-        let v = if n_rep > 1 {
-            let (b, kv_heads, s, d) = v.dims4()?;
-            v.unsqueeze(2)?
-                .expand((b, kv_heads, n_rep, s, d))?
-                .reshape((b, kv_heads * n_rep, s, d))?
-        } else {
-            v
-        };
-
-        // Scaled dot-product attention
-        #[allow(clippy::cast_precision_loss)] // head_dim is small (<=512 in practice)
-        let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let attn_weights = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?)? * scale)?;
-        let attn_weights = match attention_mask {
-            Some(mask) => attn_weights.broadcast_add(mask)?,
-            None => attn_weights,
-        };
-        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-        let attn_output = attn_weights.matmul(&v)?;
-
-        // [B, num_heads, S, head_dim] -> [B, S, hidden_size]
-        let attn_output =
-            attn_output
-                .transpose(1, 2)?
-                .contiguous()?
-                .reshape((b_sz, seq_len, ()))?;
+        // ── Flash-attn / dispatch for prefill ──
+        // `attn_dispatch::causal` tries the fused GPU kernel first (via
+        // `gpu_flash_attn`) and falls back to matmul SDPA internally — this
+        // layer never needs its own GPU-side fallback.
+        let attn_output = attn_dispatch::causal(q, k, v, scale, causal_mask)?;
+        let attn_output = attn_dispatch::merge_heads(&attn_output)?;
 
         self.o_proj.forward(&attn_output)
     }
@@ -669,14 +614,20 @@ impl DecoderLayer {
         hidden_states: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
+        causal_mask: Option<&CausalMask>,
         attention_mask: Option<&Tensor>,
         shared_kv: Option<(Tensor, Tensor)>,
     ) -> Result<Tensor> {
         let residual = hidden_states;
         let hidden_states = self.input_layernorm.forward(hidden_states)?;
-        let hidden_states =
-            self.self_attn
-                .forward(&hidden_states, cos, sin, attention_mask, shared_kv)?;
+        let hidden_states = self.self_attn.forward(
+            &hidden_states,
+            cos,
+            sin,
+            causal_mask,
+            attention_mask,
+            shared_kv,
+        )?;
         let hidden_states = (residual + hidden_states)?;
 
         let residual = &hidden_states;
@@ -899,25 +850,15 @@ impl HunYuanDenseV1 {
         let sin = sin.to_dtype(self.dtype)?;
 
         // Build causal mask
-        let attention_mask = if seq_len > 1 {
-            let total_len = start_pos + seq_len;
-            // Build [seq_len, total_len] mask: 1.0 where allowed, 0.0 where masked
-            let mut mask_data = vec![0f32; seq_len * total_len];
-            for i in 0..seq_len {
-                // Each query position i can attend to all cached positions + positions 0..=i
-                for j in 0..total_len {
-                    if j <= start_pos + i {
-                        mask_data[i * total_len + j] = 1.0;
-                    }
-                }
-            }
-            let mask = Tensor::from_vec(mask_data, (seq_len, total_len), input_ids.device())?;
-            // Convert: 0.0 (masked) -> -1e9, 1.0 (attend) -> 0.0
-            let mask = mask
-                .broadcast_lt(&Tensor::new(0.5f32, input_ids.device())?)?
-                .to_dtype(DType::F32)?;
-            let mask = (mask * (-1e9f64))?.to_dtype(self.dtype)?;
-            Some(mask.unsqueeze(0)?.unsqueeze(0)?) // [1, 1, seq_len, total_len]
+        let causal_mask = if seq_len > 1 {
+            let kv_len = start_pos + seq_len;
+            Some(CausalMask::new(
+                seq_len,
+                kv_len,
+                start_pos,
+                self.dtype,
+                input_ids.device(),
+            )?)
         } else {
             None
         };
@@ -940,7 +881,8 @@ impl HunYuanDenseV1 {
                 &hidden_states,
                 &cos,
                 &sin,
-                attention_mask.as_ref(),
+                causal_mask.as_ref(),
+                None,
                 shared_kv,
             )?;
 
@@ -1152,7 +1094,8 @@ impl HunYuanDenseV1 {
 
         let mut hidden_states = hidden_states;
         for layer in &mut self.layers {
-            hidden_states = layer.forward(&hidden_states, &cos, &sin, attention_mask, None)?;
+            hidden_states =
+                layer.forward(&hidden_states, &cos, &sin, None, attention_mask, None)?;
         }
 
         let hidden_states = self.norm.forward(&hidden_states)?;
@@ -1328,4 +1271,225 @@ fn pad_and_stack_kv_caches(
     let stacked_k = Tensor::cat(&padded_ks, 0)?.contiguous()?;
     let stacked_v = Tensor::cat(&padded_vs, 0)?.contiguous()?;
     Ok(Some((stacked_k, stacked_v)))
+}
+
+#[cfg(test)]
+fn tiny_config() -> Config {
+    Config {
+        vocab_size: 32,
+        hidden_size: 16,
+        intermediate_size: 32,
+        num_hidden_layers: 1,
+        num_attention_heads: 4,
+        num_key_value_heads: 2,
+        head_dim: Some(4),
+        hidden_act: "silu".to_string(),
+        max_position_embeddings: 32,
+        rms_norm_eps: 1e-5,
+        rope_theta: Some(10000.0),
+        rope_scaling: None,
+        attention_bias: Some(false),
+        use_qk_norm: true,
+        tie_word_embeddings: true,
+        use_cla: None,
+        cla_share_factor: None,
+    }
+}
+
+#[cfg(test)]
+fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
+    (a - b)
+        .expect("sub")
+        .abs()
+        .expect("abs")
+        .max_all()
+        .expect("max_all")
+        .to_scalar::<f32>()
+        .expect("to_scalar")
+}
+
+#[cfg(test)]
+mod tests {
+    use candle_nn::VarMap;
+
+    use super::{Config, DType, Device, HunYuanDenseV1, Tensor, max_abs_diff, tiny_config};
+
+    /// Prefill (seq_len>1, through `attn_dispatch::causal` with an explicit
+    /// mask) then decode (seq_len==1, through `attn_dispatch::decode`) must
+    /// be deterministic across repeated runs on the same model, the same
+    /// wiring check used for Qwen3's equivalent dispatch paths.
+    #[test]
+    fn test_attn_dispatch_prefill_and_decode_deterministic() {
+        let cfg = tiny_config();
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = candle_nn::VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let mut model = HunYuanDenseV1::new(&cfg, &vb).expect("new");
+
+        let prefill_ids = Tensor::new(&[[1u32, 2, 3, 4, 5]], &device).expect("prefill_ids");
+        let decode_ids = Tensor::new(&[[6u32]], &device).expect("decode_ids");
+
+        let out_a = model.forward(&prefill_ids, 0).expect("prefill a");
+        let dec_a = model.forward(&decode_ids, 5).expect("decode a");
+
+        model.clear_kv_cache();
+        let out_b = model.forward(&prefill_ids, 0).expect("prefill b");
+        let dec_b = model.forward(&decode_ids, 5).expect("decode b");
+
+        assert_eq!(out_a.dims(), out_b.dims());
+        assert!(max_abs_diff(&out_a, &out_b) < 1e-5);
+        assert_eq!(dec_a.dims(), dec_b.dims());
+        assert!(max_abs_diff(&dec_a, &dec_b) < 1e-5);
+    }
+
+    /// CLA (cross-layer attention)'s shared-KV path — a second layer reusing
+    /// an anchor layer's post-RoPE/QK-norm K/V via `compute_attention`'s
+    /// `shared_kv` parameter — must also produce deterministic, finite
+    /// output. This path bypasses `update_kv_cache` entirely for shared
+    /// layers, so it isn't exercised by the non-CLA test above.
+    #[test]
+    fn test_cla_shared_kv_deterministic() {
+        let cfg = Config {
+            num_hidden_layers: 2,
+            use_cla: Some(true),
+            cla_share_factor: Some(2),
+            ..tiny_config()
+        };
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = candle_nn::VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let mut model = HunYuanDenseV1::new(&cfg, &vb).expect("new");
+
+        let ids = Tensor::new(&[[1u32, 2, 3]], &device).expect("ids");
+        let out_a = model.forward(&ids, 0).expect("forward a");
+        model.clear_kv_cache();
+        let out_b = model.forward(&ids, 0).expect("forward b");
+
+        assert_eq!(out_a.dims(), out_b.dims());
+        assert!(max_abs_diff(&out_a, &out_b) < 1e-5);
+    }
+}
+
+/// End-to-end coverage of `HunyuanAttention`'s `attn_dispatch` wiring on a
+/// real GPU (this machine's ROCm GPU, or a CUDA GPU when built with
+/// `--features cuda` elsewhere). `head_dim` is 128 here (unlike
+/// `tiny_config`'s 4) specifically so the fused kernel's `validate_bshd`
+/// check passes and this actually exercises `gpu_flash_attn`'s kernel
+/// dispatch, not just its matmul-SDPA fallback. `attn_dispatch`'s own
+/// `gpu_tests` already cover the dispatch math in isolation against a
+/// naive reference; this covers this model's own plumbing (merged QKV
+/// split, RoPE-then-QK-norm ordering, mask construction) by comparing a
+/// GPU F16 forward pass against the same weights run on CPU in F32.
+#[cfg(all(test, any(feature = "cuda", feature = "rocm")))]
+mod gpu_tests {
+    use std::collections::HashMap;
+
+    use candle_nn::{VarBuilder, VarMap};
+
+    use super::{Config, DType, Device, HunYuanDenseV1, Tensor, max_abs_diff};
+    use crate::ops::fused_ops::fattn::test_support::test_gpu_device;
+
+    fn gpu_config() -> Config {
+        Config {
+            hidden_size: 256,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            head_dim: Some(128),
+            intermediate_size: 64,
+            ..super::tiny_config()
+        }
+    }
+
+    /// Clones `varmap`'s current values onto `device` in `dtype`, so a
+    /// second model built from the result starts from the exact same
+    /// weights as the CPU model `varmap` backs, not an independent random
+    /// init.
+    fn clone_varmap_to(varmap: &VarMap, dtype: DType, device: &Device) -> VarBuilder<'static> {
+        let tensors: HashMap<String, Tensor> = varmap
+            .data()
+            .lock()
+            .expect("varmap lock")
+            .iter()
+            .map(|(name, var)| {
+                let t = var
+                    .as_tensor()
+                    .to_device(device)
+                    .expect("to_device")
+                    .to_dtype(dtype)
+                    .expect("to_dtype");
+                (name.clone(), t)
+            })
+            .collect();
+        VarBuilder::from_tensors(tensors, dtype, device)
+    }
+
+    // Prefill (causal, explicit mask) and decode (no mask) on a real GPU
+    // must produce finite output matching the same weights run on CPU in
+    // F32, within F16 tolerance.
+    #[test]
+    fn test_gpu_prefill_and_decode_match_cpu_reference() {
+        let cfg = gpu_config();
+        let cpu = Device::Cpu;
+        let gpu = test_gpu_device();
+
+        let varmap = VarMap::new();
+        let cpu_vb = VarBuilder::from_varmap(&varmap, DType::F32, &cpu);
+        let mut cpu_model = HunYuanDenseV1::new(&cfg, &cpu_vb).expect("cpu new");
+
+        let prefill_ids = Tensor::new(&[[1u32, 2, 3, 4, 5]], &cpu).expect("prefill_ids");
+        let decode_ids = Tensor::new(&[[6u32]], &cpu).expect("decode_ids");
+        let cpu_prefill = cpu_model.forward(&prefill_ids, 0).expect("cpu prefill");
+        let cpu_decode = cpu_model.forward(&decode_ids, 5).expect("cpu decode");
+
+        let gpu_vb = clone_varmap_to(&varmap, DType::F16, &gpu);
+        let mut gpu_model = HunYuanDenseV1::new(&cfg, &gpu_vb).expect("gpu new");
+
+        let prefill_ids_gpu = prefill_ids.to_device(&gpu).expect("prefill to gpu");
+        let decode_ids_gpu = decode_ids.to_device(&gpu).expect("decode to gpu");
+        let gpu_prefill = gpu_model.forward(&prefill_ids_gpu, 0).expect("gpu prefill");
+        let gpu_decode = gpu_model.forward(&decode_ids_gpu, 5).expect("gpu decode");
+
+        let gpu_prefill_f32 = gpu_prefill
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_device(&cpu)
+            .unwrap();
+        let gpu_decode_f32 = gpu_decode
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_device(&cpu)
+            .unwrap();
+
+        assert_eq!(cpu_prefill.dims(), gpu_prefill_f32.dims());
+        assert_eq!(cpu_decode.dims(), gpu_decode_f32.dims());
+        // F16 tolerance, relative to each reference logit's own magnitude
+        // (floored at 1.0 so near-zero logits don't demand unreasonable
+        // absolute precision) — same convention as flash_attn's own tests.
+        let prefill_tol = cpu_prefill
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap()
+            .max(1.0)
+            * 0.1;
+        let decode_tol = cpu_decode
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap()
+            .max(1.0)
+            * 0.1;
+        assert!(
+            max_abs_diff(&cpu_prefill, &gpu_prefill_f32) < prefill_tol,
+            "prefill mismatch"
+        );
+        assert!(
+            max_abs_diff(&cpu_decode, &gpu_decode_f32) < decode_tol,
+            "decode mismatch"
+        );
+    }
 }

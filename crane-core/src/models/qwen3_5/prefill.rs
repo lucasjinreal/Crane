@@ -20,6 +20,7 @@ use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 
 use super::model::Qwen3_5TextModel;
+use crate::models::utils::CausalMask;
 
 /// Prefill chunk size in tokens when nothing else selects one; the same size
 /// crane-serve prefills in. Every pass dequantizes (or, for packed `MoE`
@@ -76,7 +77,7 @@ pub(super) fn forward(
     model: &mut Qwen3_5TextModel,
     input_ids: &Tensor,
     start_pos: usize,
-    attention_mask: Option<&Tensor>,
+    attention_mask: Option<&CausalMask>,
 ) -> Result<Tensor> {
     let timer = crate::utils::prof::pass(input_ids.dim(1)?, model.device());
     let out = forward_inner(model, input_ids, start_pos, attention_mask);
@@ -90,7 +91,7 @@ fn forward_inner(
     model: &mut Qwen3_5TextModel,
     input_ids: &Tensor,
     start_pos: usize,
-    attention_mask: Option<&Tensor>,
+    attention_mask: Option<&CausalMask>,
 ) -> Result<Tensor> {
     let (_b, seq_len) = input_ids.dims2()?;
     let chunk = chunk_size();
@@ -159,18 +160,9 @@ pub(super) fn causal_mask(
     start_pos: usize,
     device: &Device,
     dtype: DType,
-) -> Result<Tensor> {
+) -> Result<CausalMask> {
     let total_k = start_pos + seq_q;
-    let mut data: Vec<f32> = Vec::with_capacity(seq_q * total_k);
-    for q in start_pos..total_k {
-        for k in 0..total_k {
-            data.push(if k > q { f32::NEG_INFINITY } else { 0.0 });
-        }
-    }
-    Ok(Tensor::from_vec(data, (seq_q, total_k), device)?
-        .to_dtype(dtype)?
-        .unsqueeze(0)?
-        .unsqueeze(0)?)
+    Ok(CausalMask::new(seq_q, total_k, start_pos, dtype, device)?)
 }
 
 #[cfg(test)]
@@ -345,8 +337,9 @@ mod tests {
     fn causal_mask_uses_absolute_positions() {
         let dev = Device::Cpu;
         let mask = causal_mask(2, 3, &dev, DType::F32).expect("mask");
-        assert_eq!(mask.dims(), &[1, 1, 2, 5]);
+        assert_eq!(mask.as_tensor().dims(), &[1, 1, 2, 5]);
         let v = mask
+            .as_tensor()
             .flatten_all()
             .expect("flatten")
             .to_vec1::<f32>()

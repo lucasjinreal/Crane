@@ -73,6 +73,7 @@ impl Model {
             rope_mode: RopeMode::HalfSplit,
             use_qk_norm: false,
             norm_eps: cfg.rms_norm_eps,
+            causal: true,
         };
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_l = vb_m.pp("layers");
@@ -150,7 +151,17 @@ impl Model {
         let attention_mask: Option<Tensor> = match attn_mask {
             Some(mask) => Some(self.prepare_attention_mask(mask)?),
             None => {
-                if seq_len <= 1 {
+                // `prepare_causal_attention_mask`'s window check only ever
+                // compares positions within this call's own `tgt_len` block
+                // (never against `seqlen_offset`), so it's a no-op beyond
+                // plain causality whenever `tgt_len <= sliding_window + 1`
+                // (the max in-block gap `tgt_len - 1` can't exceed
+                // `sliding_window`). In that case the mask is exactly what
+                // `GqaAttention`'s `causal: true` dispatch already builds
+                // internally, so skip building it and let that dispatch
+                // reach the fused kernel. Otherwise the window genuinely
+                // restricts visibility and the explicit mask stays.
+                if seq_len <= 1 || seq_len <= self.sliding_window.saturating_add(1) {
                     None
                 } else {
                     Some(self.prepare_causal_attention_mask(b_size, seq_len, seqlen_offset)?)

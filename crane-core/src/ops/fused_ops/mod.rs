@@ -31,6 +31,9 @@
 //! - [`moe_combine`] — fused `MoE` combine (router-weighted sum of routed outputs)
 
 pub mod atan2;
+pub mod fattn;
+pub mod fattn_mma;
+pub mod fattn_tile;
 pub mod moe_combine;
 pub mod qsa_mask;
 pub mod snake;

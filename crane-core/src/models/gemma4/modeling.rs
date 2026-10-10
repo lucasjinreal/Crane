@@ -27,8 +27,10 @@ use serde::Deserialize;
 use std::io::{Read, Seek};
 
 // Reuse the polymorphic linear layer and the shared GGUF loader.
+use crate::models::modules::attn_dispatch;
 use crate::models::modules::embedding::EmbeddingLayer;
 use crate::models::modules::ffn::SwiGluFfn;
+use crate::models::utils::CausalMask;
 pub use crate::ops::linear::LinearLayer;
 pub use crate::quantized::gguf_file::Gguf;
 // `Device::is_rocm` is inherent on the ROCm candle fork; this extension only
@@ -261,6 +263,10 @@ struct Attention {
     num_kv_heads: usize,
     head_dim: usize,
     is_shared: bool,
+    /// `Some(window)` for sliding-window layers, `None` for full-attention
+    /// layers. Drives the `attn_dispatch::windowed` vs `attn_dispatch::causal`
+    /// choice in `forward`.
+    sliding_window: Option<usize>,
     kv_cache: Option<(Tensor, Tensor)>,
     cache_seq_len: usize,
 }
@@ -275,6 +281,10 @@ impl Attention {
         let head_dim = match layer_type {
             LayerType::SlidingAttention => config.head_dim,
             LayerType::FullAttention => config.global_head_dim(),
+        };
+        let sliding_window = match layer_type {
+            LayerType::SlidingAttention => Some(config.sliding_window.unwrap_or(512)),
+            LayerType::FullAttention => None,
         };
         let num_heads = config.num_attention_heads;
         let num_kv_heads = config.num_key_value_heads;
@@ -323,6 +333,7 @@ impl Attention {
             num_kv_heads,
             head_dim,
             is_shared,
+            sliding_window,
             kv_cache: None,
             cache_seq_len: 0,
         })
@@ -333,6 +344,7 @@ impl Attention {
         num_kv_heads: usize,
         head_dim: usize,
         is_shared: bool,
+        sliding_window: Option<usize>,
         rms_norm_eps: f64,
         gg: &mut Gguf<R>,
         layer_idx: usize,
@@ -365,6 +377,7 @@ impl Attention {
             num_kv_heads,
             head_dim,
             is_shared,
+            sliding_window,
             kv_cache: None,
             cache_seq_len: 0,
         })
@@ -429,7 +442,7 @@ impl Attention {
         hidden_states: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
-        attention_mask: Option<&Tensor>,
+        causal_mask: Option<&CausalMask>,
         layer_type: LayerType,
         rotated_dim: Option<usize>,
         shared_kv: Option<&(Tensor, Tensor)>,
@@ -497,63 +510,22 @@ impl Attention {
         };
 
         // ── SDPA ──
-        let n_rep = self.num_heads / self.num_kv_heads;
-
-        if n_rep > 1 && seq_len == 1 {
-            // Gemma4: scaling = 1.0 (QK norms handle normalization)
-            let q_g = q
-                .reshape((b_sz, self.num_kv_heads, n_rep, self.head_dim))?
-                .contiguous()?;
-            let k_t = k.transpose(2, 3)?.contiguous()?;
-            let attn_weights = q_g.matmul(&k_t)?;
-
-            let attn_weights = match attention_mask {
-                Some(mask) => attn_weights.broadcast_add(mask)?,
-                None => attn_weights,
-            };
-            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-            let attn_output = attn_weights.matmul(&v)?;
-
-            let attn_output = attn_output
-                .reshape((b_sz, self.num_heads, self.head_dim))?
-                .reshape((b_sz, 1, self.num_heads * self.head_dim))?;
+        // Gemma4: scaling = 1.0 (QK norms handle normalization), not
+        // attn_dispatch::attention_scale(head_dim).
+        if seq_len == 1 {
+            let attn_output = attn_dispatch::decode(&q, &k, &v, 1.0, None)?;
+            let attn_output = attn_dispatch::merge_heads(&attn_output)?;
             return self.o_proj.forward(&attn_output);
         }
 
-        let k = if n_rep > 1 {
-            let (b, kv_heads, s, d) = k.dims4()?;
-            k.unsqueeze(2)?
-                .expand((b, kv_heads, n_rep, s, d))?
-                .reshape((b, kv_heads * n_rep, s, d))?
-        } else {
-            k
+        let attn_output = match self.sliding_window {
+            // `windowed`'s `window_left` excludes the current position, while
+            // Gemma4's window size includes it. `window_right = 0` keeps it
+            // causal, so no future tokens are visible.
+            Some(window) => attn_dispatch::windowed(&q, &k, &v, 1.0, window - 1, 0)?,
+            None => attn_dispatch::causal(&q, &k, &v, 1.0, causal_mask)?,
         };
-        let v = if n_rep > 1 {
-            let (b, kv_heads, s, d) = v.dims4()?;
-            v.unsqueeze(2)?
-                .expand((b, kv_heads, n_rep, s, d))?
-                .reshape((b, kv_heads * n_rep, s, d))?
-        } else {
-            v
-        };
-
-        // Gemma4: scaling = 1.0 (QK norms handle normalization)
-        let q = q.contiguous()?;
-        let k = k.contiguous()?;
-        let v = v.contiguous()?;
-        let attn_weights = q.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
-        let attn_weights = match attention_mask {
-            Some(mask) => attn_weights.broadcast_add(mask)?,
-            None => attn_weights,
-        };
-        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-        let attn_output = attn_weights.matmul(&v)?;
-
-        let attn_output =
-            attn_output
-                .transpose(1, 2)?
-                .contiguous()?
-                .reshape((b_sz, seq_len, ()))?;
+        let attn_output = attn_dispatch::merge_heads(&attn_output)?;
 
         self.o_proj.forward(&attn_output)
     }
@@ -711,11 +683,16 @@ impl DecoderLayer {
         gg: &mut Gguf<R>,
         layer_idx: usize,
     ) -> Result<Self> {
+        let sliding_window = match layer_type {
+            LayerType::SlidingAttention => Some(config.sliding_window.unwrap_or(512)),
+            LayerType::FullAttention => None,
+        };
         let self_attn = Attention::new_from_gguf(
             config.num_attention_heads,
             config.num_key_value_heads,
             head_dim,
             is_shared,
+            sliding_window,
             config.rms_norm_eps,
             gg,
             layer_idx,
@@ -776,7 +753,7 @@ impl DecoderLayer {
         per_layer_input: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
-        attention_mask: Option<&Tensor>,
+        causal_mask: Option<&CausalMask>,
         rotated_dim: Option<usize>,
         shared_kv: Option<&(Tensor, Tensor)>,
     ) -> Result<Tensor> {
@@ -787,7 +764,7 @@ impl DecoderLayer {
             &hidden_states,
             cos,
             sin,
-            attention_mask,
+            causal_mask,
             self.layer_type,
             rotated_dim,
             shared_kv,
@@ -846,7 +823,6 @@ pub struct Gemma4Model {
     ple_embed_scale: f64,
     ple_projection_scale: f64,
     ple_input_scale: f64,
-    sliding_window: usize,
     full_rotated_dim: usize,
 }
 
@@ -939,7 +915,6 @@ impl Gemma4Model {
         let ple_embed_scale = (ple_dim as f64).sqrt();
         let ple_projection_scale = (config.hidden_size as f64).powf(-0.5);
         let ple_input_scale = 2.0_f64.powf(-0.5);
-        let sliding_window = config.sliding_window.unwrap_or(512);
 
         Ok(Self {
             embed_tokens,
@@ -959,7 +934,6 @@ impl Gemma4Model {
             ple_embed_scale,
             ple_projection_scale,
             ple_input_scale,
-            sliding_window,
             full_rotated_dim,
         })
     }
@@ -1176,7 +1150,6 @@ impl Gemma4Model {
             ple_embed_scale,
             ple_projection_scale,
             ple_input_scale,
-            sliding_window,
             full_rotated_dim,
         })
     }
@@ -1312,14 +1285,16 @@ impl Gemma4Model {
         let cos_full = cos_full.to_dtype(self.dtype)?;
         let sin_full = sin_full.to_dtype(self.dtype)?;
 
-        // Attention masks
-        let sliding_mask = if seq_len > 1 {
-            Some(self.build_sliding_mask(seq_len, total_len, start_pos, hidden_states.device())?)
-        } else {
-            None
-        };
+        // Attention mask for full-attention layers only. Sliding-window
+        // layers build their own mask internally via attn_dispatch::windowed.
         let causal_mask = if seq_len > 1 {
-            Some(self.build_causal_mask(seq_len, total_len, start_pos, hidden_states.device())?)
+            Some(CausalMask::new(
+                seq_len,
+                total_len,
+                start_pos,
+                self.dtype,
+                hidden_states.device(),
+            )?)
         } else {
             None
         };
@@ -1333,7 +1308,7 @@ impl Gemma4Model {
             let lt = self.layer_types[i];
 
             let (cos, sin, mask) = match lt {
-                LayerType::SlidingAttention => (&cos_sliding, &sin_sliding, sliding_mask.as_ref()),
+                LayerType::SlidingAttention => (&cos_sliding, &sin_sliding, None),
                 LayerType::FullAttention => (&cos_full, &sin_full, causal_mask.as_ref()),
             };
 
@@ -1384,49 +1359,6 @@ impl Gemma4Model {
         }
     }
 
-    fn build_sliding_mask(
-        &self,
-        seq_len: usize,
-        total_len: usize,
-        start_pos: usize,
-        device: &Device,
-    ) -> Result<Tensor> {
-        let window = self.sliding_window;
-        let mut mask_data = vec![0f32; seq_len * total_len];
-        for i in 0..seq_len {
-            let pos_i = start_pos + i;
-            for j in 0..total_len {
-                let visible = j <= pos_i && j >= pos_i.saturating_sub(window - 1);
-                if !visible {
-                    mask_data[i * total_len + j] = -1e9;
-                }
-            }
-        }
-        let mask =
-            Tensor::from_vec(mask_data, (seq_len, total_len), device)?.to_dtype(self.dtype)?;
-        Ok(mask.unsqueeze(0)?.unsqueeze(0)?)
-    }
-
-    fn build_causal_mask(
-        &self,
-        seq_len: usize,
-        total_len: usize,
-        start_pos: usize,
-        device: &Device,
-    ) -> Result<Tensor> {
-        let mut mask_data = vec![0f32; seq_len * total_len];
-        for i in 0..seq_len {
-            for j in 0..total_len {
-                if j > start_pos + i {
-                    mask_data[i * total_len + j] = -1e9;
-                }
-            }
-        }
-        let mask =
-            Tensor::from_vec(mask_data, (seq_len, total_len), device)?.to_dtype(self.dtype)?;
-        Ok(mask.unsqueeze(0)?.unsqueeze(0)?)
-    }
-
     // ── KV Cache Management ─────────────────────────────────────────────
 
     pub fn clear_kv_cache(&mut self) {
@@ -1462,5 +1394,241 @@ impl Gemma4Model {
 
     pub fn model_dtype(&self) -> DType {
         self.dtype
+    }
+}
+
+#[cfg(test)]
+fn tiny_config() -> Gemma4TextConfig {
+    Gemma4TextConfig {
+        vocab_size: 16,
+        hidden_size: 16,
+        intermediate_size: 32,
+        num_hidden_layers: 2,
+        num_attention_heads: 4,
+        num_key_value_heads: 2,
+        head_dim: 4,
+        global_head_dim: Some(8),
+        max_position_embeddings: 32,
+        rms_norm_eps: 1e-5,
+        hidden_activation: Some("gelu_pytorch_tanh".to_string()),
+        use_double_wide_mlp: false,
+        tie_word_embeddings: true,
+        sliding_window: Some(4),
+        final_logit_softcapping: None,
+        hidden_size_per_layer_input: Some(4),
+        vocab_size_per_layer_input: Some(16),
+        num_kv_shared_layers: Some(0),
+        layer_types: vec![
+            "sliding_attention".to_string(),
+            "full_attention".to_string(),
+        ],
+        rope_parameters: None,
+        eos_token_id: None,
+    }
+}
+
+#[cfg(test)]
+fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
+    (a - b)
+        .expect("sub")
+        .abs()
+        .expect("abs")
+        .max_all()
+        .expect("max_all")
+        .to_scalar::<f32>()
+        .expect("to_scalar")
+}
+
+#[cfg(test)]
+mod tests {
+    use candle_nn::{VarBuilder, VarMap};
+
+    use super::{DType, Device, Gemma4Model, Gemma4TextConfig, Tensor, max_abs_diff, tiny_config};
+
+    /// Prefill (seq_len>1, through `attn_dispatch::windowed`/`causal` with
+    /// one layer of each type) then decode (seq_len==1, through
+    /// `attn_dispatch::decode`) must be deterministic across repeated runs
+    /// on the same model, the same wiring check used for Qwen3's and
+    /// HunyuanDense's equivalent dispatch paths.
+    #[test]
+    fn test_attn_dispatch_prefill_and_decode_deterministic() {
+        let cfg = tiny_config();
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let mut model = Gemma4Model::new(&cfg, vb, false).expect("new");
+
+        let prefill_ids = Tensor::new(&[[1u32, 2, 3, 4, 5]], &device).expect("prefill_ids");
+        let decode_ids = Tensor::new(&[[6u32]], &device).expect("decode_ids");
+
+        let out_a = model.forward(&prefill_ids, 0).expect("prefill a");
+        let dec_a = model.forward(&decode_ids, 5).expect("decode a");
+
+        model.clear_kv_cache();
+        let out_b = model.forward(&prefill_ids, 0).expect("prefill b");
+        let dec_b = model.forward(&decode_ids, 5).expect("decode b");
+
+        assert_eq!(out_a.dims(), out_b.dims());
+        assert!(max_abs_diff(&out_a, &out_b) < 1e-5);
+        assert_eq!(dec_a.dims(), dec_b.dims());
+        assert!(max_abs_diff(&dec_a, &dec_b) < 1e-5);
+    }
+
+    /// Gemma4's KV-sharing path reuses a prior non-shared layer's
+    /// post-RoPE/QK-norm K/V of the same `LayerType` via
+    /// `Attention::forward`'s `shared_kv` parameter. It must also produce
+    /// deterministic, finite output through the same dispatch path as the
+    /// non-shared layers above.
+    #[test]
+    fn test_shared_kv_deterministic() {
+        let cfg = Gemma4TextConfig {
+            num_hidden_layers: 4,
+            num_kv_shared_layers: Some(2),
+            layer_types: vec![
+                "sliding_attention".to_string(),
+                "full_attention".to_string(),
+                "sliding_attention".to_string(),
+                "full_attention".to_string(),
+            ],
+            ..tiny_config()
+        };
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let mut model = Gemma4Model::new(&cfg, vb, false).expect("new");
+
+        let ids = Tensor::new(&[[1u32, 2, 3]], &device).expect("ids");
+        let out_a = model.forward(&ids, 0).expect("forward a");
+        model.clear_kv_cache();
+        let out_b = model.forward(&ids, 0).expect("forward b");
+
+        assert_eq!(out_a.dims(), out_b.dims());
+        assert!(max_abs_diff(&out_a, &out_b) < 1e-5);
+    }
+}
+
+/// End-to-end coverage of `Gemma4Attention`'s `attn_dispatch` wiring on a
+/// real GPU (this machine's ROCm GPU, or a CUDA GPU when built with
+/// `--features cuda` elsewhere). Both `head_dim` and `global_head_dim` are
+/// 128 here (unlike `tiny_config`'s 4/8) specifically so the fused kernel's
+/// `validate_bshd` check passes for both layer types and this actually
+/// exercises `gpu_flash_attn`'s kernel dispatch, not just its matmul-SDPA
+/// fallback. `attn_dispatch`'s own `gpu_tests` already cover the dispatch
+/// math in isolation against a naive reference. This covers this model's
+/// own plumbing (QK norms, partial RoPE, PLE, mask construction) by
+/// comparing a GPU F16 forward pass against the same weights run on CPU in
+/// F32.
+#[cfg(all(test, any(feature = "cuda", feature = "rocm")))]
+mod gpu_tests {
+    use std::collections::HashMap;
+
+    use candle_nn::{VarBuilder, VarMap};
+
+    use super::{DType, Device, Gemma4Model, Gemma4TextConfig, Tensor, max_abs_diff};
+    use crate::ops::fused_ops::fattn::test_support::test_gpu_device;
+
+    fn gpu_config() -> Gemma4TextConfig {
+        Gemma4TextConfig {
+            hidden_size: 256,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            head_dim: 128,
+            global_head_dim: Some(128),
+            intermediate_size: 64,
+            ..super::tiny_config()
+        }
+    }
+
+    /// Clones `varmap`'s current values onto `device` in `dtype`, so a
+    /// second model built from the result starts from the exact same
+    /// weights as the CPU model `varmap` backs, not an independent random
+    /// init.
+    fn clone_varmap_to(varmap: &VarMap, dtype: DType, device: &Device) -> VarBuilder<'static> {
+        let tensors: HashMap<String, Tensor> = varmap
+            .data()
+            .lock()
+            .expect("varmap lock")
+            .iter()
+            .map(|(name, var)| {
+                let t = var
+                    .as_tensor()
+                    .to_device(device)
+                    .expect("to_device")
+                    .to_dtype(dtype)
+                    .expect("to_dtype");
+                (name.clone(), t)
+            })
+            .collect();
+        VarBuilder::from_tensors(tensors, dtype, device)
+    }
+
+    // Prefill (sliding + full layers) and decode on a real GPU must produce
+    // finite output matching the same weights run on CPU in F32, within F16
+    // tolerance.
+    #[test]
+    fn test_gpu_prefill_and_decode_match_cpu_reference() {
+        let cfg = gpu_config();
+        let cpu = Device::Cpu;
+        let gpu = test_gpu_device();
+
+        let varmap = VarMap::new();
+        let cpu_vb = VarBuilder::from_varmap(&varmap, DType::F32, &cpu);
+        let mut cpu_model = Gemma4Model::new(&cfg, cpu_vb, false).expect("cpu new");
+
+        let prefill_ids = Tensor::new(&[[1u32, 2, 3, 4, 5]], &cpu).expect("prefill_ids");
+        let decode_ids = Tensor::new(&[[6u32]], &cpu).expect("decode_ids");
+        let cpu_prefill = cpu_model.forward(&prefill_ids, 0).expect("cpu prefill");
+        let cpu_decode = cpu_model.forward(&decode_ids, 5).expect("cpu decode");
+
+        let gpu_vb = clone_varmap_to(&varmap, DType::F16, &gpu);
+        let mut gpu_model = Gemma4Model::new(&cfg, gpu_vb, false).expect("gpu new");
+
+        let prefill_ids_gpu = prefill_ids.to_device(&gpu).expect("prefill to gpu");
+        let decode_ids_gpu = decode_ids.to_device(&gpu).expect("decode to gpu");
+        let gpu_prefill = gpu_model.forward(&prefill_ids_gpu, 0).expect("gpu prefill");
+        let gpu_decode = gpu_model.forward(&decode_ids_gpu, 5).expect("gpu decode");
+
+        let gpu_prefill_f32 = gpu_prefill
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_device(&cpu)
+            .unwrap();
+        let gpu_decode_f32 = gpu_decode
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_device(&cpu)
+            .unwrap();
+
+        assert_eq!(cpu_prefill.dims(), gpu_prefill_f32.dims());
+        assert_eq!(cpu_decode.dims(), gpu_decode_f32.dims());
+        // F16 tolerance, relative to each reference logit's own magnitude
+        // (floored at 1.0 so near-zero logits don't demand unreasonable
+        // absolute precision). Same convention as flash_attn's own tests.
+        let prefill_tol = cpu_prefill
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap()
+            .max(1.0)
+            * 0.1;
+        let decode_tol = cpu_decode
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap()
+            .max(1.0)
+            * 0.1;
+        assert!(
+            max_abs_diff(&cpu_prefill, &gpu_prefill_f32) < prefill_tol,
+            "prefill mismatch"
+        );
+        assert!(
+            max_abs_diff(&cpu_decode, &gpu_decode_f32) < decode_tol,
+            "decode mismatch"
+        );
     }
 }

@@ -17,7 +17,9 @@
 //! no KV cache, quantization, or backend plumbing to port, only the
 //! architecture description to confirm against.
 
+use crate::models::modules::attn_dispatch;
 use crate::models::modules::rotary::RotaryEmbedding;
+use crate::models::utils::CausalMask;
 use crate::quantized::gguf_file::Gguf;
 use crate::quantized::gguf_metadata::GgufMetadata;
 use candle_core::quantized::gguf_file;
@@ -304,7 +306,7 @@ impl Attention {
         hidden_states: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
-        attention_mask: Option<&Tensor>,
+        causal_mask: Option<&CausalMask>,
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _) = hidden_states.dims3()?;
 
@@ -339,88 +341,29 @@ impl Attention {
 
         let (k, v) = self.update_kv_cache(k, v)?;
 
-        self.compute_attention(q, k, v, attention_mask, b_sz, seq_len)
+        self.compute_attention(&q, &k, &v, causal_mask, seq_len)
     }
 
     fn compute_attention(
         &self,
-        q: Tensor,
-        k: Tensor,
-        v: Tensor,
-        attention_mask: Option<&Tensor>,
-        b_sz: usize,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        causal_mask: Option<&CausalMask>,
         seq_len: usize,
     ) -> Result<Tensor> {
-        let n_rep = self.num_heads / self.num_kv_heads;
+        let scale = attn_dispatch::attention_scale(self.head_dim);
 
-        if n_rep > 1 && seq_len == 1 {
-            // ── GQA-grouped SDPA for decode (seq_len=1) ──
-            // Keep 4D tensors throughout; candle matmul handles
-            // non-contiguous K internally with a single flatten pass.
-            let scale = 1.0 / (self.head_dim as f64).sqrt();
-
-            // Q: [B, H, 1, D] → [B, kv_heads, n_rep, D], pre-scaled
-            let q_g = (q.reshape((b_sz, self.num_kv_heads, n_rep, self.head_dim))? * scale)?;
-
-            // K^T: [B, kv_heads, D, S] — just a view, no copy
-            let k_t = k.transpose(2, 3)?;
-
-            // scores: [B, kv_heads, n_rep, S]
-            let attn_weights = q_g.matmul(&k_t)?;
-
-            let attn_weights = match attention_mask {
-                Some(mask) => {
-                    // mask [B, 1, 1, S] broadcasts over kv_heads & n_rep
-                    attn_weights.broadcast_add(mask)?
-                },
-                None => attn_weights,
-            };
-            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-
-            // V: [B, kv_heads, S, D] — matmul handles non-contiguous
-            let attn_output = attn_weights.matmul(&v)?; // [B, kv_heads, n_rep, D]
-
-            // Reshape back: → [B, H, D] → [B, 1, H*D]
-            let attn_output = attn_output
-                .reshape((b_sz, self.num_heads, self.head_dim))?
-                .reshape((b_sz, 1, self.num_heads * self.head_dim))?;
+        if seq_len == 1 {
+            // ── Decode (seq_len=1) ──
+            let attn_output = attn_dispatch::decode(q, k, v, scale, None)?;
+            let attn_output = attn_dispatch::merge_heads(&attn_output)?;
             return self.o_proj.forward(&attn_output);
         }
 
-        // ── Standard SDPA for prefill or when n_rep == 1 ──
-        let k = if n_rep > 1 {
-            let (b, kv_heads, s, d) = k.dims4()?;
-            k.unsqueeze(2)?
-                .expand((b, kv_heads, n_rep, s, d))?
-                .reshape((b, kv_heads * n_rep, s, d))?
-        } else {
-            k
-        };
-        let v = if n_rep > 1 {
-            let (b, kv_heads, s, d) = v.dims4()?;
-            v.unsqueeze(2)?
-                .expand((b, kv_heads, n_rep, s, d))?
-                .reshape((b, kv_heads * n_rep, s, d))?
-        } else {
-            v
-        };
-
-        // Scaled dot-product attention
-        let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let attn_weights = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?)? * scale)?;
-        let attn_weights = match attention_mask {
-            Some(mask) => attn_weights.broadcast_add(mask)?,
-            None => attn_weights,
-        };
-        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-        let attn_output = attn_weights.matmul(&v)?;
-
-        // [B, num_heads, S, head_dim] -> [B, S, hidden_size]
-        let attn_output =
-            attn_output
-                .transpose(1, 2)?
-                .contiguous()?
-                .reshape((b_sz, seq_len, ()))?;
+        // ── Flash-attn / dispatch for prefill ──
+        let attn_output = attn_dispatch::causal(q, k, v, scale, causal_mask)?;
+        let attn_output = attn_dispatch::merge_heads(&attn_output)?;
 
         self.o_proj.forward(&attn_output)
     }
@@ -579,13 +522,13 @@ impl DecoderLayer {
         hidden_states: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
-        attention_mask: Option<&Tensor>,
+        causal_mask: Option<&CausalMask>,
     ) -> Result<Tensor> {
         let residual = hidden_states;
         let hidden_states = self.input_layernorm.forward(hidden_states)?;
         let hidden_states = self
             .self_attn
-            .forward(&hidden_states, cos, sin, attention_mask)?;
+            .forward(&hidden_states, cos, sin, causal_mask)?;
         let hidden_states = (residual + hidden_states)?;
 
         let residual = &hidden_states;
@@ -784,32 +727,22 @@ impl MiniCpm5Model {
         let sin = sin.to_dtype(self.dtype)?;
 
         // Build causal mask
-        let attention_mask = if seq_len > 1 {
-            let total_len = start_pos + seq_len;
-            // Build [seq_len, total_len] mask: 1.0 where allowed, 0.0 where masked
-            let mut mask_data = vec![0f32; seq_len * total_len];
-            for i in 0..seq_len {
-                // Each query position i can attend to all cached positions + positions 0..=i
-                for j in 0..total_len {
-                    if j <= start_pos + i {
-                        mask_data[i * total_len + j] = 1.0;
-                    }
-                }
-            }
-            let mask = Tensor::from_vec(mask_data, (seq_len, total_len), input_ids.device())?;
-            // Convert: 0.0 (masked) -> -1e9, 1.0 (attend) -> 0.0
-            let mask = mask
-                .broadcast_lt(&Tensor::new(0.5f32, input_ids.device())?)?
-                .to_dtype(DType::F32)?;
-            let mask = (mask * (-1e9f64))?.to_dtype(self.dtype)?;
-            Some(mask.unsqueeze(0)?.unsqueeze(0)?) // [1, 1, seq_len, total_len]
+        let causal_mask = if seq_len > 1 {
+            let kv_len = start_pos + seq_len;
+            Some(CausalMask::new(
+                seq_len,
+                kv_len,
+                start_pos,
+                self.dtype,
+                input_ids.device(),
+            )?)
         } else {
             None
         };
 
         let mut hidden_states = hidden_states;
         for layer in self.layers.iter_mut() {
-            hidden_states = layer.forward(&hidden_states, &cos, &sin, attention_mask.as_ref())?;
+            hidden_states = layer.forward(&hidden_states, &cos, &sin, causal_mask.as_ref())?;
         }
 
         let hidden_states = self.norm.forward(&hidden_states)?;
