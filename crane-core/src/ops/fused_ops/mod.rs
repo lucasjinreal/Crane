@@ -30,6 +30,11 @@
 //! - [`swiglu`] — fused `SwiGLU` activation (silu(gate) * up)
 //! - [`moe_combine`] — fused `MoE` combine (router-weighted sum of routed outputs)
 
+// Casts in this module's CPU fallback paths narrow tensor dims/counts
+// already bounded by the tensor's own shape, never by untrusted runtime
+// input.
+#![allow(clippy::cast_possible_truncation)]
+
 pub mod atan2;
 pub mod moe_combine;
 pub mod qsa_mask;

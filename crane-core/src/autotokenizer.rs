@@ -1,3 +1,6 @@
+// `u64 as usize` below is lossless on every supported (64-bit) target.
+#![allow(clippy::cast_possible_truncation)]
+
 use hf_hub::{HFClientBuilder, split_id};
 use minijinja_contrib::add_to_environment;
 use minijinja_contrib::pycompat::unknown_method_callback;

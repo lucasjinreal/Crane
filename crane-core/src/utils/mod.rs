@@ -1,3 +1,8 @@
+// Casts narrowed in this module (image/audio pixel and sample dimensions,
+// profiling nanosecond counters) are bounded by realistic media sizes or by
+// u64's own huge range, never by untrusted runtime input.
+#![allow(clippy::cast_possible_truncation)]
+
 pub mod cast_var_builder;
 pub mod image_utils;
 pub mod prof;

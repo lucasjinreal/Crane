@@ -1,3 +1,7 @@
+// Tensor dims below are already validated non-negative; usize is 64-bit on
+// every supported target.
+#![allow(clippy::cast_possible_truncation)]
+
 use anyhow::Result;
 use anyhow::anyhow;
 use candle_core::{DType, Device, Tensor};

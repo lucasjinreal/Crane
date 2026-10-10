@@ -3,6 +3,14 @@ name = "crane-examples"
 version.workspace = true
 edition = "2021"
 
+# Demo float/time->index and dimension casts in these binaries are bounded by
+# construction (clamped sample amplitudes, small hardcoded/demo buffer
+# sizes). clippy::pedantic can't see those bounds, and the lint is
+# non-blocking in CI, so one crate-level allow replaces annotating every
+# individual cast site.
+[lints.clippy]
+cast_possible_truncation = "allow"
+
 [dependencies]
 # default-features = false on both, plus crane-core/default-backend below:
 # see crane-serve/Cargo.toml's comment on the same pattern. Without it,

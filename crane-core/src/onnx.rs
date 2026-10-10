@@ -4,6 +4,12 @@
 //! useful for tools which need to verify whether Candle's ONNX evaluator can
 //! execute a model without becoming coupled to Candle themselves.
 
+// Tensor dims/ranks and ONNX graph attrs (kernel/stride/pad sizes, axis
+// indices) narrowed throughout this module and its submodules are already
+// bounded by the tensor's own shape or a small model-graph attribute, never
+// by untrusted runtime input.
+#![allow(clippy::cast_possible_truncation)]
+
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 

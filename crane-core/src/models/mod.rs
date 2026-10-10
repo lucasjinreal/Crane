@@ -1,3 +1,9 @@
+// Casts narrowed throughout model implementations in this module (tensor
+// ranks/dims, vocab/codebook indices loaded from config, image/audio pixel
+// and sample dimensions) are bounded by the model's own config or the
+// tensor's own shape, never by untrusted runtime input.
+#![allow(clippy::cast_possible_truncation)]
+
 #[cfg(feature = "onnx")]
 pub mod g2p;
 #[cfg(feature = "onnx")]
