@@ -35,7 +35,10 @@ pub fn load_pt_tensor_bytes(path: &Path, index: usize) -> Result<Vec<u8>> {
         let entry = archive
             .by_index(i)
             .with_context(|| format!("failed to read ZIP entry {i} in {}", path.display()))?;
-        let name = entry.name();
+        let name = entry.name().with_context(|| {
+            format!("failed to read name of ZIP entry {i} in {}", path.display())
+        })?;
+        let name = name.as_ref();
         if name == suffix || name.ends_with(&dir_suffix) {
             match_index = Some(i);
             break;

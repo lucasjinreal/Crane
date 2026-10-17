@@ -40,7 +40,7 @@ impl Siglip2MLP {
     /// Returns an error if the `VarBuilder` is missing the `fc1`/`fc2`
     /// weights or they don't match the configured `hidden_size`/
     /// `intermediate_size`.
-    pub fn new(config: &Siglip2Config, vb: VarBuilder) -> Result<Self> {
+    pub fn new(config: &Siglip2Config, vb: &VarBuilder) -> Result<Self> {
         let fc1 = linear(config.hidden_size, config.intermediate_size, vb.pp("fc1"))?;
         let fc2 = linear(config.hidden_size, config.intermediate_size, vb.pp("fc2"))?;
 
@@ -78,7 +78,7 @@ impl Siglip2Attention {
     ///
     /// Returns an error if the `VarBuilder` is missing the attention
     /// projection weights or they don't match the configured `hidden_size`.
-    pub fn new(config: &Siglip2Config, vb: VarBuilder) -> Result<Self> {
+    pub fn new(config: &Siglip2Config, vb: &VarBuilder) -> Result<Self> {
         let embed_dim = config.hidden_size;
         let num_heads = config.num_attention_heads;
         let head_dim = embed_dim / num_heads;
@@ -149,15 +149,15 @@ impl Siglip2EncoderLayer {
     /// Returns an error if building the attention, MLP, or either layer norm
     /// sub-module fails, typically from missing or mismatched weights in
     /// `vb`.
-    pub fn new(config: &Siglip2Config, vb: VarBuilder) -> Result<Self> {
-        let self_attn = Siglip2Attention::new(config, vb.pp("self_attn"))?;
+    pub fn new(config: &Siglip2Config, vb: &VarBuilder) -> Result<Self> {
+        let self_attn = Siglip2Attention::new(config, &vb.pp("self_attn"))?;
 
         let layer_norm1 = layer_norm(
             config.hidden_size,
             config.layer_norm_eps,
             vb.pp("layer_norm1"),
         )?;
-        let mlp = Siglip2MLP::new(config, vb.pp("mlp"))?;
+        let mlp = Siglip2MLP::new(config, &vb.pp("mlp"))?;
         let layer_norm2 = layer_norm(
             config.hidden_size,
             config.layer_norm_eps,
@@ -197,10 +197,10 @@ impl Siglip2Encoder {
     ///
     /// Returns an error if constructing any of the `num_hidden_layers`
     /// encoder layers fails.
-    pub fn new(config: &Siglip2Config, vb: VarBuilder) -> Result<Self> {
+    pub fn new(config: &Siglip2Config, vb: &VarBuilder) -> Result<Self> {
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for i in 0..config.num_hidden_layers {
-            let layer = Siglip2EncoderLayer::new(config, vb.pp(&format!("layers.{i}")))?;
+            let layer = Siglip2EncoderLayer::new(config, &vb.pp(&format!("layers.{i}")))?;
             layers.push(layer);
         }
         Ok(Self {
@@ -234,7 +234,7 @@ impl Siglip2VisionEmbeddings {
     /// Returns an error if the patch embedding convolution or the position
     /// embedding table cannot be built from `vb`, e.g. due to missing or
     /// mismatched weights.
-    pub fn new(config: &Siglip2Config, vb: VarBuilder) -> Result<Self> {
+    pub fn new(config: &Siglip2Config, vb: &VarBuilder) -> Result<Self> {
         let conv2dconfig = Conv2dConfig {
             stride: config.patch_size,
             ..Default::default()
@@ -353,9 +353,9 @@ impl Siglip2VisionTransformer {
     ///
     /// Returns an error if building the embeddings, encoder, post layer
     /// norm, or (when `vision_use_head` is set) the pooling head fails.
-    pub fn new(config: &Siglip2Config, vb: VarBuilder) -> Result<Self> {
-        let embeddings = Siglip2VisionEmbeddings::new(config, vb.pp("embeddings"))?;
-        let encoder = Siglip2Encoder::new(config, vb.pp("encoder"))?;
+    pub fn new(config: &Siglip2Config, vb: &VarBuilder) -> Result<Self> {
+        let embeddings = Siglip2VisionEmbeddings::new(config, &vb.pp("embeddings"))?;
+        let encoder = Siglip2Encoder::new(config, &vb.pp("encoder"))?;
 
         let post_layernorm = layer_norm(
             config.hidden_size,
@@ -366,7 +366,7 @@ impl Siglip2VisionTransformer {
         let head = if config.vision_use_head {
             Some(Siglip2MultiheadAttentionPoolingHead::new(
                 config,
-                vb.pp("head"),
+                &vb.pp("head"),
             )?)
         } else {
             None
@@ -417,8 +417,8 @@ impl Siglip2MultiheadAttentionPoolingHead {
     ///
     /// Returns an error if building the attention sub-module or output
     /// projection fails.
-    pub fn new(config: &Siglip2Config, vb: VarBuilder) -> Result<Self> {
-        let attn = Siglip2Attention::new(config, vb.pp("attn"))?;
+    pub fn new(config: &Siglip2Config, vb: &VarBuilder) -> Result<Self> {
+        let attn = Siglip2Attention::new(config, &vb.pp("attn"))?;
         let output_proj = linear(
             config.hidden_size,
             config.projection_dim,
@@ -442,8 +442,8 @@ impl Siglip2VisionModel {
     /// # Errors
     ///
     /// Returns an error if building the underlying vision transformer fails.
-    pub fn new(config: &Siglip2Config, vb: VarBuilder) -> Result<Self> {
-        let vision_model = Siglip2VisionTransformer::new(config, vb.pp("vision_model"))?;
+    pub fn new(config: &Siglip2Config, vb: &VarBuilder) -> Result<Self> {
+        let vision_model = Siglip2VisionTransformer::new(config, &vb.pp("vision_model"))?;
         Ok(Self { vision_model })
     }
 
@@ -477,7 +477,7 @@ impl Siglip2VisionModel {
         let filenames = utils::get_safetensors_files(model_path).unwrap();
 
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, *dtype, device) }?;
-        let vision_model = Siglip2VisionTransformer::new(&config, vb.pp("vision_model"))?;
+        let vision_model = Siglip2VisionTransformer::new(&config, &vb.pp("vision_model"))?;
 
         Ok(Self { vision_model })
     }

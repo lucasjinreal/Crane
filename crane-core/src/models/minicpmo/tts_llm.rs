@@ -63,26 +63,6 @@ pub struct MiniCpmTts {
     pub config: TtsConfig,
 }
 
-/// Whisper-style additive causal mask, `[seq_len, kv_len]` broadcastable —
-/// every model in this codebase that uses `GqaAttention` builds its own
-/// local copy of this rather than importing another module's private
-/// helper (see `qwen3_tts::modeling::build_causal_mask`).
-fn build_causal_mask(
-    seq_len: usize,
-    offset: usize,
-    device: &Device,
-    dtype: DType,
-) -> Result<Tensor> {
-    let kv_len = offset + seq_len;
-    let mut data = vec![0f32; seq_len * kv_len];
-    for i in 0..seq_len {
-        for j in (offset + i + 1)..kv_len {
-            data[i * kv_len + j] = f32::MIN;
-        }
-    }
-    Tensor::from_vec(data, (1, 1, seq_len, kv_len), device)?.to_dtype(dtype)
-}
-
 /// Undoes llama.cpp's `convert_hf_to_gguf.py`'s `permute()`, applied at
 /// conversion time to `q_proj`/`k_proj` (and only those — never `v_proj`/
 /// `o_proj`) so its own native `ggml_rope` kernel (adjacent-pair
@@ -149,6 +129,7 @@ impl MiniCpmTts {
             rope_mode: RopeMode::HalfSplit,
             use_qk_norm: false,
             norm_eps: 1e-6, // HF LlamaConfig default; MiniCPMTTSConfig doesn't override it.
+            causal: true,
         };
         let vb_layers = vb.pp("model").pp("layers");
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
@@ -249,6 +230,7 @@ impl MiniCpmTts {
             rope_mode: RopeMode::HalfSplit,
             use_qk_norm: false,
             norm_eps: 1e-6,
+            causal: true,
         };
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
@@ -408,20 +390,13 @@ impl MiniCpmTts {
         let cos = cos.to_dtype(self.dtype)?;
         let sin = sin.to_dtype(self.dtype)?;
 
-        let mask = if seq_len > 1 {
-            Some(build_causal_mask(
-                seq_len,
-                start_pos,
-                &self.device,
-                self.dtype,
-            )?)
-        } else {
-            None
-        };
-
         let mut hidden = inputs_embeds.clone();
         for layer in &mut self.layers {
-            hidden = layer.forward(&hidden, Some((&cos, &sin)), mask.as_ref())?;
+            // Plain causal, no padding mask: this is exactly what
+            // `GqaAttention`'s `causal: true` dispatch already builds
+            // internally, so pass `None` and let it reach the fused kernel
+            // instead of hand-building the same mask here.
+            hidden = layer.forward(&hidden, Some((&cos, &sin)), None)?;
         }
         self.norm.forward(&hidden)
     }

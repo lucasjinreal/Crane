@@ -1,8 +1,10 @@
 // pub mod conn_ve_llm;
 pub mod attention;
+pub mod attn_dispatch;
 pub mod embedding;
 pub mod ffn;
 pub mod flash_attn;
+pub(super) mod gpu_flash_attn;
 pub(crate) mod kv_cache;
 pub mod mel;
 pub mod moe;

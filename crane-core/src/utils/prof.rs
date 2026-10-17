@@ -156,15 +156,47 @@ pub enum Span {
     /// (CPU->GPU) specifically. A subset of one of [`Span::MoeToDevice`]'s
     /// three calls in that function.
     MoeCpuOutDev,
+    // Tier 2c — inside `Mlp` (dense, non-`MoE` layers only — Qwen3.5's FFN).
+    // Added to find out, with real measurements instead of reading vendored
+    // backend source, which of the three quantized GEMMs (or the activation
+    // between them) is actually expensive.
+    /// Time spent in the dense `Mlp::forward`'s `gate_proj` call.
+    MlpGate,
+    /// Time spent in the dense `Mlp::forward`'s `up_proj` call.
+    MlpUp,
+    /// Time spent in the dense `Mlp::forward`'s `swiglu()` activation,
+    /// between the gate/up projections and the down projection.
+    MlpActivation,
+    /// Time spent in the dense `Mlp::forward`'s `down_proj` call.
+    MlpDown,
+    // Tier 4 — inside every `QuantizedLinear::forward` call across the whole
+    // pass (GDN projections, dense/MoE MLP, attention q/k/v/o, wherever a
+    // `QuantizedLinear` is on the hot path). Not nested under any single
+    // other tier's range even though it physically runs inside e.g.
+    // `Mlp`/`GdnProj` — those spans are not expected to equal
+    // `QuantCast + QuantMatmul` because they also include candle ops around
+    // the matmuls (swiglu, reshapes). Added to settle, with real numbers
+    // instead of reading vendored backend source, how much total pass time
+    // is the `to_dtype` round-trip around the quantized matmul versus the
+    // matmul dispatch itself.
+    /// Time spent in `QuantizedLinear::forward`'s `to_dtype` calls (both the
+    /// upcast before the matmul and the downcast after), summed across every
+    /// quantized linear call in the pass.
+    QuantCast,
+    /// Time spent in `QuantizedLinear::forward`'s `self.matmul.forward(..)`
+    /// call itself, summed across every quantized linear call in the pass.
+    QuantMatmul,
 }
 
-const NUM_SPANS: usize = 29;
+const NUM_SPANS: usize = 35;
 const TIER1: std::ops::Range<usize> = 0..8;
 const TIER2: std::ops::Range<usize> = 8..13;
 const TIER3: std::ops::Range<usize> = 13..16;
 const TIER2_MOE: std::ops::Range<usize> = 16..21;
 const TIER3_MOE: std::ops::Range<usize> = 21..26;
 const TIER3C_MOE: std::ops::Range<usize> = 26..29;
+const TIER2C_MLP: std::ops::Range<usize> = 29..33;
+const TIER4_QUANT: std::ops::Range<usize> = 33..35;
 
 const NAMES: [&str; NUM_SPANS] = [
     "embed",
@@ -196,6 +228,12 @@ const NAMES: [&str; NUM_SPANS] = [
     "cpu_xs",
     "cpu_weights",
     "cpu_out",
+    "gate",
+    "up",
+    "act",
+    "down", //
+    "cast",
+    "matmul",
 ];
 
 static SPAN_NS: [AtomicU64; NUM_SPANS] = [const { AtomicU64::new(0) }; NUM_SPANS];
@@ -266,13 +304,27 @@ pub fn timed<T>(span: Span, f: impl FnOnce() -> T) -> T {
 }
 
 /// Running totals for one kind of pass (decode or prefill).
-#[derive(Default, Clone, Copy)]
+#[derive(Clone, Copy)]
 struct Totals {
     passes: u64,
     tokens: u64,
     enqueue_ns: u64,
     wall_ns: u64,
     spans: [u64; NUM_SPANS],
+}
+
+impl Default for Totals {
+    // `#[derive(Default)]` needs `[u64; NUM_SPANS]: Default`, which std only
+    // provides for N <= 32; a literal repeat expression has no such bound.
+    fn default() -> Self {
+        Self {
+            passes: 0,
+            tokens: 0,
+            enqueue_ns: 0,
+            wall_ns: 0,
+            spans: [0; NUM_SPANS],
+        }
+    }
 }
 
 static TOTALS: Mutex<[Totals; 2]> = Mutex::new([
@@ -407,6 +459,8 @@ fn report(kind: usize, t: &Totals) {
     );
     prof_log!("[crane-prof]   moe_detail: {}", line(TIER3_MOE));
     prof_log!("[crane-prof]   moe_cpu_detail: {}", line(TIER3C_MOE));
+    prof_log!("[crane-prof]   mlp_detail: {}", line(TIER2C_MLP));
+    prof_log!("[crane-prof]   quant: {}", line(TIER4_QUANT));
 }
 
 #[cfg(test)]
@@ -426,7 +480,7 @@ mod tests {
         assert_eq!(SPAN_NS[Span::Embed as usize].load(Ordering::Relaxed), 0);
     }
 
-    /// The five tiers must partition the span list exactly — a span left out
+    /// The seven tiers must partition the span list exactly — a span left out
     /// of every tier would be recorded and never reported.
     #[test]
     fn tiers_cover_every_span() {
@@ -436,7 +490,9 @@ mod tests {
         assert_eq!(TIER3.end, TIER2_MOE.start);
         assert_eq!(TIER2_MOE.end, TIER3_MOE.start);
         assert_eq!(TIER3_MOE.end, TIER3C_MOE.start);
-        assert_eq!(TIER3C_MOE.end, NUM_SPANS);
+        assert_eq!(TIER3C_MOE.end, TIER2C_MLP.start);
+        assert_eq!(TIER2C_MLP.end, TIER4_QUANT.start);
+        assert_eq!(TIER4_QUANT.end, NUM_SPANS);
         assert_eq!(NAMES.len(), NUM_SPANS);
     }
 }

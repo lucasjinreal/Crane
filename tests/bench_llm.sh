@@ -10,7 +10,7 @@
 # server you already have running (e.g. via `podman compose up`).
 #
 # Usage:
-#   ./tests/bench_decode_prefill.sh [decode|prefill|default|sweep] [host:port]
+#   ./tests/bench_llm.sh [decode|prefill|prefill+decode|sweep] [host:port]
 #
 # Requires: curl, jq, bc
 
@@ -19,17 +19,18 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR/.." || exit 1
 
-MODE="${1:-default}"
+MODE="${1:-prefill+decode}"
 HOST="${2:-localhost:8080}"
 URL="http://$HOST/v1/chat/completions"
 
 # Files concatenated into the prefill benchmark's fixed prompt. Sized to land
 # in the same few-thousand-to-low-five-figure token range real coding-agent
 # requests hit in practice, since a coding agent's system prompt commonly
-# includes the repo's own agent-instructions file plus whatever source it
-# read. Adjust this list to change the prefill benchmark's prompt size.
+# includes a repo-level doc plus whatever source it read. Must be files
+# tracked in the repo, so the prompt is reproducible across checkouts.
+# Adjust this list to change the prefill benchmark's prompt size.
 PREFILL_SOURCES=(
-    "AGENTS.md"
+    "README.md"
     "crane-core/src/device.rs"
 )
 
@@ -54,7 +55,7 @@ run_decode_bench() {
     echo "=== Decode benchmark ==="
     echo "Fixed short prompt, forced long generation, no tools, greedy decoding."
 
-    local payload response t0 t1 completion_tokens elapsed
+    local payload response t0 t1 completion_tokens finish_reason elapsed
     payload=$(jq -n '{
         model: "default",
         messages: [{
@@ -72,11 +73,17 @@ run_decode_bench() {
     t1=$(date +%s.%N)
 
     completion_tokens=$(echo "$response" | jq -r '.usage.completion_tokens // empty')
+    finish_reason=$(echo "$response" | jq -r '.choices[0].finish_reason // empty')
     elapsed=$(echo "$t1 - $t0" | bc)
     echo "Wall time: ${elapsed}s"
     if [ -n "$completion_tokens" ]; then
         echo "Completion tokens: $completion_tokens"
         echo "Client-side tok/s: $(echo "scale=2; $completion_tokens / $elapsed" | bc)"
+        if [ "$finish_reason" != "length" ]; then
+            echo "Warning: finish_reason=$finish_reason (expected 'length') -- the model" >&2
+            echo "stopped before max_tokens, so completion_tokens isn't fixed across runs" >&2
+            echo "and tok/s isn't comparable to other runs." >&2
+        fi
     else
         echo "Response (no usage field found):"
         echo "$response"
@@ -89,7 +96,7 @@ run_prefill_bench() {
     echo "=== Prefill benchmark ==="
     echo "Fixed large prompt (pinned repo files), minimal generation."
 
-    local file payload response t0 t1 elapsed
+    local file payload response t0 t1 elapsed prompt_tokens
     for file in "${PREFILL_SOURCES[@]}"; do
         if [ ! -f "$file" ]; then
             echo "Prefill source file not found: $file" >&2
@@ -123,11 +130,19 @@ run_prefill_bench() {
     response=$(curl -s "$URL" -H "Content-Type: application/json" -d "$payload")
     t1=$(date +%s.%N)
 
+    prompt_tokens=$(echo "$response" | jq -r '.usage.prompt_tokens // empty')
     elapsed=$(echo "$t1 - $t0" | bc)
     echo "Wall time: ${elapsed}s"
-    echo "Response: $response"
+    if [ -n "$prompt_tokens" ]; then
+        echo "Prompt tokens: $prompt_tokens"
+        echo "Client-side tok/s (wall time, includes the 4-token decode): $(echo "scale=2; $prompt_tokens / $elapsed" | bc)"
+    else
+        echo "Response (no usage field found):"
+        echo "$response"
+    fi
     echo "Cross-check against the server log's 'Prefill complete' / prefill_tok_s"
-    echo "line for this request."
+    echo "line for this request -- it excludes the decode step and client-side"
+    echo "request overhead that the wall-time figure above includes."
 }
 
 run_sweep_bench() {
@@ -176,14 +191,14 @@ run_sweep_bench() {
 case "$MODE" in
 decode) run_decode_bench ;;
 prefill) run_prefill_bench ;;
-default)
+prefill+decode)
     run_decode_bench
     echo
     run_prefill_bench
     ;;
 sweep) run_sweep_bench ;;
 *)
-    echo "Usage: $0 [decode|prefill|default|sweep] [host:port]" >&2
+    echo "Usage: $0 [decode|prefill|prefill+decode|sweep] [host:port]" >&2
     exit 1
     ;;
 esac

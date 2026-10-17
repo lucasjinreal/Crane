@@ -108,6 +108,9 @@ impl DecoderLayer {
                         cfg.hidden_size,
                         &vb,
                         None,
+                        // QSA indexer mask isn't plain causal; the fused
+                        // flash-attn kernel can't represent it.
+                        false,
                     )?,
                     indexer: QsaIndexer::load(
                         cfg.indexer()?,
@@ -161,7 +164,9 @@ impl DecoderLayer {
                 TokenMixer::Linear { gdn, dims }
             },
             LayerType::IndexedAttention => TokenMixer::Attention {
-                attn: FullAttention::from_gguf_dims(attention_dims(cfg), gg, idx)?,
+                // QSA indexer mask isn't plain causal; the fused flash-attn
+                // kernel can't represent it.
+                attn: FullAttention::from_gguf_dims(attention_dims(cfg), gg, idx, false)?,
                 indexer: QsaIndexer::from_gguf(cfg.indexer()?, cfg.rms_norm_eps, gg, idx)?,
             },
         };
@@ -276,7 +281,7 @@ fn indexed_attention(
             sin: &sin,
             rot_dim,
         };
-        outs.push(attn.forward(&xs, slice, Some(&mask), Some(kv))?);
+        outs.push(attn.forward(&xs, slice, None, Some(&mask), Some(kv))?);
         offset += len;
         // Each slice's scores grow with the cache, so the backend's exact-size
         // cache cannot reuse them (see `release_cached_memory`).

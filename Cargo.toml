@@ -48,9 +48,9 @@ candle-transformers-sycl = { package = "candle-transformers", git = "https://git
 
 # AMD ROCm/HIP backend fork (adds a `rocm` candle feature). Remove once ROCm
 # support merges into candle main.
-candle-core-rocm = { package = "candle-core", git = "https://github.com/xmiksay/candle", branch = "feat/rocm-backend" }
-candle-nn-rocm = { package = "candle-nn", git = "https://github.com/xmiksay/candle", branch = "feat/rocm-backend" }
-candle-transformers-rocm = { package = "candle-transformers", git = "https://github.com/xmiksay/candle", branch = "feat/rocm-backend" }
+candle-core-rocm = { package = "candle-core", git = "https://github.com/cryptomilk/candle", branch = "asn-feat-rocm-backend" }
+candle-nn-rocm = { package = "candle-nn", git = "https://github.com/cryptomilk/candle", branch = "asn-feat-rocm-backend" }
+candle-transformers-rocm = { package = "candle-transformers", git = "https://github.com/cryptomilk/candle", branch = "asn-feat-rocm-backend" }
 
 tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 fst = "0.4"
