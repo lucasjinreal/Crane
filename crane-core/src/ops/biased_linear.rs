@@ -51,7 +51,9 @@ impl BiasedLinear {
         }
         #[cfg(feature = "cuda")]
         if let Some(blas) = &self.blas {
-            if self.inner.weight().dtype() == DType::BF16 || candle_core::cuda_backend::gemm_reduced_precision_f32() {
+            if self.inner.weight().dtype() == DType::BF16
+                || candle_core::cuda_backend::gemm_reduced_precision_f32()
+            {
                 return match self.inner.weight().dtype() {
                     DType::BF16 => self.forward_cuda::<half::bf16>(xs, blas),
                     DType::F32 => self.forward_cuda::<f32>(xs, blas),
@@ -62,7 +64,15 @@ impl BiasedLinear {
         self.inner.forward(xs)
     }
     #[cfg(feature = "cuda")]
-    fn forward_cuda<T: candle_core::cuda_backend::CudaDType + candle_core::WithDType + candle_core::cuda_backend::cudarc::driver::DeviceRepr>(&self, xs: &Tensor, blas: &CudaBlasLT) -> Result<Tensor> {
+    fn forward_cuda<
+        T: candle_core::cuda_backend::CudaDType
+            + candle_core::WithDType
+            + candle_core::cuda_backend::cudarc::driver::DeviceRepr,
+    >(
+        &self,
+        xs: &Tensor,
+        blas: &CudaBlasLT,
+    ) -> Result<Tensor> {
         use candle_core::{CudaStorage, Storage, op::BackpropOp};
         let xs = xs.to_dtype(T::DTYPE)?.contiguous()?;
         let (output, input) = self.inner.weight().dims2()?;
@@ -84,7 +94,17 @@ impl BiasedLinear {
         let w = get::<T>(&w_store)?.slice(w_layout.start_offset()..);
         let b = get::<T>(&b_store)?.slice(b_layout.start_offset()..);
         let mut out = unsafe { dev.alloc::<T>(rows * output) }?;
-        cuda::matmul(blas, &w, &x, &b, &mut out, output, rows, input, T::DTYPE == DType::F32)?;
+        cuda::matmul(
+            blas,
+            &w,
+            &x,
+            &b,
+            &mut out,
+            output,
+            rows,
+            input,
+            T::DTYPE == DType::F32,
+        )?;
         let mut shape = xs.dims().to_vec();
         *shape.last_mut().expect("linear input rank") = output;
         Ok(Tensor::from_storage(

@@ -102,7 +102,8 @@ pub fn rms_norm(x: &Tensor, alpha: Option<&Tensor>, eps: f32) -> Result<Tensor> 
     let width = x.dim(candle_core::D::Minus1)?;
     if x.dtype() != DType::F32
         || alpha.is_some_and(|a| {
-            a.dtype() != DType::F32 || a.dims() != [width]
+            a.dtype() != DType::F32
+                || a.dims() != [width]
                 || a.device().location() != x.device().location()
         })
     {
@@ -126,8 +127,7 @@ fn cuda_rms_norm(x: &Tensor, alpha: Option<&Tensor>, eps: f32) -> Result<Tensor>
     };
     use candle_core::{CudaStorage, Storage, op::BackpropOp};
     let x = x.contiguous()?;
-    let width = u32::try_from(x.dim(candle_core::D::Minus1)?)
-        .map_err(candle_core::Error::wrap)?;
+    let width = u32::try_from(x.dim(candle_core::D::Minus1)?).map_err(candle_core::Error::wrap)?;
     let _count = u32::try_from(x.elem_count()).map_err(candle_core::Error::wrap)?;
     let rows = u32::try_from(x.elem_count() / width as usize).map_err(candle_core::Error::wrap)?;
     if rows == 0 {

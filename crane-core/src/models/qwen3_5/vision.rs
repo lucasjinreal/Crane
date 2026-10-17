@@ -422,15 +422,17 @@ impl Qwen3_5VisionModel {
         }
         let max_val = (self.num_grid_per_side - 1) as f32;
         let step = max_val / (steps.saturating_sub(1)) as f32;
-        (0..steps).map(|i| {
-            if i < steps / 2 {
-                i as f32 * step
-            } else {
-                // CUDA linspace works backwards from the endpoint in the
-                // upper half and contracts the multiply/subtract.
-                (-step).mul_add((steps - 1 - i) as f32, max_val)
-            }
-        }).collect()
+        (0..steps)
+            .map(|i| {
+                if i < steps / 2 {
+                    i as f32 * step
+                } else {
+                    // CUDA linspace works backwards from the endpoint in the
+                    // upper half and contracts the multiply/subtract.
+                    (-step).mul_add((steps - 1 - i) as f32, max_val)
+                }
+            })
+            .collect()
     }
 
     // This function's length comes from building four separate bilinear-

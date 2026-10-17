@@ -14,9 +14,9 @@
 //! them to PTX for CUDA, and on `ROCm` candle hands the same text to `hipcc` at
 //! first use.
 
-pub mod fused_ops;
-pub mod float_math;
 pub mod biased_linear;
+pub mod float_math;
+pub mod fused_ops;
 pub mod gdn;
 pub mod hyper_connection;
 pub mod linear;

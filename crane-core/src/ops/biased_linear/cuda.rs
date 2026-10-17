@@ -49,8 +49,16 @@ pub(super) fn matmul<T: DeviceRepr>(
     use sys::cublasLtMatmulDescAttributes_t as A;
     use sys::cublasLtMatmulPreferenceAttributes_t as P;
     thread_local! {static WORK:RefCell<HashMap<usize,CudaSlice<u8>>>=RefCell::new(HashMap::new());}
-    let dtype = if tf32 { sys::cudaDataType_t::CUDA_R_32F } else { sys::cudaDataType_t::CUDA_R_16BF };
-    let compute = if tf32 { sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32 } else { sys::cublasComputeType_t::CUBLAS_COMPUTE_32F };
+    let dtype = if tf32 {
+        sys::cudaDataType_t::CUDA_R_32F
+    } else {
+        sys::cudaDataType_t::CUDA_R_16BF
+    };
+    let compute = if tf32 {
+        sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32
+    } else {
+        sys::cublasComputeType_t::CUBLAS_COMPUTE_32F
+    };
     let stream = blas.stream();
     let key = Arc::as_ptr(stream) as usize;
     WORK.with(|work| -> Result<()> {
@@ -68,37 +76,19 @@ pub(super) fn matmul<T: DeviceRepr>(
         let (op, _og) = out.device_ptr_mut(stream);
         let (scratch, _sg) = workspace.device_ptr_mut(stream);
         let desc = own(
-            lt::create_matmul_desc(
-                compute,
-                sys::cudaDataType_t::CUDA_R_32F,
-            ),
+            lt::create_matmul_desc(compute, sys::cudaDataType_t::CUDA_R_32F),
             lt::destroy_matmul_desc,
         )?;
         let a = own(
-            lt::create_matrix_layout(
-                dtype,
-                k as u64,
-                m as u64,
-                k as i64,
-            ),
+            lt::create_matrix_layout(dtype, k as u64, m as u64, k as i64),
             lt::destroy_matrix_layout,
         )?;
         let b = own(
-            lt::create_matrix_layout(
-                dtype,
-                k as u64,
-                n as u64,
-                k as i64,
-            ),
+            lt::create_matrix_layout(dtype, k as u64, n as u64, k as i64),
             lt::destroy_matrix_layout,
         )?;
         let c = own(
-            lt::create_matrix_layout(
-                dtype,
-                m as u64,
-                n as u64,
-                m as i64,
-            ),
+            lt::create_matrix_layout(dtype, m as u64, n as u64, m as i64),
             lt::destroy_matrix_layout,
         )?;
         let preference = own(lt::create_matmul_pref(), lt::destroy_matmul_pref)?;
