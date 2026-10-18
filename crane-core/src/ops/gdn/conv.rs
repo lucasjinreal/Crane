@@ -31,6 +31,24 @@ pub fn causal_conv1d(
     dims: &GdnDims,
     cache: &mut GdnLayerCache,
 ) -> Result<Tensor> {
+    causal_conv1d_ckpt(x, conv1d_weight, dims, cache, None).map(|(y, _)| y)
+}
+
+/// [`causal_conv1d`] that can also return the conv state as it stands after
+/// the first `ckpt` tokens of `x` (`0 < ckpt < seq_len`), for speculative
+/// decoding's mid-block checkpoint. The live `cache.conv_state` still ends up
+/// after all of `x`.
+///
+/// # Errors
+///
+/// Same as [`causal_conv1d`].
+pub fn causal_conv1d_ckpt(
+    x: &Tensor,
+    conv1d_weight: &Tensor,
+    dims: &GdnDims,
+    cache: &mut GdnLayerCache,
+    ckpt: Option<usize>,
+) -> Result<(Tensor, Option<Tensor>)> {
     let (_, seq_len, _) = x.dims3()?;
     // Prefill and decode may run in different dtypes (see `Qwen3_5TextModel`'s
     // `attn_dtype`); the small state follows the pass it feeds.
@@ -38,7 +56,7 @@ pub fn causal_conv1d(
         cache.conv_state = cache.conv_state.to_dtype(x.dtype())?;
     }
     if seq_len == 1 {
-        return decode_conv1d(x, conv1d_weight, cache);
+        return Ok((decode_conv1d(x, conv1d_weight, cache)?, None));
     }
     let x_t = x.transpose(1, 2)?.contiguous()?;
     // `conv_state` is shape `[1, conv_dim, kernel_size]` — the kernel-size
@@ -52,6 +70,12 @@ pub fn causal_conv1d(
     cache.conv_state = hidden
         .narrow(2, new_len - state_len, state_len)?
         .contiguous()?;
+    // State after the first `p` tokens: the `state_len` columns ending at `p`
+    // of the same concatenation.
+    let ckpt_state = ckpt
+        .filter(|&p| p > 0 && p < seq_len)
+        .map(|p| hidden.narrow(2, p, state_len).and_then(|t| t.contiguous()))
+        .transpose()?;
 
     let weight = conv1d_weight.squeeze(1)?.to_dtype(hidden.dtype())?;
     // Output `t` reads the `kernel`-wide window ending at `t`, i.e. the cached
@@ -74,9 +98,10 @@ pub fn causal_conv1d(
         offset,
     )?
     .to_dtype(x.dtype())?;
-    candle_nn::ops::silu(&out.to_dtype(candle_core::DType::F32)?)?
+    let y = candle_nn::ops::silu(&out.to_dtype(candle_core::DType::F32)?)?
         .to_dtype(x.dtype())?
-        .transpose(1, 2)
+        .transpose(1, 2)?;
+    Ok((y, ckpt_state))
 }
 
 /// Single-token specialization of [`causal_conv1d`], for decode.
@@ -185,6 +210,9 @@ mod tests {
         GdnLayerCache {
             conv_state: Tensor::zeros((1, conv_dim, kernel), DType::F32, dev).unwrap(),
             recurrent_state: Tensor::zeros((1, 1, 1, 1), DType::F32, dev).unwrap(),
+            checkpoint_at: None,
+            checkpoint: None,
+            prefer_serial: false,
         }
     }
 

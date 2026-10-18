@@ -148,6 +148,18 @@ pub struct Args {
     /// enables `--quant`, which the vision-capable path does not support.
     #[arg(long, help_heading = "Model")]
     pub text_only: bool,
+    /// MiniCPM-V only: path to the llama.cpp `mmproj-*.gguf` vision
+    /// projector to pair with a GGUF `-m`. When `-m` is a `.gguf` and this is
+    /// unset, a sibling `mmproj*.gguf` in the same directory is used (the
+    /// full `mmproj-model-f16.gguf` is preferred over the `-4x` one).
+    #[arg(long, help_heading = "Model")]
+    pub mmproj: Option<String>,
+    /// MiniCPM-V only: enable DSpark speculative decoding with this drafter —
+    /// the `MiniCPM-V-4.7-1B-DSpark` checkpoint directory or a
+    /// `dspark-*.gguf` file. Output is unchanged (greedy verification); only
+    /// the speed differs, mostly on code/math-like text.
+    #[arg(long, help_heading = "Model")]
+    pub dspark: Option<String>,
     /// API key required to access non-exempt endpoints (`/health`,
     /// `/v1/stats`, `/`, and `/ui/*` excluded). Repeatable to configure
     /// multiple valid keys. Pass with no value (`--api-key`) to generate a
@@ -843,6 +855,34 @@ fn resolve_expert_placement(
     )
 }
 
+/// The `mmproj-*.gguf` to pair with a MiniCPM-V GGUF: `--mmproj` if given,
+/// else a sibling of the LLM file. The full-pipeline `mmproj-model-f16.gguf`
+/// wins over the `-4x` variant, which cannot run `"16x"` mode.
+fn find_mmproj(llm_gguf: &str, explicit: Option<&str>) -> anyhow::Result<String> {
+    if let Some(p) = explicit {
+        return Ok(p.to_string());
+    }
+    let dir = std::path::Path::new(llm_gguf)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let mut found: Vec<String> = std::fs::read_dir(dir)?
+        .filter_map(Result::ok)
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.starts_with("mmproj") && n.to_lowercase().ends_with(".gguf"))
+        .collect();
+    found.sort_by_key(|n| (n.contains("4x"), n.clone()));
+    found
+        .into_iter()
+        .next()
+        .map(|n| dir.join(n).to_string_lossy().into_owned())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no mmproj*.gguf next to {llm_gguf}; pass --mmproj <file> for MiniCPM-V GGUF models"
+            )
+        })
+}
+
 fn apply_text_only_override(
     text_only: bool,
     model_type: ModelType,
@@ -1322,9 +1362,21 @@ pub async fn run(mut args: Args) -> Result<()> {
         // instead of unconditionally forcing CPU on ROCm builds.
         let use_cpu = args.cpu || !is_gpu_device(&device);
         let use_bf16 = device.is_cuda();
-        let tok_path = std::path::Path::new(&args.model_path).join("tokenizer.json");
-        let tokenizer = tokenizers::Tokenizer::from_file(&tok_path)
-            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
+        // A GGUF `-m` (MiniCPM-V + mmproj) carries its own tokenizer; every
+        // other VLM is a checkpoint directory with a `tokenizer.json`.
+        let tokenizer = if std::path::Path::new(&args.model_path)
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("gguf"))
+        {
+            crane_core::utils::tokenizer_utils::build_tokenizer_from_gguf_path(&args.model_path)?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("GGUF {} has no embedded tokenizer", args.model_path)
+                })?
+        } else {
+            let tok_path = std::path::Path::new(&args.model_path).join("tokenizer.json");
+            tokenizers::Tokenizer::from_file(&tok_path)
+                .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?
+        };
         let chat_template =
             engine::model_factory::create_chat_template(model_type, &args.model_path);
         let mut vlm_tx_opt_inner: Option<tokio::sync::mpsc::UnboundedSender<VlmRequest>> = None;
@@ -1339,8 +1391,13 @@ pub async fn run(mut args: Args) -> Result<()> {
         > = None;
         let background_thread_inner: Option<std::thread::JoinHandle<()>>;
         if resolved_type == engine::model_factory::ModelType::MinicpmV46 {
-            info!("Loading MiniCPM-V-4.6 model from: {}", args.model_path);
+            info!(
+                "Loading MiniCPM-V (4.6/4.7) model from: {}",
+                args.model_path
+            );
             let model_path_clone = args.model_path.clone();
+            let mmproj_clone = args.mmproj.clone();
+            let dspark_clone = args.dspark.clone();
             let device_clone = device.clone();
             let dtype_clone = dtype;
             let (mcpv_tx, mut mcpv_rx) =
@@ -1349,18 +1406,39 @@ pub async fn run(mut args: Args) -> Result<()> {
                 .name("minicpm-v-vlm-engine".into())
                 .spawn(move || {
                     use crane_core::models::minicpm_v::{MinicpmV46VLModel, VlGenerationConfig};
-                    let mut vlm = match MinicpmV46VLModel::new(
-                        &model_path_clone,
-                        &device_clone,
-                        &dtype_clone,
-                    ) {
+                    let is_gguf = std::path::Path::new(&model_path_clone)
+                        .extension()
+                        .is_some_and(|e| e.eq_ignore_ascii_case("gguf"));
+                    let loaded = if is_gguf {
+                        find_mmproj(&model_path_clone, mmproj_clone.as_deref()).and_then(|mmproj| {
+                            info!("MiniCPM-V GGUF: LLM {model_path_clone}, mmproj {mmproj}");
+                            MinicpmV46VLModel::from_gguf(
+                                &model_path_clone,
+                                &mmproj,
+                                &device_clone,
+                                &dtype_clone,
+                            )
+                        })
+                    } else {
+                        MinicpmV46VLModel::new(&model_path_clone, &device_clone, &dtype_clone)
+                    };
+                    let mut vlm = match loaded {
                         Ok(m) => m,
                         Err(e) => {
-                            tracing::error!("Failed to load MiniCPM-V-4.6 model: {e}");
+                            tracing::error!("Failed to load MiniCPM-V model: {e:#}");
                             return;
                         },
                     };
-                    info!("MiniCPM-V-4.6 engine thread started");
+                    if let Some(draft) = &dspark_clone {
+                        match vlm.load_dspark(draft) {
+                            Ok(()) => info!("DSpark speculative decoding enabled ({draft})"),
+                            Err(e) => {
+                                tracing::error!("Failed to load DSpark drafter {draft}: {e:#}");
+                                return;
+                            },
+                        }
+                    }
+                    info!("MiniCPM-V engine thread started");
                     while let Some(req) = mcpv_rx.blocking_recv() {
                         let MinicpmVVlmRequest {
                             img_path,
@@ -1382,9 +1460,25 @@ pub async fn run(mut args: Args) -> Result<()> {
                                 }
                             })?;
                             tracing::info!(
-                                "MiniCPM-V-4.6 request completed in {:?}",
+                                "MiniCPM-V request completed in {:?}",
                                 started.elapsed()
                             );
+                            if let Some(st) = vlm.last_spec_stats() {
+                                tracing::info!(
+                                    "DSpark: {} rounds, {:.2} tokens/round, {} drafts accepted \
+                                     (draft {:.0} ms, verify {:.0} ms, other {:.0} ms); \
+                                     {} plain tokens, {} switches ({:.0} ms)",
+                                    st.rounds,
+                                    st.mean_accept_len(),
+                                    st.accepted_drafts,
+                                    st.draft_secs * 1e3,
+                                    st.verify_secs * 1e3,
+                                    st.other_secs * 1e3,
+                                    st.plain_tokens,
+                                    st.switches,
+                                    st.switch_secs * 1e3,
+                                );
+                            }
                             Ok(out)
                         })();
                         if let Err(ref e) = res {

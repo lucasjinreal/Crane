@@ -6,8 +6,10 @@
 //! + hierarchical downsample merger) is new. See `config.rs` for the full
 //! rationale and `vlm.rs` for the top-level entry point.
 
+pub mod canvas_rope;
 pub mod config;
 pub mod merger;
+pub mod mmproj_gguf;
 pub mod preprocess;
 pub mod vision;
 pub mod vlm;

@@ -453,7 +453,9 @@ impl WindowAttentionMerger {
 pub struct VisionModel {
     embeddings: VisionEmbeddings,
     layers: Vec<EncoderLayer>,
-    vit_merger: WindowAttentionMerger,
+    /// `None` for 4x-only checkpoints (the `mmproj-model-f16-4x.gguf` ships no
+    /// `vit_merger` weights).
+    vit_merger: Option<WindowAttentionMerger>,
     post_layernorm: LayerNorm,
     insert_layer_id: usize,
 }
@@ -475,7 +477,15 @@ impl VisionModel {
         for i in 0..cfg.num_hidden_layers {
             layers.push(EncoderLayer::new(cfg, &vb_layers.pp(i))?);
         }
-        let vit_merger = WindowAttentionMerger::new(cfg, window_kernel_size, &vb.pp("vit_merger"))?;
+        let vit_merger = if vb.pp("vit_merger").contains_tensor("layer_norm1.weight") {
+            Some(WindowAttentionMerger::new(
+                cfg,
+                window_kernel_size,
+                &vb.pp("vit_merger"),
+            )?)
+        } else {
+            None
+        };
         let post_layernorm =
             layer_norm(cfg.hidden_size, cfg.layer_norm_eps, vb.pp("post_layernorm"))?;
         Ok(Self {
@@ -497,6 +507,8 @@ impl VisionModel {
 
     /// `pixel_values`: NaViT-packed `[1, C, patch_size, total_patches]`.
     /// `target_sizes`: per-image/-slice `(h, w)` patch-grid dims.
+    /// `use_vit_merger`: `false` for `downsample_mode: "4x"` — the mid-stack
+    /// window merger is skipped and sizes come back unchanged.
     ///
     /// Returns `(last_hidden_state, downsampled_target_sizes)` — the second
     /// element accounts for the 2x2 merge inside `vit_merger` (each axis
@@ -512,6 +524,7 @@ impl VisionModel {
         &self,
         pixel_values: &Tensor,
         target_sizes: &[(usize, usize)],
+        use_vit_merger: bool,
     ) -> Result<(Tensor, Vec<(usize, usize)>)> {
         let embeds = self.embeddings.forward(pixel_values, target_sizes)?;
         let (_b, _s, hidden) = embeds.dims3()?;
@@ -522,10 +535,16 @@ impl VisionModel {
 
         for (i, layer) in self.layers.iter().enumerate() {
             xs = layer.forward(&xs, &boundaries)?;
-            if i == self.insert_layer_id {
+            if use_vit_merger && i == self.insert_layer_id {
+                let vit_merger = self.vit_merger.as_ref().ok_or_else(|| {
+                    candle_core::Error::Msg(
+                        "16x mode needs vit_merger weights, but this checkpoint has none \
+                         (4x-only mmproj)"
+                            .into(),
+                    )
+                })?;
                 let (merged, new_sizes) =
-                    self.vit_merger
-                        .forward(&xs, &cur_target_sizes, &boundaries)?;
+                    vit_merger.forward(&xs, &cur_target_sizes, &boundaries)?;
                 xs = merged;
                 cur_target_sizes = new_sizes;
                 boundaries = Self::image_boundaries(&cur_target_sizes);

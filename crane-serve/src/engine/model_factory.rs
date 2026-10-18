@@ -59,7 +59,11 @@ impl ModelType {
             // Bare "minicpm" is aliased to MiniCPM5 for now, since it's the
             // only OpenBMB family member Crane supports; re-scope this once
             // MiniCPM-o/MiniCPM-V land as their own `ModelType`s.
+            // `MinicpmV46` is the type for the whole MiniCPM-V 4.x family: the 4.7
+            // checkpoints load through the same VLM class (it switches on
+            // `config.json`'s `mrope_mode`).
             "minicpmv46" | "minicpmv4.6" | "minicpmv4_6" | "minicpm-v4.6" | "minicpm-v-4.6"
+            | "minicpmv47" | "minicpmv4.7" | "minicpmv4_7" | "minicpm-v4.7" | "minicpm-v-4.7"
             | "minicpmv" => Self::MinicpmV46,
             "minicpmo" | "minicpm-o" | "minicpm_o" | "minicpmoduplex" | "minicpm-o-duplex"
             | "minicpm_o_duplex" => Self::MiniCpmODuplex,
@@ -252,7 +256,9 @@ pub fn detect_model_type(model_path: &str) -> ModelType {
                     };
                 },
                 "qwen4_exp" | "qwen4_exp_text" => return ModelType::Qwen4Exp,
-                "minicpmv4_6" | "minicpmv4.6" => return ModelType::MinicpmV46,
+                "minicpmv4_6" | "minicpmv4.6" | "minicpmv4_7" | "minicpmv4.7" => {
+                    return ModelType::MinicpmV46;
+                },
                 "minicpmo" => return ModelType::MiniCpmODuplex,
                 "qwen3_tts" | "qwen3tts" => return ModelType::Qwen3TTS,
                 "qwen3_asr" | "qwen3asr" => return ModelType::Qwen3ASR,
@@ -277,7 +283,7 @@ pub fn detect_model_type(model_path: &str) -> ModelType {
                 if a.contains("gemma4") {
                     return ModelType::Gemma4;
                 }
-                if a.contains("minicpmv4_6") {
+                if a.contains("minicpmv4_6") || a.contains("minicpmv4_7") {
                     return ModelType::MinicpmV46;
                 }
                 // Checked before any bare "minicpm" fallback would exist —
@@ -509,7 +515,15 @@ fn detect_from_gguf_header(path: &Path) -> Option<ModelType> {
         // "qwen35moe" is the MoE variant (e.g. Ornith-1.5-35B-A3B), which the
         // same loader handles: experts are detected per layer.
         "qwen35" | "qwen35moe" | "qwen3_5" | "qwen3.5" | "qwen36" | "qwen3_6" | "qwen3.6"
-        | "qwen38" | "qwen3_8" | "qwen3.8" => Some(ModelType::Qwen3_5),
+        | "qwen38" | "qwen3_8" | "qwen3.8" => {
+            // MiniCPM-V's LLM is a plain `qwen35` GGUF; only the sibling
+            // mmproj says it is a vision model.
+            if has_minicpmv_mmproj(path) {
+                Some(ModelType::MinicpmV46)
+            } else {
+                Some(ModelType::Qwen3_5)
+            }
+        },
         "qwen3" | "qwen3moe" => Some(ModelType::Qwen3),
         "qwen4exp" => Some(ModelType::Qwen4Exp),
         "qwen2" => Some(ModelType::Qwen25),
@@ -525,6 +539,34 @@ fn detect_from_gguf_header(path: &Path) -> Option<ModelType> {
             None
         },
     }
+}
+
+/// Whether a `mmproj*.gguf` beside `llm_gguf` is a MiniCPM-V projector
+/// (`clip.projector_type` starting with `minicpmv`).
+fn has_minicpmv_mmproj(llm_gguf: &Path) -> bool {
+    let Some(dir) = llm_gguf.parent() else {
+        return false;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.filter_map(Result::ok).any(|e| {
+        let name = e.file_name().to_string_lossy().to_lowercase();
+        if !(name.starts_with("mmproj") && name.ends_with(".gguf")) {
+            return false;
+        }
+        let Ok(mmap) = crane_core::quantized::gguf_file::mmap_gguf_file(e.path()) else {
+            return false;
+        };
+        crane_core::quantized::extended_gguf::read_content_lenient(mmap.as_ref())
+            .ok()
+            .and_then(|ct| {
+                ct.metadata
+                    .get("clip.projector_type")
+                    .and_then(|v| v.to_string().ok().cloned())
+            })
+            .is_some_and(|t| t.starts_with("minicpmv"))
+    })
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -969,6 +1011,39 @@ mod tests {
     }
 
     #[test]
+    fn model_type_from_str_minicpm_v47_variants() {
+        for s in [
+            "minicpmv47",
+            "minicpmv4.7",
+            "minicpmv4_7",
+            "minicpm-v4.7",
+            "MiniCPM-V-4.7",
+        ] {
+            assert_eq!(ModelType::from_str(s), ModelType::MinicpmV46, "{s}");
+        }
+    }
+
+    #[test]
+    fn detect_from_config_json_minicpmv4_7() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.json");
+        std::fs::write(&config, r#"{"model_type": "minicpmv4_7"}"#).unwrap();
+        assert_eq!(
+            detect_model_type(dir.path().to_str().unwrap()),
+            ModelType::MinicpmV46
+        );
+        std::fs::write(
+            &config,
+            r#"{"architectures": ["MiniCPMV4_7ForConditionalGeneration"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            detect_model_type(dir.path().to_str().unwrap()),
+            ModelType::MinicpmV46
+        );
+    }
+
+    #[test]
     fn model_type_is_vlm_includes_minicpm_v46() {
         assert!(ModelType::MinicpmV46.is_vlm());
         assert!(!ModelType::Minicpm5.is_vlm());
@@ -1216,6 +1291,54 @@ mod tests {
         .unwrap();
         let result = detect_model_type(dir.path().to_str().unwrap());
         assert_eq!(result, ModelType::Qwen4Exp);
+    }
+
+    /// Build a minimal GGUF header: `(key, string value)` metadata pairs only.
+    fn tiny_gguf(kv: &[(&str, &str)]) -> Vec<u8> {
+        let mut file = b"GGUF".to_vec();
+        file.extend(3u32.to_le_bytes());
+        file.extend(0u64.to_le_bytes());
+        file.extend((kv.len() as u64).to_le_bytes());
+        for (k, v) in kv {
+            file.extend((k.len() as u64).to_le_bytes());
+            file.extend(k.as_bytes());
+            file.extend(8u32.to_le_bytes());
+            file.extend((v.len() as u64).to_le_bytes());
+            file.extend(v.as_bytes());
+        }
+        file
+    }
+
+    /// MiniCPM-V's LLM GGUF is plain `qwen35`; a sibling MiniCPM-V mmproj is
+    /// what routes it to the VLM loader. A text-only Qwen 3.5 GGUF, or one
+    /// beside some other model's mmproj, stays `Qwen3_5`.
+    #[test]
+    fn detect_minicpm_v_gguf_via_sibling_mmproj() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = dir.path().join("MiniCPM-V-4_7-1B-Q8_0.gguf");
+        std::fs::write(&llm, tiny_gguf(&[("general.architecture", "qwen35")])).unwrap();
+        let path = llm.to_str().unwrap();
+        assert_eq!(detect_model_type(path), ModelType::Qwen3_5);
+
+        std::fs::write(
+            dir.path().join("mmproj-other.gguf"),
+            tiny_gguf(&[
+                ("general.architecture", "clip"),
+                ("clip.projector_type", "qwen3vl_merger"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(detect_model_type(path), ModelType::Qwen3_5);
+
+        std::fs::write(
+            dir.path().join("mmproj-model-f16.gguf"),
+            tiny_gguf(&[
+                ("general.architecture", "clip"),
+                ("clip.projector_type", "minicpmv4_7"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(detect_model_type(path), ModelType::MinicpmV46);
     }
 
     /// Qwen 3.5 MoE (e.g. Ornith-1.5-35B-A3B): `qwen3_5_moe` in config.json,

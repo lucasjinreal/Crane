@@ -56,6 +56,11 @@ pub use cuda_impl::*;
 #[cfg(feature = "cuda")]
 pub use cuda_topk::topk_indices;
 
+// Metal port of the same top-k kernel; only the batched-rows entry point
+// (`topk_indices_rows`) uses it so far.
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+mod metal_topk;
+
 #[cfg(all(feature = "rocm", not(feature = "cuda")))]
 mod rocm_impl;
 
@@ -68,6 +73,10 @@ mod sycl_impl;
 #[cfg(all(feature = "sycl", not(any(feature = "cuda", feature = "rocm"))))]
 pub use sycl_impl::*;
 
+// SYCL port of the same top-k kernel; like Metal, only `topk_indices_rows`.
+#[cfg(all(feature = "sycl", not(any(feature = "cuda", feature = "rocm"))))]
+mod sycl_topk;
+
 // Always compiled: it needs no backend, the GPU entry points fall back to it
 // (off a GPU device, and above the top-k kernel's maximum `k`), and the kernel
 // cross-check tests compare against it.
@@ -75,3 +84,37 @@ pub mod portable;
 
 #[cfg(not(any(feature = "cuda", feature = "rocm", feature = "sycl")))]
 pub use portable::*;
+
+/// Top-`k` indices of every row of a contiguous f32 `[rows, n]` matrix, as
+/// `[rows, k]`. One pair of launches on CUDA, Metal and SYCL; a per-row loop
+/// elsewhere.
+///
+/// # Errors
+///
+/// Returns an error if `x` is not a contiguous f32 matrix or `k` is out of range.
+pub fn topk_indices_rows(
+    x: &candle_core::Tensor,
+    k: usize,
+) -> candle_core::Result<candle_core::Tensor> {
+    #[cfg(feature = "cuda")]
+    if x.device().is_cuda() {
+        return cuda_topk::topk_indices(x, k);
+    }
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    if x.device().is_metal()
+        && let Some(ids) = metal_topk::topk_indices_rows(x, k)?
+    {
+        return Ok(ids);
+    }
+    #[cfg(all(feature = "sycl", not(any(feature = "cuda", feature = "rocm"))))]
+    if x.device().is_sycl()
+        && let Some(ids) = sycl_topk::topk_indices_rows(x, k)?
+    {
+        return Ok(ids);
+    }
+    let (rows, _) = x.dims2()?;
+    let per_row = (0..rows)
+        .map(|i| topk_indices(&x.narrow(0, i, 1)?.flatten_all()?.contiguous()?, k)?.unsqueeze(0))
+        .collect::<candle_core::Result<Vec<_>>>()?;
+    candle_core::Tensor::cat(&per_row, 0)
+}

@@ -104,9 +104,41 @@ pub struct Config {
     pub downsample_mode: String,
     #[serde(default = "default_true")]
     pub tie_word_embeddings: bool,
+    /// 4.7+: `"canvas"` selects canvas M-RoPE ([`super::canvas_rope`]); absent
+    /// (4.6) means plain sequential positions.
+    #[serde(default)]
+    pub mrope_mode: Option<String>,
+    /// 4.7+ marker token ids the canvas layout is anchored on.
+    #[serde(default)]
+    pub image_start_id: Option<u32>,
+    #[serde(default)]
+    pub image_end_id: Option<u32>,
+    #[serde(default)]
+    pub slice_start_id: Option<u32>,
+    #[serde(default)]
+    pub slice_end_id: Option<u32>,
+    #[serde(default)]
+    pub newline_id: Option<u32>,
 }
 
-/// Load a HF `config.json` for a MiniCPM-V-4.6 checkpoint.
+impl Config {
+    /// Marker ids for canvas M-RoPE, or `None` when this checkpoint uses plain
+    /// sequential positions (4.6) — or declares `canvas` without all ids.
+    pub fn canvas_token_ids(&self) -> Option<super::canvas_rope::CanvasTokenIds> {
+        if self.mrope_mode.as_deref() != Some("canvas") {
+            return None;
+        }
+        Some(super::canvas_rope::CanvasTokenIds {
+            image_start: self.image_start_id?,
+            image_end: self.image_end_id?,
+            slice_start: self.slice_start_id?,
+            slice_end: self.slice_end_id?,
+            newline: self.newline_id?,
+        })
+    }
+}
+
+/// Load a HF `config.json` for a MiniCPM-V-4.6/4.7 checkpoint.
 ///
 /// # Errors
 ///

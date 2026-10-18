@@ -1,6 +1,8 @@
 //! Top-level `GatedDeltaNet` layer: orchestrates input projection, causal
 //! `Conv1D`, gated delta rule recurrence, gated `RMSNorm`, and output projection.
 
+#[cfg(any(feature = "cuda", feature = "metal"))]
+use candle_core::DType;
 use candle_core::quantized::GgmlDType;
 use candle_core::{Module, Result, Tensor};
 use candle_nn::VarBuilder;
@@ -8,10 +10,16 @@ use candle_nn::VarBuilder;
 use super::backend::{GdnGateConsts, apply_recurrence, compute_beta_g, l2_alpha, l2_norm_fused};
 use super::cache::GdnLayerCache;
 use super::config::{GdnConfig, GdnDims, VHeadOrder};
-use super::conv::causal_conv1d;
+use super::conv::causal_conv1d_ckpt;
 use super::norm::RmsNormGated;
 use super::projection::{GdnInputProjection, GdnInputProjectionKind};
 use crate::ops::linear::{LinearLayer, linear_layer};
+
+/// The fused multi-token stages for this build's GPU backend (same API on both).
+#[cfg(feature = "cuda")]
+use super::gdn_fused as gf;
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+use super::metal_backend as gf;
 
 /// One linear-attention layer as used by Qwen 3.5 (and similar hybrid models).
 ///
@@ -36,6 +44,21 @@ struct GdnDerived {
     gates: GdnGateConsts,
     /// The `[head_k_dim]` scale vector for the fused Q/K L2 norm.
     l2_alpha: Tensor,
+    /// Weights pre-rounded for the fused path (CUDA, Metal).
+    #[cfg(any(feature = "cuda", feature = "metal"))]
+    fused: Option<FusedConsts>,
+}
+
+/// What the fused kernels need, derived once: the op-by-op path rounds the
+/// conv and norm weights through the activation dtype (bf16 on CUDA, the model
+/// dtype on Metal) on every call; doing it here is the same arithmetic without
+/// the per-call launches.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+struct FusedConsts {
+    /// `conv1d.weight` as `[conv_dim, kernel]` f32 (via the activation dtype).
+    conv_w: Tensor,
+    /// Gated-norm weight `[head_v_dim]` f32 (via the activation dtype).
+    norm_w: Tensor,
 }
 
 impl GatedDeltaNet {
@@ -200,6 +223,28 @@ impl GatedDeltaNet {
     ) -> Result<Self> {
         // `conv1d_weight` is the dtype/device witness: it is always present and
         // always carries the model's compute dtype on both load paths.
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        let fused = {
+            let device = conv1d_weight.device();
+            // CUDA's fused pass is bf16-only; Metal's runs in the model dtype.
+            let act = if device.is_cuda() {
+                Some(DType::BF16)
+            } else if device.is_metal() {
+                Some(conv1d_weight.dtype())
+            } else {
+                None
+            };
+            match act {
+                Some(act) if norm.activation() == super::norm::GateActivation::Silu => {
+                    let via = |t: &Tensor| t.to_dtype(act)?.to_dtype(DType::F32)?.contiguous();
+                    Some(FusedConsts {
+                        conv_w: via(&conv1d_weight.squeeze(1)?)?,
+                        norm_w: via(norm.weight())?,
+                    })
+                },
+                _ => None,
+            }
+        };
         let derived = GdnDerived {
             gates: GdnGateConsts::new(&a_log, &dt_bias)?,
             l2_alpha: l2_alpha(
@@ -207,6 +252,8 @@ impl GatedDeltaNet {
                 conv1d_weight.dtype(),
                 conv1d_weight.device(),
             )?,
+            #[cfg(any(feature = "cuda", feature = "metal"))]
+            fused,
         };
         Ok(Self {
             input_proj,
@@ -237,33 +284,77 @@ impl GatedDeltaNet {
         let (batch_size, seq_len, _) = x.dims3()?;
         let dtype = x.dtype();
 
+        // Speculative decoding asks for a copy of the state after the first
+        // `p` tokens. Projections and the conv run once over the whole input;
+        // only the conv-state capture and the recurrence are split at `p`.
+        let ckpt = cache.checkpoint_at.take();
+        if ckpt == Some(0) {
+            cache.save_checkpoint()?;
+        }
+        let split = ckpt.filter(|&p| p > 0 && p < seq_len);
+
         // 1. Input projections → Q, K, V, Z, B, A.
         let projected = timed(Span::GdnProj, || {
             self.input_proj.forward(x, dims, batch_size, seq_len)
         })?;
 
+        // Fused path: conv, Q/K/V prep, recurrence and gated norm in a
+        // handful of launches instead of ~45 (see `gdn_fused`; on Metal every
+        // pass, see `metal_backend`).
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        if let Some(fused) = &self.derived.fused
+            && projected.mixed_qkv.is_some()
+            && gf::supported(x, dims)
+        {
+            let out = self.forward_fused(&projected, fused, dims, cache, split)?;
+            if ckpt.is_some_and(|p| p >= seq_len) {
+                cache.save_checkpoint()?;
+            }
+            return Ok(out);
+        }
+
         // 2. Causal Conv1D over [Q|K|V].
-        let mixed_qkv = timed(Span::GdnConv, || {
+        let (mixed_qkv, conv_ckpt) = timed(Span::GdnConv, || {
             let mixed_qkv = projected.conv_input(dims, batch_size, seq_len)?;
-            causal_conv1d(&mixed_qkv, &self.conv1d_weight, dims, cache)
+            causal_conv1d_ckpt(&mixed_qkv, &self.conv1d_weight, dims, cache, split)
         })?;
 
-        // 3-6 in one launch on SYCL.
+        // 3-6 in one launch on SYCL (two around a speculative checkpoint).
         #[cfg(all(feature = "sycl", not(feature = "cuda"), not(feature = "rocm")))]
         if mixed_qkv.device().is_sycl() && std::env::var("CRANE_GDN_PORTABLE").is_err() {
-            let fused = timed(Span::GdnRecur, || {
-                super::sycl_backend::gdn_fused_sycl(
-                    &mixed_qkv,
-                    &projected.a,
-                    &projected.b,
-                    &self.derived.gates.neg_exp_a_log,
-                    &self.derived.gates.dt_bias,
-                    &cache.recurrent_state,
-                    dims,
-                )
-            })?;
-            if let Some((y, state)) = fused {
+            let fused = timed(Span::GdnRecur, || -> Result<Option<Tensor>> {
+                let run = |state: &Tensor, t0: usize, len: usize| {
+                    super::sycl_backend::gdn_fused_sycl(
+                        &mixed_qkv.narrow(1, t0, len)?,
+                        &projected.a.narrow(1, t0, len)?,
+                        &projected.b.narrow(1, t0, len)?,
+                        &self.derived.gates.neg_exp_a_log,
+                        &self.derived.gates.dt_bias,
+                        state,
+                        dims,
+                    )
+                };
+                let p = split.unwrap_or(seq_len);
+                let Some((head, state)) = run(&cache.recurrent_state, 0, p)? else {
+                    return Ok(None);
+                };
                 cache.recurrent_state = state;
+                if p == seq_len {
+                    return Ok(Some(head));
+                }
+                let conv_state = conv_ckpt
+                    .clone()
+                    .expect("conv checkpoint computed for 0 < p < seq_len");
+                cache.checkpoint = Some((conv_state, cache.recurrent_state.copy()?));
+                let (tail, state) = run(&cache.recurrent_state, p, seq_len - p)?
+                    .expect("the tail has the head's shapes and dtype");
+                cache.recurrent_state = state;
+                Ok(Some(Tensor::cat(&[&head, &tail], 1)?))
+            })?;
+            if let Some(y) = fused {
+                if ckpt.is_some_and(|p| p >= seq_len) {
+                    cache.save_checkpoint()?;
+                }
                 return timed(Span::GdnFinish, || {
                     self.finish_forward(&y, &projected.z, batch_size, seq_len)
                 });
@@ -284,16 +375,139 @@ impl GatedDeltaNet {
         })?;
 
         // 6. Run the gated delta rule recurrence.
-        let y = timed(Span::GdnRecur, || {
-            apply_recurrence(
-                &q, &k, &v, &g, &beta, dims, batch_size, seq_len, cache, dtype,
-            )
+        let y = timed(Span::GdnRecur, || -> Result<Tensor> {
+            let Some(p) = split else {
+                return apply_recurrence(
+                    &q, &k, &v, &g, &beta, dims, batch_size, seq_len, cache, dtype,
+                );
+            };
+            let seg = |t: &Tensor, from: usize, len: usize| t.narrow(1, from, len);
+            let head = apply_recurrence(
+                &seg(&q, 0, p)?,
+                &seg(&k, 0, p)?,
+                &seg(&v, 0, p)?,
+                &seg(&g, 0, p)?,
+                &seg(&beta, 0, p)?,
+                dims,
+                batch_size,
+                p,
+                cache,
+                dtype,
+            )?;
+            let conv_state = conv_ckpt.expect("conv checkpoint computed for 0 < p < seq_len");
+            cache.checkpoint = Some((conv_state, cache.recurrent_state.copy()?));
+            let tail_len = seq_len - p;
+            let tail = apply_recurrence(
+                &seg(&q, p, tail_len)?,
+                &seg(&k, p, tail_len)?,
+                &seg(&v, p, tail_len)?,
+                &seg(&g, p, tail_len)?,
+                &seg(&beta, p, tail_len)?,
+                dims,
+                batch_size,
+                tail_len,
+                cache,
+                dtype,
+            )?;
+            Tensor::cat(&[&head, &tail], 1)
         })?;
+
+        if ckpt.is_some_and(|p| p >= seq_len) {
+            cache.save_checkpoint()?;
+        }
 
         // 7. Gated RMSNorm + output projection.
         timed(Span::GdnFinish, || {
             self.finish_forward(&y, &projected.z, batch_size, seq_len)
         })
+    }
+
+    /// The fused path (a multi-token bf16 pass on CUDA, any pass on Metal);
+    /// `split` is the speculative-decoding checkpoint position
+    /// (`0 < p < seq_len`).
+    #[cfg(any(feature = "cuda", feature = "metal"))]
+    fn forward_fused(
+        &self,
+        projected: &super::projection::GdnProjection,
+        fused: &FusedConsts,
+        dims: &GdnDims,
+        cache: &mut GdnLayerCache,
+        split: Option<usize>,
+    ) -> Result<Tensor> {
+        use crate::utils::prof::{Span, timed};
+
+        let mixed = projected.mixed_qkv.as_ref().expect("checked by the caller");
+        let seq_len = mixed.dim(1)?;
+        let h = dims.num_v_heads;
+        let x2 = mixed.reshape((seq_len, dims.conv_dim))?.contiguous()?;
+        let act = x2.dtype();
+        if cache.conv_state.dtype() != act {
+            cache.conv_state = cache.conv_state.to_dtype(act)?;
+        }
+        let state = cache.conv_state.contiguous()?;
+        let mut conv = timed(Span::GdnConv, || {
+            gf::conv_silu(&x2, &state, &fused.conv_w, split)
+        })?;
+        cache.conv_state = conv.state.clone();
+
+        let segments: Vec<(usize, usize)> = match split {
+            Some(p) => vec![(0, p), (p, seq_len - p)],
+            None => vec![(0, seq_len)],
+        };
+        let out_buf = gf::alloc_post_out(&x2, seq_len, h)?;
+        #[allow(clippy::cast_possible_truncation)]
+        let scale = (1.0 / (dims.head_k_dim as f64).sqrt()) as f32;
+        for (i, &(t0, len)) in segments.iter().enumerate() {
+            if i == 1 {
+                // State after the first `p` tokens.
+                let conv_state = conv
+                    .ckpt
+                    .take()
+                    .expect("conv checkpoint for 0 < p < seq_len");
+                cache.checkpoint = Some((conv_state, cache.recurrent_state.copy()?));
+            }
+            let pre = timed(Span::GdnQkv, || {
+                gf::prep(
+                    &conv.y,
+                    &projected.a,
+                    &projected.b,
+                    &self.derived.gates.neg_exp_a_log,
+                    &self.derived.gates.dt_bias,
+                    dims,
+                    t0,
+                    len,
+                    scale,
+                )
+            })?;
+            let y = timed(Span::GdnRecur, || {
+                super::backend::recurrence_prepped(
+                    &pre.q, &pre.k, &pre.v, &pre.g, &pre.beta, dims, 1, len, cache, act,
+                )
+            })?;
+            // The chunked (long-prefill) recurrence yields bf16 on CUDA, the
+            // serial one f32; the kernel reads f32 and re-rounding a bf16 value
+            // is exact.
+            let y = if y.dtype() == DType::F32 {
+                y
+            } else {
+                y.to_dtype(DType::F32)?
+            };
+            timed(Span::GdnFinish, || {
+                gf::post_norm(
+                    &out_buf,
+                    &y,
+                    &projected.z,
+                    &fused.norm_w,
+                    self.norm.eps(),
+                    t0,
+                    len,
+                    h,
+                )
+            })?;
+        }
+        let out =
+            gf::post_out_tensor(out_buf, &x2, seq_len, h)?.reshape((1, seq_len, dims.value_dim))?;
+        timed(Span::GdnFinish, || self.out_proj.forward(&out))
     }
 
     fn finish_forward(

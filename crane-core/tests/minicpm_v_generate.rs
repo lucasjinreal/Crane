@@ -42,6 +42,10 @@ fn minicpm_v_generate_is_coherent() {
     let cfg = VlGenerationConfig {
         max_new_tokens: 96,
         strip_thinking: false,
+        enable_thinking: None,
+        downsample_mode: None,
+        dspark: None,
+        ..Default::default()
     };
     let text = model
         .generate(

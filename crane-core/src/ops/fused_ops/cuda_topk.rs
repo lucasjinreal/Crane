@@ -46,6 +46,9 @@ thread_local! {
 /// Two-stage block reduction. `k` above [`MAX_TOPK`] falls back to the host
 /// sort rather than truncating.
 ///
+/// A `[rows, n]` matrix is selected row by row in the same two launches (the
+/// kernel's `gridDim.y` is the row axis) and yields `[rows, k]`.
+///
 /// Returns a `[k]` U32 tensor of the indices of the k largest values.
 ///
 /// # Errors
@@ -59,10 +62,10 @@ pub fn topk_indices(logits: &Tensor, k: usize) -> Result<Tensor> {
     if !logits.is_contiguous() {
         candle_core::bail!("topk_indices requires contiguous input");
     }
-    if logits.rank() != 1 {
-        candle_core::bail!("topk_indices expects a 1D tensor");
+    if logits.rank() > 2 {
+        candle_core::bail!("topk_indices expects a 1D tensor or a [rows, n] matrix");
     }
-    let n = logits.dims1()?;
+    let n = *logits.dims().last().expect("rank >= 1");
     if k == 0 || k > n {
         candle_core::bail!("topk_indices expects 0 < k <= n");
     }
@@ -87,16 +90,12 @@ impl candle_core::CustomOp1 for TopKIndicesOp {
             candle_core::bail!("topk_indices requires contiguous layout");
         }
         let k = self.k;
-        let n = layout.shape().elem_count();
+        let dims = layout.shape().dims();
+        let n = *dims.last().expect("rank >= 1");
+        let rows = layout.shape().elem_count() / n;
         let start = layout.start_offset();
-        let end = start + n;
-
-        let mut pairs: Vec<(f32, u32)> = match storage {
-            candle_core::CpuStorage::F32(vs) => vs[start..end]
-                .iter()
-                .enumerate()
-                .map(|(i, &v)| (v, i as u32))
-                .collect(),
+        let vs = match storage {
+            candle_core::CpuStorage::F32(vs) => &vs[start..start + rows * n],
             _ => candle_core::bail!("topk_indices only supports f32"),
         };
 
@@ -107,13 +106,25 @@ impl candle_core::CustomOp1 for TopKIndicesOp {
                 .unwrap_or(std::cmp::Ordering::Greater)
                 .then(a.1.cmp(&b.1))
         };
-        let kth = k.saturating_sub(1);
-        pairs.select_nth_unstable_by(kth, order);
-        pairs.truncate(k);
-        pairs.sort_by(order);
-
-        let out: Vec<u32> = pairs.into_iter().map(|(_, i)| i).collect();
-        Ok((candle_core::CpuStorage::U32(out), Shape::from_dims(&[k])))
+        let mut out: Vec<u32> = Vec::with_capacity(rows * k);
+        for row in vs.chunks(n) {
+            let mut pairs: Vec<(f32, u32)> = row
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| (v, i as u32))
+                .collect();
+            let kth = k.saturating_sub(1);
+            pairs.select_nth_unstable_by(kth, order);
+            pairs.truncate(k);
+            pairs.sort_by(order);
+            out.extend(pairs.into_iter().map(|(_, i)| i));
+        }
+        let shape = if dims.len() == 1 {
+            Shape::from_dims(&[k])
+        } else {
+            Shape::from_dims(&[rows, k])
+        };
+        Ok((candle_core::CpuStorage::U32(out), shape))
     }
 
     fn cuda_fwd(
@@ -128,7 +139,9 @@ impl candle_core::CustomOp1 for TopKIndicesOp {
         }
         let k = self.k;
         let k_u32 = k as u32;
-        let n = layout.shape().elem_count();
+        let dims = layout.shape().dims();
+        let n = *dims.last().expect("rank >= 1");
+        let rows = layout.shape().elem_count() / n;
         let n_u32 = n as u32;
         let dev = &storage.device;
 
@@ -145,7 +158,7 @@ impl candle_core::CustomOp1 for TopKIndicesOp {
         let grid_dim = grid as u32;
         let items_per_block = n.div_ceil(grid) as u32;
 
-        let cap_elems = grid * k;
+        let cap_elems = rows * grid * k;
         let dev_id = dev.id();
         let tmp_keys = TOPK_TMP.with(|cell| -> Result<_> {
             let mut map = cell.borrow_mut();
@@ -165,7 +178,7 @@ impl candle_core::CustomOp1 for TopKIndicesOp {
             }
         })?;
 
-        let out_idx = unsafe { dev.alloc::<u32>(k)? };
+        let out_idx = unsafe { dev.alloc::<u32>(rows * k)? };
 
         // Stage 1 hands stage 2 packed sort keys, not (value, index) pairs: the
         // ordering is entirely inside the key, so the merge never sees a float.
@@ -179,7 +192,7 @@ impl candle_core::CustomOp1 for TopKIndicesOp {
             builder.arg(&tmp_keys);
             unsafe {
                 builder.launch(LaunchConfig {
-                    grid_dim: (grid_dim, 1, 1),
+                    grid_dim: (grid_dim, rows as u32, 1),
                     block_dim: (TOPK_BLOCK, 1, 1),
                     shared_mem_bytes: 0,
                 })
@@ -197,7 +210,7 @@ impl candle_core::CustomOp1 for TopKIndicesOp {
             builder.arg(&out_idx);
             unsafe {
                 builder.launch(LaunchConfig {
-                    grid_dim: (1, 1, 1),
+                    grid_dim: (1, rows as u32, 1),
                     block_dim: (TOPK_BLOCK, 1, 1),
                     shared_mem_bytes: 0,
                 })
@@ -206,6 +219,11 @@ impl candle_core::CustomOp1 for TopKIndicesOp {
         }
 
         let dst = CudaStorage::wrap_cuda_slice(out_idx, dev.clone());
-        Ok((dst, Shape::from_dims(&[k])))
+        let shape = if dims.len() == 1 {
+            Shape::from_dims(&[k])
+        } else {
+            Shape::from_dims(&[rows, k])
+        };
+        Ok((dst, shape))
     }
 }

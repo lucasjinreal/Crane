@@ -21,6 +21,13 @@ use ribo::utils::log;
 use std::io::{Read, Seek};
 use std::sync::{Arc, Mutex};
 
+/// Below this many (token, expert) pairs per expert, the CUDA k-quant `MoE`
+/// path stays on the grouped matvec rather than switching to the dequantize +
+/// GEMM prefill path (see `SparseMoeBlock::k_quant_gemm_forward`). Measured
+/// crossover on an RTX 3090 at 256 experts, top-8: between 64 and 96.
+#[cfg(feature = "cuda")]
+const GROUPED_MAX_PAIRS_PER_EXPERT: usize = 80;
+
 /// Configuration for Mixture-of-Experts feed-forward layers.
 #[derive(Debug, Clone)]
 pub struct MoeConfig {
@@ -988,6 +995,18 @@ impl SparseMoeBlock {
         )? {
             return out.reshape(original_dims);
         }
+        #[cfg(feature = "cuda")]
+        if let Some(out) = Self::grouped_forward(
+            xs_f32,
+            topk_ids,
+            topk_weights,
+            gate_up_exps,
+            down_exps,
+            original_dtype,
+            original_dims,
+        )? {
+            return Ok(out);
+        }
         let intermediate_size = gate_up_exps.shape().dims()[1] / 2;
         let xs_3d = prof::timed(Span::MoeInputPrep, || xs_f32.unsqueeze(1)?.contiguous())?;
         let gate_up_out = prof::timed(Span::MoeGateUp, || {
@@ -1004,6 +1023,70 @@ impl SparseMoeBlock {
 
         prof::timed(Span::MoeCombine, || {
             Self::combine_expert_outputs(&down_out, topk_weights, original_dtype, original_dims)
+        })
+    }
+
+    /// Whether [`Self::grouped_forward`] handles these experts: `Q4_K` /
+    /// `Q5_K` / `Q6_K`, unless `CRANE_MOE_GROUPED=0`.
+    #[cfg(feature = "cuda")]
+    fn grouped_applies(gate_up_exps: &QTensor, down_exps: &QTensor) -> bool {
+        use crate::ops::moe_grouped::supported;
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("CRANE_MOE_GROUPED").map_or(true, |v| v != "0"))
+            && supported(gate_up_exps.dtype())
+            && supported(down_exps.dtype())
+    }
+
+    /// The default side of [`Self::fused_forward`] on CUDA, for `Q4_K` /
+    /// `Q5_K` / `Q6_K` experts below the GEMM threshold (decode, speculative
+    /// verify blocks and prefill chunks up to ~2.5k tokens): the batch's pairs are
+    /// bucketed by expert and each used expert is read once for all the
+    /// tokens routed to it ([`crate::ops::moe_grouped`]), where
+    /// `indexed_moe_forward` reads it once per pair, and the glue between the
+    /// projections is one launch each. Per layer on an RTX 3090 at
+    /// MiniCPM-V-4.7-35B-A3B shapes (`cuda_packed_k_quant_experts_bench`):
+    /// 0.117 -> 0.048 ms at 1 token, 0.77 -> 0.49 ms at a 16-token speculative
+    /// verify block, 21 -> 3.3 ms at 256 tokens (which used to take the GEMM).
+    /// `CRANE_MOE_GROUPED=0` restores the old dispatch. `None` when this path
+    /// does not apply.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a kernel launch or tensor op fails.
+    #[cfg(feature = "cuda")]
+    fn grouped_forward(
+        xs_f32: &Tensor,
+        topk_ids: &Tensor,
+        topk_weights: &Tensor,
+        gate_up_exps: &QTensor,
+        down_exps: &QTensor,
+        original_dtype: DType,
+        original_dims: &[usize],
+    ) -> Result<Option<Tensor>> {
+        use crate::ops::moe_grouped::{
+            combine, group_pairs, grouped_matvec_q8, quantize, swiglu_quantize,
+        };
+        if !xs_f32.device().is_cuda() || !Self::grouped_applies(gate_up_exps, down_exps) {
+            return Ok(None);
+        }
+        let experts = gate_up_exps.shape().dims3()?.0;
+        let top_k = topk_ids.dim(1)?;
+        // Six launches per layer: group, quantize, gate/up, swiglu+quantize,
+        // down, combine.
+        let (groups, xs_q8) = prof::timed(Span::MoeInputPrep, || {
+            Ok::<_, candle_core::Error>((group_pairs(topk_ids, experts)?, quantize(xs_f32)?))
+        })?;
+        let gate_up = prof::timed(Span::MoeGateUp, || {
+            grouped_matvec_q8(&xs_q8, &groups, gate_up_exps, top_k)
+        })?;
+        let hidden = prof::timed(Span::MoeActivation, || swiglu_quantize(&gate_up))?;
+        let down = prof::timed(Span::MoeDownProj, || {
+            grouped_matvec_q8(&hidden, &groups, down_exps, 1)
+        })?;
+        prof::timed(Span::MoeCombine, || {
+            combine(&down, topk_weights, original_dtype)?
+                .reshape(original_dims)
+                .map(Some)
         })
     }
 
@@ -1045,7 +1128,17 @@ impl SparseMoeBlock {
         ) else {
             return Ok(None);
         };
-        if topk_ids.elem_count() < GEMM_MIN_PAIRS {
+        // The GEMM path decodes every routed expert to f16 first, a fixed cost
+        // that the grouped matvec (`Self::grouped_forward`) does not pay: with
+        // it available, the GEMM only wins once each expert sees ~80 pairs
+        // (between 2048 and 3072 tokens at 256 experts, top-8; at 512 tokens
+        // the grouped path is 3.4x faster).
+        let min_pairs = if Self::grouped_applies(gate_up_exps, down_exps) {
+            GROUPED_MAX_PAIRS_PER_EXPERT * gate_up_exps.shape().dims3()?.0
+        } else {
+            GEMM_MIN_PAIRS
+        };
+        if topk_ids.elem_count() < min_pairs {
             return Ok(None);
         }
         let (_, gate_up_rows, hidden) = gate_up_exps.shape().dims3()?;
@@ -5718,7 +5811,7 @@ mod tests {
             IQuantExperts::new(IQuantType::Q6K, down, down_shape, &device)?,
         )?;
 
-        for tokens in [1usize, 8, 64, 512, 2048] {
+        for tokens in [1usize, 2, 4, 8, 16, 64, 256, 512, 2048, 4096] {
             // Small activations keep the random blocks' outputs inside f16.
             let xs = (Tensor::randn(0f32, 1.0, (tokens, hidden), &device)? * 0.01)?;
             let ids: Vec<u32> = (0..tokens * top_k)

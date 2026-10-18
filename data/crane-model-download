@@ -240,6 +240,44 @@ MODELS = {
         "kind": "vlm",
         "description": "MiniCPM-V 4.6, vision-language chat (Apache-2.0)",
     },
+    "minicpm-v-4.7": {
+        "repo_id": "openbmb/MiniCPM-V-4.7-1B",
+        "dirname": "MiniCPM-V-4.7-1B",
+        "kind": "vlm",
+        "description": "MiniCPM-V 4.7 1B, vision-language chat, canvas M-RoPE, 16x/4x visual token compression (Apache-2.0)",
+    },
+    "minicpm-v-4.7-gguf": {
+        "repo_id": "openbmb/MiniCPM-V-4.7-1B-gguf",
+        "dirname": "MiniCPM-V-4.7-1B-gguf",
+        "kind": "vlm",
+        "quant_template": "MiniCPM-V-4_7-1B-{quant}.gguf",
+        # The LLM GGUF is a plain `qwen35` file; the vision tower lives in the
+        # mmproj. crane-serve routes the GGUF to the VLM loader only because
+        # this mmproj sits beside it (or via `--mmproj`), so it must land in
+        # the same directory. The `mmproj-model-f16-4x.gguf` variant (no
+        # vit_merger, 4x-only) is not fetched; the full one serves both modes.
+        "extra_files": {
+            "openbmb/MiniCPM-V-4.7-1B-gguf": {
+                "mmproj-model-f16.gguf": "mmproj-model-f16.gguf",
+            },
+        },
+        "description": "MiniCPM-V 4.7 1B, GGUF LLM quant + mmproj vision projector, embedded tokenizer (Apache-2.0)",
+    },
+    "minicpm-v-4.7-dspark": {
+        "repo_id": "openbmb/MiniCPM-V-4.7-1B-DSpark",
+        "dirname": "MiniCPM-V-4.7-1B-DSpark",
+        "kind": "vlm",
+        "usage_hint": "crane-serve --model-path <MiniCPM-V-4.7-1B dir> --dspark {target}",
+        "description": "DSpark speculative-decoding draft heads for MiniCPM-V 4.7 1B, BF16 (Apache-2.0); pass to crane-serve --dspark",
+    },
+    "minicpm-v-4.7-dspark-gguf": {
+        "repo_id": "openbmb/MiniCPM-V-4.7-1B-DSpark-gguf",
+        "dirname": "MiniCPM-V-4.7-1B-DSpark-gguf",
+        "kind": "vlm",
+        "quant_template": "dspark-MiniCPM-V-4_7-1B-{quant}.gguf",
+        "usage_hint": "crane-serve --model-path <MiniCPM-V-4.7-1B GGUF> --dspark {target}",
+        "description": "DSpark speculative-decoding draft heads for MiniCPM-V 4.7 1B, GGUF quant (Apache-2.0); pass to crane-serve --dspark",
+    },
     "minicpm-o-4.5": {
         "repo_id": "openbmb/MiniCPM-o-4_5",
         "dirname": "MiniCPM-o-4_5",

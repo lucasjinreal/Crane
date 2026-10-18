@@ -1932,9 +1932,9 @@ pub(crate) fn simple_eval_(
                     bail!("select_last_index for ArgMin is currently not supported")
                 }
                 let output = if keepdims == 1 {
-                    input.argmin_keepdim(axis)?
+                    crate::ops::arg_reduce::argmin_keepdim(input, axis)?
                 } else {
-                    input.argmin(axis)?
+                    crate::ops::arg_reduce::argmin(input, axis)?
                 }
                 .to_dtype(DType::I64)?;
                 values.insert(node.output[0].clone(), output);
@@ -1960,9 +1960,9 @@ pub(crate) fn simple_eval_(
                     bail!("select_last_index for ArgMin is currently not supported")
                 }
                 let output = if keepdims == 1 {
-                    input.argmax_keepdim(axis)?
+                    crate::ops::arg_reduce::argmax_keepdim(input, axis)?
                 } else {
-                    input.argmax(axis)?
+                    crate::ops::arg_reduce::argmax(input, axis)?
                 }
                 .to_dtype(DType::I64)?;
                 values.insert(node.output[0].clone(), output);

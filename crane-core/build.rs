@@ -80,6 +80,8 @@ fn main() {
             "kernels/sycl/quant_iq.cpp",
             "kernels/sycl/hyper_connection.cpp",
             "kernels/sycl/qsa_mask.cpp",
+            "kernels/sycl/topk.cpp",
+            "kernels/sycl/dspark.cpp",
         ];
         let lib = out_dir.join("libcrane_gdn_sycl.so");
 

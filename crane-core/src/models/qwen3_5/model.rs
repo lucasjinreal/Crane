@@ -34,6 +34,9 @@ pub struct StateSnapshot {
     attn_lens: Vec<Option<usize>>,
 }
 
+/// Longest speculative pass that runs the GDN recurrence on the serial kernel.
+const SPEC_SERIAL_MAX: usize = 64;
+
 /// Text-only Qwen 3.5 transformer.
 ///
 /// `gdn_caches` is indexed by layer; `None` for full-attention blocks, `Some`
@@ -76,6 +79,7 @@ impl Qwen3_5TextModel {
         dtype: DType,
         quant: Option<GgmlDType>,
     ) -> Result<Self> {
+        disable_cuda_event_tracking(device);
         let text_cfg = cfg.text().clone();
         // HF saves Qwen 3.5 weights with the prefix
         //   model.language_model.layers.{i}.{linear_attn,self_attn}.*
@@ -220,6 +224,7 @@ impl Qwen3_5TextModel {
         device: &Device,
         extended: Option<crate::quantized::extended_gguf::ExtendedGgufInfo>,
     ) -> Result<Self> {
+        disable_cuda_event_tracking(device);
         // QMatMul handles quantized weights internally; dequantized side
         // tensors (norms, conv kernels) use the compute dtype, while the
         // embedding stays quantized whatever it is. F16 on Metal / ROCm /
@@ -611,6 +616,114 @@ impl Qwen3_5TextModel {
         let s = xs.dim(1)?;
         let last = xs.narrow(1, s - 1, 1)?.contiguous()?;
         self.head(&last)
+    }
+
+    /// Speculative-decoding verification pass over `hidden_states`
+    /// `[1, S, hidden]` (already embedded). Unlike [`Self::forward_embeds`] it
+    /// returns logits for the **last `n_logits` positions** and the
+    /// post-layer hidden states at `tap_layers` for **every** position.
+    ///
+    /// Every GDN layer snapshots its recurrent state after the first
+    /// `checkpoint_at` tokens; [`Self::commit_spec`] later restores it. That is
+    /// what lets a verification block be `[already-accepted tokens] + [drafts]`
+    /// without the rejected drafts leaving their mark on the recurrent state.
+    ///
+    /// `serial_gdn` runs the GDN recurrence on the serial kernel (one launch,
+    /// exact f32) when the block is short; pass `false` for prefill so it uses
+    /// the same kernels as a plain prefill.
+    ///
+    /// Returns `(logits [n_logits, vocab] f32, taps [S, tap_layers.len() * hidden])`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any layer, the head, or the tap concatenation fails.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_spec(
+        &mut self,
+        hidden_states: &Tensor,
+        position_ids: &Tensor,
+        start_pos: usize,
+        checkpoint_at: usize,
+        tap_layers: &[usize],
+        n_logits: usize,
+        serial_gdn: bool,
+    ) -> Result<(Tensor, Tensor)> {
+        let (_b, seq_len, _h) = hidden_states.dims3()?;
+        let timer = crate::utils::prof::pass(seq_len, hidden_states.device());
+        for slot in self.gdn_caches.iter_mut().flatten() {
+            slot.checkpoint_at = Some(checkpoint_at);
+            slot.checkpoint = None;
+            // A verification block is short: one serial launch beats the
+            // chunked formulation's dozens (long prefill chunks keep it).
+            slot.prefer_serial = serial_gdn && seq_len <= SPEC_SERIAL_MAX;
+        }
+        let mask = super::prefill::causal_mask(
+            seq_len,
+            start_pos,
+            hidden_states.device(),
+            self.attention_dtype(),
+        )?;
+        let (cos, sin) = self.rotary.cos_sin_with_position_ids(position_ids)?;
+        let rope = RopeSlice {
+            cos: &cos,
+            sin: &sin,
+            rot_dim: self.rotary.rot_dim(),
+        };
+        let mut xs = hidden_states.clone();
+        if xs.dtype() != self.attention_dtype() {
+            xs = xs.to_dtype(self.attention_dtype())?;
+        }
+        let mut taps = Vec::with_capacity(tap_layers.len());
+        for i in 0..self.layers.len() {
+            let layer = &self.layers[i];
+            let gdn_slot = self.gdn_caches[i].as_mut();
+            let attn_slot = self.attn_caches[i].as_mut();
+            xs = layer.forward(&xs, rope, Some(&mask), gdn_slot, attn_slot)?;
+            if tap_layers.contains(&i) {
+                taps.push(xs.clone());
+            }
+        }
+        let taps = Tensor::cat(&taps, 2)?.squeeze(0)?;
+        let n = n_logits.min(seq_len);
+        if n == 0 {
+            let empty = Tensor::zeros((0, 1), DType::F32, xs.device())?;
+            if let Some(t) = timer {
+                t.finish(xs.device());
+            }
+            return Ok((empty, taps));
+        }
+        let tail = xs.narrow(1, seq_len - n, n)?.contiguous()?;
+        let logits = crate::utils::prof::timed(crate::utils::prof::Span::Head, || {
+            let normed = self.norm.forward(&tail)?.reshape((n, ()))?;
+            self.lm_head.forward_logits(&normed)
+        })?;
+        if let Some(t) = timer {
+            t.finish(xs.device());
+        }
+        Ok((logits.to_dtype(DType::F32)?, taps))
+    }
+
+    /// Finish a [`Self::forward_spec`] round: every GDN layer reverts to its
+    /// checkpoint and every full-attention K/V cache is truncated to
+    /// `attn_len` tokens, i.e. the model state is "everything before
+    /// `checkpoint_at`" again.
+    pub fn commit_spec(&mut self, attn_len: usize) {
+        for slot in self.gdn_caches.iter_mut().flatten() {
+            slot.take_checkpoint();
+        }
+        for slot in self.attn_caches.iter_mut().flatten() {
+            slot.truncate(attn_len);
+        }
+    }
+
+    /// `lm_head` alone (no final norm) over rows `[N, hidden]` -> `[N, vocab]`.
+    /// For drafters that share the target's output head.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the head matmul fails.
+    pub fn lm_head_logits(&self, hidden: &Tensor) -> Result<Tensor> {
+        Ok(self.lm_head.forward_logits(hidden)?)
     }
 
     /// Run every decoder layer over already-embedded hidden states `xs`,
@@ -1135,6 +1248,24 @@ impl ModelForCausalLM for Model {
         }
         Ok(tokens)
     }
+}
+
+/// Turn off candle's per-tensor CUDA event tracking (cudarc records and waits
+/// on an event around every tensor access, for multi-stream safety). Crane
+/// runs each model on one stream, so the events are pure overhead: on
+/// MiniCPM-V-4.7-35B-A3B they were ~31k driver calls (~8.5 ms of CPU) per
+/// DSpark round. The other decoders do the same (`EventTrackingGuard`).
+fn disable_cuda_event_tracking(device: &Device) {
+    #[cfg(feature = "cuda")]
+    if let Device::Cuda(dev) = device {
+        if dev.is_event_tracking() {
+            // Safety: all work for this model is issued on the device's single
+            // stream, so ordering is already guaranteed without events.
+            unsafe { dev.disable_event_tracking() };
+        }
+    }
+    #[cfg(not(feature = "cuda"))]
+    let _ = device;
 }
 
 #[cfg(test)]

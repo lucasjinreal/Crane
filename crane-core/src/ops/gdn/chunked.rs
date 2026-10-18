@@ -3,10 +3,10 @@
 //! Chunked (blocked) formulation of the gated delta rule recurrence, used for
 //! prefill (`seq_len > 1`) on CUDA, `ROCm`, and SYCL — the backends whose
 //! serial per-timestep kernel pays a device kernel-launch/sync cost per
-//! token. CPU and Metal never reach this module: they keep using the
-//! original per-timestep [`super::gated_delta_rule_recurrence`], whose
-//! per-op cost is a plain function call rather than a device launch, so the
-//! motivation for chunking doesn't apply there.
+//! token. The CPU never reaches this module: it keeps using the original
+//! per-timestep [`super::gated_delta_rule_recurrence`], whose per-op cost is
+//! a plain function call rather than a device launch. On Metal it is opt-in
+//! (`CRANE_GDN_CHUNKED=1`): the Metal serial kernel is faster at every length.
 //!
 //! [`super::cuda_backend`] / [`super::rocm_backend`] launch a kernel that
 //! scans the whole sequence one timestep at a time — for a 2048-token prefill
@@ -39,7 +39,12 @@
 // job that actually executes tests (GPU-feature builds only compile-check
 // there; see AGENTS.md's Build Commands section).
 #![cfg_attr(
-    not(any(feature = "cuda", feature = "rocm", feature = "sycl")),
+    not(any(
+        feature = "cuda",
+        feature = "rocm",
+        feature = "sycl",
+        feature = "metal"
+    )),
     allow(dead_code)
 )]
 
@@ -48,6 +53,7 @@ use candle_core::{DType, Result, Tensor};
 /// Maximum chunk size the triangular-inverse kernel supports without opting
 /// into larger-than-default dynamic shared memory: `2*cs*cs*4 <= 49152`
 /// (the 48KB default limit on every CUDA/ROCm GPU without an opt-in call).
+#[cfg_attr(not(any(feature = "cuda", feature = "rocm")), allow(dead_code))]
 pub(super) const MAX_CHUNK_SIZE: usize = 78;
 
 /// Chunk size for the blocked recurrence. Matches llama.cpp's non-KDA
@@ -265,6 +271,12 @@ fn build_tri_inverse(kb: &Tensor, cs: usize) -> Result<Tensor> {
     #[cfg(all(feature = "rocm", not(feature = "cuda")))]
     if kb.device().is_rocm() {
         return super::rocm_backend::gdn_chunk_tri_inverse_rocm(kb);
+    }
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    if kb.device().is_metal()
+        && let Some(t_inv) = super::metal_backend::gdn_chunk_tri_inverse_metal(kb)?
+    {
+        return Ok(t_inv);
     }
     build_tri_inverse_portable(kb, cs)
 }

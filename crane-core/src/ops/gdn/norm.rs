@@ -76,6 +76,21 @@ impl RmsNormGated {
         }
     }
 
+    #[cfg(any(feature = "cuda", feature = "metal"))]
+    pub(super) fn activation(&self) -> GateActivation {
+        self.activation
+    }
+
+    #[cfg(any(feature = "cuda", feature = "metal"))]
+    pub(super) fn eps(&self) -> f32 {
+        self.eps
+    }
+
+    #[cfg(any(feature = "cuda", feature = "metal"))]
+    pub(super) fn weight(&self) -> &Tensor {
+        &self.weight
+    }
+
     /// Forward pass. `x` and `gate` must share shape `[..., size]`.
     ///
     /// # Errors

@@ -40,7 +40,7 @@ fn emit_sycl_rpath() {
             }
         }
     }
-    found.sort_by(|a, b| b.0.cmp(&a.0));
+    found.sort_by_key(|(when, _)| std::cmp::Reverse(*when));
 
     // `--disable-new-dtags` emits the old DT_RPATH rather than DT_RUNPATH:
     // RUNPATH applies only to the object carrying it, while RPATH is searched

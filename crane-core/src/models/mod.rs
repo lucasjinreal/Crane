@@ -9,6 +9,7 @@
 // practice.
 #![allow(clippy::cast_precision_loss)]
 
+pub mod dspark;
 #[cfg(feature = "onnx")]
 pub mod g2p;
 #[cfg(feature = "onnx")]

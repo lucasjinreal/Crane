@@ -63,10 +63,30 @@ impl Merger {
     /// Returns an error if the `VarBuilder`'s weights are missing or have a
     /// shape that doesn't match the merger's expected layer dimensions.
     pub fn new(cfg: &Config, vb: &VarBuilder) -> Result<Self> {
-        let (merge_h, merge_w) = cfg.merge_kernel_size;
-        let vision_hidden = cfg.vision_config.hidden_size;
-        let llm_hidden = cfg.text_config.hidden_size;
-        let merger_times = cfg.merger_times.max(1);
+        Self::with_dims(
+            cfg.vision_config.hidden_size,
+            cfg.text_config.hidden_size,
+            cfg.merge_kernel_size,
+            cfg.merger_times,
+            vb,
+        )
+    }
+
+    /// Like [`Self::new`], from explicit dimensions — for loaders with no
+    /// HF `config.json` (the mmproj GGUF path).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::new`].
+    pub fn with_dims(
+        vision_hidden: usize,
+        llm_hidden: usize,
+        merge_kernel_size: (usize, usize),
+        merger_times: usize,
+        vb: &VarBuilder,
+    ) -> Result<Self> {
+        let (merge_h, merge_w) = merge_kernel_size;
+        let merger_times = merger_times.max(1);
 
         let vb_mlp = vb.pp("mlp");
         let mut mlp = Vec::with_capacity(merger_times);
