@@ -812,7 +812,8 @@ fn resolve_dtype(
 /// Resolve `--gpu-memory-limit` / `--offload-experts` into an initial `MoE`
 /// expert `Device` (`devices.expert`) and, when the real GPU/CPU split must
 /// be decided after the model exists, an [`ExpertCachePolicy`] for the
-/// caller to hand to [`crate::engine::backend::Qwen3Backend::new`].
+/// caller to hand to [`crate::engine::backend::Qwen3Backend::new`] /
+/// [`crate::engine::backend::Qwen3_5Backend::new_with_options`].
 ///
 /// - No GPU / `--cpu`, or `--offload-experts`: experts start (and stay) on
 ///   CPU, no cache.

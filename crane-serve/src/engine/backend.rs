@@ -605,6 +605,10 @@ pub struct Qwen3_5Backend {
     pub model: crane_core::models::qwen3_5::Model,
     #[allow(dead_code)]
     dtype: DType,
+    /// Per-expert GPU residency cache, if one was seeded at construction
+    /// (`cache_policy` was `Some` and enough VRAM remained for at least one
+    /// slot per layer). `None` means every expert stays CPU-resident.
+    expert_cache: Option<Arc<ExpertCache>>,
 }
 
 impl Qwen3_5Backend {
@@ -618,6 +622,7 @@ impl Qwen3_5Backend {
             dtype,
             crane_core::models::qwen3_5::ModelFormat::Auto,
             None,
+            None,
         )
     }
 
@@ -625,19 +630,26 @@ impl Qwen3_5Backend {
     /// `None` falls back to the `CRANE_ISQ` env var inside the model loader.
     /// `devices.expert` places `MoE` expert weights on a different device
     /// than the rest of the model (`MoE` `CPU` offload); callers that don't
-    /// need that should pass [`DeviceAssignment::uniform`].
+    /// need that should pass [`DeviceAssignment::uniform`]. `cache_policy`
+    /// is `Some` only when `devices.expert` starts on CPU and the runtime
+    /// wants the model to attempt seeding a per-expert [`ExpertCache`]
+    /// after construction, once real VRAM headroom is known.
     ///
     /// # Errors
     ///
-    /// Returns an error if the model fails to load from `model_path`.
+    /// Returns an error if the model fails to load from `model_path`, or if
+    /// seeding the expert cache fails outright (not counting an
+    /// out-of-memory sizing decision, which is caught and logged inside the
+    /// model as a fallback to all-CPU dispatch).
     pub fn new_with_options(
         model_path: &str,
         devices: &DeviceAssignment,
         dtype: &DType,
         format: crane_core::models::qwen3_5::ModelFormat,
         quant: Option<crane_core::GgmlDType>,
+        cache_policy: Option<&ExpertCachePolicy>,
     ) -> Result<Self> {
-        let model = match quant {
+        let mut model = match quant {
             Some(dt) => crane_core::models::qwen3_5::Model::new_with_options_and_devices(
                 model_path,
                 devices,
@@ -649,9 +661,19 @@ impl Qwen3_5Backend {
                 model_path, devices, dtype, format,
             )?,
         };
+        let expert_cache = match cache_policy {
+            Some(p) => model.seed_expert_cache(
+                p.vram_ceiling_bytes,
+                p.max_concurrent,
+                p.max_seq_len,
+                p.chunk_tokens,
+            )?,
+            None => None,
+        };
         Ok(Self {
             model,
             dtype: *dtype,
+            expert_cache,
         })
     }
 }
@@ -714,6 +736,38 @@ impl ModelBackend for Qwen3_5Backend {
 
     fn warmup(&mut self) {
         self.model.warmup();
+    }
+
+    fn kv_bytes_per_token(&self) -> Option<u64> {
+        Some(self.model.kv_bytes_per_token())
+    }
+
+    fn moe_offload_reservation_bytes(&self, chunk_tokens: usize) -> u64 {
+        self.model.moe_offload_reservation_bytes(chunk_tokens)
+    }
+
+    fn reseed_expert_cache(&mut self, policy: &ExpertCachePolicy) -> Result<()> {
+        // `ExpertCache`'s own slot budget is fixed at seed time from the
+        // VRAM available then; it never grows on its own (decay_and_swap
+        // only changes *which* experts are cached, not how many). Drop the
+        // old cache first so its GPU tensors are freed before the reseed's
+        // live VRAM query runs, or the freed headroom this call exists to
+        // reclaim would be undercounted.
+        self.model.clear_expert_cache();
+        self.expert_cache = None;
+        self.expert_cache = self.model.seed_expert_cache(
+            policy.vram_ceiling_bytes,
+            policy.max_concurrent,
+            policy.max_seq_len,
+            policy.chunk_tokens,
+        )?;
+        Ok(())
+    }
+
+    fn expert_cache_on_step(&self, tokens_this_step: u64) -> Result<usize> {
+        self.expert_cache
+            .as_ref()
+            .map_or(Ok(0), |c| c.on_step(tokens_this_step).map_err(Into::into))
     }
 
     // supports_kv_swap defaults to false → engine caps max_concurrent to 1.

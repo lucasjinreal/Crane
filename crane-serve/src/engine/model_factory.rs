@@ -586,9 +586,10 @@ fn resolve(model_type: ModelType, model_path: &str) -> ModelType {
 ///
 /// `quant` requests in-situ quantization of a safetensors checkpoint (e.g.
 /// `q4k`, `q8_0`); only backends that support it accept the flag.
-/// `devices.expert` and `cache_policy` are Qwen3-specific `MoE` expert
-/// placement inputs (see [`super::backend::Qwen3Backend::new`]); ignored by
-/// every other backend, which uses `devices.main` for everything.
+/// `devices.expert` and `cache_policy` are `MoE` expert placement inputs
+/// consumed by `MoE` backends (see [`super::backend::Qwen3Backend::new`],
+/// [`super::backend::Qwen3_5Backend::new_with_options`]); ignored by every
+/// other backend, which uses `devices.main` for everything.
 ///
 /// # Errors
 ///
@@ -667,7 +668,12 @@ pub fn create_backend(
                 ModelFormat::Auto => crane_core::models::qwen3_5::ModelFormat::Auto,
             };
             Ok(Box::new(Qwen3_5Backend::new_with_options(
-                model_path, devices, dtype, q35_fmt, quant,
+                model_path,
+                devices,
+                dtype,
+                q35_fmt,
+                quant,
+                cache_policy,
             )?))
         },
         ModelType::Qwen4Exp => {
