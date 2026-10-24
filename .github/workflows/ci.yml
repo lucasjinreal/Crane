@@ -66,8 +66,24 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: Jimver/cuda-toolkit@v0.2.35
+      - uses: Jimver/cuda-toolkit@v0.2.36
         id: cuda-toolkit
+        with:
+          # 'local' installs the full toolkit meta-package, including
+          # GDS/nvidia-fs, Nsight, and cuda-demo-suite; their post-install
+          # scripts fail on this runner (no GPU/driver) even with
+          # --toolkit-only args. 'network' lets us request only what
+          # candle's cudarc build links against (see cudarc's feature list
+          # in .tmp/candle/Cargo.toml: cublas, cublaslt, curand, driver,
+          # nvrtc) plus nvcc/cudart.
+          method: network
+          # The runner image is on Ubuntu 26.04 now, whose NVIDIA apt repo
+          # only carries CUDA 13.3+ (no -13-2 packages, the action's
+          # default). Pin to 13.3.1, the newest version this action's
+          # release still recognizes (13.4 isn't in its version list yet).
+          cuda: '13.3.1'
+          sub-packages: '["nvcc", "cudart", "cudart-dev", "nvrtc", "nvrtc-dev", "driver-dev"]'
+          non-cuda-sub-packages: '["libcublas", "libcublas-dev", "libcurand", "libcurand-dev"]'
       - name: Install protoc and ALSA dev headers
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libasound2-dev
       - name: Build (CUDA)

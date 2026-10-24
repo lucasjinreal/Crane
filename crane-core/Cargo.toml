@@ -31,6 +31,11 @@ ahash = "0.8"
 anyhow = "1.0.97"
 
 candle-flash-attn = { version = "=0.11.0", optional = true }
+# ROCm counterpart to `candle-flash-attn` above, for parity/speed testing
+# against this crate's own vendored fattn_mma/fattn_tile kernels: same
+# forward-pass causal/windowed API shape, backed by AMD Composable Kernel
+# instead of CUTLASS.
+candle-flash-attn-rocm = { git = "https://github.com/cryptomilk/candle-flash-attn-rocm", optional = true }
 # Candle backend variants — see `src/candle_backend.rs`. Every variant,
 # including the plain/stock one, is a *renamed* dependency on the underlying
 # `candle-core`/`candle-nn`/`candle-transformers` package (`candle-core-default`,
@@ -164,6 +169,10 @@ rocm = [
     "candle-nn-rocm/rocm",
     "candle-transformers-rocm/rocm",
 ]
+# Pulls in candle-flash-attn-rocm (CK-backed) purely for the parity tests in
+# `ops::fused_ops::fattn_mma`'s `gpu_tests` that compare it against this
+# crate's own vendored kernels. Requires `rocm`.
+flash-attn-rocm = ["rocm", "dep:candle-flash-attn-rocm"]
 # Intel oneAPI/SYCL backend (experimental fork). Same deal as `rocm` above,
 # including the `--no-default-features` requirement.
 sycl = [

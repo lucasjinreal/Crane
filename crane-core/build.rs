@@ -23,8 +23,49 @@ fn oneapi_runtime_dirs() -> Vec<String> {
     .collect()
 }
 
-fn main() {
+/// Non-recursive `.cu` file listing for a single directory, sorted for
+/// deterministic build output.
+#[cfg(feature = "cuda")]
+fn cu_files_in(dir: &str) -> Vec<std::path::PathBuf> {
+    let mut paths: Vec<_> = std::fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("reading {dir}: {e}"))
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|ext| ext == "cu"))
+        .collect();
+    paths.sort();
+    paths
+}
 
+/// Compiles `kernels/cuda/`'s (and `kernels/cuda/fattn/`'s) `.cu` sources
+/// into the `crane_kernels_ptx.rs` bindings `ops::fused_ops`'s CUDA
+/// dispatchers `include!`. `flash_attention/` holds a separately built host
+/// launch adapter (cudaforge + CUTLASS, gated behind
+/// `flash-attn`/`flash-inference`) that must not go through this PTX-only
+/// pipeline, so it's deliberately not globbed here.
+#[cfg(feature = "cuda")]
+fn build_cuda_ptx() {
+    use std::env;
+    use std::path::PathBuf;
+
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+
+    let mut kernel_paths = cu_files_in("kernels/cuda");
+    kernel_paths.extend(cu_files_in("kernels/cuda/fattn"));
+
+    let builder = bindgen_cuda::Builder::default()
+        .kernel_paths(kernel_paths)
+        .arg("--expt-relaxed-constexpr")
+        .arg("--extended-lambda")
+        .arg("-std=c++17")
+        .arg("-O3");
+
+    let bindings = builder.build_ptx().expect("Failed to compile CUDA kernels");
+    bindings
+        .write(out_dir.join("crane_kernels_ptx.rs"))
+        .expect("Failed to write PTX bindings");
+}
+
+fn main() {
     #[cfg(any(feature = "flash-attn", feature = "flash-inference"))]
     {
         use std::path::PathBuf;
@@ -39,19 +80,26 @@ fn main() {
         });
         println!("cargo::rerun-if-env-changed=CRANE_FLASH_ATTN_HEADERS");
         println!("cargo::rerun-if-changed=kernels/cuda/flash_attention/");
-        let out=PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
+        let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
         cudaforge::KernelBuilder::new()
             .source_files(["kernels/cuda/flash_attention/launch.cu"])
             .out_dir(&out)
             .with_cutlass(Some("7d49e6c7e2f8896c47f586706e67e1fb215529dc"))
-            .arg(&format!("-I{}",headers.display()))
-            .arg("-std=c++17").arg("-O3").arg("--fmad=true")
-            .arg("--expt-relaxed-constexpr").arg("--expt-extended-lambda")
-            .arg("-U__CUDA_NO_HALF_OPERATORS__").arg("-U__CUDA_NO_HALF_CONVERSIONS__")
-            .arg("-U__CUDA_NO_HALF2_OPERATORS__").arg("-U__CUDA_NO_BFLOAT16_CONVERSIONS__")
-            .arg("-Xcompiler").arg("-fPIC")
-            .build_lib(out.join("libcrane_flash_split.a")).expect("build Crane split-KV launcher");
-        println!("cargo::rustc-link-search=native={}",out.display());
+            .arg(&format!("-I{}", headers.display()))
+            .arg("-std=c++17")
+            .arg("-O3")
+            .arg("--fmad=true")
+            .arg("--expt-relaxed-constexpr")
+            .arg("--expt-extended-lambda")
+            .arg("-U__CUDA_NO_HALF_OPERATORS__")
+            .arg("-U__CUDA_NO_HALF_CONVERSIONS__")
+            .arg("-U__CUDA_NO_HALF2_OPERATORS__")
+            .arg("-U__CUDA_NO_BFLOAT16_CONVERSIONS__")
+            .arg("-Xcompiler")
+            .arg("-fPIC")
+            .build_lib(out.join("libcrane_flash_split.a"))
+            .expect("build Crane split-KV launcher");
+        println!("cargo::rustc-link-search=native={}", out.display());
         println!("cargo::rustc-link-lib=static=crane_flash_split");
         println!("cargo::rustc-link-lib=dylib=cudart");
         println!("cargo::rustc-link-lib=dylib=stdc++");
@@ -78,26 +126,7 @@ fn main() {
 
     // Only compile CUDA kernels when the cuda feature is enabled.
     #[cfg(feature = "cuda")]
-    {
-        use std::env;
-        use std::path::PathBuf;
-
-        let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-
-        // Top-level CUDA sources are embedded PTX kernels. Subdirectories
-        // contain separately built host launch adapters, such as FlashAttention,
-        // which must not be compiled through the PTX-only pipeline.
-        let builder = bindgen_cuda::Builder::default()
-            .kernel_paths_glob("kernels/cuda/*.cu")
-            .arg("--expt-relaxed-constexpr")
-            .arg("-std=c++17")
-            .arg("-O3");
-
-        let bindings = builder.build_ptx().expect("Failed to compile CUDA kernels");
-        bindings
-            .write(out_dir.join("crane_kernels_ptx.rs"))
-            .expect("Failed to write PTX bindings");
-    }
+    build_cuda_ptx();
 
     // Compile the fused SYCL kernels into `libcrane_gdn_sycl.so` with `icpx`.
     // Only when `--features sycl` — a plain build never needs oneAPI. The

@@ -45,7 +45,9 @@ impl BiasedLinear {
         })
     }
     /// Configure only this F32 linear, without changing attention matmul precision.
-    pub fn set_tf32(&mut self, enabled: bool) { self.f32_tf32=enabled; }
+    pub fn set_tf32(&mut self, enabled: bool) {
+        self.f32_tf32 = enabled;
+    }
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         if xs.dim(candle_core::D::Minus1)? != self.inner.weight().dim(1)? {
             candle_core::bail!("biased linear input width differs from its weights");
@@ -56,7 +58,8 @@ impl BiasedLinear {
         #[cfg(feature = "cuda")]
         if let Some(blas) = &self.blas {
             if self.inner.weight().dtype() == DType::BF16
-                || self.f32_tf32 || candle_core::cuda_backend::gemm_reduced_precision_f32()
+                || self.f32_tf32
+                || candle_core::cuda_backend::gemm_reduced_precision_f32()
             {
                 return match self.inner.weight().dtype() {
                     DType::BF16 => self.forward_cuda::<half::bf16>(xs, blas),

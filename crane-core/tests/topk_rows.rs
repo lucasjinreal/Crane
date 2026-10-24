@@ -57,12 +57,18 @@ fn gpu_argmax_handles_bf16_and_f32() {
     #[cfg(all(feature = "sycl", not(any(feature = "cuda", feature = "metal"))))]
     let dev = Device::new_sycl(0).unwrap();
     let n = 248_094;
-    let noise = Tensor::randn(0f32, 1.0, n, &Device::Cpu).unwrap().to_vec1::<f32>().unwrap();
+    let noise = Tensor::randn(0f32, 1.0, n, &Device::Cpu)
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
     for spike in [0, n / 2, n - 1] {
         let mut v = noise.clone();
         v[spike] = 100.0;
         for dt in [DType::F32, DType::BF16] {
-            let logits = Tensor::from_vec(v.clone(), n, &dev).unwrap().to_dtype(dt).unwrap();
+            let logits = Tensor::from_vec(v.clone(), n, &dev)
+                .unwrap()
+                .to_dtype(dt)
+                .unwrap();
             let got = crane_core::ops::gpu_argmax(&logits).unwrap();
             assert_eq!(got as usize, spike, "{dt:?}");
         }

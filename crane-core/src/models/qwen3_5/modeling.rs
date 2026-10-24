@@ -19,7 +19,9 @@ use candle_core::{D, DType, Device, Module, Result, Tensor};
 use candle_nn::VarBuilder;
 use std::io::{Read, Seek};
 
+use crate::models::modules::attn_dispatch;
 use crate::models::modules::moe::{MlpOrMoe, SparseMoeBlock};
+use crate::models::utils::CausalMask;
 use crate::ops::linear::{LinearLayer, linear_layer};
 use crate::quantized::gguf_file::Gguf;
 
@@ -79,7 +81,11 @@ impl Qwen35RmsNorm {
 impl Module for Qwen35RmsNorm {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         if matches!(x.dtype(), DType::BF16 | DType::F16) {
-            return crate::ops::float_math::rms_norm_low_precision(x,&self.alpha.to_dtype(DType::F32)?,self.eps);
+            return crate::ops::float_math::rms_norm_low_precision(
+                x,
+                &self.alpha.to_dtype(DType::F32)?,
+                self.eps,
+            );
         }
         let alpha = self.alpha.to_dtype(x.dtype())?;
         candle_nn::ops::rms_norm(&x.contiguous()?, &alpha, self.eps)
@@ -398,24 +404,6 @@ pub struct RopeSlice<'a> {
 
 // ── Full-attention layer ────────────────────────────────────────────────
 
-/// Standard softmax attention layer for Qwen 3.5's `full_attention` blocks.
-///
-/// Differences from the regular Qwen 3 attention:
-/// - `q_proj` outputs `num_heads * head_dim * 2`; the second half is a sigmoid
-///   gate applied to the attention output.
-/// - Per-head QK-norm is always present (`q_norm`, `k_norm` of size `head_dim`).
-/// - `RoPE` is MRoPE-interleaved applied only to the first `rot_dim` components.
-///   `CRANE_ATTN_EXPAND=1` forces the legacy GQA-expansion path (decode and
-///   prefill) instead of the grouped matmul. The two are mathematically
-///   identical, so this exists to A/B them: same binary, same weights, one
-///   variable.
-fn legacy_attn_expand() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("CRANE_ATTN_EXPAND").is_ok_and(|v| !matches!(v.trim(), "" | "0"))
-    })
-}
-
 /// Shape of a [`FullAttention`] layer, independent of which model config it
 /// comes from.
 #[derive(Debug, Clone, Copy)]
@@ -440,6 +428,13 @@ impl From<&TextConfig> for AttentionDims {
     }
 }
 
+/// Standard softmax attention layer for Qwen 3.5's `full_attention` blocks.
+///
+/// Differences from the regular Qwen 3 attention:
+/// - `q_proj` outputs `num_heads * head_dim * 2`; the second half is a sigmoid
+///   gate applied to the attention output.
+/// - Per-head QK-norm is always present (`q_norm`, `k_norm` of size `head_dim`).
+/// - `RoPE` is MRoPE-interleaved applied only to the first `rot_dim` components.
 pub struct FullAttention {
     q_proj: LinearLayer,
     k_proj: LinearLayer,
@@ -454,7 +449,12 @@ pub struct FullAttention {
     /// Dtype the K/V cache and attention run in when it differs from the
     /// activations' (see [`Self::set_attention_dtype`]); `None` follows them.
     attn_dtype: Option<DType>,
-    flash_causal: bool,
+    /// Whether this layer's mask is plain causal. When `true`, GPU flash
+    /// attention is attempted regardless of whether a pre-built mask tensor
+    /// is present (the fused kernel derives its own causal pattern from
+    /// `kv_offset`, so the mask is redundant). `false` for Qwen4-Exp, whose
+    /// QSA indexer mask is not representable by the fused kernel.
+    causal: bool,
 }
 
 impl FullAttention {
@@ -470,11 +470,15 @@ impl FullAttention {
     ///
     /// Returns an error if a required weight tensor is missing or has an unexpected shape.
     pub fn load(cfg: &TextConfig, vb: &VarBuilder, quant: Option<GgmlDType>) -> Result<Self> {
-        Self::load_dims(AttentionDims::from(cfg), cfg.hidden_size, vb, quant)
+        Self::load_dims(AttentionDims::from(cfg), cfg.hidden_size, vb, quant, true)
     }
 
     /// [`Self::load`] for any config that shares this attention (HF layout:
     /// `q_proj`, `k_proj`, `v_proj`, `o_proj`, `q_norm`, `k_norm`).
+    ///
+    /// `causal` controls whether GPU flash attention is attempted; pass
+    /// `false` for callers whose mask isn't plain causal (e.g. Qwen4-Exp's
+    /// QSA indexer).
     ///
     /// # Errors
     ///
@@ -484,6 +488,7 @@ impl FullAttention {
         hidden_size: usize,
         vb: &VarBuilder,
         quant: Option<GgmlDType>,
+        causal: bool,
     ) -> Result<Self> {
         let AttentionDims {
             num_heads,
@@ -516,7 +521,7 @@ impl FullAttention {
             head_dim,
             has_output_gate: output_gate,
             attn_dtype: None,
-            flash_causal: false,
+            causal,
         })
     }
 
@@ -540,11 +545,15 @@ impl FullAttention {
         gg: &mut Gguf<R>,
         layer_idx: usize,
     ) -> Result<Self> {
-        Self::from_gguf_dims(AttentionDims::from(cfg), gg, layer_idx)
+        Self::from_gguf_dims(AttentionDims::from(cfg), gg, layer_idx, true)
     }
 
     /// [`Self::from_gguf`] for any config sharing the llama.cpp layout
     /// (`attn_q`, `attn_k`, `attn_v`, `attn_output`, `attn_{q,k}_norm`).
+    ///
+    /// `causal` controls whether GPU flash attention is attempted; pass
+    /// `false` for callers whose mask isn't plain causal (e.g. Qwen4-Exp's
+    /// QSA indexer).
     ///
     /// # Errors
     ///
@@ -553,6 +562,7 @@ impl FullAttention {
         dims: AttentionDims,
         gg: &mut Gguf<R>,
         layer_idx: usize,
+        causal: bool,
     ) -> Result<Self> {
         let prefix = format!("blk.{layer_idx}");
         let q_proj = gg.linear(&format!("{prefix}.attn_q.weight"))?;
@@ -581,7 +591,7 @@ impl FullAttention {
             head_dim: dims.head_dim,
             has_output_gate: dims.output_gate,
             attn_dtype: None,
-            flash_causal: false,
+            causal,
         })
     }
 
@@ -596,6 +606,7 @@ impl FullAttention {
         &self,
         x: &Tensor,
         rope: RopeSlice<'_>,
+        causal_mask: Option<&CausalMask>,
         attention_mask: Option<&Tensor>,
         kv_cache: Option<&mut KvCache>,
     ) -> Result<Tensor> {
@@ -654,7 +665,9 @@ impl FullAttention {
             _ => (q, k, v),
         };
         // The model builds its mask in the attention dtype; a caller-supplied
-        // one may not match.
+        // one may not match. `causal_mask` needs no equivalent cast here:
+        // `attn_dispatch::causal`'s fused-kernel and matmul-fallback paths
+        // both already cast it to the query's dtype internally.
         let attention_mask = match attention_mask {
             Some(m) if m.dtype() != q.dtype() => Some(m.to_dtype(q.dtype())?),
             Some(m) => Some(m.clone()),
@@ -670,36 +683,23 @@ impl FullAttention {
             None => (k, v),
         };
 
-        let n_rep = self.num_heads / self.num_kv_heads;
-        let scale = 1.0 / (self.head_dim as f64).sqrt();
+        let scale = attn_dispatch::attention_scale(self.head_dim);
 
-        #[cfg(any(feature = "flash-attn", feature = "flash-inference"))]
-        let flash_output = if self.flash_causal
-            && q.device().is_cuda()
-            && matches!(q.dtype(), DType::BF16 | DType::F16)
-        {
-            Some(
-                {
-                    let fq=q.transpose(1,2)?.contiguous()?;
-                    let fk=k.transpose(1,2)?.contiguous()?;
-                    let fv=v.transpose(1,2)?.contiguous()?;
-                    if q.dtype()==DType::BF16 && self.head_dim==256 && fq.dim(1)?==fk.dim(1)? {
-                        crate::ops::flash_split::causal_bf16_256_auto(&fq,&fk,&fv)
-                    } else {crate::ops::flash_split::attention(&fq,&fk,&fv,scale as f32,true)}
-                }?
-                .reshape((b_sz, seq_len, self.num_heads * self.head_dim))?,
-            )
+        let y = if self.causal {
+            if seq_len == 1 {
+                attn_dispatch::merge_heads(&attn_dispatch::decode(
+                    &q,
+                    &k,
+                    &v,
+                    scale,
+                    attention_mask,
+                )?)?
+            } else {
+                attn_dispatch::merge_heads(&attn_dispatch::causal(&q, &k, &v, scale, causal_mask)?)?
+            }
         } else {
-            None
-        };
-        #[cfg(not(any(feature = "flash-attn", feature = "flash-inference")))]
-        let flash_output: Option<Tensor> = None;
-        let y = if let Some(output) = flash_output {
-            output
-        } else if legacy_attn_expand() {
-            expanded_sdpa(&q, &k, &v, attention_mask, scale, n_rep)?
-        } else {
-            grouped_sdpa(&q, &k, &v, attention_mask, scale, n_rep)?
+            let n_rep = self.num_heads / self.num_kv_heads;
+            grouped_sdpa(&q, &k, &v, attention_mask, f64::from(scale), n_rep)?
         }
         .to_dtype(out_dtype)?;
 
@@ -740,7 +740,7 @@ pub(crate) fn attn_query_slice(heads: usize, cells: usize) -> usize {
 /// [`attn_query_slice`], so the score matrix stays bounded however long the
 /// prefill chunk and the context are.
 ///
-/// Expanding them instead (see [`expanded_sdpa`]) materializes `k_rep`,
+/// Expanding them instead materializes `k_rep`,
 /// `v_rep` and `k_t`, each `[B, num_heads, cells, D]`: on Qwen3.8-27B (24 q /
 /// 4 KV heads) that was 1.7 GB of traffic per decoded token at 2912 tokens of
 /// context, and on Qwen3.8-Flash-Next (24 / 2) ~1.2 GB of prefill memory at
@@ -822,48 +822,6 @@ fn grouped_sdpa_slice(
         .reshape((b_sz, seq_len, num_heads * head_dim))
 }
 
-/// The same attention with K/V expanded to every query head, kept for A/B
-/// comparisons (`CRANE_ATTN_EXPAND=1`); see [`grouped_sdpa`].
-// q/k/v/b/s/d are the standard attention-shape names.
-#[allow(clippy::many_single_char_names)]
-fn expanded_sdpa(
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-    mask: Option<&Tensor>,
-    scale: f64,
-    n_rep: usize,
-) -> Result<Tensor> {
-    let (b_sz, num_heads, seq_len, _) = q.dims4()?;
-    let expand = |t: &Tensor| -> Result<Tensor> {
-        if n_rep == 1 {
-            return Ok(t.clone());
-        }
-        let (b, kv_heads, s, d) = t.dims4()?;
-        t.unsqueeze(2)?
-            .expand((b, kv_heads, n_rep, s, d))?
-            .contiguous()?
-            .reshape((b, num_heads, s, d))
-    };
-    let k_t = expand(k)?.transpose(D::Minus2, D::Minus1)?.contiguous()?;
-    let attn_logits = (q.matmul(&k_t)? * scale)?;
-    let attn_weights = match mask {
-        Some(mask) => attn_weights_with_mask(&attn_logits, mask)?,
-        None => attn_logits,
-    };
-    let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-    attn_weights
-        .matmul(&expand(v)?)?
-        .transpose(1, 2)?
-        .reshape((b_sz, seq_len, ()))
-}
-
-fn attn_weights_with_mask(attn_logits: &Tensor, mask: &Tensor) -> Result<Tensor> {
-    // HF applies the mask (shape `[B, 1, S_q, S_k]` for additive causal mask)
-    // via `attn_weights + mask` and softmax. We do the same.
-    attn_logits.broadcast_add(mask)
-}
-
 // ── MLP ────────────────────────────────────────────────────────────────
 
 /// Standard `SwiGLU` MLP: `down(silu(gate(x)) * up(x))`.
@@ -918,7 +876,7 @@ impl Module for Mlp {
         let gate = self.gate.forward(x)?;
         let up = self.up.forward(x)?;
         let h = if matches!(gate.dtype(), DType::BF16 | DType::F16) {
-            crate::ops::float_math::swiglu_low_precision(&gate,&up)?
+            crate::ops::float_math::swiglu_low_precision(&gate, &up)?
         } else {
             crate::ops::fused_ops::swiglu::swiglu(&gate, &up)?
         };
@@ -947,15 +905,6 @@ enum LayerImpl {
 }
 
 impl DecoderLayer {
-    /// Enable fused causal attention. Caller guarantees an unpadded standard
-    /// causal mask; arbitrary masks must retain the default attention path.
-    #[cfg(any(feature = "flash-attn", feature = "flash-inference"))]
-    pub fn enable_flash_causal(&mut self) {
-        if let LayerImpl::FullAttention(attention) = &mut self.layer_impl {
-            attention.flash_causal = true;
-        }
-    }
-
     /// # Errors
     ///
     /// Returns an error if a required weight tensor is missing or has an unexpected shape.
@@ -1089,7 +1038,7 @@ impl DecoderLayer {
         &self,
         x: &Tensor,
         rope: RopeSlice<'_>,
-        attention_mask: Option<&Tensor>,
+        causal_mask: Option<&CausalMask>,
         gdn_cache: Option<&mut GdnLayerCache>,
         attn_cache: Option<&mut KvCache>,
     ) -> Result<Tensor> {
@@ -1105,7 +1054,7 @@ impl DecoderLayer {
                     "full-attention layer should not receive a GDN cache"
                 );
                 timed(Span::Attn, || {
-                    attn.forward(&normed, rope, attention_mask, attn_cache)
+                    attn.forward(&normed, rope, causal_mask, None, attn_cache)
                 })?
             },
             LayerImpl::LinearAttention(gdn) => {
@@ -1149,54 +1098,5 @@ mod tests {
         assert_eq!(attn_query_slice(24, 32_768), 42);
         assert!(24 * attn_query_slice(24, 32_768) * 32_768 * 4 <= ATTN_SCORE_BUDGET);
         assert_eq!(attn_query_slice(24, 1 << 20), 16);
-    }
-
-    /// The grouped GQA attention equals the expanded one, for decode and
-    /// prefill shapes, with and without a causal mask, on every device this
-    /// build has.
-    #[test]
-    fn grouped_sdpa_matches_expanded() -> anyhow::Result<()> {
-        #[allow(unused_mut)]
-        let mut devices = vec![Device::Cpu];
-        #[cfg(feature = "sycl")]
-        if candle_core::utils::sycl_is_available() {
-            devices.push(Device::new_sycl(0)?);
-        }
-        // Qwen3.8-27B (24 q / 4 KV) and Qwen3.8-Flash-Next (24 / 2) layouts,
-        // then Ornith-1.5-35B (16 / 2) with queries in more than one slice:
-        // 512-query slices, and budget-shrunk ones (419 at 5000 cells).
-        for (heads, kv_heads, seq, cells) in [
-            (24, 4, 1, 300),
-            (24, 2, 1, 77),
-            (24, 4, 37, 300),
-            (24, 2, 64, 64),
-            (16, 2, 700, 900),
-            (16, 2, 600, 5000),
-        ] {
-            let n_rep = heads / kv_heads;
-            let d = 32;
-            let cpu = Device::Cpu;
-            let q = Tensor::randn(0f32, 1.0, (1, heads, seq, d), &cpu)?;
-            let k = Tensor::randn(0f32, 1.0, (1, kv_heads, cells, d), &cpu)?;
-            let v = Tensor::randn(0f32, 1.0, (1, kv_heads, cells, d), &cpu)?;
-            let mask = super::super::prefill::causal_mask(seq, cells - seq, &cpu, DType::F32)?;
-            for dev in &devices {
-                let on = |t: &Tensor| t.to_device(dev);
-                for m in [None, Some(&mask)] {
-                    let m = m.map(on).transpose()?;
-                    let want =
-                        expanded_sdpa(&on(&q)?, &on(&k)?, &on(&v)?, m.as_ref(), 0.17, n_rep)?;
-                    let got = grouped_sdpa(&on(&q)?, &on(&k)?, &on(&v)?, m.as_ref(), 0.17, n_rep)?;
-                    assert_eq!(got.dims(), &[1, seq, heads * d]);
-                    let diff = (got - want)?.abs()?.max_all()?.to_scalar::<f32>()?;
-                    assert!(
-                        diff < 1e-4,
-                        "{dev:?} heads {heads}/{kv_heads} seq {seq} masked {}: diff {diff}",
-                        m.is_some()
-                    );
-                }
-            }
-        }
-        Ok(())
     }
 }
