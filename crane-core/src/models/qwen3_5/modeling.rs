@@ -1117,6 +1117,26 @@ impl DecoderLayer {
         matches!(self.layer_impl, LayerImpl::LinearAttention(_))
     }
 
+    /// This layer's `MoE` block, or `None` for a dense layer. `mlp` is
+    /// private to this module (`model.rs` holds the layer vector but not the
+    /// struct internals), so expert-cache wiring in `model.rs` goes through
+    /// this accessor instead of matching `MlpOrMoe` directly.
+    #[must_use]
+    pub(crate) fn moe_block(&self) -> Option<&SparseMoeBlock> {
+        match &self.mlp {
+            MlpOrMoe::Moe(block) => Some(block),
+            MlpOrMoe::Dense(_) => None,
+        }
+    }
+
+    /// Mutable counterpart of [`Self::moe_block`].
+    pub(crate) fn moe_block_mut(&mut self) -> Option<&mut SparseMoeBlock> {
+        match &mut self.mlp {
+            MlpOrMoe::Moe(block) => Some(block),
+            MlpOrMoe::Dense(_) => None,
+        }
+    }
+
     /// Forward pass. For `LinearAttention` blocks pass `Some(gdn_cache)` and
     /// `None` for `attn_cache`; for `FullAttention` blocks pass `Some(attn_cache)`
     /// and `None` for `gdn_cache`.
