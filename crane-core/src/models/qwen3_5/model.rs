@@ -8,6 +8,7 @@ use candle_core::quantized::GgmlDType;
 use candle_core::{DType, Device, Module, Tensor};
 use candle_nn::{Linear, VarBuilder, embedding};
 
+use crate::device::DeviceAssignment;
 use crate::ops::linear::{LinearLayer, parse_ggml_dtype, quantize_linear};
 use crate::quantized::gguf_metadata::GgufMetadata;
 use crate::utils::DeviceExt;
@@ -85,6 +86,25 @@ impl Qwen3_5TextModel {
         dtype: DType,
         quant: Option<GgmlDType>,
     ) -> Result<Self> {
+        Self::new_with_expert_device(cfg, vb, device, dtype, quant, device)
+    }
+
+    /// Like [`Self::new`], but places `MoE` expert weights on `expert_device`
+    /// rather than `device`. Used for `MoE` `CPU` offload (see
+    /// [`crate::device::DeviceAssignment`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a required weight tensor is missing or has an
+    /// unexpected shape.
+    pub fn new_with_expert_device(
+        cfg: &Config,
+        vb: &VarBuilder,
+        device: &Device,
+        dtype: DType,
+        quant: Option<GgmlDType>,
+        expert_device: &Device,
+    ) -> Result<Self> {
         disable_cuda_event_tracking(device);
         let text_cfg = cfg.text().clone();
         // HF saves Qwen 3.5 weights with the prefix
@@ -114,13 +134,15 @@ impl Qwen3_5TextModel {
         let layer_types = text_cfg.layer_types();
         let mut layers = Vec::with_capacity(text_cfg.num_hidden_layers);
         for (idx, &layer_type) in layer_types.iter().enumerate() {
-            layers.push(DecoderLayer::load(
+            let mut layer = DecoderLayer::load_with_expert_device(
                 &text_cfg,
                 idx,
                 layer_type,
                 vb_lm.pp("layers").pp(idx),
                 quant,
-            )?);
+                expert_device,
+            )?;
+            layers.push(layer);
         }
 
         let norm = Qwen35RmsNorm::load(
@@ -211,7 +233,7 @@ impl Qwen3_5TextModel {
         reader: &mut R,
         device: &Device,
     ) -> Result<Self> {
-        Self::from_gguf_impl(ct, reader, device, None)
+        Self::from_gguf_impl(ct, reader, &DeviceAssignment::uniform(device), None)
     }
 
     /// # Errors
@@ -223,15 +245,51 @@ impl Qwen3_5TextModel {
         device: &Device,
         extended: crate::quantized::extended_gguf::ExtendedGgufInfo,
     ) -> Result<Self> {
-        Self::from_gguf_impl(ct, reader, device, Some(extended))
+        Self::from_gguf_impl(
+            ct,
+            reader,
+            &DeviceAssignment::uniform(device),
+            Some(extended),
+        )
+    }
+
+    /// Like [`Self::from_gguf`], but places `MoE` expert weights on
+    /// `devices.expert` rather than `devices.main`. Used for `MoE` `CPU`
+    /// offload (see [`DeviceAssignment`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if required GGUF metadata or tensors are missing or malformed.
+    pub fn from_gguf_with_devices<R: std::io::Read + std::io::Seek>(
+        ct: candle_core::quantized::gguf_file::Content,
+        reader: &mut R,
+        devices: &DeviceAssignment,
+    ) -> Result<Self> {
+        Self::from_gguf_impl(ct, reader, devices, None)
+    }
+
+    /// Like [`Self::from_gguf_extended`], but places `MoE` expert weights on
+    /// `devices.expert` rather than `devices.main`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if required GGUF metadata or tensors are missing or malformed.
+    pub fn from_gguf_extended_with_devices<R: std::io::Read + std::io::Seek>(
+        ct: candle_core::quantized::gguf_file::Content,
+        reader: &mut R,
+        devices: &DeviceAssignment,
+        extended: crate::quantized::extended_gguf::ExtendedGgufInfo,
+    ) -> Result<Self> {
+        Self::from_gguf_impl(ct, reader, devices, Some(extended))
     }
 
     fn from_gguf_impl<R: std::io::Read + std::io::Seek>(
         ct: candle_core::quantized::gguf_file::Content,
         reader: &mut R,
-        device: &Device,
+        devices: &DeviceAssignment,
         extended: Option<crate::quantized::extended_gguf::ExtendedGgufInfo>,
     ) -> Result<Self> {
+        let device = &devices.main;
         disable_cuda_event_tracking(device);
         // QMatMul handles quantized weights internally; dequantized side
         // tensors (norms, conv kernels) use the compute dtype, while the
@@ -371,7 +429,8 @@ impl Qwen3_5TextModel {
 
         let mut layers = Vec::with_capacity(num_hidden_layers);
         for (idx, &layer_type) in layer_types.iter().enumerate() {
-            let mut layer = DecoderLayer::from_gguf(&text_cfg, layer_type, &mut gg, idx, device)?;
+            let mut layer =
+                DecoderLayer::from_gguf(&text_cfg, layer_type, &mut gg, idx, &devices.expert)?;
             layer.set_attention_dtype(attn_dtype);
             layers.push(layer);
         }
@@ -1029,7 +1088,29 @@ impl Model {
         dtype: &DType,
         format: ModelFormat,
     ) -> Result<Self> {
-        Self::new_with_options(model_path, device, dtype, format, isq_from_env())
+        Self::new_with_format_and_devices(
+            model_path,
+            &DeviceAssignment::uniform(device),
+            dtype,
+            format,
+        )
+    }
+
+    /// Like [`Self::new_with_format`], but `devices.expert` places `MoE`
+    /// expert weights on a different device than the rest of the model
+    /// (`MoE` `CPU` offload); callers that don't need that should pass
+    /// [`DeviceAssignment::uniform`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the model or tokenizer cannot be loaded from `model_path`.
+    pub fn new_with_format_and_devices(
+        model_path: &str,
+        devices: &DeviceAssignment,
+        dtype: &DType,
+        format: ModelFormat,
+    ) -> Result<Self> {
+        Self::new_with_options_and_devices(model_path, devices, dtype, format, isq_from_env())
     }
 
     /// Load with an explicit in-situ quantization level (`quant`). `None`
@@ -1042,6 +1123,30 @@ impl Model {
     pub fn new_with_options(
         model_path: &str,
         device: &Device,
+        dtype: &DType,
+        format: ModelFormat,
+        quant: Option<GgmlDType>,
+    ) -> Result<Self> {
+        Self::new_with_options_and_devices(
+            model_path,
+            &DeviceAssignment::uniform(device),
+            dtype,
+            format,
+            quant,
+        )
+    }
+
+    /// Like [`Self::new_with_options`], but `devices.expert` places `MoE`
+    /// expert weights on a different device than the rest of the model
+    /// (`MoE` `CPU` offload); callers that don't need that should pass
+    /// [`DeviceAssignment::uniform`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the model or tokenizer cannot be loaded from `model_path`.
+    pub fn new_with_options_and_devices(
+        model_path: &str,
+        devices: &DeviceAssignment,
         dtype: &DType,
         format: ModelFormat,
         quant: Option<GgmlDType>,
@@ -1060,14 +1165,14 @@ impl Model {
             other => other,
         };
         match format {
-            ModelFormat::Safetensors => Self::from_pretrained(model_path, device, *dtype, quant),
+            ModelFormat::Safetensors => Self::from_pretrained(model_path, devices, *dtype, quant),
             ModelFormat::Gguf => {
                 if quant.is_some() {
                     eprintln!(
                         "[qwen3_5] --quant/CRANE_ISQ ignored: GGUF weights are already quantized"
                     );
                 }
-                Self::from_gguf_file(model_path, device)
+                Self::from_gguf_file(model_path, devices)
             },
             ModelFormat::Auto => unreachable!("Auto is resolved above"),
         }
@@ -1077,7 +1182,8 @@ impl Model {
     /// (`tokenizer.ggml.tokens` / `tokenizer.ggml.merges` / `token_type`);
     /// a sibling `tokenizer.json` is only consulted if the GGUF lacks the
     /// embedded metadata (older / third-party quantizers).
-    fn from_gguf_file(model_path: &str, device: &Device) -> Result<Self> {
+    fn from_gguf_file(model_path: &str, devices: &DeviceAssignment) -> Result<Self> {
+        let device = &devices.main;
         use crate::utils::tokenizer_utils::resolve_gguf_tokenizer;
 
         let gguf_path = std::path::Path::new(model_path);
@@ -1113,9 +1219,9 @@ impl Model {
                     extended.tensors.len()
                 );
             }
-            Qwen3_5TextModel::from_gguf_extended(ct, &mut cursor, device, extended)?
+            Qwen3_5TextModel::from_gguf_extended_with_devices(ct, &mut cursor, devices, extended)?
         } else {
-            Qwen3_5TextModel::from_gguf(ct, &mut cursor, device)?
+            Qwen3_5TextModel::from_gguf_with_devices(ct, &mut cursor, devices)?
         };
         let dtype = inner.dtype();
 
@@ -1130,10 +1236,11 @@ impl Model {
 
     fn from_pretrained(
         model_path: &str,
-        device: &Device,
+        devices: &DeviceAssignment,
         dtype: DType,
         quant: Option<GgmlDType>,
     ) -> Result<Self> {
+        let device = &devices.main;
         // When ISQ is requested, memory is the caller's priority: on Metal,
         // keep the non-quantized side tensors (embedding, norms, conv) in F16
         // instead of the server's F32 default — the 248k-vocab embedding
@@ -1160,7 +1267,14 @@ impl Model {
         if let Some(dt) = quant {
             eprintln!("[qwen3_5] in-situ quantization enabled: {dt:?}");
         }
-        let inner = Qwen3_5TextModel::new(&cfg, &vb, device, dtype, quant)?;
+        let inner = Qwen3_5TextModel::new_with_expert_device(
+            &cfg,
+            &vb,
+            device,
+            dtype,
+            quant,
+            &devices.expert,
+        )?;
 
         Ok(Self {
             tokenizer: TokenOutputStream::new(tokenizer),

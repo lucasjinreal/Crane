@@ -965,6 +965,8 @@ impl DecoderLayer {
         }
     }
 
+    /// Loads `MoE` expert weights (if any) on the same device as `vb`.
+    ///
     /// # Errors
     ///
     /// Returns an error if a required weight tensor is missing or has an unexpected shape.
@@ -978,6 +980,28 @@ impl DecoderLayer {
         layer_type: LayerType,
         vb: VarBuilder,
         quant: Option<GgmlDType>,
+    ) -> Result<Self> {
+        let expert_device = vb.device().clone();
+        Self::load_with_expert_device(cfg, layer_idx, layer_type, vb, quant, &expert_device)
+    }
+
+    /// Like [`Self::load`], but places `MoE` expert weights on
+    /// `expert_device` rather than `vb`'s device, for `MoE` `CPU` offload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a required weight tensor is missing or has an unexpected shape.
+    // `vb` should be borrowed (`&VarBuilder`): it is only used to derive
+    // children. Changing it would break downstream callers (Soma) of this
+    // public API, so it stays by value.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn load_with_expert_device(
+        cfg: &TextConfig,
+        layer_idx: usize,
+        layer_type: LayerType,
+        vb: VarBuilder,
+        quant: Option<GgmlDType>,
+        expert_device: &Device,
     ) -> Result<Self> {
         let input_layernorm =
             Qwen35RmsNorm::load(cfg.hidden_size, cfg.rms_norm_eps, &vb.pp("input_layernorm"))?;
@@ -994,7 +1018,7 @@ impl DecoderLayer {
                 layer_idx,
                 cfg.hidden_size,
                 vb.pp("mlp"),
-                vb.device(),
+                expert_device,
             )?),
             None => MlpOrMoe::Dense(Mlp::load(cfg, &vb.pp("mlp"), quant)?),
         };
@@ -1025,7 +1049,9 @@ impl DecoderLayer {
     /// Block norms (`attn_norm`, `post_attention_norm`) carry the folded `+1`
     /// offset; linear-attention blocks load through
     /// [`GatedDeltaNet::from_gguf`], which documents their tensor naming and
-    /// value-head order.
+    /// value-head order. `expert_device` places this layer's `MoE` expert
+    /// weights (if any) on a device other than `gg`'s, for `MoE` `CPU`
+    /// offload.
     ///
     /// # Errors
     ///

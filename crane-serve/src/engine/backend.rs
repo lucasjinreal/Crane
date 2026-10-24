@@ -614,7 +614,7 @@ impl Qwen3_5Backend {
     pub fn new(model_path: &str, device: &Device, dtype: &DType) -> Result<Self> {
         Self::new_with_options(
             model_path,
-            device,
+            &DeviceAssignment::uniform(device),
             dtype,
             crane_core::models::qwen3_5::ModelFormat::Auto,
             None,
@@ -623,27 +623,30 @@ impl Qwen3_5Backend {
 
     /// `quant` requests in-situ quantization (`--quant` / `CRANE_ISQ`);
     /// `None` falls back to the `CRANE_ISQ` env var inside the model loader.
+    /// `devices.expert` places `MoE` expert weights on a different device
+    /// than the rest of the model (`MoE` `CPU` offload); callers that don't
+    /// need that should pass [`DeviceAssignment::uniform`].
     ///
     /// # Errors
     ///
     /// Returns an error if the model fails to load from `model_path`.
     pub fn new_with_options(
         model_path: &str,
-        device: &Device,
+        devices: &DeviceAssignment,
         dtype: &DType,
         format: crane_core::models::qwen3_5::ModelFormat,
         quant: Option<crane_core::GgmlDType>,
     ) -> Result<Self> {
         let model = match quant {
-            Some(dt) => crane_core::models::qwen3_5::Model::new_with_options(
+            Some(dt) => crane_core::models::qwen3_5::Model::new_with_options_and_devices(
                 model_path,
-                device,
+                devices,
                 dtype,
                 format,
                 Some(dt),
             )?,
-            None => crane_core::models::qwen3_5::Model::new_with_format(
-                model_path, device, dtype, format,
+            None => crane_core::models::qwen3_5::Model::new_with_format_and_devices(
+                model_path, devices, dtype, format,
             )?,
         };
         Ok(Self {

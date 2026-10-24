@@ -667,7 +667,7 @@ pub fn create_backend(
                 ModelFormat::Auto => crane_core::models::qwen3_5::ModelFormat::Auto,
             };
             Ok(Box::new(Qwen3_5Backend::new_with_options(
-                model_path, device, dtype, q35_fmt, quant,
+                model_path, devices, dtype, q35_fmt, quant,
             )?))
         },
         ModelType::Qwen4Exp => {
