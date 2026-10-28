@@ -2793,3 +2793,329 @@ mod ck_parity {
         run_causal_vs_ck_bf16(1, 32, 256, 4, 2, 256);
     }
 }
+
+/// Parity readout against `candle-flash-attn` (the upstream NVIDIA
+/// flash-attn2 CUDA kernel), gated on `flash-attn-ab`, the one feature that
+/// builds both CUDA backends. Exists so a claim about flash-attn2's own
+/// accuracy can be checked directly on CUDA hardware instead of taken on
+/// faith: this repo's CI and this dev environment are ROCm-only, so these
+/// tests cannot run here. Same structure, error metrics, and F32 naive
+/// reference as [`ck_parity`] above, just a different reference kernel and
+/// backend. Run with `--nocapture` to see the numbers.
+#[cfg(all(test, feature = "flash-attn-ab"))]
+mod flashattn2_parity {
+    use candle_core::{DType, Device, Tensor};
+
+    use super::super::fattn::test_support::{MaskMode, naive_attention, test_gpu_device};
+    use super::{fattn_mma_bf16_causal, fattn_mma_bf16_full, fattn_mma_causal, fattn_mma_full};
+
+    fn got_vec(t: Tensor) -> Vec<f32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .to_device(&Device::Cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    }
+
+    struct ErrorStats {
+        max_abs: f32,
+        mean_abs: f32,
+        max_rel: f32,
+    }
+
+    impl std::fmt::Display for ErrorStats {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                f,
+                "max_abs={:.6} mean_abs={:.6} max_rel={:.6}",
+                self.max_abs, self.mean_abs, self.max_rel
+            )
+        }
+    }
+
+    fn error_stats(got: &[f32], want: &[f32]) -> ErrorStats {
+        assert_eq!(got.len(), want.len());
+        let mut max_abs = 0f32;
+        let mut sum_abs = 0f32;
+        let mut max_rel = 0f32;
+        for (g, w) in got.iter().zip(want) {
+            let abs = (g - w).abs();
+            max_abs = max_abs.max(abs);
+            sum_abs += abs;
+            max_rel = max_rel.max(abs / w.abs().max(1e-6));
+        }
+        ErrorStats {
+            max_abs,
+            mean_abs: sum_abs / got.len() as f32,
+            max_rel,
+        }
+    }
+
+    // Non-causal: crane's fattn_mma_full vs. candle-flash-attn's flash-attn2
+    // kernel, both against the shared F32 naive reference.
+    fn run_full_vs_flashattn2(b: usize, sq: usize, skv: usize, hq: usize, hkv: usize, d: usize) {
+        let gpu = test_gpu_device();
+        let scale = 1.0f32 / (d as f32).sqrt();
+
+        let q_f32 = Tensor::randn(0f32, 1f32, (b, sq, hq, d), &Device::Cpu).unwrap();
+        let k_f32 = Tensor::randn(0f32, 1f32, (b, skv, hkv, d), &Device::Cpu).unwrap();
+        let v_f32 = Tensor::randn(0f32, 1f32, (b, skv, hkv, d), &Device::Cpu).unwrap();
+        let want = naive_attention(&q_f32, &k_f32, &v_f32, scale, MaskMode::Full, 0, 0, 0);
+
+        // crane's fattn_mma_full: q stays F32, k/v cast to F16.
+        let q = q_f32.to_device(&gpu).unwrap();
+        let k = k_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
+        let v = v_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
+        let crane_out = got_vec(fattn_mma_full(&q, &k, &v, scale).unwrap());
+
+        // candle-flash-attn requires q/k/v at a uniform dtype.
+        let q_f16 = q_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
+        let fa2_out = got_vec(candle_flash_attn::flash_attn(&q_f16, &k, &v, scale, false).unwrap());
+
+        let crane_vs_naive = error_stats(&crane_out, &want);
+        let fa2_vs_naive = error_stats(&fa2_out, &want);
+        let crane_vs_fa2 = error_stats(&crane_out, &fa2_out);
+        println!(
+            "full head_dim={d}: crane_vs_naive=({crane_vs_naive}) flashattn2_vs_naive=({fa2_vs_naive}) crane_vs_flashattn2=({crane_vs_fa2})"
+        );
+
+        assert!(
+            crane_vs_naive.max_abs <= 2e-3,
+            "crane fattn_mma_full diverged from naive reference: {crane_vs_naive}"
+        );
+        assert!(
+            fa2_vs_naive.max_abs <= 2e-3,
+            "candle-flash-attn (flash-attn2) diverged from naive reference: {fa2_vs_naive}"
+        );
+    }
+
+    fn run_causal_vs_flashattn2(b: usize, sq: usize, skv: usize, hq: usize, hkv: usize, d: usize) {
+        let gpu = test_gpu_device();
+        let scale = 1.0f32 / (d as f32).sqrt();
+        let kv_offset = skv.saturating_sub(sq);
+
+        let q_f32 = Tensor::randn(0f32, 1f32, (b, sq, hq, d), &Device::Cpu).unwrap();
+        let k_f32 = Tensor::randn(0f32, 1f32, (b, skv, hkv, d), &Device::Cpu).unwrap();
+        let v_f32 = Tensor::randn(0f32, 1f32, (b, skv, hkv, d), &Device::Cpu).unwrap();
+        let want = naive_attention(
+            &q_f32,
+            &k_f32,
+            &v_f32,
+            scale,
+            MaskMode::Causal,
+            kv_offset,
+            0,
+            0,
+        );
+
+        let q = q_f32.to_device(&gpu).unwrap();
+        let k = k_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
+        let v = v_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
+        let crane_out = got_vec(fattn_mma_causal(&q, &k, &v, scale, kv_offset).unwrap());
+
+        let q_f16 = q_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
+        let fa2_out = got_vec(candle_flash_attn::flash_attn(&q_f16, &k, &v, scale, true).unwrap());
+
+        let crane_vs_naive = error_stats(&crane_out, &want);
+        let fa2_vs_naive = error_stats(&fa2_out, &want);
+        let crane_vs_fa2 = error_stats(&crane_out, &fa2_out);
+        println!(
+            "causal head_dim={d}: crane_vs_naive=({crane_vs_naive}) flashattn2_vs_naive=({fa2_vs_naive}) crane_vs_flashattn2=({crane_vs_fa2})"
+        );
+
+        assert!(
+            crane_vs_naive.max_abs <= 2e-3,
+            "crane fattn_mma_causal diverged from naive reference: {crane_vs_naive}"
+        );
+        assert!(
+            fa2_vs_naive.max_abs <= 2e-3,
+            "candle-flash-attn (flash-attn2) diverged from naive reference: {fa2_vs_naive}"
+        );
+    }
+
+    #[test]
+    fn full_vs_flashattn2_hd64() {
+        run_full_vs_flashattn2(1, 32, 256, 4, 2, 64);
+    }
+
+    #[test]
+    fn full_vs_flashattn2_hd128() {
+        run_full_vs_flashattn2(1, 32, 256, 4, 2, 128);
+    }
+
+    #[test]
+    fn full_vs_flashattn2_hd256() {
+        run_full_vs_flashattn2(1, 32, 256, 4, 2, 256);
+    }
+
+    #[test]
+    fn causal_vs_flashattn2_hd64() {
+        run_causal_vs_flashattn2(1, 32, 256, 4, 2, 64);
+    }
+
+    #[test]
+    fn causal_vs_flashattn2_hd128() {
+        run_causal_vs_flashattn2(1, 32, 256, 4, 2, 128);
+    }
+
+    #[test]
+    fn causal_vs_flashattn2_hd256() {
+        run_causal_vs_flashattn2(1, 32, 256, 4, 2, 256);
+    }
+
+    // Native-bf16 counterparts: both kernels run end-to-end in BF16 (no F16
+    // intermediate), the dtype the maintainer's 1e-4 claim is about. Still
+    // measured against the F32 naive reference, since that's the only
+    // ground truth available in this repo.
+    fn run_full_vs_flashattn2_bf16(
+        b: usize,
+        sq: usize,
+        skv: usize,
+        hq: usize,
+        hkv: usize,
+        d: usize,
+    ) {
+        let gpu = test_gpu_device();
+        let scale = 1.0f32 / (d as f32).sqrt();
+
+        let q_f32 = Tensor::randn(0f32, 1f32, (b, sq, hq, d), &Device::Cpu).unwrap();
+        let k_f32 = Tensor::randn(0f32, 1f32, (b, skv, hkv, d), &Device::Cpu).unwrap();
+        let v_f32 = Tensor::randn(0f32, 1f32, (b, skv, hkv, d), &Device::Cpu).unwrap();
+        let want = naive_attention(&q_f32, &k_f32, &v_f32, scale, MaskMode::Full, 0, 0, 0);
+
+        // crane's fattn_mma_bf16_full: q stays F32, k/v cast to BF16.
+        let q = q_f32.to_device(&gpu).unwrap();
+        let k = k_f32
+            .to_dtype(DType::BF16)
+            .unwrap()
+            .to_device(&gpu)
+            .unwrap();
+        let v = v_f32
+            .to_dtype(DType::BF16)
+            .unwrap()
+            .to_device(&gpu)
+            .unwrap();
+        let crane_out = got_vec(fattn_mma_bf16_full(&q, &k, &v, scale).unwrap());
+
+        // candle-flash-attn requires q/k/v at a uniform dtype.
+        let q_bf16 = q_f32
+            .to_dtype(DType::BF16)
+            .unwrap()
+            .to_device(&gpu)
+            .unwrap();
+        let fa2_out =
+            got_vec(candle_flash_attn::flash_attn(&q_bf16, &k, &v, scale, false).unwrap());
+
+        let crane_vs_naive = error_stats(&crane_out, &want);
+        let fa2_vs_naive = error_stats(&fa2_out, &want);
+        let crane_vs_fa2 = error_stats(&crane_out, &fa2_out);
+        println!(
+            "full_bf16 head_dim={d}: crane_vs_naive=({crane_vs_naive}) flashattn2_vs_naive=({fa2_vs_naive}) crane_vs_flashattn2=({crane_vs_fa2})"
+        );
+
+        assert!(
+            crane_vs_naive.max_abs <= 1e-2,
+            "crane fattn_mma_bf16_full diverged from naive reference: {crane_vs_naive}"
+        );
+        assert!(
+            fa2_vs_naive.max_abs <= 1e-2,
+            "candle-flash-attn (bf16) diverged from naive reference: {fa2_vs_naive}"
+        );
+    }
+
+    fn run_causal_vs_flashattn2_bf16(
+        b: usize,
+        sq: usize,
+        skv: usize,
+        hq: usize,
+        hkv: usize,
+        d: usize,
+    ) {
+        let gpu = test_gpu_device();
+        let scale = 1.0f32 / (d as f32).sqrt();
+        let kv_offset = skv.saturating_sub(sq);
+
+        let q_f32 = Tensor::randn(0f32, 1f32, (b, sq, hq, d), &Device::Cpu).unwrap();
+        let k_f32 = Tensor::randn(0f32, 1f32, (b, skv, hkv, d), &Device::Cpu).unwrap();
+        let v_f32 = Tensor::randn(0f32, 1f32, (b, skv, hkv, d), &Device::Cpu).unwrap();
+        let want = naive_attention(
+            &q_f32,
+            &k_f32,
+            &v_f32,
+            scale,
+            MaskMode::Causal,
+            kv_offset,
+            0,
+            0,
+        );
+
+        let q = q_f32.to_device(&gpu).unwrap();
+        let k = k_f32
+            .to_dtype(DType::BF16)
+            .unwrap()
+            .to_device(&gpu)
+            .unwrap();
+        let v = v_f32
+            .to_dtype(DType::BF16)
+            .unwrap()
+            .to_device(&gpu)
+            .unwrap();
+        let crane_out = got_vec(fattn_mma_bf16_causal(&q, &k, &v, scale, kv_offset).unwrap());
+
+        let q_bf16 = q_f32
+            .to_dtype(DType::BF16)
+            .unwrap()
+            .to_device(&gpu)
+            .unwrap();
+        let fa2_out = got_vec(candle_flash_attn::flash_attn(&q_bf16, &k, &v, scale, true).unwrap());
+
+        let crane_vs_naive = error_stats(&crane_out, &want);
+        let fa2_vs_naive = error_stats(&fa2_out, &want);
+        let crane_vs_fa2 = error_stats(&crane_out, &fa2_out);
+        println!(
+            "causal_bf16 head_dim={d}: crane_vs_naive=({crane_vs_naive}) flashattn2_vs_naive=({fa2_vs_naive}) crane_vs_flashattn2=({crane_vs_fa2})"
+        );
+
+        assert!(
+            crane_vs_naive.max_abs <= 1e-2,
+            "crane fattn_mma_bf16_causal diverged from naive reference: {crane_vs_naive}"
+        );
+        assert!(
+            fa2_vs_naive.max_abs <= 1e-2,
+            "candle-flash-attn (bf16) diverged from naive reference: {fa2_vs_naive}"
+        );
+    }
+
+    #[test]
+    fn full_vs_flashattn2_bf16_hd64() {
+        run_full_vs_flashattn2_bf16(1, 32, 256, 4, 2, 64);
+    }
+
+    #[test]
+    fn full_vs_flashattn2_bf16_hd128() {
+        run_full_vs_flashattn2_bf16(1, 32, 256, 4, 2, 128);
+    }
+
+    #[test]
+    fn full_vs_flashattn2_bf16_hd256() {
+        run_full_vs_flashattn2_bf16(1, 32, 256, 4, 2, 256);
+    }
+
+    #[test]
+    fn causal_vs_flashattn2_bf16_hd64() {
+        run_causal_vs_flashattn2_bf16(1, 32, 256, 4, 2, 64);
+    }
+
+    #[test]
+    fn causal_vs_flashattn2_bf16_hd128() {
+        run_causal_vs_flashattn2_bf16(1, 32, 256, 4, 2, 128);
+    }
+
+    #[test]
+    fn causal_vs_flashattn2_bf16_hd256() {
+        run_causal_vs_flashattn2_bf16(1, 32, 256, 4, 2, 256);
+    }
+}
