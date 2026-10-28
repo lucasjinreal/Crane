@@ -142,6 +142,161 @@ pub fn fattn_tile_prefill(
     }
 }
 
+/// Causal flash-attention: `j <= i + kv_offset`. Builds the additive mask
+/// and analytic `KV_max` this kernel family always needs (see
+/// [`super::fattn_mma::fattn_mma_causal`]'s doc comment), sized for this
+/// kernel's fixed [`NCOLS1`] tile width, then dispatches to
+/// [`fattn_tile_causal_with_mask`]. Unlike [`super::fattn_mma`], this kernel
+/// never needs K/V padding: it always uses `(ncols1, ncols2) = (NCOLS1, 1)`
+/// (see this module's doc comment), and `ncols2 == 1` is exactly the case
+/// `fattn_mma_f16.cuh`'s bounds-checked (`oob_check = true`) tail-tile read
+/// already covers safely for any `seq_kv`.
+///
+/// # Errors
+///
+/// See [`fattn_tile_causal_with_mask`].
+pub fn fattn_tile_causal(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    kv_offset: usize,
+) -> Result<Tensor> {
+    let (_, seq_q, _, _) = q.dims4()?;
+    let (_, seq_kv, _, _) = k.dims4()?;
+    let mask =
+        super::fattn::build_additive_mask_f16(seq_q, seq_kv, kv_offset, None, 0, q.device())?;
+    fattn_tile_causal_with_mask(q, k, v, scale, kv_offset, &mask)
+}
+
+/// Same as [`fattn_tile_causal`], but for a caller that already has a mask
+/// shared across multiple layers in one forward pass — see
+/// [`super::fattn_mma::fattn_mma_causal_with_mask`]'s doc comment for the
+/// rationale. `mask` must encode exactly `j <= i + kv_offset`, covering `k`'s
+/// `seq_kv` (any dtype; cast to F16 here if needed).
+///
+/// # Errors
+///
+/// Returns a candle error if `q`/`k`/`v`'s shapes are incompatible, if
+/// `mask` isn't broadcastable to `[.., seq_q, seq_kv]`, or if any tensor op
+/// fails.
+pub fn fattn_tile_causal_with_mask(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    kv_offset: usize,
+    mask: &Tensor,
+) -> Result<Tensor> {
+    let (b, seq_q, _, _) = q.dims4()?;
+    let (_, seq_kv, _, _) = k.dims4()?;
+    let mask = if mask.dtype() == DType::F16 {
+        mask.clone()
+    } else {
+        mask.to_dtype(DType::F16)?
+    };
+    // kv_max_cap = seq_kv (not a FATTN_KQ_STRIDE-rounded value): the tile
+    // kernel uses KV_max as a direct loop bound with no independent clamp
+    // against the real K/V buffer length, so a looser cap would read past
+    // the buffer (see build_analytic_kv_max's doc comment).
+    let kv_max = super::fattn::build_analytic_kv_max(
+        b,
+        seq_q,
+        NCOLS1,
+        kv_offset,
+        seq_kv,
+        0,
+        seq_kv,
+        q.device(),
+    )?;
+    fattn_tile_prefill(q, k, v, Some(&mask), Some(&kv_max), scale)
+}
+
+/// Sliding-window flash-attention: `i + kv_offset - window_left <= j <= i +
+/// kv_offset + window_right`. See
+/// [`super::fattn_mma::fattn_mma_windowed`]'s doc comment for the mask/
+/// `KV_max` split.
+///
+/// # Errors
+///
+/// See [`fattn_tile_windowed_with_mask`].
+pub fn fattn_tile_windowed(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    kv_offset: usize,
+    window_left: usize,
+    window_right: usize,
+) -> Result<Tensor> {
+    let (_, seq_q, _, _) = q.dims4()?;
+    let (_, seq_kv, _, _) = k.dims4()?;
+    let mask = super::fattn::build_additive_mask_f16(
+        seq_q,
+        seq_kv,
+        kv_offset,
+        Some(window_left),
+        window_right,
+        q.device(),
+    )?;
+    fattn_tile_windowed_with_mask(q, k, v, scale, kv_offset, window_right, &mask)
+}
+
+/// Same as [`fattn_tile_windowed`], but for a caller that already has a
+/// shared mask built once per forward pass — see
+/// [`super::fattn_mma::fattn_mma_causal_with_mask`]'s doc comment for the
+/// rationale. `mask` must encode `i + kv_offset - window_left <= j <= i +
+/// kv_offset + window_right`, covering `k`'s `seq_kv`; `window_left` is not
+/// needed here, same reason as
+/// [`super::fattn_mma::fattn_mma_windowed_with_mask`].
+///
+/// # Errors
+///
+/// See [`fattn_tile_causal_with_mask`].
+pub fn fattn_tile_windowed_with_mask(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    kv_offset: usize,
+    window_right: usize,
+    mask: &Tensor,
+) -> Result<Tensor> {
+    let (b, seq_q, _, _) = q.dims4()?;
+    let (_, seq_kv, _, _) = k.dims4()?;
+    let mask = if mask.dtype() == DType::F16 {
+        mask.clone()
+    } else {
+        mask.to_dtype(DType::F16)?
+    };
+    // kv_max_cap = seq_kv: see fattn_tile_causal_with_mask's comment.
+    let kv_max = super::fattn::build_analytic_kv_max(
+        b,
+        seq_q,
+        NCOLS1,
+        kv_offset,
+        seq_kv,
+        window_right,
+        seq_kv,
+        q.device(),
+    )?;
+    fattn_tile_prefill(q, k, v, Some(&mask), Some(&kv_max), scale)
+}
+
+/// Non-causal (full, bidirectional) flash-attention: every query attends to
+/// every key. See [`super::fattn_mma::fattn_mma_full`]'s doc comment for why
+/// this passes a real all-zero mask rather than `None`.
+///
+/// # Errors
+///
+/// See [`fattn_tile_prefill`].
+pub fn fattn_tile_full(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32) -> Result<Tensor> {
+    let (_, seq_q, _, _) = q.dims4()?;
+    let (_, seq_kv, _, _) = k.dims4()?;
+    let mask = Tensor::zeros((1, 1, seq_q, seq_kv), DType::F16, q.device())?;
+    fattn_tile_prefill(q, k, v, Some(&mask), None, scale)
+}
+
 #[cfg(feature = "cuda")]
 mod cuda {
     use candle_core::Storage;
@@ -534,15 +689,13 @@ mod tests {
 }
 
 /// Correctness against a real GPU: see
-/// [`super::fattn_mma::gpu_tests`]'s module doc for the shared rationale
-/// (reused naive reference, hand-built causal mask pending the analytic
-/// `KV_max` commit).
+/// [`super::fattn_mma::gpu_tests`]'s module doc for the shared rationale.
 #[cfg(all(test, any(feature = "cuda", feature = "rocm")))]
 mod gpu_tests {
     use candle_core::{DType, Device, Tensor};
 
     use super::super::fattn::test_support::{MaskMode, naive_attention, test_gpu_device};
-    use super::fattn_tile_prefill;
+    use super::{fattn_tile_causal, fattn_tile_full, fattn_tile_prefill, fattn_tile_windowed};
 
     fn causal_mask(seq_q: usize, seq_kv: usize, kv_offset: usize, device: &Device) -> Tensor {
         let mut vals = vec![0f32; seq_q * seq_kv];
@@ -664,5 +817,156 @@ mod gpu_tests {
     #[test]
     fn causal_hd128() {
         run_causal(1, 16, 16, 2, 2, 128);
+    }
+
+    fn got_vec(t: Tensor) -> Vec<f32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .to_device(&Device::Cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    }
+
+    fn assert_close(got: &[f32], want: &[f32], tol: f32, what: &str) {
+        assert_eq!(got.len(), want.len());
+        for (i, (g, w)) in got.iter().zip(want).enumerate() {
+            assert!(
+                (g - w).abs() <= tol * w.abs().max(1.0),
+                "[{i}] got {g}, want {w} ({what})"
+            );
+        }
+    }
+
+    // End-to-end `fattn_tile_causal`: builds its own mask/KV_max internally,
+    // unlike `run_causal`'s hand-built mask.
+    #[test]
+    fn causal_fn_matches_reference_hd128() {
+        let gpu = test_gpu_device();
+        let (b, sq, skv, hq, hkv, d) = (1, 20, 150, 4, 2, 128usize);
+        let scale = 1.0f32 / (d as f32).sqrt();
+        let kv_offset = skv - sq;
+
+        let q_f32 = Tensor::randn(0f32, 1f32, (b, sq, hq, d), &Device::Cpu).unwrap();
+        let k_f32 = Tensor::randn(0f32, 1f32, (b, skv, hkv, d), &Device::Cpu).unwrap();
+        let v_f32 = Tensor::randn(0f32, 1f32, (b, skv, hkv, d), &Device::Cpu).unwrap();
+        let want = naive_attention(
+            &q_f32,
+            &k_f32,
+            &v_f32,
+            scale,
+            MaskMode::Causal,
+            kv_offset,
+            0,
+            0,
+        );
+
+        let q = q_f32.to_device(&gpu).unwrap();
+        let k = k_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
+        let v = v_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
+
+        let got = fattn_tile_causal(&q, &k, &v, scale, kv_offset).unwrap();
+        assert_close(&got_vec(got), &want, 3e-2, "causal_fn");
+    }
+
+    // End-to-end `fattn_tile_windowed`.
+    #[test]
+    fn windowed_fn_matches_reference_hd128() {
+        let gpu = test_gpu_device();
+        let (b, sq, skv, hq, hkv, d) = (1, 20, 150, 2, 2, 128usize);
+        let scale = 1.0f32 / (d as f32).sqrt();
+        let kv_offset = skv - sq;
+        let (window_left, window_right) = (20, 0);
+
+        let q_f32 = Tensor::randn(0f32, 1f32, (b, sq, hq, d), &Device::Cpu).unwrap();
+        let k_f32 = Tensor::randn(0f32, 1f32, (b, skv, hkv, d), &Device::Cpu).unwrap();
+        let v_f32 = Tensor::randn(0f32, 1f32, (b, skv, hkv, d), &Device::Cpu).unwrap();
+        let want = naive_attention(
+            &q_f32,
+            &k_f32,
+            &v_f32,
+            scale,
+            MaskMode::Windowed,
+            kv_offset,
+            window_left,
+            window_right,
+        );
+
+        let q = q_f32.to_device(&gpu).unwrap();
+        let k = k_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
+        let v = v_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
+
+        let got =
+            fattn_tile_windowed(&q, &k, &v, scale, kv_offset, window_left, window_right).unwrap();
+        assert_close(&got_vec(got), &want, 3e-2, "windowed_fn");
+    }
+
+    // End-to-end `fattn_tile_full`.
+    #[test]
+    fn full_fn_matches_reference_hd128() {
+        let gpu = test_gpu_device();
+        let (b, sq, skv, hq, hkv, d) = (1, 16, 16, 2, 2, 128usize);
+        let scale = 1.0f32 / (d as f32).sqrt();
+
+        let q_f32 = Tensor::randn(0f32, 1f32, (b, sq, hq, d), &Device::Cpu).unwrap();
+        let k_f32 = Tensor::randn(0f32, 1f32, (b, skv, hkv, d), &Device::Cpu).unwrap();
+        let v_f32 = Tensor::randn(0f32, 1f32, (b, skv, hkv, d), &Device::Cpu).unwrap();
+        let want = naive_attention(&q_f32, &k_f32, &v_f32, scale, MaskMode::Full, 0, 0, 0);
+
+        let q = q_f32.to_device(&gpu).unwrap();
+        let k = k_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
+        let v = v_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
+
+        let got = fattn_tile_full(&q, &k, &v, scale).unwrap();
+        assert_close(&got_vec(got), &want, 3e-2, "full_fn");
+    }
+
+    // A deliberately wrong mask (reversed causal) must produce a different
+    // result than the correct causal mask, proving the kernel actually
+    // reads `mask` rather than silently ignoring it.
+    #[test]
+    fn garbage_mask_changes_output() {
+        let gpu = test_gpu_device();
+        let (sq, skv, hq, hkv, d) = (16, 16, 2, 2, 128usize);
+        let scale = 1.0f32 / (d as f32).sqrt();
+        let kv_offset = 0;
+
+        let q_f32 = Tensor::randn(0f32, 1f32, (1, sq, hq, d), &Device::Cpu).unwrap();
+        let k_f32 = Tensor::randn(0f32, 1f32, (1, skv, hkv, d), &Device::Cpu).unwrap();
+        let v_f32 = Tensor::randn(0f32, 1f32, (1, skv, hkv, d), &Device::Cpu).unwrap();
+
+        let q = q_f32.to_device(&gpu).unwrap();
+        let k = k_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
+        let v = v_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
+
+        let correct_mask = causal_mask(sq, skv, kv_offset, &gpu);
+        let garbage_vals: Vec<f32> = (0..sq * skv)
+            .map(|idx| {
+                let (i, j) = (idx / skv, idx % skv);
+                let rel = j as i64 - (i as i64 + kv_offset as i64);
+                if rel > 0 { 0.0 } else { f32::NEG_INFINITY }
+            })
+            .collect();
+        let garbage_mask = Tensor::from_vec(garbage_vals, (1, sq, skv), &gpu)
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap();
+
+        let out_correct = fattn_tile_prefill(&q, &k, &v, Some(&correct_mask), None, scale).unwrap();
+        let out_garbage = fattn_tile_prefill(&q, &k, &v, Some(&garbage_mask), None, scale).unwrap();
+
+        let correct_vec = got_vec(out_correct);
+        let garbage_vec = got_vec(out_garbage);
+        let max_diff = correct_vec
+            .iter()
+            .zip(&garbage_vec)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff > 1e-3,
+            "garbage mask produced the same output as the correct mask (max diff {max_diff})"
+        );
     }
 }

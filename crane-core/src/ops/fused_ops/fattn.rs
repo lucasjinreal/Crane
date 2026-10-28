@@ -22,7 +22,28 @@
 //! so the whole module is gated at once rather than per item.
 #![cfg(any(feature = "cuda", feature = "rocm"))]
 
-use candle_core::{Layout, Result};
+use candle_core::{DType, Device, Layout, Result, Tensor};
+
+/// Prefix marking a candle error built by [`unsupported_config`]. It means
+/// this exact shape/GQA-ratio/mask combination has no instantiated kernel.
+/// That is an expected static limitation the caller should silently fall
+/// back on. It is never a sign of a real runtime failure (a launch
+/// rejection, OOM, an invalid argument, ...). `gpu_flash_attn::run`'s
+/// dispatch chain checks this prefix to decide whether to try the next
+/// kernel tier or propagate the error untouched. Swallowing every
+/// `mma`/`mma_bf16` error regardless of cause would hide genuine
+/// kernel-execution failures behind the tile-kernel fallback.
+pub(crate) const UNSUPPORTED_CONFIG_PREFIX: &str = "crane_fattn_unsupported_config: ";
+
+/// Builds a candle error tagged with [`UNSUPPORTED_CONFIG_PREFIX`]. Use
+/// only at call sites where the failure is purely a function of the input
+/// shape (no instantiated kernel for this `(head_dim, gqa_ratio, seq_kv)`,
+/// a GQA shape `select_mma_ncols` can't batch, a tile grid too large for
+/// this `seq_kv`), never for a validation bug or an actual launch/runtime
+/// error.
+pub(crate) fn unsupported_config(msg: impl std::fmt::Display) -> candle_core::Error {
+    candle_core::Error::Msg(format!("{UNSUPPORTED_CONFIG_PREFIX}{msg}"))
+}
 
 /// Byte-for-byte layout of CUDA/HIP's built-in `uint3` (`struct { unsigned
 /// int x, y, z; }`, 12 bytes, 4-byte aligned, no padding to 16 the way
@@ -439,6 +460,119 @@ pub(crate) const MAX_GRID_YZ_DIM: usize = 65535;
 /// checked against this limit instead of [`MAX_GRID_YZ_DIM`].
 pub(crate) const MAX_GRID_X_DIM: usize = 2_147_483_647;
 
+fn to_i32(n: usize, what: &str) -> Result<i32> {
+    i32::try_from(n)
+        .map_err(|_| candle_core::Error::Msg(format!("fattn: {what} ({n}) exceeds i32::MAX")))
+}
+
+/// Whether this build targets AMD/`ROCm` rather than NVIDIA CUDA, mirroring
+/// the same `cuda`-takes-priority-over-`rocm` feature precedence
+/// [`super::fattn_mma::fattn_mma_prefill`]/
+/// [`super::fattn_tile::fattn_tile_prefill`] use internally. Needed by
+/// callers that must know `is_amd` themselves to call
+/// [`select_mma_ncols`]/[`mma_config`] ahead of actually dispatching (e.g.
+/// to size a `KV_max` tensor before the kernel launch picks its own
+/// `ncols1`).
+pub(crate) fn is_amd_backend() -> bool {
+    cfg!(all(feature = "rocm", not(feature = "cuda")))
+}
+
+/// Builds a `[1, 1, seq_q, seq_kv]` `F16` additive mask where position
+/// `(i, j)` is `0.0` when `j <= i + kv_offset + window_right` and, if
+/// `window_left` is `Some`, also `j >= i + kv_offset - window_left`.
+/// Otherwise `f32::NEG_INFINITY`. `window_left = None` means no left bound
+/// (plain causal masking). Built on the CPU then uploaded via
+/// `Tensor::from_vec`, so every call allocates and uploads. A caller that
+/// applies one mask to many layers should build it once and pass it to the
+/// `*_with_mask` entry points instead.
+pub(crate) fn build_additive_mask_f16(
+    seq_q: usize,
+    seq_kv: usize,
+    kv_offset: usize,
+    window_left: Option<usize>,
+    window_right: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    let mut data = vec![0f32; seq_q * seq_kv];
+    for i in 0..seq_q {
+        for j in 0..seq_kv {
+            // seq_q/seq_kv/kv_offset/window bounds are sequence lengths, far
+            // below i64::MAX, so these never wrap; i64 is needed since `rel`
+            // can be negative.
+            #[allow(clippy::cast_possible_wrap)]
+            let (center, j_i64, window_right_i64, window_left_i64) = (
+                (i + kv_offset) as i64,
+                j as i64,
+                window_right as i64,
+                window_left.map(|w| w as i64),
+            );
+            let rel = j_i64 - center;
+            let valid = rel <= window_right_i64
+                && match window_left_i64 {
+                    Some(w) => rel >= -w,
+                    None => true,
+                };
+            if !valid {
+                data[i * seq_kv + j] = f32::NEG_INFINITY;
+            }
+        }
+    }
+    Tensor::from_vec(data, (1, 1, seq_q, seq_kv), device)?.to_dtype(DType::F16)
+}
+
+/// Builds the analytic `KV_max` tensor for causal/windowed masking: one
+/// `i32` entry per `(batch, query tile)`, where query tile `t` covers rows
+/// `t*ncols1 .. (t+1)*ncols1 - 1`. Matches llama.cpp's own
+/// `flash_attn_mask_to_KV_max` host-side semantics (not vendored; see
+/// `fattn_mma_f16.cuh`'s `kb0_stop` and `fattn_tile.cuh`'s `k_VKQ_max`): the
+/// raw KV-row bound for that tile, rounded up to the next
+/// [`FATTN_KQ_STRIDE`] multiple and capped at `kv_max_cap`. There is no
+/// `window_left` parameter because a left-side window only narrows which
+/// *early* keys are valid, handled by the mask itself, never the upper
+/// bound `KV_max` truncates.
+///
+/// `kv_max_cap` is **not** always `seq_kv` — the two kernel families consume
+/// this value differently and need different caps:
+/// - The tile kernel (`fattn_tile.cuh`) uses the raw value directly as a loop
+///   bound (`k_VKQ_0 &lt; k_VKQ_max`) with no independent clamp against the
+///   real K/V buffer length, so an over-wide cap is a real out-of-bounds
+///   read. Tile callers must pass the true `seq_kv`.
+/// - The MMA kernel (`fattn_mma_f16.cuh`) only ever narrows its own
+///   independently-computed `kb0_stop` (`min(kb0_stop, KV_max/nbatch_fa)`,
+///   itself already bounded by `iter_k = ceil(real_seq_kv/nbatch_fa)`), so a
+///   looser cap can never cause an out-of-bounds read there — but capping at
+///   a bare `seq_kv` that isn't a multiple of `nbatch_fa` (32/64/128) makes
+///   that integer division truncate `kb0_stop`, silently dropping trailing
+///   valid KV rows from the softmax. MMA callers should pass
+///   `seq_kv.next_multiple_of(FATTN_KQ_STRIDE)` (safe: `FATTN_KQ_STRIDE` is a
+///   multiple of every tabled `nbatch_fa`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_analytic_kv_max(
+    batch: usize,
+    seq_q: usize,
+    ncols1: usize,
+    kv_offset: usize,
+    seq_kv: usize,
+    window_right: usize,
+    kv_max_cap: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    let n_tiles = q_tiles(seq_q, ncols1);
+    let mut data = vec![0i32; batch * n_tiles];
+    for t in 0..n_tiles {
+        let last_row = ((t + 1) * ncols1)
+            .saturating_sub(1)
+            .min(seq_q.saturating_sub(1));
+        let last_valid_col = (last_row + kv_offset + window_right).min(seq_kv.saturating_sub(1));
+        let bound = (last_valid_col + 1).div_ceil(FATTN_KQ_STRIDE) * FATTN_KQ_STRIDE;
+        let bound = to_i32(bound.min(kv_max_cap), "kv_max entry")?;
+        for b in 0..batch {
+            data[b * n_tiles + t] = bound;
+        }
+    }
+    Tensor::from_vec(data, (batch, n_tiles), device)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -595,6 +729,126 @@ mod tests {
         drop((q_s, k_s, v_s));
         let err = validate_fattn_bshd(&q_l, &k_l, &v_l).expect_err("head_dim=100 must be rejected");
         assert!(err.to_string().contains("head_dim in"));
+    }
+
+    // A fully-visible (no kv_offset/window) causal mask: entry (i, j) is 0
+    // for j <= i, -inf for j > i.
+    #[test]
+    fn build_additive_mask_f16_plain_causal() {
+        let dev = Device::Cpu;
+        let mask = build_additive_mask_f16(4, 4, 0, None, 0, &dev).unwrap();
+        assert_eq!(mask.dims(), &[1, 1, 4, 4]);
+        assert_eq!(mask.dtype(), DType::F16);
+        let vals = mask.flatten_all().unwrap().to_vec1::<half::f16>().unwrap();
+        for i in 0..4 {
+            for j in 0..4 {
+                let v = vals[i * 4 + j];
+                if j <= i {
+                    assert_eq!(v, half::f16::from_f32(0.0), "[{i},{j}] should be visible");
+                } else {
+                    assert!(
+                        v.is_infinite() && v.is_sign_negative(),
+                        "[{i},{j}] should be masked"
+                    );
+                }
+            }
+        }
+    }
+
+    // A sliding window: entry (i, j) is visible only for
+    // i - window_left <= j <= i + window_right.
+    #[test]
+    fn build_additive_mask_f16_windowed() {
+        let dev = Device::Cpu;
+        let mask = build_additive_mask_f16(1, 10, 5, Some(2), 1, &dev).unwrap();
+        let vals = mask.flatten_all().unwrap().to_vec1::<half::f16>().unwrap();
+        // Row 0, kv_offset=5: center at j=5, visible j in [3, 6].
+        for (j, v) in vals.iter().enumerate() {
+            let visible = (3..=6).contains(&j);
+            if visible {
+                assert_eq!(*v, half::f16::from_f32(0.0), "j={j} should be visible");
+            } else {
+                assert!(
+                    v.is_infinite() && v.is_sign_negative(),
+                    "j={j} should be masked"
+                );
+            }
+        }
+    }
+
+    // Every tile's bound must be a multiple of FATTN_KQ_STRIDE (or capped at
+    // kv_max_cap), cover every row the tile is responsible for, and never
+    // exceed kv_max_cap. Uses kv_max_cap = seq_kv, the tight cap tile-kernel
+    // callers must pass (see build_analytic_kv_max's doc comment).
+    #[test]
+    fn build_analytic_kv_max_covers_tile_rows_exactly() {
+        let dev = Device::Cpu;
+        let (batch, seq_q, ncols1, kv_offset, seq_kv) = (2, 40, 16, 100, 300);
+        let kv_max =
+            build_analytic_kv_max(batch, seq_q, ncols1, kv_offset, seq_kv, 0, seq_kv, &dev)
+                .unwrap();
+        assert_eq!(kv_max.dims(), &[batch, q_tiles(seq_q, ncols1)]);
+        let vals = kv_max.flatten_all().unwrap().to_vec1::<i32>().unwrap();
+        let n_tiles = q_tiles(seq_q, ncols1);
+        for t in 0..n_tiles {
+            let last_row = ((t + 1) * ncols1 - 1).min(seq_q - 1);
+            let last_valid_col = (last_row + kv_offset).min(seq_kv - 1);
+            for b in 0..batch {
+                let bound = vals[b * n_tiles + t];
+                assert!(
+                    bound as usize > last_valid_col,
+                    "tile {t} bound {bound} must cover last valid col {last_valid_col}"
+                );
+                assert!(
+                    bound as usize <= seq_kv,
+                    "tile {t} bound {bound} must not exceed kv_max_cap"
+                );
+                assert!(
+                    bound as usize == seq_kv || bound as usize % FATTN_KQ_STRIDE == 0,
+                    "tile {t} bound {bound} must be a FATTN_KQ_STRIDE multiple unless capped at kv_max_cap"
+                );
+            }
+        }
+    }
+
+    // window_right must extend the bound past kv_offset, same rounding rule
+    // as the no-window case.
+    #[test]
+    fn build_analytic_kv_max_respects_window_right() {
+        let dev = Device::Cpu;
+        let narrow = build_analytic_kv_max(1, 16, 16, 0, 1000, 0, 1000, &dev).unwrap();
+        let wide = build_analytic_kv_max(1, 16, 16, 0, 1000, 500, 1000, &dev).unwrap();
+        let narrow_v = narrow.flatten_all().unwrap().to_vec1::<i32>().unwrap()[0];
+        let wide_v = wide.flatten_all().unwrap().to_vec1::<i32>().unwrap()[0];
+        assert!(
+            wide_v > narrow_v,
+            "window_right must raise the bound: {narrow_v} vs {wide_v}"
+        );
+    }
+
+    // R1 regression: an MMA caller passing the loose
+    // `seq_kv.next_multiple_of(FATTN_KQ_STRIDE)` cap must always get back a
+    // FATTN_KQ_STRIDE multiple, even when the real seq_kv isn't one — this is
+    // what keeps `KV_max / nbatch_fa` (fattn_mma_f16.cuh) from truncating and
+    // silently dropping trailing valid KV rows. A tile-style tight cap
+    // (kv_max_cap = seq_kv) would fail this for a non-aligned seq_kv, which
+    // is exactly why MMA/tile callers must pass different caps.
+    #[test]
+    fn build_analytic_kv_max_mma_cap_stays_stride_aligned_for_unaligned_seq_kv() {
+        let dev = Device::Cpu;
+        let (batch, seq_q, ncols1, kv_offset, seq_kv): (usize, usize, usize, usize, usize) =
+            (1, 20, 16, 0, 150);
+        let kv_max_cap = seq_kv.next_multiple_of(FATTN_KQ_STRIDE);
+        let kv_max =
+            build_analytic_kv_max(batch, seq_q, ncols1, kv_offset, seq_kv, 0, kv_max_cap, &dev)
+                .unwrap();
+        let vals = kv_max.flatten_all().unwrap().to_vec1::<i32>().unwrap();
+        for (t, &bound) in vals.iter().enumerate() {
+            assert!(
+                bound as usize % FATTN_KQ_STRIDE == 0,
+                "tile {t} bound {bound} must be a FATTN_KQ_STRIDE multiple, not truncated to the unaligned seq_kv={seq_kv}"
+            );
+        }
     }
 }
 
