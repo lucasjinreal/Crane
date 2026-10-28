@@ -532,6 +532,12 @@ impl MinicpmV46VLModel {
         self.text.reset_gdn_caches()
     }
 
+    /// Enable fused causal attention in the text tower; see
+    /// [`Qwen3_5TextModel::enable_flash_causal`].
+    pub fn enable_flash_causal(&mut self) {
+        self.text.enable_flash_causal();
+    }
+
     /// Preprocess `image` and build the `input_ids` for one user turn,
     /// expanding the chat template's single `<|image_pad|>` marker into the
     /// full structured placeholder (`<image>...</image>` [+ `<slice>...

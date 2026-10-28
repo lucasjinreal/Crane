@@ -29,8 +29,9 @@ use candle_core::{DType, Device, Layout, Result, Tensor};
 /// That is an expected static limitation the caller should silently fall
 /// back on. It is never a sign of a real runtime failure (a launch
 /// rejection, OOM, an invalid argument, ...). `gpu_flash_attn::run`'s
-/// dispatch chain checks this prefix to decide whether to try the next
-/// kernel tier or propagate the error untouched. Swallowing every
+/// dispatch chain checks this prefix (via [`is_unsupported_config`]) to
+/// decide whether to try the next kernel tier or propagate the error
+/// untouched. Swallowing every
 /// `mma`/`mma_bf16` error regardless of cause would hide genuine
 /// kernel-execution failures behind the tile-kernel fallback.
 pub(crate) const UNSUPPORTED_CONFIG_PREFIX: &str = "crane_fattn_unsupported_config: ";
@@ -43,6 +44,12 @@ pub(crate) const UNSUPPORTED_CONFIG_PREFIX: &str = "crane_fattn_unsupported_conf
 /// error.
 pub(crate) fn unsupported_config(msg: impl std::fmt::Display) -> candle_core::Error {
     candle_core::Error::Msg(format!("{UNSUPPORTED_CONFIG_PREFIX}{msg}"))
+}
+
+/// True when `err` was built via [`unsupported_config`]. See that
+/// function's doc comment.
+pub(crate) fn is_unsupported_config(err: &candle_core::Error) -> bool {
+    err.to_string().starts_with(UNSUPPORTED_CONFIG_PREFIX)
 }
 
 /// Byte-for-byte layout of CUDA/HIP's built-in `uint3` (`struct { unsigned
