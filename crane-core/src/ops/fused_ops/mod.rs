@@ -36,6 +36,9 @@
 #![allow(clippy::cast_possible_truncation)]
 
 pub mod atan2;
+pub mod fattn;
+pub mod fattn_mma;
+pub mod fattn_tile;
 pub mod moe_combine;
 pub mod qsa_mask;
 pub mod snake;
