@@ -52,6 +52,10 @@ accelerate = [
 ]
 onnx = ["crane-core/onnx", "crane/onnx"]
 cuda = ["crane-core/cuda", "crane/cuda"]
+# The CUDA backend behind `--flash-attention`, mutually exclusive. See
+# `crane-core/Cargo.toml`. `rocm` needs neither.
+flash-attn = ["cuda", "crane-core/flash-attn", "crane/flash-attn"]
+flash-attn-intree = ["cuda", "crane-core/flash-attn-intree", "crane/flash-attn-intree"]
 rocm = ["crane-core/rocm", "crane/rocm"]
 # Intel SYCL / oneAPI backend (proof-of-concept).
 sycl = [
