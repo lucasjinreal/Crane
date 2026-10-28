@@ -32,6 +32,13 @@ pub const DEFAULT_CHUNK: usize = 2048;
 static DEFAULT_CHUNK_OVERRIDE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Orders tests that set `CRANE_PREFILL_CHUNK` against tests that need one
+/// fixed chunking. The variable is process-global, so without this a test
+/// that sets it changes the chunking under a prefill running on another
+/// thread.
+#[cfg(test)]
+pub(super) static CHUNK_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Choose the chunk size to use when `CRANE_PREFILL_CHUNK` is unset.
 ///
 /// For an embedder that already feeds prefill in chunks of its own, re-chunking
@@ -280,6 +287,9 @@ mod tests {
     /// GDN recurrent state, the K/V cache, RoPE offsets and the causal mask.
     #[test]
     fn chunked_prefill_matches_single_pass() {
+        let _env = CHUNK_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dev = Device::Cpu;
         let cfg = tiny_config();
         let vb = VarBuilder::from_backend(Box::new(RandWeights), DType::F32, dev.clone());
