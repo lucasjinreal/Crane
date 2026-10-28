@@ -23,8 +23,25 @@ fn oneapi_runtime_dirs() -> Vec<String> {
     .collect()
 }
 
-/// Compiles `kernels/cuda/*.cu` into the `crane_kernels_ptx.rs` bindings
-/// `ops::fused_ops`'s CUDA dispatchers `include!`.
+/// Non-recursive `.cu` file listing for a single directory, sorted for
+/// deterministic build output.
+#[cfg(feature = "cuda")]
+fn cu_files_in(dir: &str) -> Vec<std::path::PathBuf> {
+    let mut paths: Vec<_> = std::fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("reading {dir}: {e}"))
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|ext| ext == "cu"))
+        .collect();
+    paths.sort();
+    paths
+}
+
+/// Compiles `kernels/cuda/`'s (and `kernels/cuda/fattn/`'s) `.cu` sources
+/// into the `crane_kernels_ptx.rs` bindings `ops::fused_ops`'s CUDA
+/// dispatchers `include!`. `flash_attention/` holds a separately built host
+/// launch adapter (cudaforge + CUTLASS, gated behind
+/// `flash-attn`/`flash-inference`) that must not go through this PTX-only
+/// pipeline, so it's deliberately not globbed here.
 #[cfg(feature = "cuda")]
 fn build_cuda_ptx() {
     use std::env;
@@ -32,12 +49,13 @@ fn build_cuda_ptx() {
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
-    // Top-level CUDA sources are embedded PTX kernels. Subdirectories
-    // contain separately built host launch adapters, such as FlashAttention,
-    // which must not be compiled through the PTX-only pipeline.
+    let mut kernel_paths = cu_files_in("kernels/cuda");
+    kernel_paths.extend(cu_files_in("kernels/cuda/fattn"));
+
     let builder = bindgen_cuda::Builder::default()
-        .kernel_paths_glob("kernels/cuda/*.cu")
+        .kernel_paths(kernel_paths)
         .arg("--expt-relaxed-constexpr")
+        .arg("--extended-lambda")
         .arg("-std=c++17")
         .arg("-O3");
 
