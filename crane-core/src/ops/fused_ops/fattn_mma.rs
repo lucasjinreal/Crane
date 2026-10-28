@@ -33,7 +33,8 @@
 use candle_core::{DType, Layout, Result, Tensor};
 
 use super::fattn::{
-    MAX_GRID_X_DIM, gqa_z_tiles, init_fastdiv_values, mma_config, mma_shared_mem_bytes, q_tiles,
+    FATTN_KQ_STRIDE, MAX_GRID_X_DIM, gqa_z_tiles, init_fastdiv_values, is_amd_backend, mma_config,
+    mma_shared_mem_bytes, q_tiles, select_mma_ncols, unsupported_config,
 };
 
 /// Bounds-checked scalar arguments for a `crane_fattn_mma_f16_*` launch,
@@ -295,9 +296,9 @@ impl LaunchGeometry {
         let nwarps = cfg.nthreads / 32;
         let ntiles_dst = q_tiles(seq_q, ncols1) * gqa_z_tiles(gqa_ratio, ncols2) * h_kv * batch;
         if ntiles_dst > MAX_GRID_X_DIM {
-            candle_core::bail!(
+            return Err(unsupported_config(format!(
                 "fattn_mma: grid size ({ntiles_dst}) exceeds the CUDA/HIP grid x-dimension limit ({MAX_GRID_X_DIM})"
-            );
+            )));
         }
         let shared_mem_bytes = mma_shared_mem_bytes(dkq, ncols1, ncols2, &cfg, is_amd);
         Ok(Self {
@@ -391,6 +392,332 @@ pub fn fattn_mma_prefill(
     }
 }
 
+/// `(head_dim, gqa_ratio, seq_q, seq_kv, is_amd)` for a `[B, S, H, D]` BSHD
+/// `q`/`k` pair, shared by [`mma_ncols1_for`] and [`pad_for_gqa_batching`] so
+/// the shape derivation and `num_heads_q`/`num_heads_kv` validation live in
+/// one place.
+///
+/// # Errors
+///
+/// Returns an error if `q`/`k` aren't 4D, `num_heads_kv` is `0`, or
+/// `num_heads_q` isn't a positive multiple of it.
+fn mma_shape_params(q: &Tensor, k: &Tensor) -> Result<(usize, usize, usize, usize, bool)> {
+    let (_, seq_q, h_q, d) = q.dims4()?;
+    let (_, seq_kv, h_kv, _) = k.dims4()?;
+    if h_kv == 0 || h_q % h_kv != 0 {
+        candle_core::bail!(
+            "fattn_mma: num_heads_q ({h_q}) must be a positive multiple of num_heads_kv ({h_kv})"
+        );
+    }
+    Ok((d, h_q / h_kv, seq_q, seq_kv, is_amd_backend()))
+}
+
+/// `(ncols1, gqa_ratio)` for a `[B, S, H, D]` BSHD `q`/`k` pair, shared by
+/// [`fattn_mma_causal`]/[`fattn_mma_full`]/[`fattn_mma_windowed`] to size
+/// their `KV_max` tensor before dispatching to [`fattn_mma_prefill`] (which
+/// re-derives the same `ncols1` internally from the same inputs).
+///
+/// # Errors
+///
+/// Returns an error if `q`/`k` aren't 4D, `num_heads_kv` is `0`, or
+/// `num_heads_q` isn't a multiple of it, or if no instantiated MMA kernel
+/// covers this `(head_dim, GQA ratio, seq_q, seq_kv)` combination (callers
+/// should fall back to [`super::fattn_tile`] in that case).
+fn mma_ncols1_for(q: &Tensor, k: &Tensor) -> Result<usize> {
+    let (d, gqa_ratio, seq_q, seq_kv, is_amd) = mma_shape_params(q, k)?;
+    select_mma_ncols(d, gqa_ratio, seq_q, seq_kv, is_amd)
+        .map(|(ncols1, _)| ncols1)
+        .ok_or_else(|| {
+            unsupported_config(format!(
+                "fattn_mma: no instantiated kernel for head_dim={d} gqa_ratio={gqa_ratio} seq_q={seq_q} seq_kv={seq_kv}"
+            ))
+        })
+}
+
+/// If treating `seq_kv` as padded up to the next [`FATTN_KQ_STRIDE`]
+/// multiple would unlock a GQA-batched (`ncols2 > 1`) kernel that the live,
+/// unpadded length can't (see [`super::fattn::select_mma_ncols`]'s doc
+/// comment: that path requires an aligned `seq_kv`, which a live prefill
+/// call's real token count almost never has), returns the padded length.
+/// Returns `None` when padding wouldn't change the outcome: `gqa_ratio == 1`
+/// (no sibling queries to batch, regardless of alignment), `seq_kv` is
+/// already aligned, or even the padded length still has no `ncols2 > 1`
+/// kernel (e.g. AMD `head_dim > 256`, which has no MMA path at all). This
+/// mirrors llama.cpp's own precondition for this path: upstream's `K->ne[1]`
+/// is always a KV-cache buffer already allocated padded to this stride, so
+/// its equivalent check is realistically always true; Crane's prefill calls
+/// build exactly the live-length K/V tensor instead, so this function (and
+/// [`pad_for_gqa_batching`]) exist to reproduce that same precondition.
+fn padded_seq_kv_for_gqa_batching(
+    head_dim: usize,
+    gqa_ratio: usize,
+    seq_q: usize,
+    seq_kv: usize,
+    is_amd: bool,
+) -> Option<usize> {
+    if gqa_ratio == 1 {
+        return None;
+    }
+    if let Some((_, ncols2)) = select_mma_ncols(head_dim, gqa_ratio, seq_q, seq_kv, is_amd)
+        && ncols2 > 1
+    {
+        return None;
+    }
+    let padded = seq_kv.next_multiple_of(FATTN_KQ_STRIDE);
+    if padded == seq_kv {
+        return None;
+    }
+    match select_mma_ncols(head_dim, gqa_ratio, seq_q, padded, is_amd) {
+        Some((_, ncols2)) if ncols2 > 1 => Some(padded),
+        _ => None,
+    }
+}
+
+/// Zero-pads `k`/`v`'s sequence axis (BSHD axis 1) from their live length up
+/// to `padded_seq_kv`. The kernel's GQA-batched (`ncols2 > 1`) tail tile is
+/// read with no bounds check (`oob_check = false` whenever `ncols2 > 1`, see
+/// `fattn_mma_f16.cuh`'s `flash_attn_ext_f16_iter` dispatch), so this
+/// physically extends the buffer rather than merely widening the logical
+/// `KV_max`/mask bound, which alone would leave the tail read past the real
+/// allocation. Padding with zeros (not uninitialized memory) matters: the
+/// padded columns are always masked to `-inf` by [`pad_mask`] before the
+/// softmax, but `-inf + NaN == NaN`, so a garbage bit pattern in the padding
+/// could still corrupt a row's softmax reduction even though its
+/// contribution is meant to be zero.
+fn pad_kv(k: &Tensor, v: &Tensor, padded_seq_kv: usize) -> Result<(Tensor, Tensor)> {
+    let (b, seq_kv, h_kv, d) = k.dims4()?;
+    let pad_len = padded_seq_kv - seq_kv;
+    let zeros = Tensor::zeros((b, pad_len, h_kv, d), DType::F16, k.device())?;
+    Ok((Tensor::cat(&[k, &zeros], 1)?, Tensor::cat(&[v, &zeros], 1)?))
+}
+
+/// Extends an additive F16 mask's last (kv) axis from its live width up to
+/// `padded_seq_kv` with `-inf`, so the padded K/V rows [`pad_kv`] appends
+/// never contribute to any query's softmax. `seq_kv` must be `<=
+/// padded_seq_kv` (checked by [`pad_for_gqa_batching`] before calling this).
+fn pad_mask(mask: &Tensor, padded_seq_kv: usize) -> Result<Tensor> {
+    let dims = mask.dims().to_vec();
+    let seq_kv = *dims.last().expect("mask must have at least one axis");
+    let mut pad_shape = dims.clone();
+    *pad_shape
+        .last_mut()
+        .expect("mask must have at least one axis") = padded_seq_kv - seq_kv;
+    let neg_inf =
+        Tensor::full(f32::NEG_INFINITY, pad_shape, mask.device())?.to_dtype(DType::F16)?;
+    Tensor::cat(&[mask, &neg_inf], dims.len() - 1)
+}
+
+/// Pads `k`/`v`/`mask` for GQA-batched dispatch when beneficial (see
+/// [`padded_seq_kv_for_gqa_batching`]), otherwise returns clones of the
+/// inputs unchanged (a `Tensor` clone is an `Arc` bump, not a data copy).
+/// `mask` must already be F16 and cover `k`'s live (unpadded) `seq_kv`
+/// width — checked explicitly below rather than left as an unenforced
+/// precondition, since a mismatched mask would otherwise make [`pad_mask`]
+/// either underflow (`mask`'s kv axis wider than `k`'s) or silently splice
+/// `-inf` in the wrong place (`mask`'s kv axis narrower than `k`'s,
+/// e.g. a broadcastable width-1 axis). Shared by every
+/// `fattn_mma_*`/`fattn_mma_*_with_mask` entry point so the padding decision
+/// and mechanics live in one place.
+///
+/// # Errors
+///
+/// Returns an error if `q`/`k`'s shapes are invalid (see
+/// [`mma_shape_params`]) or `mask`'s last dimension doesn't equal `k`'s live
+/// `seq_kv`.
+fn pad_for_gqa_batching(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: &Tensor,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    let (d, gqa_ratio, seq_q, seq_kv, is_amd) = mma_shape_params(q, k)?;
+    let mask_kv = mask.dims().last().copied().unwrap_or(0);
+    if mask_kv != seq_kv {
+        candle_core::bail!(
+            "fattn_mma: mask's last dimension ({mask_kv}) must equal k's seq_kv ({seq_kv})"
+        );
+    }
+    match padded_seq_kv_for_gqa_batching(d, gqa_ratio, seq_q, seq_kv, is_amd) {
+        Some(padded) => {
+            let (k, v) = pad_kv(k, v, padded)?;
+            let mask = pad_mask(mask, padded)?;
+            Ok((k, v, mask))
+        },
+        None => Ok((k.clone(), v.clone(), mask.clone())),
+    }
+}
+
+/// Causal flash-attention: `j <= i + kv_offset`. Builds the additive mask
+/// this kernel family always needs (see this module's doc comment: unlike
+/// [`super::flash_attn_mma`], `mask = None` is not a safe universal
+/// "no masking" shortcut here) and dispatches to
+/// [`fattn_mma_causal_with_mask`].
+///
+/// # Errors
+///
+/// See [`fattn_mma_causal_with_mask`].
+pub fn fattn_mma_causal(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    kv_offset: usize,
+) -> Result<Tensor> {
+    let (_, seq_q, _, _) = q.dims4()?;
+    let (_, seq_kv, _, _) = k.dims4()?;
+    let mask =
+        super::fattn::build_additive_mask_f16(seq_q, seq_kv, kv_offset, None, 0, q.device())?;
+    fattn_mma_causal_with_mask(q, k, v, scale, kv_offset, &mask)
+}
+
+/// Same as [`fattn_mma_causal`], but for a caller that already has a mask
+/// shared across multiple layers in one forward pass (e.g. a decoder stack
+/// whose `forward()` builds the mask once and passes it to every layer).
+/// That avoids the `O(seq_q * seq_kv)` mask rebuild on every call that
+/// [`fattn_mma_causal`] pays. `mask` must encode exactly
+/// `j <= i + kv_offset`, covering `k`'s live `seq_kv` (any dtype, cast to
+/// F16 here if needed). `KV_max` is still rebuilt per call. It is
+/// `O(batch * n_tiles)`, not `O(seq^2)`, so there is no analogous cost to
+/// share.
+///
+/// # Errors
+///
+/// Returns a candle error if `q`/`k`/`v`'s shapes are incompatible, if
+/// `mask` isn't broadcastable to `[.., seq_q, seq_kv]`, or if any tensor op
+/// (including the padding this function may perform, see
+/// [`pad_for_gqa_batching`]) fails.
+pub fn fattn_mma_causal_with_mask(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    kv_offset: usize,
+    mask: &Tensor,
+) -> Result<Tensor> {
+    let (b, seq_q, _, _) = q.dims4()?;
+    let mask = if mask.dtype() == DType::F16 {
+        mask.clone()
+    } else {
+        mask.to_dtype(DType::F16)?
+    };
+    let (k, v, mask) = pad_for_gqa_batching(q, k, v, &mask)?;
+    let ncols1 = mma_ncols1_for(q, &k)?;
+    let seq_kv = k.dims4()?.1;
+    // kv_max_cap rounds seq_kv up to FATTN_KQ_STRIDE rather than capping at
+    // the bare seq_kv: the MMA kernel divides KV_max by nbatch_fa
+    // (32/64/128, always a FATTN_KQ_STRIDE divisor), and its own kb0_stop is
+    // independently bounded by the real buffer length, so this cap only
+    // controls alignment, not safety (see build_analytic_kv_max's doc
+    // comment).
+    let kv_max_cap = seq_kv.next_multiple_of(FATTN_KQ_STRIDE);
+    let kv_max = super::fattn::build_analytic_kv_max(
+        b,
+        seq_q,
+        ncols1,
+        kv_offset,
+        seq_kv,
+        0,
+        kv_max_cap,
+        q.device(),
+    )?;
+    fattn_mma_prefill(q, &k, &v, Some(&mask), Some(&kv_max), scale)
+}
+
+/// Sliding-window flash-attention: `i + kv_offset - window_left <= j <= i +
+/// kv_offset + window_right`. See [`fattn_mma_causal`] for the mask/`KV_max`
+/// rationale; `window_left` only narrows the mask (there is no lower bound
+/// to the kernel's KV loop), while `window_right` also tightens `KV_max`.
+///
+/// # Errors
+///
+/// See [`fattn_mma_windowed_with_mask`].
+pub fn fattn_mma_windowed(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    kv_offset: usize,
+    window_left: usize,
+    window_right: usize,
+) -> Result<Tensor> {
+    let (_, seq_q, _, _) = q.dims4()?;
+    let (_, seq_kv, _, _) = k.dims4()?;
+    let mask = super::fattn::build_additive_mask_f16(
+        seq_q,
+        seq_kv,
+        kv_offset,
+        Some(window_left),
+        window_right,
+        q.device(),
+    )?;
+    fattn_mma_windowed_with_mask(q, k, v, scale, kv_offset, window_right, &mask)
+}
+
+/// Same as [`fattn_mma_windowed`], but for a caller that already has a
+/// shared mask built once per forward pass — see
+/// [`fattn_mma_causal_with_mask`]'s doc comment for the rationale. `mask`
+/// must encode `i + kv_offset - window_left <= j <= i + kv_offset +
+/// window_right`, covering `k`'s live `seq_kv`; `window_left` is not needed
+/// here since it only narrows the mask (already baked into `mask`), never
+/// `KV_max`'s upper bound (see `build_analytic_kv_max`'s doc comment).
+///
+/// # Errors
+///
+/// See [`fattn_mma_causal_with_mask`].
+pub fn fattn_mma_windowed_with_mask(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    kv_offset: usize,
+    window_right: usize,
+    mask: &Tensor,
+) -> Result<Tensor> {
+    let (b, seq_q, _, _) = q.dims4()?;
+    let mask = if mask.dtype() == DType::F16 {
+        mask.clone()
+    } else {
+        mask.to_dtype(DType::F16)?
+    };
+    let (k, v, mask) = pad_for_gqa_batching(q, k, v, &mask)?;
+    let ncols1 = mma_ncols1_for(q, &k)?;
+    let seq_kv = k.dims4()?.1;
+    // kv_max_cap: see fattn_mma_causal_with_mask's comment.
+    let kv_max_cap = seq_kv.next_multiple_of(FATTN_KQ_STRIDE);
+    let kv_max = super::fattn::build_analytic_kv_max(
+        b,
+        seq_q,
+        ncols1,
+        kv_offset,
+        seq_kv,
+        window_right,
+        kv_max_cap,
+        q.device(),
+    )?;
+    fattn_mma_prefill(q, &k, &v, Some(&mask), Some(&kv_max), scale)
+}
+
+/// Non-causal (full, bidirectional) flash-attention: every query attends to
+/// every key. Passes a real all-zero mask rather than `None` (see this
+/// module's doc comment), since `None` is only safe when the
+/// internally-selected `ncols2` resolves to `1`, which this entry point
+/// cannot guarantee for every `(gqa_ratio, seq_kv)` shape. No `KV_max`:
+/// nothing is masked, so there is no tail of the KV loop to skip. Still pads
+/// for GQA-batching (see [`pad_for_gqa_batching`]) when beneficial, even
+/// though no model wires this entry point up yet, for consistency with
+/// [`fattn_mma_causal`]/[`fattn_mma_windowed`].
+///
+/// # Errors
+///
+/// See [`fattn_mma_prefill`] and [`pad_for_gqa_batching`].
+pub fn fattn_mma_full(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32) -> Result<Tensor> {
+    let (_, seq_q, _, _) = q.dims4()?;
+    let (_, seq_kv, _, _) = k.dims4()?;
+    let mask = Tensor::zeros((1, 1, seq_q, seq_kv), DType::F16, q.device())?;
+    let (k, v, mask) = pad_for_gqa_batching(q, k, v, &mask)?;
+    fattn_mma_prefill(q, &k, &v, Some(&mask), None, scale)
+}
+
 #[cfg(feature = "cuda")]
 mod cuda {
     use candle_core::Storage;
@@ -399,7 +726,9 @@ mod cuda {
     use candle_core::cuda_backend::{CudaStorage, CudaStorageSlice, WrapErr};
 
     use super::{LaunchGeometry, LaunchScalars};
-    use crate::ops::fused_ops::fattn::{mma_kernel_name, select_mma_ncols, validate_fattn_bshd};
+    use crate::ops::fused_ops::fattn::{
+        mma_kernel_name, select_mma_ncols, unsupported_config, validate_fattn_bshd,
+    };
     use candle_core::{Result, Tensor};
 
     mod ptx {
@@ -462,19 +791,19 @@ mod cuda {
         let is_amd = false;
 
         let Some((ncols1, ncols2)) = select_mma_ncols(d, gqa_ratio, seq_q, seq_kv, is_amd) else {
-            candle_core::bail!(
+            return Err(unsupported_config(format!(
                 "fattn_mma: no instantiated kernel for head_dim={d} gqa_ratio={gqa_ratio} seq_kv={seq_kv}"
-            );
+            )));
         };
         // See fattn_mma_prefill's doc comment: the kernel unconditionally
         // computes `sequence % ne33` whenever ncols2 > 1, which null-derefs/
         // div-by-zeros when mask=None (ne33=0). Only ncols2==1 makes None
         // safe.
         if mask.is_none() && ncols2 != 1 {
-            candle_core::bail!(
+            return Err(unsupported_config(format!(
                 "fattn_mma: mask=None requires ncols2 == 1 (got ncols2={ncols2}); \
                  pass an explicit all-zero mask for unmasked attention with this GQA shape"
-            );
+            )));
         }
         let geometry = LaunchGeometry::new(d, ncols1, ncols2, seq_q, h_kv, b, gqa_ratio, is_amd)?;
         let kernel_name = mma_kernel_name(d, ncols1, ncols2);
@@ -607,7 +936,9 @@ mod rocm {
     use candle_core::{DType, Result, Tensor};
 
     use super::{LaunchGeometry, LaunchScalars};
-    use crate::ops::fused_ops::fattn::{mma_kernel_name, select_mma_ncols, validate_fattn_bshd};
+    use crate::ops::fused_ops::fattn::{
+        mma_kernel_name, select_mma_ncols, unsupported_config, validate_fattn_bshd,
+    };
     use crate::ops::rocm;
 
     /// Each leaf vendored header is spliced into the final source exactly
@@ -692,19 +1023,19 @@ mod rocm {
         let is_amd = true;
 
         let Some((ncols1, ncols2)) = select_mma_ncols(d, gqa_ratio, seq_q, seq_kv, is_amd) else {
-            candle_core::bail!(
+            return Err(unsupported_config(format!(
                 "fattn_mma: no instantiated kernel for head_dim={d} gqa_ratio={gqa_ratio} seq_kv={seq_kv}"
-            );
+            )));
         };
         // See fattn_mma_prefill's doc comment: the kernel unconditionally
         // computes `sequence % ne33` whenever ncols2 > 1, which null-derefs/
         // div-by-zeros when mask=None (ne33=0). Only ncols2==1 makes None
         // safe.
         if mask.is_none() && ncols2 != 1 {
-            candle_core::bail!(
+            return Err(unsupported_config(format!(
                 "fattn_mma: mask=None requires ncols2 == 1 (got ncols2={ncols2}); \
                  pass an explicit all-zero mask for unmasked attention with this GQA shape"
-            );
+            )));
         }
         let geometry = LaunchGeometry::new(d, ncols1, ncols2, seq_q, h_kv, b, gqa_ratio, is_amd)?;
         let kernel_name = mma_kernel_name(d, ncols1, ncols2);
@@ -863,19 +1194,17 @@ mod tests {
 
 /// Correctness against a real GPU (this machine's ROCm GPU, or a CUDA GPU
 /// when built with `--features cuda` elsewhere), reusing
-/// `fattn::test_support`'s naive matmul/mask/softmax/matmul reference.
-/// Covers `mask = None` (the `full`/no-masking path this kernel family
-/// branches on explicitly, `if (ncols2 > 1 || mask_h)` in
-/// `fattn_mma_f16.cuh`) and a causal mask built here directly. The
-/// analytic `KV_max`/causal-mask-building helpers land in a later commit,
-/// so these tests construct the mask by hand rather than going through
-/// `attn_dispatch`.
+/// `fattn::test_support`'s naive matmul/mask/softmax/matmul reference. The
+/// `run_*` helpers below build their mask by hand and call
+/// [`fattn_mma_prefill`] directly; [`fattn_mma_causal`]/[`fattn_mma_full`]/
+/// [`fattn_mma_windowed`] get their own separate end-to-end tests further
+/// down, covering the mask/`KV_max`-building logic those wrap around it.
 #[cfg(all(test, any(feature = "cuda", feature = "rocm")))]
 mod gpu_tests {
     use candle_core::{DType, Device, Tensor};
 
     use super::super::fattn::test_support::{MaskMode, naive_attention, test_gpu_device};
-    use super::fattn_mma_prefill;
+    use super::{fattn_mma_causal, fattn_mma_full, fattn_mma_prefill, fattn_mma_windowed};
 
     /// `[1, seq_q, seq_kv]` F16 additive causal mask: `0` where `j <=
     /// i + kv_offset`, `-inf` otherwise. Matches `fattn_mma_f16.cuh`'s
@@ -1068,5 +1397,202 @@ mod gpu_tests {
     #[test]
     fn causal_gqa_hd128() {
         run_causal(1, 32, 256, 8, 2, 128);
+    }
+
+    fn got_vec(t: Tensor) -> Vec<f32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .to_device(&Device::Cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    }
+
+    fn assert_close(got: &[f32], want: &[f32], tol: f32, what: &str) {
+        assert_eq!(got.len(), want.len());
+        for (i, (g, w)) in got.iter().zip(want).enumerate() {
+            assert!(
+                (g - w).abs() <= tol * w.abs().max(1.0),
+                "[{i}] got {g}, want {w} ({what})"
+            );
+        }
+    }
+
+    // End-to-end `fattn_mma_causal`: builds its own mask/KV_max internally,
+    // unlike `run_causal`'s hand-built mask.
+    #[test]
+    fn causal_fn_matches_reference_hd128() {
+        let gpu = test_gpu_device();
+        let (b, sq, skv, hq, hkv, d) = (1, 32, 256, 8, 2, 128usize);
+        let scale = 1.0f32 / (d as f32).sqrt();
+        let kv_offset = skv - sq;
+
+        let q_f32 = Tensor::randn(0f32, 1f32, (b, sq, hq, d), &Device::Cpu).unwrap();
+        let k_f32 = Tensor::randn(0f32, 1f32, (b, skv, hkv, d), &Device::Cpu).unwrap();
+        let v_f32 = Tensor::randn(0f32, 1f32, (b, skv, hkv, d), &Device::Cpu).unwrap();
+        let want = naive_attention(
+            &q_f32,
+            &k_f32,
+            &v_f32,
+            scale,
+            MaskMode::Causal,
+            kv_offset,
+            0,
+            0,
+        );
+
+        let q = q_f32.to_device(&gpu).unwrap();
+        let k = k_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
+        let v = v_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
+
+        let got = fattn_mma_causal(&q, &k, &v, scale, kv_offset).unwrap();
+        assert_close(&got_vec(got), &want, 3e-2, "causal_fn");
+    }
+
+    // End-to-end `fattn_mma_causal` with a non-FATTN_KQ_STRIDE-aligned
+    // seq_kv and GQA ratio > 1: unlike `causal_fn_matches_reference_hd128`'s
+    // already-aligned skv=256, this exercises `pad_for_gqa_batching`'s real
+    // `pad_kv`/`pad_mask` code path (skv=200 pads up to 256 to unlock the
+    // ncols2>1 kernel on AMD), which every other GPU test in this module
+    // short-circuits around by only ever using an aligned seq_kv.
+    #[test]
+    fn causal_fn_matches_reference_padded_gqa_hd128() {
+        let gpu = test_gpu_device();
+        let (b, sq, skv, hq, hkv, d) = (1, 20, 200, 8, 2, 128usize);
+        let scale = 1.0f32 / (d as f32).sqrt();
+        let kv_offset = skv - sq;
+
+        let q_f32 = Tensor::randn(0f32, 1f32, (b, sq, hq, d), &Device::Cpu).unwrap();
+        let k_f32 = Tensor::randn(0f32, 1f32, (b, skv, hkv, d), &Device::Cpu).unwrap();
+        let v_f32 = Tensor::randn(0f32, 1f32, (b, skv, hkv, d), &Device::Cpu).unwrap();
+        let want = naive_attention(
+            &q_f32,
+            &k_f32,
+            &v_f32,
+            scale,
+            MaskMode::Causal,
+            kv_offset,
+            0,
+            0,
+        );
+
+        let q = q_f32.to_device(&gpu).unwrap();
+        let k = k_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
+        let v = v_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
+
+        let got = fattn_mma_causal(&q, &k, &v, scale, kv_offset).unwrap();
+        assert_close(&got_vec(got), &want, 3e-2, "causal_fn_padded_gqa");
+    }
+
+    // End-to-end `fattn_mma_windowed`.
+    #[test]
+    fn windowed_fn_matches_reference_hd128() {
+        // hq != hkv (GQA ratio > 1) and skv a FATTN_KQ_STRIDE (256) multiple:
+        // on AMD, ncols2 only batches GQA heads (resolving to > 1) when both
+        // hold (see `mma_ncols2`'s `gqa_opt_applies` gate); otherwise it
+        // falls back to ncols2 == 1, which the WMMA kernel rejects
+        // unconditionally (see `select_mma_ncols`'s doc comment).
+        let gpu = test_gpu_device();
+        let (b, sq, skv, hq, hkv, d) = (1, 20, 256, 8, 2, 128usize);
+        let scale = 1.0f32 / (d as f32).sqrt();
+        let kv_offset = skv - sq;
+        let (window_left, window_right) = (20, 0);
+
+        let q_f32 = Tensor::randn(0f32, 1f32, (b, sq, hq, d), &Device::Cpu).unwrap();
+        let k_f32 = Tensor::randn(0f32, 1f32, (b, skv, hkv, d), &Device::Cpu).unwrap();
+        let v_f32 = Tensor::randn(0f32, 1f32, (b, skv, hkv, d), &Device::Cpu).unwrap();
+        let want = naive_attention(
+            &q_f32,
+            &k_f32,
+            &v_f32,
+            scale,
+            MaskMode::Windowed,
+            kv_offset,
+            window_left,
+            window_right,
+        );
+
+        let q = q_f32.to_device(&gpu).unwrap();
+        let k = k_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
+        let v = v_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
+
+        let got =
+            fattn_mma_windowed(&q, &k, &v, scale, kv_offset, window_left, window_right).unwrap();
+        assert_close(&got_vec(got), &want, 3e-2, "windowed_fn");
+    }
+
+    // End-to-end `fattn_mma_full`.
+    #[test]
+    fn full_fn_matches_reference_hd64() {
+        let gpu = test_gpu_device();
+        let (b, sq, skv, hq, hkv, d) = (1, 32, 256, 4, 2, 64usize);
+        let scale = 1.0f32 / (d as f32).sqrt();
+
+        let q_f32 = Tensor::randn(0f32, 1f32, (b, sq, hq, d), &Device::Cpu).unwrap();
+        let k_f32 = Tensor::randn(0f32, 1f32, (b, skv, hkv, d), &Device::Cpu).unwrap();
+        let v_f32 = Tensor::randn(0f32, 1f32, (b, skv, hkv, d), &Device::Cpu).unwrap();
+        let want = naive_attention(&q_f32, &k_f32, &v_f32, scale, MaskMode::Full, 0, 0, 0);
+
+        let q = q_f32.to_device(&gpu).unwrap();
+        let k = k_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
+        let v = v_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
+
+        let got = fattn_mma_full(&q, &k, &v, scale).unwrap();
+        assert_close(&got_vec(got), &want, 3e-2, "full_fn");
+    }
+
+    // A deliberately wrong mask (shifted by a large offset, so it allows and
+    // denies a disjoint set of positions from the correct one) must produce
+    // a different result than the correct causal mask, proving the kernel
+    // actually reads `mask` rather than silently ignoring it.
+    #[test]
+    fn garbage_mask_changes_output() {
+        // hq != hkv (GQA ratio > 1): see windowed_fn_matches_reference_hd128's
+        // comment for why a ratio-1 shape has no AMD WMMA kernel at all.
+        let gpu = test_gpu_device();
+        let (sq, skv, hq, hkv, d) = (16, 256, 8, 2, 128usize);
+        let scale = 1.0f32 / (d as f32).sqrt();
+        let kv_offset = skv - sq;
+
+        let q_f32 = Tensor::randn(0f32, 1f32, (1, sq, hq, d), &Device::Cpu).unwrap();
+        let k_f32 = Tensor::randn(0f32, 1f32, (1, skv, hkv, d), &Device::Cpu).unwrap();
+        let v_f32 = Tensor::randn(0f32, 1f32, (1, skv, hkv, d), &Device::Cpu).unwrap();
+
+        let q = q_f32.to_device(&gpu).unwrap();
+        let k = k_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
+        let v = v_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
+
+        let correct_mask = causal_mask(sq, skv, kv_offset, &gpu);
+        // A reversed causal mask: visible exactly where the correct mask is
+        // not (and vice versa), so the two results cannot coincidentally
+        // match unless the kernel ignores the mask entirely.
+        let garbage_vals: Vec<f32> = (0..sq * skv)
+            .map(|idx| {
+                let (i, j) = (idx / skv, idx % skv);
+                let rel = j as i64 - (i as i64 + kv_offset as i64);
+                if rel > 0 { 0.0 } else { f32::NEG_INFINITY }
+            })
+            .collect();
+        let garbage_mask = Tensor::from_vec(garbage_vals, (1, sq, skv), &gpu)
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap();
+
+        let out_correct = fattn_mma_prefill(&q, &k, &v, Some(&correct_mask), None, scale).unwrap();
+        let out_garbage = fattn_mma_prefill(&q, &k, &v, Some(&garbage_mask), None, scale).unwrap();
+
+        let correct_vec = got_vec(out_correct);
+        let garbage_vec = got_vec(out_garbage);
+        let max_diff = correct_vec
+            .iter()
+            .zip(&garbage_vec)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff > 1e-3,
+            "garbage mask produced the same output as the correct mask (max diff {max_diff})"
+        );
     }
 }
