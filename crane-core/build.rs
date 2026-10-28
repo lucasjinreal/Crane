@@ -23,6 +23,30 @@ fn oneapi_runtime_dirs() -> Vec<String> {
     .collect()
 }
 
+/// Compiles `kernels/cuda/*.cu` into the `crane_kernels_ptx.rs` bindings
+/// `ops::fused_ops`'s CUDA dispatchers `include!`.
+#[cfg(feature = "cuda")]
+fn build_cuda_ptx() {
+    use std::env;
+    use std::path::PathBuf;
+
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+
+    // Top-level CUDA sources are embedded PTX kernels. Subdirectories
+    // contain separately built host launch adapters, such as FlashAttention,
+    // which must not be compiled through the PTX-only pipeline.
+    let builder = bindgen_cuda::Builder::default()
+        .kernel_paths_glob("kernels/cuda/*.cu")
+        .arg("--expt-relaxed-constexpr")
+        .arg("-std=c++17")
+        .arg("-O3");
+
+    let bindings = builder.build_ptx().expect("Failed to compile CUDA kernels");
+    bindings
+        .write(out_dir.join("crane_kernels_ptx.rs"))
+        .expect("Failed to write PTX bindings");
+}
+
 fn main() {
     #[cfg(any(feature = "flash-attn", feature = "flash-inference"))]
     {
@@ -84,26 +108,7 @@ fn main() {
 
     // Only compile CUDA kernels when the cuda feature is enabled.
     #[cfg(feature = "cuda")]
-    {
-        use std::env;
-        use std::path::PathBuf;
-
-        let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-
-        // Top-level CUDA sources are embedded PTX kernels. Subdirectories
-        // contain separately built host launch adapters, such as FlashAttention,
-        // which must not be compiled through the PTX-only pipeline.
-        let builder = bindgen_cuda::Builder::default()
-            .kernel_paths_glob("kernels/cuda/*.cu")
-            .arg("--expt-relaxed-constexpr")
-            .arg("-std=c++17")
-            .arg("-O3");
-
-        let bindings = builder.build_ptx().expect("Failed to compile CUDA kernels");
-        bindings
-            .write(out_dir.join("crane_kernels_ptx.rs"))
-            .expect("Failed to write PTX bindings");
-    }
+    build_cuda_ptx();
 
     // Compile the fused SYCL kernels into `libcrane_gdn_sycl.so` with `icpx`.
     // Only when `--features sycl` — a plain build never needs oneAPI. The
