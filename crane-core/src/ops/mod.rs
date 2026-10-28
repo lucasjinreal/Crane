@@ -6,6 +6,8 @@
 //!   add+rmsnorm, `gpu_argmax`, top-k, HtoD/DtoH copies).
 //! - [`gdn`]       — Gated Delta Net recurrence (linear-attention path used
 //!   by Qwen 3.5 hybrid layers), with a fused recurrence kernel.
+//! - `graph_plan`  — Replay a fixed-shape forward pass as a captured CUDA or
+//!   HIP graph.
 //! - [`linear`]    — Polymorphic linear layer (standard or GGUF-quantized)
 //!   plus in-situ quantization helpers.
 //! - `rocm`        — shared launch plumbing for the `rocm` builds of the two
@@ -22,6 +24,8 @@ pub mod flash_split;
 pub mod float_math;
 pub mod fused_ops;
 pub mod gdn;
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+pub mod graph_plan;
 pub mod hyper_connection;
 pub mod linear;
 pub mod linear_no_bias;
@@ -39,6 +43,3 @@ pub mod rocm;
 pub use fused_ops::*;
 pub use gdn::*;
 pub use linear::LinearLayer;
-
-#[cfg(feature = "cuda")]
-pub mod cuda_graph;
