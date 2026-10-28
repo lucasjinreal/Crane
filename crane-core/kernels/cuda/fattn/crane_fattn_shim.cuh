@@ -42,6 +42,9 @@
 // declare unconditionally: redeclaring an identical type alias is valid
 // C++, so this is a no-op under real CUDA where the alias already exists.
 using nv_bfloat162 = __nv_bfloat162;
+// Same reasoning for the scalar type: `fattn_mma_bf16.cuh` casts through
+// this (not `__nv_bfloat16` directly) to match `nv_bfloat162`'s spelling.
+using nv_bfloat16 = __nv_bfloat16;
 
 #if defined(__HIPCC__)
 #define GGML_USE_HIP

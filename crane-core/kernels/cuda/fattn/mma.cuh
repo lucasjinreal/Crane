@@ -808,6 +808,64 @@ namespace ggml_cuda_mma {
     }
 #endif // defined(TURING_MMA_AVAILABLE)
 
+    // bf16 counterpart of get_half2 above, for the bf16 flash-attention
+    // kernel's QK^T-to-PV tile conversion (fattn_mma_bf16.cuh). Native bf16
+    // MMA only exists from Ampere onward (no Turing fallback, unlike f16),
+    // so this is gated on AMPERE_MMA_AVAILABLE rather than
+    // TURING_MMA_AVAILABLE, and has no Volta branch. There is no
+    // get_transposed(nv_bfloat162) counterpart: fattn_mma_bf16.cuh never
+    // instantiates the narrow (cols_per_warp == 8) tile shape that is the
+    // only caller of get_transposed on the f16 side, so it is never needed.
+#if defined(AMPERE_MMA_AVAILABLE)
+    template <int I, int J>
+    static __device__ __forceinline__ tile<I, J/2, nv_bfloat162> get_bf16(const tile<I, J, float> & tile_float) {
+        tile<I, J/2, nv_bfloat162> ret;
+#pragma unroll
+        for (int l0 = 0; l0 < tile_float.ne; l0 += 2) {
+            ret.x[l0/2] = __floats2bfloat162_rn(tile_float.x[l0 + 0], tile_float.x[l0 + 1]);
+        }
+        return ret;
+    }
+#elif defined(AMD_WMMA_AVAILABLE) && defined(RDNA3)
+    static __device__ __forceinline__ tile<16, 8, nv_bfloat162, DATA_LAYOUT_I_MAJOR_MIRRORED> get_bf16(
+            const tile<16, 16, float, DATA_LAYOUT_I_MAJOR> & tile_float) {
+        tile<16, 8, nv_bfloat162, DATA_LAYOUT_I_MAJOR_MIRRORED> ret;
+#pragma unroll
+        for (int l = 0; l < tile_float.ne; ++l) {
+            float tmp[2];
+            int i = threadIdx.x / 16;
+            tmp[i] = tile_float.x[l];
+            i ^= 1;
+            tmp[i] = __shfl_xor_sync(0xFFFFFFFF, tile_float.x[l], 16, WARP_SIZE);
+            // __floats2bfloat162_rn(float, float) is CUDA-only; HIP only has
+            // the float2-argument __float22bfloat162_rn, which both targets
+            // provide.
+            ret.x[l] = __float22bfloat162_rn(make_float2(tmp[0], tmp[1]));
+        }
+        return ret;
+    }
+#elif defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
+    template <int I, int J>
+    static __device__ __forceinline__ tile<I, J/2, nv_bfloat162> get_bf16(const tile<I, J, float> & tile_float) {
+        tile<I, J/2, nv_bfloat162> ret;
+#pragma unroll
+        for (int l0 = 0; l0 < tile_float.ne; l0 += 2) {
+            // __floats2bfloat162_rn(float, float) is CUDA-only; HIP only has
+            // the float2-argument __float22bfloat162_rn, which both targets
+            // provide.
+            ret.x[l0/2] = __float22bfloat162_rn(make_float2(tile_float.x[l0 + 0], tile_float.x[l0 + 1]));
+        }
+        return ret;
+    }
+#else // Turing-without-Ampere, or Volta: no native bf16 MMA, never called.
+    template <int I, int J>
+    static __device__ __forceinline__ tile<I, J/2, nv_bfloat162> get_bf16(const tile<I, J, float> & tile_float) {
+        GGML_UNUSED(tile_float);
+        NO_DEVICE_CODE;
+        return tile<I, J/2, nv_bfloat162>{};
+    }
+#endif // defined(AMPERE_MMA_AVAILABLE)
+
     template <int I, int J, typename T, data_layout dl>
     static __device__ __forceinline__ void load_generic(tile<I, J, T, dl> & t, const T * __restrict__ xs0, const int stride) {
 #pragma unroll
@@ -928,21 +986,32 @@ namespace ggml_cuda_mma {
             : "l"(xs));
 #elif defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         static_assert(dl == DATA_LAYOUT_I_MAJOR || dl == DATA_LAYOUT_I_MAJOR_MIRRORED, "bad data layout");
+        // T is half2 for the f16 kernel, nv_bfloat162 for the bf16 kernel:
+        // dispatch the lows/highs-pack and scalar-component type accordingly
+        // rather than hardcoding half2, so this AMD path (used for V-tile
+        // transposed loads by both kernel families) is correct for either.
+        static_assert(std::is_same_v<T, half2> || std::is_same_v<T, nv_bfloat162>, "unsupported element type");
+        using scalar_t = std::conditional_t<std::is_same_v<T, half2>, half, nv_bfloat16>;
         if constexpr (I == 32) {
 #pragma unroll
             for (int l0 = 0; l0 < t.ne/2; ++l0) {
-                const half2 tmp0 = xs0[(2*t.get_j(l0) + 0)*stride + t.get_i(l0)/2];
-                const half2 tmp1 = xs0[(2*t.get_j(l0) + 1)*stride + t.get_i(l0)/2];
+                const T tmp0 = xs0[(2*t.get_j(l0) + 0)*stride + t.get_i(l0)/2];
+                const T tmp1 = xs0[(2*t.get_j(l0) + 1)*stride + t.get_i(l0)/2];
 
-                t.x[l0]          =  __lows2half2(tmp0, tmp1);
-                t.x[l0 + t.ne/2] = __highs2half2(tmp0, tmp1);
+                if constexpr (std::is_same_v<T, half2>) {
+                    t.x[l0]          =  __lows2half2(tmp0, tmp1);
+                    t.x[l0 + t.ne/2] = __highs2half2(tmp0, tmp1);
+                } else {
+                    t.x[l0]          =  __lows2bfloat162(tmp0, tmp1);
+                    t.x[l0 + t.ne/2] = __highs2bfloat162(tmp0, tmp1);
+                }
             }
         } else {
-            half * xh = (half *) t.x;
+            scalar_t * xh = (scalar_t *) t.x;
 #pragma unroll
             for (int l = 0; l < t.ne; ++l) {
-                xh[2*l + 0] = ((const half *) xs0)[(2*t.get_j(l) + 0)*(2*stride) + t.get_i(l)];
-                xh[2*l + 1] = ((const half *) xs0)[(2*t.get_j(l) + 1)*(2*stride) + t.get_i(l)];
+                xh[2*l + 0] = ((const scalar_t *) xs0)[(2*t.get_j(l) + 0)*(2*stride) + t.get_i(l)];
+                xh[2*l + 1] = ((const scalar_t *) xs0)[(2*t.get_j(l) + 1)*(2*stride) + t.get_i(l)];
             }
         }
 #else
@@ -1257,10 +1326,27 @@ namespace ggml_cuda_mma {
 #endif // TURING_MMA_AVAILABLE
     }
 
+    // Wide (cols_per_warp == 16) bf16 QK^T/PV counterpart of the f16 overload
+    // above. NVIDIA has no native m16n16 bf16 MMA instruction, so (like the
+    // f16 case) this issues two m16n8k16 bf16 instructions, one per half of
+    // the 16-wide output; unlike f16 there is no pre-Ampere fallback, since
+    // bf16 MMA requires AMPERE_MMA_AVAILABLE unconditionally (see
+    // mma.cuh:1184's narrow bf16 overload, which fattn_mma_bf16.cuh does not
+    // use: it never instantiates the narrow cols_per_warp == 8 tile shape).
     template <data_layout dl_ab, data_layout dl_d>
     static __device__ __forceinline__ void mma(
             tile<16, 16, float, dl_d> & D, const tile<16, 8, nv_bfloat162, dl_ab> & A, const tile<16, 8, nv_bfloat162, dl_ab> & B) {
-#if defined(AMD_WMMA_AVAILABLE)
+#if defined(AMPERE_MMA_AVAILABLE)
+        const int * Axi = (const int *) A.x;
+        const int * Bxi = (const int *) B.x;
+        int       * Dxi = (int       *) D.x;
+        asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+            : "+r"(Dxi[0]), "+r"(Dxi[1]), "+r"(Dxi[2]), "+r"(Dxi[3])
+            : "r"(Axi[0]), "r"(Axi[1]), "r"(Axi[2]), "r"(Axi[3]), "r"(Bxi[0]), "r"(Bxi[2]));
+        asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+            : "+r"(Dxi[4]), "+r"(Dxi[5]), "+r"(Dxi[6]), "+r"(Dxi[7])
+            : "r"(Axi[0]), "r"(Axi[1]), "r"(Axi[2]), "r"(Axi[3]), "r"(Bxi[1]), "r"(Bxi[3]));
+#elif defined(AMD_WMMA_AVAILABLE)
 #if defined(RDNA4)
         using bf16x8_t = __attribute__((ext_vector_type(8))) __bf16;
         using floatx8_t = __attribute__((ext_vector_type(8))) float;
@@ -1302,7 +1388,7 @@ namespace ggml_cuda_mma {
 #else
         GGML_UNUSED_VARS(D, A, B);
         NO_DEVICE_CODE;
-#endif // defined(AMD_WMMA_AVAILABLE)
+#endif // defined(AMPERE_MMA_AVAILABLE)
     }
 
     template <data_layout dl_d, data_layout dl_ab>
