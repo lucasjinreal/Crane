@@ -80,8 +80,11 @@ pub(crate) fn try_causal(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32) -> Opti
 ///
 /// `mask` may have any float dtype and must be broadcastable to
 /// `[.., seq_q, seq_kv]`. The kernel casts it to F16 on the device. It must
-/// encode exactly `j <= i + kv_offset`. The analytic `KV_max` cuts off any
-/// other pattern silently, so a padding or custom mask is not honored.
+/// hide every key past the causal diagonal `j <= i + kv_offset`, because the
+/// analytic `KV_max` cuts those off whatever the mask says. Below the
+/// diagonal the mask is read in full, so it may hide more, such as the keys
+/// outside a sliding window. A mask that unmasks keys past the diagonal is
+/// not honored.
 ///
 /// # Errors
 ///
@@ -507,14 +510,24 @@ mod gpu_tests {
     /// Additive `[1, 1, sq, skv]` causal mask: `0` where `j <= i + kv_offset`,
     /// `-inf` elsewhere.
     fn causal_mask(sq: usize, skv: usize, kv_offset: usize, dtype: DType, dev: &Device) -> Tensor {
+        windowed_mask(sq, skv, kv_offset, None, dtype, dev)
+    }
+
+    /// [`causal_mask`] that also hides keys with `j + window <= i + kv_offset`.
+    /// This is the sliding-window mask of `window` keys, the query included.
+    fn windowed_mask(
+        sq: usize,
+        skv: usize,
+        kv_offset: usize,
+        window: Option<usize>,
+        dtype: DType,
+        dev: &Device,
+    ) -> Tensor {
         let vals: Vec<f32> = (0..sq * skv)
             .map(|idx| {
                 let (i, j) = (idx / skv, idx % skv);
-                if j <= i + kv_offset {
-                    0.0
-                } else {
-                    f32::NEG_INFINITY
-                }
+                let visible = j <= i + kv_offset && window.is_none_or(|w| j + w > i + kv_offset);
+                if visible { 0.0 } else { f32::NEG_INFINITY }
             })
             .collect();
         Tensor::from_vec(vals, (1, 1, sq, skv), dev)
@@ -524,10 +537,16 @@ mod gpu_tests {
     }
 
     /// `softmax(q @ k^T * scale + causal mask) @ v` in F32 on the CPU, BHSD.
+    fn naive_causal(inp: &Inputs) -> Vec<f32> {
+        naive_windowed(inp, None)
+    }
+
+    /// [`naive_causal`] that also hides keys more than `window - 1` behind
+    /// the query, like Gemma4's sliding layers.
     // q/k/v/b/h/s/d are standard ML tensor-shape notation (query, key, value,
     // batch, heads, seq_len, head_dim).
     #[allow(clippy::many_single_char_names)]
-    fn naive_causal(inp: &Inputs) -> Vec<f32> {
+    fn naive_windowed(inp: &Inputs, window: Option<usize>) -> Vec<f32> {
         let [q, k, v] = &inp.reference;
         let (b, hq, sq, d) = q.dims4().unwrap();
         let (_, hkv, skv, _) = k.dims4().unwrap();
@@ -545,7 +564,7 @@ mod gpu_tests {
         let scores = (q.matmul(&expand(k).transpose(2, 3).unwrap()).unwrap()
             * f64::from(inp.scale))
         .unwrap();
-        let mask = causal_mask(sq, skv, inp.kv_offset, DType::F32, &Device::Cpu);
+        let mask = windowed_mask(sq, skv, inp.kv_offset, window, DType::F32, &Device::Cpu);
         let probs = softmax_last_dim(&scores.broadcast_add(&mask).unwrap()).unwrap();
         probs
             .matmul(&expand(v))
@@ -654,6 +673,32 @@ mod gpu_tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         assert!(max_diff > 1e-3, "wrong mask matched the correct one");
+    }
+
+    // A sliding-window mask hides keys below the diagonal. The kernel must
+    // honor it exactly, since only the keys past the diagonal are trimmed
+    // analytically. This is what Gemma4's sliding layers rely on, with a
+    // window shorter than the prompt and a warm cache.
+    #[test]
+    fn try_causal_with_mask_honors_sliding_window() {
+        let inp = inputs((1, 4, 2, 40, 120, 128), DType::F16);
+        let [q, k, v] = &inp.gpu;
+        let window = 8;
+        let mask = windowed_mask(40, 120, inp.kv_offset, Some(window), DType::F16, q.device());
+        let got = try_causal_with_mask(q, k, v, inp.scale, &mask)
+            .expect("GPU device must serve a supported shape")
+            .unwrap();
+        let want = naive_windowed(&inp, Some(window));
+        assert_close(&to_vec(&got), &want, 3e-2);
+
+        // The window must matter here, or the check above proves nothing.
+        let plain = naive_causal(&inp);
+        let max_diff = plain
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_diff > 1e-2, "window did not change the reference");
     }
 
     // The prefill form is the same attention in `[B, S, H*D]` layout, with
