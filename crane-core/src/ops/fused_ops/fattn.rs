@@ -1091,8 +1091,8 @@ pub(crate) mod test_support {
         Windowed,
     }
 
-    /// `softmax(q @ k^T * scale [+ mask]) @ v` in F32 on the CPU, expanding
-    /// `k`/`v`'s heads for GQA. `q`, `k`, `v` are BSHD.
+    /// `softmax(q @ k^T * scale [+ mask]) @ v` in F32 on `q`'s device,
+    /// expanding `k`/`v`'s heads for GQA. `q`, `k`, `v` are BSHD.
     pub(crate) fn naive_attention(
         q: &Tensor,
         k: &Tensor,
@@ -1155,5 +1155,160 @@ pub(crate) mod test_support {
             .unwrap()
             .to_vec1::<f32>()
             .unwrap()
+    }
+
+    ///// Long-sequence inputs ////////////////////////////////////////////
+
+    /// Q heads of the long-sequence inputs. With [`LONG_SEQ_HKV`] and
+    /// `head_dim=256` this is Qwen3.5's full-attention shape.
+    pub(crate) const LONG_SEQ_HQ: usize = 8;
+    /// KV heads of the long-sequence inputs.
+    pub(crate) const LONG_SEQ_HKV: usize = 2;
+
+    /// Value distribution of [`long_seq_inputs`]. The logit sizes below hold
+    /// at every `head_dim`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum LongSeqDist {
+        /// q, k, v ~ N(0, 1).
+        Normal,
+        /// q, k ~ N(0, 4), which gives logits a std of about 4. v ~ N(0, 1).
+        Scaled,
+        /// [`LongSeqDist::Normal`] plus two keys every query aligns with. The
+        /// second one is larger and sits at 60% of the sequence, so rows past
+        /// it see a new running max many KV tiles into the loop.
+        Spike,
+    }
+
+    /// Seeded BSHD `[1, seq, LONG_SEQ_HQ, d]` q and `[1, seq, LONG_SEQ_HKV,
+    /// d]` k/v, flattened, where `d` is `head_dim`. Candle's `randn` cannot
+    /// be seeded, which a reproducible regression test needs.
+    pub(crate) fn long_seq_inputs(
+        seq: usize,
+        d: usize,
+        dist: LongSeqDist,
+        seed: u64,
+    ) -> [Vec<f32>; 3] {
+        let qk_std = if dist == LongSeqDist::Scaled {
+            2.0
+        } else {
+            1.0
+        };
+        let seed = seed.wrapping_mul(4);
+        let mut q = seeded_normals(seed, seq * LONG_SEQ_HQ * d, qk_std);
+        let mut k = seeded_normals(seed + 1, seq * LONG_SEQ_HKV * d, qk_std);
+        let mut v = seeded_normals(seed + 2, seq * LONG_SEQ_HKV * d, 1.0);
+        if dist == LongSeqDist::Spike {
+            let n_rep = LONG_SEQ_HQ / LONG_SEQ_HKV;
+            // head_dim is at most 512, exact in an f32.
+            #[allow(clippy::cast_precision_loss)]
+            let sqrt_d = (d as f32).sqrt();
+            let mut dirs = seeded_normals(seed + 3, LONG_SEQ_HKV * d, 1.0);
+            for (g, u) in dirs.chunks_exact_mut(d).enumerate() {
+                let norm = u.iter().map(|x| x * x).sum::<f32>().sqrt();
+                for x in u.iter_mut() {
+                    *x /= norm;
+                }
+                for row in q.chunks_exact_mut(LONG_SEQ_HQ * d) {
+                    for h in row[g * n_rep * d..][..n_rep * d].chunks_exact_mut(d) {
+                        h.iter_mut().zip(&*u).for_each(|(x, e)| *x += 4.0 * e);
+                    }
+                }
+                // Logits 4 * mag / sqrt(d) of about 8 and 16, against a
+                // typical std of 1.
+                for (pos, mag) in [(3, 2.0 * sqrt_d), (seq * 3 / 5, 4.0 * sqrt_d)] {
+                    let at = (pos * LONG_SEQ_HKV + g) * d;
+                    k[at..at + d]
+                        .iter_mut()
+                        .zip(&*u)
+                        .for_each(|(x, e)| *x = mag * e);
+                    v[at..at + d].iter_mut().for_each(|x| *x *= 3.0);
+                }
+            }
+        }
+        [q, k, v]
+    }
+
+    /// Causal `softmax(q @ k^T * scale) @ v` in F64 on the CPU, for the given
+    /// query `rows` and every head. `q`, `k`, `v` are flat long-sequence
+    /// inputs (see [`long_seq_inputs`]) with `seq_q == seq_kv` and
+    /// `head_dim` `d`. Returns `[rows.len(), LONG_SEQ_HQ, d]`, flattened.
+    // q/k/v/h/g/d are standard ML tensor-shape notation, see `naive_attention`.
+    #[allow(clippy::many_single_char_names)]
+    pub(crate) fn attention_rows_f64(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        d: usize,
+        scale: f32,
+        rows: &[usize],
+    ) -> Vec<f64> {
+        fn kv_row(t: &[f32], j: usize, g: usize, d: usize) -> &[f32] {
+            &t[(j * LONG_SEQ_HKV + g) * d..][..d]
+        }
+
+        let n_rep = LONG_SEQ_HQ / LONG_SEQ_HKV;
+        let mut out = Vec::with_capacity(rows.len() * LONG_SEQ_HQ * d);
+        let mut logits = Vec::new();
+        let mut acc = vec![0f64; d];
+        for &i in rows {
+            for h in 0..LONG_SEQ_HQ {
+                let g = h / n_rep;
+                let qi = &q[(i * LONG_SEQ_HQ + h) * d..][..d];
+                logits.clear();
+                logits.extend((0..=i).map(|j| {
+                    let dot: f64 = qi
+                        .iter()
+                        .zip(kv_row(k, j, g, d))
+                        .map(|(&a, &b)| f64::from(a) * f64::from(b))
+                        .sum();
+                    dot * f64::from(scale)
+                }));
+                let max = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                acc.fill(0.0);
+                let mut sum = 0.0;
+                for (j, &l) in logits.iter().enumerate() {
+                    let p = (l - max).exp();
+                    sum += p;
+                    let vj = kv_row(v, j, g, d);
+                    acc.iter_mut()
+                        .zip(vj)
+                        .for_each(|(a, &x)| *a += p * f64::from(x));
+                }
+                out.extend(acc.iter().map(|a| a / sum));
+            }
+        }
+        out
+    }
+
+    /// `n` samples from `N(0, std^2)`, deterministic in `seed`.
+    pub(crate) fn seeded_normals(seed: u64, n: usize, std: f32) -> Vec<f32> {
+        let mut state = seed;
+        // Top 53 bits mapped to (0, 1], so the log below stays finite. The
+        // u64 -> f64 casts keep at most 53 bits, exact in an f64.
+        #[allow(clippy::cast_precision_loss)]
+        let mut uniform = || ((splitmix64(&mut state) >> 11) + 1) as f64 / (1u64 << 53) as f64;
+        let mut out = Vec::with_capacity(n);
+        while out.len() < n {
+            // Box-Muller: two uniforms give two independent normals.
+            let r = (-2.0 * uniform().ln()).sqrt() * f64::from(std);
+            let (sin, cos) = (std::f64::consts::TAU * uniform()).sin_cos();
+            // Rounds a sample of a few units to f32, which is the intent.
+            #[allow(clippy::cast_possible_truncation)]
+            let pair = [(r * cos) as f32, (r * sin) as f32];
+            out.push(pair[0]);
+            if out.len() < n {
+                out.push(pair[1]);
+            }
+        }
+        out
+    }
+
+    /// Advances `state` and returns the next splitmix64 output.
+    pub(crate) fn splitmix64(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
     }
 }

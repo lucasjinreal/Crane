@@ -37,6 +37,8 @@
 
 pub mod atan2;
 pub mod fattn;
+#[cfg(test)]
+mod fattn_long_seq_host;
 pub mod fattn_mma;
 pub mod fattn_tile;
 pub mod moe_combine;
