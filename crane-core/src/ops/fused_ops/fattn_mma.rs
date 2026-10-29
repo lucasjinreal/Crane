@@ -3119,3 +3119,7 @@ mod flashattn2_parity {
         run_causal_vs_flashattn2_bf16(1, 32, 256, 4, 2, 256);
     }
 }
+
+#[cfg(all(test, crane_fattn))]
+#[path = "fattn_long_seq_tests.rs"]
+mod long_seq_tests;
