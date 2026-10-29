@@ -3127,3 +3127,7 @@ mod long_seq_tests;
 #[cfg(all(test, crane_fattn))]
 #[path = "fattn_golden_tests.rs"]
 mod golden_tests;
+
+#[cfg(all(test, crane_fattn))]
+#[path = "fattn_bench_tests.rs"]
+mod bench_tests;

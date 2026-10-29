@@ -26,6 +26,9 @@ pub use kv_cache::{KvCache, KvCacheBackend, KvCacheKind};
 pub use model::StateSnapshot;
 pub use model::{Model, ModelFormat, Qwen3_5TextModel};
 pub(crate) use modeling::attn_query_slice;
+// Re-exported for the fattn timing harness only.
+#[cfg(all(test, crane_fattn))]
+pub(crate) use modeling::grouped_sdpa;
 pub use modeling::{
     AttentionDims, DecoderLayer, FullAttention, MRotaryEmbedding, Mlp, Qwen35RmsNorm, RopeSlice,
     apply_mrope,

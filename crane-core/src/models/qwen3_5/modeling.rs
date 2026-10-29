@@ -802,7 +802,7 @@ pub(crate) fn attn_query_slice(heads: usize, cells: usize) -> usize {
 /// `q` is `[B, num_heads, S, D]` with heads ordered `kv_head * n_rep + r`;
 /// `k`/`v` are `[B, kv_heads, cells, D]`; `mask` is additive and broadcasts to
 /// `[B, 1, S, cells]`. Returns `[B, S, num_heads * D]`.
-fn grouped_sdpa(
+pub(crate) fn grouped_sdpa(
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
