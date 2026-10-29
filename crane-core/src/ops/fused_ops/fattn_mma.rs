@@ -20,10 +20,11 @@
 //! `ops::fused_ops::flash_attn_mma`'s
 //! kernel (which masks purely via a `kv_offset` scalar and never reads a
 //! mask tensor), this kernel family branches on whether `mask`/`KV_max` are
-//! null (`if (ncols2 > 1 || mask_h)` in `fattn_mma_f16.cuh`), so `mask`
-//! being `None` is a real, intentional "no masking at all" mode (`full`),
-//! not an unsupported case. Callers always pass the caller's actual mask
-//! intent through, never silently drop it.
+//! null (`if (mask_h)` in `fattn_mma_f16.cuh`), so `mask` being `None` is a
+//! real, intentional "no masking at all" mode, not an unsupported case.
+//! The plain `*_causal` entries pass no mask and a `causal_kv_offset`, and
+//! the kernel masks the diagonal itself. Callers always pass the caller's
+//! actual mask intent through, never silently drop it.
 //!
 //! Gated the same way as `fattn.rs`: every item here exists solely to
 //! support CUDA/ROCm kernel dispatch, so there is no CPU-relevant content
@@ -125,6 +126,12 @@ fn to_i64(n: usize, what: &str) -> Result<i64> {
 fn to_u32(n: usize, what: &str) -> Result<u32> {
     u32::try_from(n)
         .map_err(|_| candle_core::Error::Msg(format!("fattn_mma: {what} ({n}) exceeds u32::MAX")))
+}
+
+/// The kernel's `causal_kv_offset` argument. `None` maps to `-1`, which the
+/// kernel reads as "not causal".
+fn kernel_causal_offset(causal_kv_offset: Option<usize>) -> Result<i32> {
+    causal_kv_offset.map_or(Ok(-1), |o| to_i32(o, "causal_kv_offset"))
 }
 
 /// Byte stride for axis `axis` of a tensor whose element size is `elem_bytes`.
@@ -354,25 +361,19 @@ impl LaunchGeometry {
 /// for the tile layout; it bounds each tile's KV loop (`fattn_mma_f16.cuh`'s
 /// `kb0_stop`).
 ///
-/// **`mask = None` is only valid when the internally-selected `ncols2`
+/// **`mask = None` is only accepted when the internally-selected `ncols2`
 /// (see [`super::fattn::select_mma_ncols`]) resolves to `1`; this is
-/// enforced below, not just documented.** The kernel's own mask-pointer
-/// logic (`fattn_mma_f16.cuh`: `ncols2 == 1 && !mask ? nullptr : (const
-/// half *) (mask + nb33*(sequence % ne33))`) only skips dereferencing
-/// `mask`/`ne33` when `ncols2 == 1`; for `ncols2 > 1` (GQA-batched launches)
-/// it unconditionally computes `sequence % ne33` even when the caller
-/// passed no mask, and `ne33 = 0` in that case. This was confirmed on real
-/// `ROCm` hardware as a null-pointer/modulo-by-zero hardware exception
-/// before this was caught. Since `ncols2` is selected internally from
-/// `gqa_ratio`/`seq_kv` (not caller-controlled), a caller that always wants
-/// "no masking" and might hit a GQA-batched launch must pass a real
-/// all-zero mask tensor instead of `None` to stay safe across every
-/// `(gqa_ratio, seq_kv)` combination; passing `None` into a `ncols2 > 1`
-/// launch now returns a `Result::Err` instead of reaching the kernel.
-/// `None` is a true optimization only for the plain-MHA/unpadded-`seq_kv`
-/// case where `ncols2 == 1` is guaranteed. (On AMD, `ncols2` never actually
-/// resolves to `1` at all. See `select_mma_ncols`'s doc comment, so
-/// `mask = None` is never valid there in practice, only on NVIDIA.)
+/// enforced below, not just documented.** The kernel accepts a null mask at
+/// any `ncols2`, but this public contract stays as it is for API stability.
+/// Since `ncols2` is selected internally from `gqa_ratio`/`seq_kv` (not
+/// caller-controlled), a caller that always wants "no masking" and might
+/// hit a GQA-batched launch must pass a real all-zero mask tensor instead
+/// of `None`; passing `None` into a `ncols2 > 1` launch returns a
+/// `Result::Err`. `None` is a true optimization only for the
+/// plain-MHA/unpadded-`seq_kv` case where `ncols2 == 1` is guaranteed. (On
+/// AMD, `ncols2` never actually resolves to `1` at all. See
+/// `select_mma_ncols`'s doc comment, so `mask = None` is never valid there
+/// in practice, only on NVIDIA.)
 ///
 /// # Errors
 ///
@@ -411,18 +412,33 @@ pub fn fattn_mma_prefill(
     {
         candle_core::bail!("fattn_mma: kv_max must be I32, got {:?}", kv.dtype());
     }
+    prefill_dispatch(q, k, v, mask, kv_max, scale, None)
+}
 
+/// Backend dispatch shared by [`fattn_mma_prefill`] and the in-kernel causal
+/// entries. `causal_kv_offset = Some(o)` makes the kernel mask keys `j > i +
+/// o` itself, in addition to any `mask`. Callers validate dtypes before
+/// calling this.
+fn prefill_dispatch(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: Option<&Tensor>,
+    kv_max: Option<&Tensor>,
+    scale: f32,
+    causal_kv_offset: Option<usize>,
+) -> Result<Tensor> {
     #[cfg(feature = "cuda")]
     {
-        cuda::fattn_mma_prefill_cuda(q, k, v, mask, kv_max, scale)
+        cuda::fattn_mma_prefill_cuda(q, k, v, mask, kv_max, scale, causal_kv_offset)
     }
     #[cfg(all(feature = "rocm", not(feature = "cuda")))]
     {
-        rocm::fattn_mma_prefill_rocm(q, k, v, mask, kv_max, scale)
+        rocm::fattn_mma_prefill_rocm(q, k, v, mask, kv_max, scale, causal_kv_offset)
     }
     #[cfg(not(any(feature = "cuda", feature = "rocm")))]
     {
-        let _ = (q, k, v, mask, kv_max, scale);
+        let _ = (q, k, v, mask, kv_max, scale, causal_kv_offset);
         candle_core::bail!("fattn_mma_prefill: requires the cuda or rocm feature")
     }
 }
@@ -474,18 +490,30 @@ pub fn fattn_mma_bf16_prefill(
     {
         candle_core::bail!("fattn_mma_bf16: kv_max must be I32, got {:?}", kv.dtype());
     }
+    prefill_dispatch_bf16(q, k, v, mask, kv_max, scale, None)
+}
 
+/// bf16 counterpart of [`prefill_dispatch`].
+fn prefill_dispatch_bf16(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: Option<&Tensor>,
+    kv_max: Option<&Tensor>,
+    scale: f32,
+    causal_kv_offset: Option<usize>,
+) -> Result<Tensor> {
     #[cfg(feature = "cuda")]
     {
-        cuda::fattn_mma_bf16_prefill_cuda(q, k, v, mask, kv_max, scale)
+        cuda::fattn_mma_bf16_prefill_cuda(q, k, v, mask, kv_max, scale, causal_kv_offset)
     }
     #[cfg(all(feature = "rocm", not(feature = "cuda")))]
     {
-        rocm::fattn_mma_bf16_prefill_rocm(q, k, v, mask, kv_max, scale)
+        rocm::fattn_mma_bf16_prefill_rocm(q, k, v, mask, kv_max, scale, causal_kv_offset)
     }
     #[cfg(not(any(feature = "cuda", feature = "rocm")))]
     {
-        let _ = (q, k, v, mask, kv_max, scale);
+        let _ = (q, k, v, mask, kv_max, scale, causal_kv_offset);
         candle_core::bail!("fattn_mma_bf16_prefill: requires the cuda or rocm feature")
     }
 }
@@ -737,11 +765,10 @@ fn pad_for_gqa_batching_bf16(
     }
 }
 
-/// Causal flash-attention: `j <= i + kv_offset`. Builds the additive mask
-/// this kernel family always needs (see this module's doc comment: unlike
-/// [`super::flash_attn_mma`], `mask = None` is not a safe universal
-/// "no masking" shortcut here) and dispatches to
-/// [`fattn_mma_causal_with_mask`].
+/// Causal flash-attention: `j <= i + kv_offset`. The kernel masks the
+/// diagonal itself from `kv_offset`, so no mask tensor is built or read.
+/// Output is bitwise equal to [`fattn_mma_causal_with_mask`] given a plain
+/// causal mask.
 ///
 /// # Errors
 ///
@@ -755,9 +782,12 @@ pub fn fattn_mma_causal(
 ) -> Result<Tensor> {
     let (_, seq_q, _, _) = q.dims4()?;
     let (_, seq_kv, _, _) = k.dims4()?;
-    let mask =
-        super::fattn::build_additive_mask_f16(seq_q, seq_kv, kv_offset, None, 0, q.device())?;
-    fattn_mma_causal_with_mask(q, k, v, scale, kv_offset, &mask)
+    if causal_needs_host_mask(seq_q, seq_kv, kv_offset) {
+        let mask =
+            super::fattn::build_additive_mask_f16(seq_q, seq_kv, kv_offset, None, 0, q.device())?;
+        return fattn_mma_causal_with_mask(q, k, v, scale, kv_offset, &mask);
+    }
+    causal_in_kernel(q, k, v, scale, kv_offset)
 }
 
 /// Same as [`fattn_mma_causal`], but for a caller that already has a mask
@@ -809,8 +839,8 @@ pub fn fattn_mma_causal_with_mask(
     fattn_mma_prefill(q, &k, &v, Some(&mask), Some(&kv_max), scale)
 }
 
-/// Native-bf16 counterpart of [`fattn_mma_causal`]: dispatches to
-/// [`fattn_mma_bf16_causal_with_mask`]/[`fattn_mma_bf16_prefill`] instead.
+/// Native-bf16 counterpart of [`fattn_mma_causal`]: masks in the kernel and
+/// dispatches through [`fattn_mma_bf16_prefill`]'s kernels instead.
 ///
 /// # Errors
 ///
@@ -824,9 +854,95 @@ pub fn fattn_mma_bf16_causal(
 ) -> Result<Tensor> {
     let (_, seq_q, _, _) = q.dims4()?;
     let (_, seq_kv, _, _) = k.dims4()?;
-    let mask =
-        super::fattn::build_additive_mask_f16(seq_q, seq_kv, kv_offset, None, 0, q.device())?;
-    fattn_mma_bf16_causal_with_mask(q, k, v, scale, kv_offset, &mask)
+    if causal_needs_host_mask(seq_q, seq_kv, kv_offset) {
+        let mask =
+            super::fattn::build_additive_mask_f16(seq_q, seq_kv, kv_offset, None, 0, q.device())?;
+        return fattn_mma_bf16_causal_with_mask(q, k, v, scale, kv_offset, &mask);
+    }
+    causal_in_kernel(q, k, v, scale, kv_offset)
+}
+
+/// Whether a causal launch must use the host mask. A diagonal that reaches
+/// past the live keys would unmask the zero K/V padding, and only the host
+/// mask hides it.
+fn causal_needs_host_mask(seq_q: usize, seq_kv: usize, kv_offset: usize) -> bool {
+    seq_q + kv_offset > seq_kv
+}
+
+/// Shared body of [`fattn_mma_causal`] and [`fattn_mma_bf16_causal`]: pads
+/// `k`/`v` for GQA batching and launches with no mask, so the kernel masks
+/// the diagonal from `kv_offset`. Picks the native-bf16 kernels when `k`/`v`
+/// are `BF16`, the plain F16 kernels when they are `F16`.
+fn causal_in_kernel(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    kv_offset: usize,
+) -> Result<Tensor> {
+    // Same mixed-precision contract as fattn_mma_prefill/fattn_mma_bf16_prefill:
+    // q stays F32, k/v share a single F16 or BF16 dtype.
+    if q.dtype() != DType::F32 {
+        candle_core::bail!("fattn_mma causal: q must be F32, got {:?}", q.dtype());
+    }
+    if v.dtype() != k.dtype() {
+        candle_core::bail!(
+            "fattn_mma causal: k/v dtypes must match, got k={:?} v={:?}",
+            k.dtype(),
+            v.dtype()
+        );
+    }
+    let bf16 = match k.dtype() {
+        DType::F16 => false,
+        DType::BF16 => true,
+        other => candle_core::bail!("fattn_mma causal: k/v must be F16 or BF16, got {other:?}"),
+    };
+    let (batch, seq_q, _, _) = q.dims4()?;
+    let (head_dim, gqa_ratio, _, seq_kv, is_amd) = mma_shape_params(q, k)?;
+    let padded = if bf16 {
+        padded_seq_kv_for_gqa_batching_bf16(head_dim, gqa_ratio, seq_q, seq_kv, is_amd)
+    } else {
+        padded_seq_kv_for_gqa_batching(head_dim, gqa_ratio, seq_q, seq_kv, is_amd)
+    };
+    // Unpadded, the clones only bump the storage `Arc`s.
+    let (k, v) = match padded {
+        Some(padded) => pad_kv(k, v, padded)?,
+        None => (k.clone(), v.clone()),
+    };
+    let ncols1 = if bf16 {
+        mma_ncols1_for_bf16(q, &k)?
+    } else {
+        mma_ncols1_for(q, &k)?
+    };
+    let kv_max = causal_kv_max(batch, seq_q, ncols1, kv_offset, &k, q.device())?;
+    if bf16 {
+        prefill_dispatch_bf16(q, &k, &v, None, Some(&kv_max), scale, Some(kv_offset))
+    } else {
+        prefill_dispatch(q, &k, &v, None, Some(&kv_max), scale, Some(kv_offset))
+    }
+}
+
+/// `KV_max` for a causal launch over `k`'s (possibly padded) `seq_kv`. See
+/// [`fattn_mma_causal_with_mask`]'s comment on the rounded cap.
+fn causal_kv_max(
+    batch: usize,
+    seq_q: usize,
+    ncols1: usize,
+    kv_offset: usize,
+    k: &Tensor,
+    device: &candle_core::Device,
+) -> Result<Tensor> {
+    let seq_kv = k.dims4()?.1;
+    super::fattn::build_analytic_kv_max(
+        batch,
+        seq_q,
+        ncols1,
+        kv_offset,
+        seq_kv,
+        0,
+        seq_kv.next_multiple_of(FATTN_KQ_STRIDE),
+        device,
+    )
 }
 
 /// Native-bf16 counterpart of [`fattn_mma_causal_with_mask`]. Like its f16
@@ -1122,6 +1238,7 @@ mod cuda {
         mask: Option<&Tensor>,
         kv_max: Option<&Tensor>,
         scale: f32,
+        causal_kv_offset: Option<usize>,
     ) -> Result<Tensor> {
         let (q_s, q_l) = q.storage_and_layout();
         let (k_s, k_l) = k.storage_and_layout();
@@ -1136,11 +1253,10 @@ mod cuda {
                 "fattn_mma: no instantiated kernel for head_dim={d} gqa_ratio={gqa_ratio} seq_kv={seq_kv}"
             )));
         };
-        // See fattn_mma_prefill's doc comment: the kernel unconditionally
-        // computes `sequence % ne33` whenever ncols2 > 1, which null-derefs/
-        // div-by-zeros when mask=None (ne33=0). Only ncols2==1 makes None
-        // safe.
-        if mask.is_none() && ncols2 != 1 {
+        // See fattn_mma_prefill's doc comment: a plain mask=None stays
+        // limited to ncols2 == 1. The in-kernel causal entries pass no mask
+        // and are exempt.
+        if mask.is_none() && causal_kv_offset.is_none() && ncols2 != 1 {
             return Err(unsupported_config(format!(
                 "fattn_mma: mask=None requires ncols2 == 1 (got ncols2={ncols2}); \
                  pass an explicit all-zero mask for unmasked attention with this GQA shape"
@@ -1190,6 +1306,8 @@ mod cuda {
             scale,
         )?;
 
+        let causal_kv_offset = super::kernel_causal_offset(causal_kv_offset)?;
+
         let n_out = b * seq_q * h_q * d;
         let dst = unsafe { dev.alloc::<f32>(n_out) }?;
 
@@ -1204,7 +1322,7 @@ mod cuda {
         builder.arg(&k_sl);
         builder.arg(&v_sl);
         // SAFETY: the kernel treats a null mask/sinks/KV_max pointer as "not
-        // provided" (`if (ncols2 > 1 || mask_h)` in `fattn_mma_f16.cuh`), the
+        // provided" (`if (mask_h)` in `fattn_mma_f16.cuh`), the
         // same contract llama.cpp's own host dispatch relies on. Passing a
         // `0u64` in place of the typed slice relies on cudarc copying the
         // argument's raw bytes into the kernel's pointer-sized parameter
@@ -1253,6 +1371,7 @@ mod cuda {
         builder.arg(&p.nb31);
         builder.arg(&p.nb32);
         builder.arg(&p.nb33);
+        builder.arg(&causal_kv_offset);
         // SAFETY: the argument list above matches
         // `crane_fattn_mma_f16_d{d}_v{d}_c{ncols1}_s{ncols2}`'s `extern "C"`
         // signature exactly (`DECL_FATTN_MMA_F16_CASE` in
@@ -1290,6 +1409,7 @@ mod cuda {
         mask: Option<&Tensor>,
         kv_max: Option<&Tensor>,
         scale: f32,
+        causal_kv_offset: Option<usize>,
     ) -> Result<Tensor> {
         let (q_s, q_l) = q.storage_and_layout();
         let (k_s, k_l) = k.storage_and_layout();
@@ -1305,9 +1425,9 @@ mod cuda {
                 "fattn_mma_bf16: no instantiated kernel for head_dim={d} gqa_ratio={gqa_ratio} seq_kv={seq_kv}"
             )));
         };
-        // See fattn_mma_prefill_cuda's identical check: the kernel
-        // unconditionally computes `sequence % ne33` whenever ncols2 > 1.
-        if mask.is_none() && ncols2 != 1 {
+        // See fattn_mma_prefill_cuda's identical check. The in-kernel
+        // causal entries pass no mask and are exempt.
+        if mask.is_none() && causal_kv_offset.is_none() && ncols2 != 1 {
             return Err(unsupported_config(format!(
                 "fattn_mma_bf16: mask=None requires ncols2 == 1 (got ncols2={ncols2}); \
                  pass an explicit all-zero mask for unmasked attention with this GQA shape"
@@ -1357,6 +1477,8 @@ mod cuda {
             h_kv,
             scale,
         )?;
+
+        let causal_kv_offset = super::kernel_causal_offset(causal_kv_offset)?;
 
         let n_out = b * seq_q * h_q * d;
         let dst = unsafe { dev.alloc::<f32>(n_out) }?;
@@ -1413,6 +1535,7 @@ mod cuda {
         builder.arg(&p.nb31);
         builder.arg(&p.nb32);
         builder.arg(&p.nb33);
+        builder.arg(&causal_kv_offset);
         // SAFETY: the argument list above matches
         // `crane_fattn_mma_bf16_d{d}_v{d}_c{ncols1}_s{ncols2}`'s `extern "C"`
         // signature exactly (`DECL_FATTN_MMA_BF16_CASE` in
@@ -1566,6 +1689,7 @@ mod rocm {
         mask: Option<&Tensor>,
         kv_max: Option<&Tensor>,
         scale: f32,
+        causal_kv_offset: Option<usize>,
     ) -> Result<Tensor> {
         let (q_s, q_l) = q.storage_and_layout();
         let (k_s, k_l) = k.storage_and_layout();
@@ -1580,11 +1704,10 @@ mod rocm {
                 "fattn_mma: no instantiated kernel for head_dim={d} gqa_ratio={gqa_ratio} seq_kv={seq_kv}"
             )));
         };
-        // See fattn_mma_prefill's doc comment: the kernel unconditionally
-        // computes `sequence % ne33` whenever ncols2 > 1, which null-derefs/
-        // div-by-zeros when mask=None (ne33=0). Only ncols2==1 makes None
-        // safe.
-        if mask.is_none() && ncols2 != 1 {
+        // See fattn_mma_prefill's doc comment: a plain mask=None stays
+        // limited to ncols2 == 1. The in-kernel causal entries pass no mask
+        // and are exempt.
+        if mask.is_none() && causal_kv_offset.is_none() && ncols2 != 1 {
             return Err(unsupported_config(format!(
                 "fattn_mma: mask=None requires ncols2 == 1 (got ncols2={ncols2}); \
                  pass an explicit all-zero mask for unmasked attention with this GQA shape"
@@ -1624,6 +1747,8 @@ mod rocm {
             h_kv,
             scale,
         )?;
+
+        let causal_kv_offset = super::kernel_causal_offset(causal_kv_offset)?;
 
         let n_out = b * seq_q * h_q * d;
         let dst = dev.alloc::<f32>(n_out)?;
@@ -1672,6 +1797,7 @@ mod rocm {
             rocm::arg(&p.nb31),
             rocm::arg(&p.nb32),
             rocm::arg(&p.nb33),
+            rocm::arg(&causal_kv_offset),
         ];
 
         // SAFETY: the argument list above matches
@@ -1713,6 +1839,7 @@ mod rocm {
         mask: Option<&Tensor>,
         kv_max: Option<&Tensor>,
         scale: f32,
+        causal_kv_offset: Option<usize>,
     ) -> Result<Tensor> {
         let (q_s, q_l) = q.storage_and_layout();
         let (k_s, k_l) = k.storage_and_layout();
@@ -1728,9 +1855,9 @@ mod rocm {
                 "fattn_mma_bf16: no instantiated kernel for head_dim={d} gqa_ratio={gqa_ratio} seq_kv={seq_kv}"
             )));
         };
-        // See fattn_mma_prefill_rocm's identical check: the kernel
-        // unconditionally computes `sequence % ne33` whenever ncols2 > 1.
-        if mask.is_none() && ncols2 != 1 {
+        // See fattn_mma_prefill_rocm's identical check. The in-kernel
+        // causal entries pass no mask and are exempt.
+        if mask.is_none() && causal_kv_offset.is_none() && ncols2 != 1 {
             return Err(unsupported_config(format!(
                 "fattn_mma_bf16: mask=None requires ncols2 == 1 (got ncols2={ncols2}); \
                  pass an explicit all-zero mask for unmasked attention with this GQA shape"
@@ -1771,6 +1898,8 @@ mod rocm {
             h_kv,
             scale,
         )?;
+
+        let causal_kv_offset = super::kernel_causal_offset(causal_kv_offset)?;
 
         let n_out = b * seq_q * h_q * d;
         let dst = dev.alloc::<f32>(n_out)?;
@@ -1819,6 +1948,7 @@ mod rocm {
             rocm::arg(&p.nb31),
             rocm::arg(&p.nb32),
             rocm::arg(&p.nb33),
+            rocm::arg(&causal_kv_offset),
         ];
 
         // SAFETY: see fattn_mma_prefill_rocm's identical SAFETY comment;
@@ -1888,6 +2018,33 @@ mod tests {
             fattn_mma_prefill(&q, &k, &v, None, None, 0.125).expect_err("must reject F32 k/v");
         assert!(err.to_string().contains("k/v must be F16"));
     }
+
+    // The causal entries use the host mask exactly when the diagonal of the
+    // last query row reaches past the last live key.
+    #[test]
+    fn causal_needs_host_mask_only_past_live_keys() {
+        assert!(!causal_needs_host_mask(20, 200, 179));
+        assert!(!causal_needs_host_mask(20, 200, 180));
+        assert!(causal_needs_host_mask(20, 200, 181));
+        assert!(!causal_needs_host_mask(64, 64, 0));
+    }
+
+    // `None` maps to the kernel's "not causal" sentinel, `Some` passes the
+    // offset through, and an offset beyond `i32::MAX` is rejected.
+    #[test]
+    fn kernel_causal_offset_maps_none_to_sentinel() {
+        assert_eq!(kernel_causal_offset(None).unwrap(), -1);
+        assert_eq!(kernel_causal_offset(Some(5)).unwrap(), 5);
+        assert!(kernel_causal_offset(Some(usize::MAX)).is_err());
+    }
+
+    // The narrow-tile test shapes in `gpu_tests` must really select
+    // `ncols1 * ncols2 == 8` on NVIDIA, or they test nothing new.
+    #[test]
+    fn narrow_bitwise_shapes_select_ncols_8_on_nvidia() {
+        assert_eq!(select_mma_ncols(128, 4, 2, 256, false), Some((2, 4)));
+        assert_eq!(select_mma_ncols(128, 1, 8, 64, false), Some((8, 1)));
+    }
 }
 
 /// Correctness against a real GPU (this machine's ROCm GPU, or a CUDA GPU
@@ -1901,10 +2058,12 @@ mod tests {
 mod gpu_tests {
     use candle_core::{DType, Device, Tensor};
 
+    use super::super::fattn::is_amd_backend;
     use super::super::fattn::test_support::{MaskMode, naive_attention, test_gpu_device};
     use super::{
-        fattn_mma_bf16_causal, fattn_mma_bf16_prefill, fattn_mma_causal, fattn_mma_full,
-        fattn_mma_prefill, fattn_mma_windowed,
+        fattn_mma_bf16_causal, fattn_mma_bf16_causal_with_mask, fattn_mma_bf16_prefill,
+        fattn_mma_causal, fattn_mma_causal_with_mask, fattn_mma_full, fattn_mma_prefill,
+        fattn_mma_windowed,
     };
 
     /// `[1, seq_q, seq_kv]` F16 additive causal mask: `0` where `j <=
@@ -2171,11 +2330,10 @@ mod gpu_tests {
         run_full(1, 32, 256, 4, 2, 256);
     }
 
-    // mask = None is only valid when the selected ncols2 == 1 (see
+    // mask = None is only accepted when the selected ncols2 == 1 (see
     // fattn_mma_prefill's doc comment); ncols2 never resolves to 1 on AMD
     // (select_mma_ncols's doc comment), so this must fail cleanly with the
-    // "no instantiated kernel" error, never a hardware exception, on this
-    // (ROCm) backend.
+    // "no instantiated kernel" error on this (ROCm) backend.
     #[test]
     fn none_mask_bails_cleanly_when_ncols2_never_resolves_to_one_on_amd() {
         let gpu = test_gpu_device();
@@ -2198,9 +2356,7 @@ mod gpu_tests {
 
     // Same (head_dim, gqa_ratio, seq_kv) shape as causal_gqa_hd128, which
     // resolves to ncols2=4 on AMD: mask=None must bail with the explicit
-    // "requires ncols2 == 1" error rather than reach the kernel, which
-    // would null-deref/modulo-by-zero on `ne33` (see fattn_mma_prefill's
-    // doc comment).
+    // "requires ncols2 == 1" error (see fattn_mma_prefill's doc comment).
     #[test]
     fn none_mask_bails_cleanly_when_ncols2_resolves_above_one() {
         let gpu = test_gpu_device();
@@ -2365,6 +2521,151 @@ mod gpu_tests {
 
         let got = fattn_mma_bf16_causal(&q, &k, &v, scale, kv_offset).unwrap();
         assert_close(&got_vec(got), &want, 3e-2, "causal_fn_padded_gqa_bf16");
+    }
+
+    // Runs the in-kernel causal entry and the host-mask entry on the same
+    // inputs and requires identical output bits.
+    #[allow(clippy::many_single_char_names)]
+    fn assert_causal_bitwise_equals_with_mask(
+        bf16: bool,
+        (b, sq, skv, hq, hkv, d): (usize, usize, usize, usize, usize, usize),
+    ) {
+        let gpu = test_gpu_device();
+        // `d` is at most 256, exact in an f32.
+        #[allow(clippy::cast_precision_loss)]
+        let scale = 1.0f32 / (d as f32).sqrt();
+        let kv_offset = skv - sq;
+        let kv_dtype = if bf16 { DType::BF16 } else { DType::F16 };
+
+        let q = Tensor::randn(0f32, 1f32, (b, sq, hq, d), &gpu).unwrap();
+        let k = Tensor::randn(0f32, 1f32, (b, skv, hkv, d), &gpu)
+            .unwrap()
+            .to_dtype(kv_dtype)
+            .unwrap();
+        let v = Tensor::randn(0f32, 1f32, (b, skv, hkv, d), &gpu)
+            .unwrap()
+            .to_dtype(kv_dtype)
+            .unwrap();
+        let mask = causal_mask(sq, skv, kv_offset, &gpu);
+
+        let (got, want) = if bf16 {
+            (
+                fattn_mma_bf16_causal(&q, &k, &v, scale, kv_offset),
+                fattn_mma_bf16_causal_with_mask(&q, &k, &v, scale, kv_offset, &mask),
+            )
+        } else {
+            (
+                fattn_mma_causal(&q, &k, &v, scale, kv_offset),
+                fattn_mma_causal_with_mask(&q, &k, &v, scale, kv_offset, &mask),
+            )
+        };
+        let (got, want) = (got_vec(got.unwrap()), got_vec(want.unwrap()));
+        assert_eq!(got.len(), want.len());
+        let mismatches = got
+            .iter()
+            .zip(&want)
+            .filter(|(g, w)| g.to_bits() != w.to_bits())
+            .count();
+        assert_eq!(
+            mismatches,
+            0,
+            "bf16={bf16} b={b} sq={sq} skv={skv} hq={hq} hkv={hkv} d={d}: {mismatches} of {} elements differ",
+            got.len()
+        );
+    }
+
+    // Shapes cover an unaligned seq_kv with GQA padding, a decode-like
+    // offset, padding with an offset, and batch 2. MHA (ncols2 == 1) has no
+    // AMD kernel, so it only runs on NVIDIA.
+    const CAUSAL_BITWISE_SHAPES: [(usize, usize, usize, usize, usize, usize); 4] = [
+        (1, 231, 231, 8, 2, 256),
+        (1, 16, 256, 8, 2, 128),
+        (1, 100, 300, 8, 2, 64),
+        (2, 64, 64, 8, 2, 128),
+    ];
+
+    // NVIDIA-only f16 shapes with `ncols1 * ncols2 == 8`, the narrow
+    // `cols_per_warp == 8` mask site: `(2, 4)` and `(8, 1)`. AMD and the
+    // bf16 kernels have no such tile.
+    const CAUSAL_BITWISE_NARROW_SHAPES: [(usize, usize, usize, usize, usize, usize); 2] =
+        [(1, 2, 256, 8, 2, 128), (1, 8, 64, 4, 4, 128)];
+
+    // `fattn_mma_causal` (kernel masks) equals `fattn_mma_causal_with_mask`
+    // (host mask) bit for bit.
+    #[test]
+    fn causal_matches_causal_with_mask_bitwise() {
+        for shape in CAUSAL_BITWISE_SHAPES {
+            assert_causal_bitwise_equals_with_mask(false, shape);
+        }
+        if !is_amd_backend() {
+            assert_causal_bitwise_equals_with_mask(false, (1, 64, 64, 4, 4, 128));
+            for shape in CAUSAL_BITWISE_NARROW_SHAPES {
+                assert_causal_bitwise_equals_with_mask(false, shape);
+            }
+        }
+    }
+
+    // Same check for the native-bf16 kernels.
+    #[test]
+    fn causal_matches_causal_with_mask_bitwise_bf16() {
+        for shape in CAUSAL_BITWISE_SHAPES {
+            assert_causal_bitwise_equals_with_mask(true, shape);
+        }
+        if !is_amd_backend() {
+            assert_causal_bitwise_equals_with_mask(true, (1, 64, 64, 4, 4, 128));
+        }
+    }
+
+    // A diagonal reaching past the live keys (`kv_offset > skv - sq`) on a
+    // padded GQA shape: the causal entry must fall back to the host mask so
+    // the zero K/V padding stays masked.
+    #[allow(clippy::many_single_char_names)]
+    fn assert_causal_past_live_keys_matches_reference(bf16: bool) {
+        let gpu = test_gpu_device();
+        let (b, sq, skv, hq, hkv, d) = (1, 20, 200, 8, 2, 128usize);
+        // `d` is 128, exact in an f32.
+        #[allow(clippy::cast_precision_loss)]
+        let scale = 1.0f32 / (d as f32).sqrt();
+        let kv_offset = skv - sq + 37;
+        assert!(super::causal_needs_host_mask(sq, skv, kv_offset));
+
+        let q_f32 = Tensor::randn(0f32, 1f32, (b, sq, hq, d), &Device::Cpu).unwrap();
+        let k_f32 = Tensor::randn(0f32, 1f32, (b, skv, hkv, d), &Device::Cpu).unwrap();
+        let v_f32 = Tensor::randn(0f32, 1f32, (b, skv, hkv, d), &Device::Cpu).unwrap();
+        let want = naive_attention(
+            &q_f32,
+            &k_f32,
+            &v_f32,
+            scale,
+            MaskMode::Causal,
+            kv_offset,
+            0,
+            0,
+        );
+
+        let kv_dtype = if bf16 { DType::BF16 } else { DType::F16 };
+        let q = q_f32.to_device(&gpu).unwrap();
+        let k = k_f32.to_dtype(kv_dtype).unwrap().to_device(&gpu).unwrap();
+        let v = v_f32.to_dtype(kv_dtype).unwrap().to_device(&gpu).unwrap();
+
+        let got = if bf16 {
+            fattn_mma_bf16_causal(&q, &k, &v, scale, kv_offset)
+        } else {
+            fattn_mma_causal(&q, &k, &v, scale, kv_offset)
+        };
+        assert_close(&got_vec(got.unwrap()), &want, 3e-2, "causal_past_live_keys");
+    }
+
+    // `fattn_mma_causal` past the live keys matches the reference.
+    #[test]
+    fn causal_past_live_keys_matches_reference() {
+        assert_causal_past_live_keys_matches_reference(false);
+    }
+
+    // Same check for `fattn_mma_bf16_causal`.
+    #[test]
+    fn causal_past_live_keys_matches_reference_bf16() {
+        assert_causal_past_live_keys_matches_reference(true);
     }
 
     // End-to-end `fattn_mma_windowed`.

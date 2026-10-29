@@ -423,7 +423,8 @@ static __device__ __forceinline__ void flash_attn_ext_bf16_iter(
         float        * const __restrict__ KQ_rowsum,
         const int jt,
         const int kb0,
-        const int k_VKQ_sup) {
+        const int k_VKQ_sup,
+        const int causal_kv_offset) {
 #if defined(AMPERE_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
     constexpr int  warp_size       = ggml_cuda_get_physical_warp_size();
     constexpr int  ncols           = ncols1 * ncols2;
@@ -447,7 +448,7 @@ static __device__ __forceinline__ void flash_attn_ext_bf16_iter(
     // nstages is always 0 (see this file's module doc), so the mask is
     // always loaded synchronously here; there is no K-tile preload for the
     // next iteration to do multi-stage.
-    if (ncols2 > 1 || mask_h) {
+    if (mask_h) {
         flash_attn_ext_bf16_load_mask<ncols1, nwarps, nbatch_fa, false, oob_check, use_sparse>
             (mask_h, tile_mask, stride_mask, k_VKQ_0, k_VKQ_sup, jt*ncols1, ne01, indices);
     }
@@ -527,7 +528,7 @@ static __device__ __forceinline__ void flash_attn_ext_bf16_iter(
     }
     float KQ_rowsum_add[cols_per_thread] = {0.0f};
 
-    if (ncols2 > 1 || mask_h) {
+    if (mask_h) {
 #pragma unroll
         for (int i00 = 0; i00 < nbatch_fa; i00 += np*T_C_KQ::J) {
             const int i0 = i00 + (threadIdx.y % np)*T_C_KQ::J;
@@ -553,6 +554,25 @@ static __device__ __forceinline__ void flash_attn_ext_bf16_iter(
                 KQ_C[i00/(np*T_C_KQ::J)].x[l0 + 1] += slope*tmp.y;
             }
 #endif // RDNA3
+        }
+    }
+
+    // Keys past the diagonal get -inf, the value the host mask adds.
+    // The tile test is block-uniform, so only tiles crossing the
+    // diagonal pay for the per-element loop.
+    if (causal_kv_offset >= 0 && k_VKQ_0 + nbatch_fa - 1 > jt*ncols1 + causal_kv_offset) {
+#pragma unroll
+        for (int i00 = 0; i00 < nbatch_fa; i00 += np*T_C_KQ::J) {
+            const int i0 = i00 + (threadIdx.y % np)*T_C_KQ::J;
+#pragma unroll
+            for (int l = 0; l < T_C_KQ::ne; ++l) {
+                const int i = i0 + T_C_KQ::get_j(l);
+                const int j = ((threadIdx.y / np)*cols_per_warp + T_C_KQ::get_i(l)) / ncols2;
+
+                if (k_VKQ_0 + i > jt*ncols1 + j + causal_kv_offset) {
+                    KQ_C[i00/(np*T_C_KQ::J)].x[l] = -INFINITY;
+                }
+            }
         }
     }
 
@@ -690,7 +710,7 @@ static __device__ __forceinline__ void flash_attn_ext_bf16_iter(
         scale, slope, logit_softcap, ne01, ne02,
         stride_K, stride_V, stride_mask,
         tile_Q, tile_K, tile_V, tile_mask,
-        Q_B, VKQ_C, KQ_max, KQ_rowsum, kb0);
+        Q_B, VKQ_C, KQ_max, KQ_rowsum, kb0, causal_kv_offset);
     NO_DEVICE_CODE;
 #endif // defined(AMPERE_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
 }
@@ -733,7 +753,8 @@ static __device__ __forceinline__ void flash_attn_ext_bf16_process_tile(
         const int jt,
         const int zt_gqa,
         const int kb0_start,
-        const int kb0_stop) {
+        const int kb0_stop,
+        const int causal_kv_offset) {
 #if defined(AMPERE_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
     //In this kernel Q, K, V are matrices while i, j, k are matrix indices.
 
@@ -859,7 +880,7 @@ static __device__ __forceinline__ void flash_attn_ext_bf16_process_tile(
                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
                 (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
+                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, causal_kv_offset);
         }
         constexpr bool last_iter = true;
         const     int  k_VKQ_sup = ne11 - kb0*nbatch_fa;
@@ -868,7 +889,7 @@ static __device__ __forceinline__ void flash_attn_ext_bf16_process_tile(
               T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
             (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
              ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-             KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
+             KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, causal_kv_offset);
     } else {
         constexpr bool oob_check = false;
         for (; kb0 < kb0_stop-1; ++kb0) {
@@ -879,7 +900,7 @@ static __device__ __forceinline__ void flash_attn_ext_bf16_process_tile(
                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
                 (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
+                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, causal_kv_offset);
         }
         constexpr bool last_iter = true;
         constexpr int  k_VKQ_sup = nbatch_fa;
@@ -888,7 +909,7 @@ static __device__ __forceinline__ void flash_attn_ext_bf16_process_tile(
              T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
             (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
              ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-             KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
+             KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, causal_kv_offset);
     }
 
     // Finally, sum up partial KQ rowsums.
@@ -1175,7 +1196,7 @@ static __device__ __forceinline__ void flash_attn_ext_bf16_process_tile(
     GGML_UNUSED_VARS(Q_f2, K_h2, V_h2, mask_h, indices, sinks_f, dstk, dstk_fixup,
         scale, slope, logit_softcap, ne01, ne02, gqa_ratio,
         stride_Q1, stride_Q2, stride_K, stride_V, stride_mask,
-        jt, kb0_start, kb0_stop);
+        jt, kb0_start, kb0_stop, causal_kv_offset);
     NO_DEVICE_CODE;
 #endif // defined(AMPERE_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
 }
@@ -1215,7 +1236,8 @@ static __device__ __forceinline__ void flash_attn_ext_bf16(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33) {
+                            const int32_t nb31, const int32_t nb32, const int64_t nb33,
+                            const int32_t causal_kv_offset) {
     ggml_cuda_pdl_sync(); // TODO optimize placement
 #if defined(FLASH_ATTN_AVAILABLE) && (defined(AMPERE_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE))
     const char * GGML_CUDA_RESTRICT Q              = Q_ptr;
@@ -1283,7 +1305,7 @@ static __device__ __forceinline__ void flash_attn_ext_bf16(
 
         const float2 * Q_f2   = (const float2 *) (Q + nb03*sequence + nb02*zt_Q);
         const nv_bfloat162 * K_h2 = (const nv_bfloat162 *) (K + nb13*sequence + nb12*z_KV);
-        const half   * mask_h = ncols2 == 1 && !mask ? nullptr :
+        const half   * mask_h = !mask ? nullptr :
             (const half *) (mask + nb33*(sequence % ne33));
         float2       * dstk   = ((float2 *) dst) + (sequence*ne01.z*ne02 + zt_Q) * (DV/2);
 
@@ -1300,12 +1322,12 @@ static __device__ __forceinline__ void flash_attn_ext_bf16(
             constexpr bool needs_fixup = false; // CUDA block is working on an entire tile.
             flash_attn_ext_bf16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup>
                 (Q_f2, K_h2, V_h2, mask_h, nullptr, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
-                 ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
+                 ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop, causal_kv_offset);
         } else {
             constexpr bool needs_fixup = true; // CUDA block is missing the beginning of a tile.
             flash_attn_ext_bf16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup>
                 (Q_f2, K_h2, V_h2, mask_h, nullptr, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
-                 ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
+                 ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop, causal_kv_offset);
         }
 
         kbc += iter_k;
@@ -1329,7 +1351,7 @@ static __device__ __forceinline__ void flash_attn_ext_bf16(
 
     const float2 * Q_f2   = (const float2 *) (Q + nb03*sequence + nb02*zt_Q);
     const nv_bfloat162 * K_h2 = (const nv_bfloat162 *) (K + nb13*sequence + nb12*z_KV);
-    const half   * mask_h = ncols2 == 1 && !mask ? nullptr :
+    const half   * mask_h = !mask ? nullptr :
         (const half *) (mask + nb33*(sequence % ne33));
     float2       * dstk   = ((float2 *) dst) + (sequence*ne01.z*ne02 + zt_Q) * (DV/2);
 
@@ -1346,7 +1368,7 @@ static __device__ __forceinline__ void flash_attn_ext_bf16(
     constexpr bool needs_fixup = false;
     flash_attn_ext_bf16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup>
         (Q_f2, K_h2, V_h2, mask_h, nullptr, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
-         ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
+         ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop, causal_kv_offset);
 #else
     GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,
@@ -1356,7 +1378,7 @@ static __device__ __forceinline__ void flash_attn_ext_bf16(
               nb11, nb12, nb13,
               nb21, nb22, nb23,
               ne31, ne32, ne33,
-              nb31, nb32, nb33);
+              nb31, nb32, nb33, causal_kv_offset);
     NO_DEVICE_CODE;
 #endif // defined(FLASH_ATTN_AVAILABLE) && (defined(AMPERE_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE))
 }
@@ -1378,12 +1400,14 @@ static __device__ __forceinline__ void flash_attn_ext_bf16(
         int32_t nb11, int32_t nb12, int64_t nb13,                                                       \
         int32_t nb21, int32_t nb22, int64_t nb23,                                                       \
         int32_t ne31, int32_t ne32, int32_t ne33,                                                       \
-        int32_t nb31, int32_t nb32, int64_t nb33)                                                       \
+        int32_t nb31, int32_t nb32, int64_t nb33,                                                       \
+        int32_t causal_kv_offset)                                                                       \
     {                                                                                                    \
         flash_attn_ext_bf16<DKQ_, DV_, ncols1_, ncols2_, false, false, false>(                          \
             Q, K, V, mask, sinks, KV_max, dst, dst_meta,                                                \
             scale, max_bias, m0, m1, n_head_log2, logit_softcap,                                        \
             ne00, ne01, ne02, ne03, nb01, nb02, nb03,                                                    \
             ne10, ne11, ne12, ne13, nb11, nb12, nb13,                                                    \
-            nb21, nb22, nb23, ne31, ne32, ne33, nb31, nb32, nb33);                                       \
+            nb21, nb22, nb23, ne31, ne32, ne33, nb31, nb32, nb33,                                        \
+            causal_kv_offset);                                                                          \
     }
