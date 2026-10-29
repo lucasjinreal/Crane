@@ -3123,3 +3123,7 @@ mod flashattn2_parity {
 #[cfg(all(test, crane_fattn))]
 #[path = "fattn_long_seq_tests.rs"]
 mod long_seq_tests;
+
+#[cfg(all(test, crane_fattn))]
+#[path = "fattn_golden_tests.rs"]
+mod golden_tests;

@@ -45,9 +45,13 @@ use super::{
 use crate::models::modules::gpu_flash_attn::try_causal_prefill;
 
 /// Unaligned lengths take the K/V padding path, aligned ones do not.
-const SEQS: [usize; 5] = [231, 238, 1024, 2048, 4096];
-const DISTS: [LongSeqDist; 3] = [LongSeqDist::Normal, LongSeqDist::Scaled, LongSeqDist::Spike];
-const SEEDS_PER_DIST: u64 = 10;
+pub(super) const SEQS: [usize; 5] = [231, 238, 1024, 2048, 4096];
+/// Input distributions of the sweep.
+pub(super) const DISTS: [LongSeqDist; 3] =
+    [LongSeqDist::Normal, LongSeqDist::Scaled, LongSeqDist::Spike];
+/// Seeds per distribution. Distribution `i` uses seeds `i * SEEDS_PER_DIST`
+/// and up.
+pub(super) const SEEDS_PER_DIST: u64 = 10;
 /// Rows per block in the F64 check, which samples each block's first and
 /// last row.
 const F64_BLOCK: usize = 64;
@@ -604,7 +608,7 @@ fn scaled_q(q: &[f32], scale: f32, dtype: DType) -> Vec<f32> {
 
 /// Rounds host values to `dtype` and back, so every path sees the same
 /// inputs.
-fn round_to(host: Vec<f32>, dtype: DType) -> Vec<f32> {
+pub(super) fn round_to(host: Vec<f32>, dtype: DType) -> Vec<f32> {
     let n = host.len();
     Tensor::from_vec(host, n, &Device::Cpu)
         .unwrap()
@@ -617,7 +621,7 @@ fn round_to(host: Vec<f32>, dtype: DType) -> Vec<f32> {
 }
 
 /// Copies a GPU result of any float dtype to the host as flat F32.
-fn to_host(t: &Tensor) -> Vec<f32> {
+pub(super) fn to_host(t: &Tensor) -> Vec<f32> {
     t.to_dtype(DType::F32)
         .unwrap()
         .flatten_all()
