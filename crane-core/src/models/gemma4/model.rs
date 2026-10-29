@@ -85,6 +85,12 @@ impl Model {
         self.inner.clear_kv_cache();
     }
 
+    /// Enable fused causal attention for prefill, see
+    /// [`Gemma4Model::enable_flash_causal`].
+    pub fn enable_flash_causal(&mut self) {
+        self.inner.enable_flash_causal();
+    }
+
     fn from_pretrained(model_path: &str, device: &Device, dtype: &DType) -> Result<Model> {
         let tokenizer_path = std::path::Path::new(model_path).join("tokenizer.json");
         if !tokenizer_path.exists() {

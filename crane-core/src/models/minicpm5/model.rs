@@ -132,6 +132,12 @@ impl Model {
         self.inner.clear_kv_cache();
     }
 
+    /// Enable fused causal attention for prefill, see
+    /// [`MiniCpm5Model::enable_flash_causal`].
+    pub fn enable_flash_causal(&mut self) {
+        self.inner.enable_flash_causal();
+    }
+
     /// EOS token id(s) read from `generation_config.json` / `config.json`
     /// (safetensors) at load time. Empty for GGUF checkpoints — the GGUF
     /// path relies on the request's `eos_token_id` or a tokenizer lookup.

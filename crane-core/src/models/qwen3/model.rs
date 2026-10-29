@@ -165,6 +165,12 @@ impl Model {
         self.inner.clear_kv_cache();
     }
 
+    /// Enable fused causal attention for prefill, see
+    /// [`Qwen3Model::enable_flash_causal`].
+    pub fn enable_flash_causal(&mut self) {
+        self.inner.enable_flash_causal();
+    }
+
     /// Bytes of KV cache one sequence consumes per generated token. See
     /// [`Config::kv_bytes_per_token`].
     pub fn kv_bytes_per_token(&self) -> u64 {

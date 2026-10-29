@@ -10,6 +10,8 @@
 #![allow(clippy::cast_precision_loss)]
 
 pub mod dspark;
+#[cfg(all(test, any(feature = "cuda", feature = "rocm")))]
+pub(crate) mod flash_test_support;
 #[cfg(feature = "onnx")]
 pub mod g2p;
 #[cfg(feature = "onnx")]

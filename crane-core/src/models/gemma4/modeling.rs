@@ -29,6 +29,7 @@ use std::io::{Read, Seek};
 // Reuse the polymorphic linear layer and the shared GGUF loader.
 use crate::models::modules::embedding::EmbeddingLayer;
 use crate::models::modules::ffn::SwiGluFfn;
+use crate::models::modules::gpu_flash_attn;
 pub use crate::ops::linear::LinearLayer;
 pub use crate::quantized::gguf_file::Gguf;
 // `Device::is_rocm` is inherent on the ROCm candle fork; this extension only
@@ -263,6 +264,9 @@ struct Attention {
     is_shared: bool,
     kv_cache: Option<(Tensor, Tensor)>,
     cache_seq_len: usize,
+    /// Opt-in vendored flash attention for prefill, see
+    /// [`Gemma4Model::enable_flash_causal`].
+    flash_causal: bool,
 }
 
 impl Attention {
@@ -325,6 +329,7 @@ impl Attention {
             is_shared,
             kv_cache: None,
             cache_seq_len: 0,
+            flash_causal: false,
         })
     }
 
@@ -367,6 +372,7 @@ impl Attention {
             is_shared,
             kv_cache: None,
             cache_seq_len: 0,
+            flash_causal: false,
         })
     }
 
@@ -430,6 +436,7 @@ impl Attention {
         cos: &Tensor,
         sin: &Tensor,
         attention_mask: Option<&Tensor>,
+        flash_mask: Option<&Tensor>,
         layer_type: LayerType,
         rotated_dim: Option<usize>,
         shared_kv: Option<&(Tensor, Tensor)>,
@@ -518,6 +525,20 @@ impl Attention {
                 .reshape((b_sz, self.num_heads, self.head_dim))?
                 .reshape((b_sz, 1, self.num_heads * self.head_dim))?;
             return self.o_proj.forward(&attn_output);
+        }
+
+        // Opt-in vendored flash attention for prefill, GPU only. The mask is
+        // the layer's own: causal for full layers, causal plus the sliding
+        // window for the others. The kernel reads it, and its analytic
+        // `KV_max` only trims keys past the causal diagonal. Gemma4 scales by
+        // 1.0, the QK norms handle normalization. It returns `None` for what
+        // it cannot serve, such as `head_dim` 512 on AMD, and the SDPA below
+        // runs.
+        if self.flash_causal && seq_len > 1 {
+            let mask = flash_mask.or(attention_mask);
+            if let Some(out) = gpu_flash_attn::try_causal_prefill(&q, &k, &v, 1.0, mask)? {
+                return self.o_proj.forward(&out);
+            }
         }
 
         let k = if n_rep > 1 {
@@ -777,6 +798,7 @@ impl DecoderLayer {
         cos: &Tensor,
         sin: &Tensor,
         attention_mask: Option<&Tensor>,
+        flash_mask: Option<&Tensor>,
         rotated_dim: Option<usize>,
         shared_kv: Option<&(Tensor, Tensor)>,
     ) -> Result<Tensor> {
@@ -788,6 +810,7 @@ impl DecoderLayer {
             cos,
             sin,
             attention_mask,
+            flash_mask,
             self.layer_type,
             rotated_dim,
             shared_kv,
@@ -823,6 +846,10 @@ impl DecoderLayer {
 
     fn clear_kv_cache(&mut self) {
         self.self_attn.clear_kv_cache();
+    }
+
+    fn enable_flash_causal(&mut self) {
+        self.self_attn.flash_causal = true;
     }
 }
 
@@ -1324,6 +1351,11 @@ impl Gemma4Model {
             None
         };
 
+        // One F16 copy of each mask for every opted-in layer, instead of a
+        // cast in each of them.
+        let (flash_sliding, flash_full) =
+            self.prepare_flash_masks(sliding_mask.as_ref(), causal_mask.as_ref())?;
+
         // Forward pass through layers
         let mut hidden_states = hidden_states;
         let first_shared = self.config.first_kv_shared_layer();
@@ -1332,9 +1364,19 @@ impl Gemma4Model {
         for i in 0..self.layers.len() {
             let lt = self.layer_types[i];
 
-            let (cos, sin, mask) = match lt {
-                LayerType::SlidingAttention => (&cos_sliding, &sin_sliding, sliding_mask.as_ref()),
-                LayerType::FullAttention => (&cos_full, &sin_full, causal_mask.as_ref()),
+            let (cos, sin, mask, flash_mask) = match lt {
+                LayerType::SlidingAttention => (
+                    &cos_sliding,
+                    &sin_sliding,
+                    sliding_mask.as_ref(),
+                    flash_sliding.as_ref(),
+                ),
+                LayerType::FullAttention => (
+                    &cos_full,
+                    &sin_full,
+                    causal_mask.as_ref(),
+                    flash_full.as_ref(),
+                ),
             };
 
             let rotated_dim = match lt {
@@ -1353,6 +1395,7 @@ impl Gemma4Model {
                 cos,
                 sin,
                 mask,
+                flash_mask,
                 rotated_dim,
                 shared_kv,
             )?;
@@ -1435,6 +1478,38 @@ impl Gemma4Model {
         }
     }
 
+    /// Enable fused causal attention for prefill. The caller guarantees an
+    /// unpadded standard prefill, whose masks are the plain causal mask for
+    /// full layers and the causal sliding-window mask for the others.
+    ///
+    /// The vendored kernels compute `KV_max` analytically and skip KV tiles
+    /// past the causal diagonal, so a mask that is not causal is cut off
+    /// silently instead of honored. A mask that hides extra keys below the
+    /// diagonal, as the sliding window does, is honored. An F32 model runs
+    /// the kernel in F16, so its opted-in attention has F16 precision.
+    /// Anything the kernels cannot serve, such as the 512-wide full-attention
+    /// heads on AMD or a CPU device, keeps the default path.
+    pub fn enable_flash_causal(&mut self) {
+        for layer in &mut self.layers {
+            layer.enable_flash_causal();
+        }
+    }
+
+    /// F16 copies of the sliding and full masks for the opted-in layers, see
+    /// [`gpu_flash_attn::prepare_mask`]. Both are `None` when no layer opted
+    /// in or the masks need no cast.
+    fn prepare_flash_masks(
+        &self,
+        sliding: Option<&Tensor>,
+        full: Option<&Tensor>,
+    ) -> Result<(Option<Tensor>, Option<Tensor>)> {
+        if !self.layers.iter().any(|l| l.self_attn.flash_causal) {
+            return Ok((None, None));
+        }
+        let prepare = |mask: Option<&Tensor>| mask.map_or(Ok(None), gpu_flash_attn::prepare_mask);
+        Ok((prepare(sliding)?, prepare(full)?))
+    }
+
     pub fn num_layers(&self) -> usize {
         self.layers.len()
     }
@@ -1462,5 +1537,48 @@ impl Gemma4Model {
 
     pub fn model_dtype(&self) -> DType {
         self.dtype
+    }
+}
+
+#[cfg(all(test, any(feature = "cuda", feature = "rocm")))]
+mod flash_causal_tests {
+    use super::*;
+    use crate::models::flash_test_support::{assert_flash_tracks_default, hash_weights};
+
+    /// Sliding layers use `head_dim` 128 and full layers 256, so both have a
+    /// kernel on every backend. The 8-key window is shorter than the prompts,
+    /// so it matters. The last two layers reuse an earlier layer's K/V.
+    fn tiny_config() -> Gemma4TextConfig {
+        serde_json::from_str(
+            r#"{"vocab_size":64,"hidden_size":256,"intermediate_size":128,
+            "num_hidden_layers":4,"num_attention_heads":4,"num_key_value_heads":2,
+            "head_dim":128,"global_head_dim":256,"max_position_embeddings":256,
+            "rms_norm_eps":1e-6,"hidden_activation":"gelu_pytorch_tanh",
+            "tie_word_embeddings":true,"sliding_window":8,"num_kv_shared_layers":2,
+            "layer_types":["sliding_attention","full_attention",
+                           "sliding_attention","full_attention"],
+            "rope_parameters":{
+             "full_attention":{"rope_theta":1000000.0,"rope_type":"proportional",
+                               "partial_rotary_factor":0.25},
+             "sliding_attention":{"rope_theta":10000.0,"rope_type":"default"}}}"#,
+        )
+        .unwrap()
+    }
+
+    // Prefill and continuation prefill through the vendored kernels, with
+    // the sliding window and shared K/V, then a decode step through the
+    // default path, must track an unflagged model.
+    #[test]
+    fn flash_causal_tracks_default_attention() {
+        assert_flash_tracks_default(
+            "gemma4",
+            64,
+            [(DType::BF16, 0.2), (DType::F16, 0.04)],
+            |dev, dtype| {
+                Gemma4Model::new(&tiny_config(), &hash_weights(dev, dtype), false).unwrap()
+            },
+            |m, ids, start| m.forward(ids, start).unwrap(),
+            Gemma4Model::enable_flash_causal,
+        );
     }
 }
