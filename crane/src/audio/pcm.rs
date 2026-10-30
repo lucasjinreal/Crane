@@ -66,6 +66,7 @@ fn f32_to_i16_sample(s: f32) -> i16 {
 ///
 /// This is the canonical conversion used by the Wyoming transport
 /// (`audio-chunk` payloads) and the HTTP PCM response format.
+#[must_use]
 pub fn pcm_f32_to_i16(samples: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(samples.len() * 2);
     for &s in samples {
@@ -81,6 +82,7 @@ pub fn pcm_f32_to_i16(samples: &[f32]) -> Vec<u8> {
 ///
 /// This is the canonical conversion for incoming Wyoming `audio-chunk`
 /// payloads and other raw PCM input.
+#[must_use]
 pub fn pcm_i16_to_f32(bytes: &[u8]) -> Vec<f32> {
     bytes
         .chunks_exact(2)

@@ -36,6 +36,7 @@ impl Default for GenerationConfig {
 }
 
 impl GenerationConfig {
+    #[must_use]
     pub fn with_max_tokens(max: usize) -> Self {
         Self {
             max_new_tokens: max,

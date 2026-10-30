@@ -48,6 +48,7 @@ impl<'a> AsrStream<'a> {
     ///
     /// Used by the default [`Asr::transcribe_stream`] implementation for
     /// models without true streaming support.
+    #[must_use]
     pub fn once(transcript: Transcript) -> Self {
         Self::new(std::iter::once(Ok(transcript)))
     }

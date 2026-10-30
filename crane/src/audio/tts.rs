@@ -66,6 +66,7 @@ impl<'a> TtsStream<'a> {
     ///
     /// Used by the default [`Tts::generate_speech_stream`] implementation
     /// for models that produce the full waveform before returning.
+    #[must_use]
     pub fn once(audio_info: AudioInfo, tensor: Tensor) -> Self {
         Self::new(audio_info, std::iter::once(Ok(tensor)))
     }

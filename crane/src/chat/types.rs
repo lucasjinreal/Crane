@@ -51,6 +51,7 @@ pub struct ChatHistory {
 }
 
 impl ChatHistory {
+    #[must_use]
     pub fn new(max_turns: usize) -> Self {
         Self {
             messages: Vec::new(),

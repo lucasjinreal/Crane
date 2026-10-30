@@ -9,6 +9,7 @@ pub struct GpuMemoryInfo {
     pub total_bytes: u64,
 }
 
+#[must_use]
 pub fn gpu_memory_info(device: &DeviceConfig) -> Option<GpuMemoryInfo> {
     match device {
         DeviceConfig::Cuda(index) => cuda_gpu_memory_info(*index as usize),
