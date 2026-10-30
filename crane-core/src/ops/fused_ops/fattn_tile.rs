@@ -542,10 +542,12 @@ mod rocm {
         let module_name = "crane_fattn_tile_instances";
         let source = rocm_tile_source();
 
-        let q_ptr = rocm::device_ptr(&q_s, q_l, DType::F32, "fattn_tile q")?; // q stays F32
-        let k_ptr = rocm::device_ptr(&k_s, k_l, DType::F16, "fattn_tile k")?;
-        let v_ptr = rocm::device_ptr(&v_s, v_l, DType::F16, "fattn_tile v")?;
+        let q_ptr = rocm::strided_device_ptr(&q_s, q_l, DType::F32, "fattn_tile q")?; // q stays F32
+        let k_ptr = rocm::strided_device_ptr(&k_s, k_l, DType::F16, "fattn_tile k")?;
+        let v_ptr = rocm::strided_device_ptr(&v_s, v_l, DType::F16, "fattn_tile v")?;
 
+        // The mask stays on the contiguous device_ptr. Callers make it
+        // contiguous, and its strides are not layout-checked.
         let mask_layout = mask.map(Tensor::storage_and_layout);
         let mask_ptr: *mut c_void = match &mask_layout {
             Some((s, l)) => rocm::device_ptr(s, l, DType::F16, "fattn_tile mask")?,
@@ -694,7 +696,9 @@ mod tests {
 mod gpu_tests {
     use candle_core::{DType, Device, Tensor};
 
-    use super::super::fattn::test_support::{MaskMode, naive_attention, test_gpu_device};
+    use super::super::fattn::test_support::{
+        MaskMode, naive_attention, narrowed_bhsd, test_gpu_device,
+    };
     use super::{fattn_tile_causal, fattn_tile_full, fattn_tile_prefill, fattn_tile_windowed};
 
     fn causal_mask(seq_q: usize, seq_kv: usize, kv_offset: usize, device: &Device) -> Tensor {
@@ -869,6 +873,38 @@ mod gpu_tests {
 
         let got = fattn_tile_causal(&q, &k, &v, scale, kv_offset).unwrap();
         assert_close(&got_vec(got), &want, 3e-2, "causal_fn");
+    }
+
+    // Strided BSHD views of narrowed BHSD buffers give the same bits as
+    // contiguous copies of them.
+    #[test]
+    #[allow(clippy::many_single_char_names)]
+    fn strided_inputs_match_contiguous_bitwise_hd128() {
+        let gpu = test_gpu_device();
+        let (b, sq, skv, hq, hkv, d) = (1, 20, 150, 4, 2, 128usize);
+        let strided = |s: usize, h: usize, dtype: DType| {
+            narrowed_bhsd((b, h, s, d), dtype, &gpu)
+                .transpose(1, 2)
+                .unwrap()
+        };
+        let q = strided(sq, hq, DType::F32);
+        let k = strided(skv, hkv, DType::F16);
+        let v = strided(skv, hkv, DType::F16);
+        let (qc, kc, vc) = (
+            q.contiguous().unwrap(),
+            k.contiguous().unwrap(),
+            v.contiguous().unwrap(),
+        );
+
+        let got = got_vec(fattn_tile_causal(&q, &k, &v, 0.125, skv - sq).unwrap());
+        let want = got_vec(fattn_tile_causal(&qc, &kc, &vc, 0.125, skv - sq).unwrap());
+        assert_eq!(got.len(), want.len());
+        assert!(
+            got.iter()
+                .zip(&want)
+                .all(|(g, w)| g.to_bits() == w.to_bits()),
+            "strided and contiguous outputs differ"
+        );
     }
 
     // End-to-end `fattn_tile_windowed`.

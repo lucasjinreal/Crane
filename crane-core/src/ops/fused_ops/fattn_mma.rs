@@ -1720,10 +1720,12 @@ mod rocm {
 
         // See this module's doc comment: q stays F32 (never F16) for this
         // kernel family.
-        let q_ptr = rocm::device_ptr(&q_s, q_l, DType::F32, "fattn_mma q")?;
-        let k_ptr = rocm::device_ptr(&k_s, k_l, DType::F16, "fattn_mma k")?;
-        let v_ptr = rocm::device_ptr(&v_s, v_l, DType::F16, "fattn_mma v")?;
+        let q_ptr = rocm::strided_device_ptr(&q_s, q_l, DType::F32, "fattn_mma q")?;
+        let k_ptr = rocm::strided_device_ptr(&k_s, k_l, DType::F16, "fattn_mma k")?;
+        let v_ptr = rocm::strided_device_ptr(&v_s, v_l, DType::F16, "fattn_mma v")?;
 
+        // The mask stays on the contiguous device_ptr. Callers make it
+        // contiguous, and its strides are not layout-checked.
         let mask_layout = mask.map(Tensor::storage_and_layout);
         let mask_ptr: *mut c_void = match &mask_layout {
             Some((s, l)) => rocm::device_ptr(s, l, DType::F16, "fattn_mma mask")?,
@@ -1871,10 +1873,12 @@ mod rocm {
 
         // See this module's doc comment: q stays F32 (never F16/BF16) for
         // this kernel family.
-        let q_ptr = rocm::device_ptr(&q_s, q_l, DType::F32, "fattn_mma_bf16 q")?;
-        let k_ptr = rocm::device_ptr(&k_s, k_l, DType::BF16, "fattn_mma_bf16 k")?;
-        let v_ptr = rocm::device_ptr(&v_s, v_l, DType::BF16, "fattn_mma_bf16 v")?;
+        let q_ptr = rocm::strided_device_ptr(&q_s, q_l, DType::F32, "fattn_mma_bf16 q")?;
+        let k_ptr = rocm::strided_device_ptr(&k_s, k_l, DType::BF16, "fattn_mma_bf16 k")?;
+        let v_ptr = rocm::strided_device_ptr(&v_s, v_l, DType::BF16, "fattn_mma_bf16 v")?;
 
+        // The mask stays on the contiguous device_ptr. Callers make it
+        // contiguous, and its strides are not layout-checked.
         let mask_layout = mask.map(Tensor::storage_and_layout);
         let mask_ptr: *mut c_void = match &mask_layout {
             Some((s, l)) => rocm::device_ptr(s, l, DType::F16, "fattn_mma_bf16 mask")?,
@@ -2059,7 +2063,9 @@ mod gpu_tests {
     use candle_core::{DType, Device, Tensor};
 
     use super::super::fattn::is_amd_backend;
-    use super::super::fattn::test_support::{MaskMode, naive_attention, test_gpu_device};
+    use super::super::fattn::test_support::{
+        MaskMode, naive_attention, narrowed_bhsd, test_gpu_device,
+    };
     use super::{
         fattn_mma_bf16_causal, fattn_mma_bf16_causal_with_mask, fattn_mma_bf16_prefill,
         fattn_mma_causal, fattn_mma_causal_with_mask, fattn_mma_full, fattn_mma_prefill,
@@ -2666,6 +2672,91 @@ mod gpu_tests {
     #[test]
     fn causal_past_live_keys_matches_reference_bf16() {
         assert_causal_past_live_keys_matches_reference(true);
+    }
+
+    // Runs the causal entries on strided Q/K/V views and on contiguous
+    // copies of them, and requires identical output bits.
+    // `d` is at most 256, exact in an f32.
+    #[allow(clippy::many_single_char_names, clippy::cast_precision_loss)]
+    fn assert_strided_bitwise_equals_contiguous(
+        bf16: bool,
+        (b, sq, skv, hq, hkv, d): (usize, usize, usize, usize, usize, usize),
+    ) {
+        let gpu = test_gpu_device();
+        let scale = 1.0f32 / (d as f32).sqrt();
+        let kv_offset = skv - sq;
+        let kv_dtype = if bf16 { DType::BF16 } else { DType::F16 };
+        let bshd = |s: usize, h: usize, dtype: DType| {
+            narrowed_bhsd((b, h, s, d), dtype, &gpu)
+                .transpose(1, 2)
+                .unwrap()
+        };
+        let q = bshd(sq, hq, DType::F32);
+        let k = bshd(skv, hkv, kv_dtype);
+        let v = bshd(skv, hkv, kv_dtype);
+        assert!(!q.is_contiguous() && !k.is_contiguous() && !v.is_contiguous());
+        let (qc, kc, vc) = (
+            q.contiguous().unwrap(),
+            k.contiguous().unwrap(),
+            v.contiguous().unwrap(),
+        );
+        let mask = causal_mask(sq, skv, kv_offset, &gpu);
+
+        let run = |q: &Tensor, k: &Tensor, v: &Tensor, with_mask: bool| {
+            let out = match (bf16, with_mask) {
+                (true, false) => fattn_mma_bf16_causal(q, k, v, scale, kv_offset),
+                (true, true) => fattn_mma_bf16_causal_with_mask(q, k, v, scale, kv_offset, &mask),
+                (false, false) => fattn_mma_causal(q, k, v, scale, kv_offset),
+                (false, true) => fattn_mma_causal_with_mask(q, k, v, scale, kv_offset, &mask),
+            };
+            got_vec(out.unwrap())
+        };
+        for with_mask in [false, true] {
+            let (got, want) = (run(&q, &k, &v, with_mask), run(&qc, &kc, &vc, with_mask));
+            assert_eq!(got.len(), want.len());
+            let mismatches = got
+                .iter()
+                .zip(&want)
+                .filter(|(g, w)| g.to_bits() != w.to_bits())
+                .count();
+            assert_eq!(
+                mismatches,
+                0,
+                "bf16={bf16} with_mask={with_mask} b={b} sq={sq} skv={skv} hq={hq} hkv={hkv} d={d}: {mismatches} of {} elements differ",
+                got.len()
+            );
+        }
+    }
+
+    // Covers GQA ratios, head dims and an unaligned seq_kv (231). MHA has
+    // no AMD kernel, so it only runs on NVIDIA.
+    const STRIDED_SHAPES: [(usize, usize, usize, usize, usize, usize); 4] = [
+        (1, 256, 256, 8, 2, 256),
+        (2, 64, 256, 8, 2, 128),
+        (1, 16, 256, 8, 2, 64),
+        (1, 231, 231, 8, 2, 256),
+    ];
+
+    // Strided Q/K/V views give the same bits as contiguous copies (f16).
+    #[test]
+    fn strided_inputs_match_contiguous_bitwise() {
+        for shape in STRIDED_SHAPES {
+            assert_strided_bitwise_equals_contiguous(false, shape);
+        }
+        if !is_amd_backend() {
+            assert_strided_bitwise_equals_contiguous(false, (1, 64, 64, 4, 4, 128));
+        }
+    }
+
+    // Same check for the native-bf16 kernels.
+    #[test]
+    fn strided_inputs_match_contiguous_bitwise_bf16() {
+        for shape in STRIDED_SHAPES {
+            assert_strided_bitwise_equals_contiguous(true, shape);
+        }
+        if !is_amd_backend() {
+            assert_strided_bitwise_equals_contiguous(true, (1, 64, 64, 4, 4, 128));
+        }
     }
 
     // End-to-end `fattn_mma_windowed`.

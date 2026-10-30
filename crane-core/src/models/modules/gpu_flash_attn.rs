@@ -267,6 +267,7 @@ fn run(
     mma: impl FnOnce(&Tensor, &Tensor, &Tensor) -> Result<Tensor>,
     tile: impl FnOnce(&Tensor, &Tensor, &Tensor) -> Result<Tensor>,
 ) -> Result<Option<Tensor>> {
+    use crate::ops::fused_ops::fattn::{KV_ELEM_BYTES, Q_ELEM_BYTES};
     use ribo::utils::log;
 
     let orig_dtype = q.dtype();
@@ -275,27 +276,29 @@ fn run(
     let v_bshd = v.transpose(1, 2)?;
 
     if orig_dtype == DType::BF16 && !bf16_disabled() {
-        // The device pointer helpers need full contiguity, which the
-        // BHSD to BSHD transpose does not provide on its own.
+        // The kernels read the strided BSHD views of k/v directly.
         let q_f32 = q_bshd.to_dtype(DType::F32)?;
-        let k_bf16 = k_bshd.contiguous()?;
-        let v_bf16 = v_bshd.contiguous()?;
+        let k_bf16 = addressable(k_bshd, KV_ELEM_BYTES, false)?;
+        let v_bf16 = addressable(v_bshd, KV_ELEM_BYTES, false)?;
         return match mma_bf16(&q_f32, &k_bf16, &v_bf16) {
             Ok(out_bshd) => out_bshd.transpose(1, 2).map(Some),
             Err(e) => unsupported_to_none(e),
         };
     }
 
-    // The cast branches produce contiguous tensors for free. The others must
-    // call contiguous() explicitly.
+    // Inputs already in the kernel's dtype go in as strided views. Only the
+    // others pay a cast.
     let q_f32 = if orig_dtype == DType::F32 {
-        q_bshd.contiguous()?
+        addressable(q_bshd, Q_ELEM_BYTES, true)?
     } else {
         log_cast_once(orig_dtype);
         q_bshd.to_dtype(DType::F32)?
     };
     let (k_f16, v_f16) = if orig_dtype == DType::F16 {
-        (k_bshd.contiguous()?, v_bshd.contiguous()?)
+        (
+            addressable(k_bshd, KV_ELEM_BYTES, false)?,
+            addressable(v_bshd, KV_ELEM_BYTES, false)?,
+        )
     } else {
         log_cast_once(orig_dtype);
         (k_bshd.to_dtype(DType::F16)?, v_bshd.to_dtype(DType::F16)?)
@@ -361,6 +364,28 @@ fn log_cast_once(orig_dtype: DType) {
             "gpu_flash_attn: casting {orig_dtype:?} q to F32 and k/v to F16 for the vendored kernels (logged once)"
         );
     });
+}
+
+/// Returns `t` itself when the kernels can address its layout, so a view
+/// reaches them uncopied. Any other layout gets a fresh contiguous copy.
+/// A non-4D `t` passes through, so the kernel's own validation rejects it.
+#[cfg(crane_fattn)]
+fn addressable(t: Tensor, elem_bytes: usize, batch_in_i32: bool) -> Result<Tensor> {
+    use crate::ops::fused_ops::fattn::check_kernel_layout;
+
+    if t.rank() != 4 || check_kernel_layout(t.layout(), elem_bytes, batch_in_i32, "").is_ok() {
+        return Ok(t);
+    }
+    copy_unaddressable(&t)
+}
+
+/// Copies a view whose offset or strides the kernels cannot address. Plain
+/// `contiguous()` would keep a misaligned start offset.
+#[cfg(crane_fattn)]
+#[cold]
+#[inline(never)]
+fn copy_unaddressable(t: &Tensor) -> Result<Tensor> {
+    t.force_contiguous()
 }
 
 ///// Helpers /////////////////////////////////////////////////////////////
@@ -475,7 +500,7 @@ mod gpu_tests {
     use candle_core::{DType, Device, Tensor};
     use candle_nn::ops::softmax_last_dim;
 
-    use crate::ops::fused_ops::fattn::test_support::test_gpu_device;
+    use crate::ops::fused_ops::fattn::test_support::{narrowed_bhsd, test_gpu_device};
 
     use super::{try_causal, try_causal_prefill, try_causal_with_mask};
 
@@ -632,6 +657,75 @@ mod gpu_tests {
     #[test]
     fn try_causal_f16_gqa_ratio_8() {
         check_try_causal((1, 8, 1, 20, 150, 128), DType::F16, 3e-2);
+    }
+
+    /// Requires `try_causal` on `q`/`k`/`v` to give the same bits as on
+    /// contiguous copies of them.
+    fn assert_matches_contiguous_bitwise(q: &Tensor, k: &Tensor, v: &Tensor) {
+        let call = |q: &Tensor, k: &Tensor, v: &Tensor| {
+            let out = try_causal(q, k, v, 0.125)
+                .expect("GPU device must serve a supported shape")
+                .unwrap();
+            to_vec(&out)
+        };
+        let got = call(q, k, v);
+        let want = call(
+            &q.contiguous().unwrap(),
+            &k.contiguous().unwrap(),
+            &v.contiguous().unwrap(),
+        );
+        assert_eq!(got.len(), want.len());
+        assert!(
+            got.iter()
+                .zip(&want)
+                .all(|(g, w)| g.to_bits() == w.to_bits()),
+            "{:?}: outputs differ from contiguous inputs",
+            q.dtype()
+        );
+    }
+
+    // KV-cache-style narrowed BHSD views give the same bits as contiguous
+    // copies, for every dtype.
+    #[test]
+    #[allow(clippy::many_single_char_names)]
+    fn try_causal_strided_matches_contiguous() {
+        let dev = test_gpu_device();
+        let (b, hq, hkv, s, d) = (1, 8, 2, 256, 128);
+        for dtype in [DType::BF16, DType::F16, DType::F32] {
+            let q = narrowed_bhsd((b, hq, s, d), dtype, &dev);
+            let k = narrowed_bhsd((b, hkv, s, d), dtype, &dev);
+            let v = narrowed_bhsd((b, hkv, s, d), dtype, &dev);
+            assert!(!k.transpose(1, 2).unwrap().is_contiguous());
+            assert_matches_contiguous_bitwise(&q, &k, &v);
+        }
+    }
+
+    // K/V at an element offset the kernels cannot address are copied and
+    // still served by the kernel, not left to the caller's SDPA.
+    #[test]
+    #[allow(clippy::many_single_char_names)]
+    fn try_causal_misaligned_kv_still_served() {
+        let dev = test_gpu_device();
+        let (b, hq, hkv, s, d) = (1, 8, 2, 256, 128);
+        let misaligned = |dtype: DType| {
+            let n = b * hkv * s * d;
+            Tensor::randn(0f32, 1f32, n + 1, &dev)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap()
+                .narrow(0, 1, n)
+                .unwrap()
+                .reshape((b, hkv, s, d))
+                .unwrap()
+        };
+        // F32 K/V are cast to fresh F16 tensors, so only these two reach
+        // the copy.
+        for dtype in [DType::BF16, DType::F16] {
+            let q = narrowed_bhsd((b, hq, s, d), dtype, &dev);
+            let (k, v) = (misaligned(dtype), misaligned(dtype));
+            assert_eq!(k.layout().start_offset(), 1);
+            assert_matches_contiguous_bitwise(&q, &k, &v);
+        }
     }
 
     // A plain causal mask built by the caller must give the same answer as
