@@ -73,6 +73,7 @@ pub struct ParsedOutput {
 }
 
 impl ParsedOutput {
+    #[must_use]
     pub fn has_calls(&self) -> bool {
         !self.tool_calls.is_empty()
     }
@@ -106,6 +107,7 @@ impl ParsedOutput {
 /// truncated call. Silently discarding the rest of the message on every such
 /// mention would lose real answer text, so the leading `<` is re-emitted as
 /// literal content and scanning continues instead.
+#[must_use]
 pub fn parse_output(text: &str) -> ParsedOutput {
     let mut content = String::new();
     let mut tool_calls = Vec::new();

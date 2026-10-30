@@ -87,6 +87,7 @@ impl ReasoningSplitter {
     ///
     /// If the prompt's last `<think>` is not followed by a `</think>`, the
     /// template left the block open and the completion begins inside it.
+    #[must_use]
     pub fn for_prompt(prompt: &str) -> Self {
         let open = prompt.rfind(THINK_OPEN);
         let close = prompt.rfind(THINK_CLOSE);
@@ -104,6 +105,7 @@ impl ReasoningSplitter {
     }
 
     /// A splitter for output known to contain no reasoning block.
+    #[must_use]
     pub fn disabled() -> Self {
         Self {
             in_reasoning: false,
@@ -114,6 +116,7 @@ impl ReasoningSplitter {
     }
 
     /// Whether the completion is currently inside a reasoning block.
+    #[must_use]
     pub fn in_reasoning(&self) -> bool {
         self.in_reasoning
     }
@@ -208,6 +211,7 @@ pub(crate) fn partial_tag_suffix_len(haystack: &str, tag: &str) -> usize {
 ///
 /// Returns `(reasoning_content, content)`; `reasoning_content` is `None` when
 /// the completion carried no reasoning block.
+#[must_use]
 pub fn split_complete(prompt: &str, output: &str) -> (Option<String>, String) {
     let mut splitter = ReasoningSplitter::for_prompt(prompt);
     let (mut reasoning, mut content) = splitter.push(output);

@@ -203,6 +203,7 @@ impl ChatMessage {
 
     /// Extract the plain text content from the message.
     /// For multimodal messages, concatenates all text parts.
+    #[must_use]
     pub fn text_content(&self) -> String {
         match &self.content {
             ChatMessageContent::Text(s) => s.clone(),
@@ -218,6 +219,7 @@ impl ChatMessage {
     }
 
     /// Extract image URLs from multimodal content.
+    #[must_use]
     pub fn image_urls(&self) -> Vec<String> {
         match &self.content {
             ChatMessageContent::Text(_) => vec![],
@@ -350,6 +352,7 @@ impl ChunkDelta {
     }
 
     /// Empty delta, used by the terminal `finish_reason` chunk.
+    #[must_use]
     pub fn empty() -> Self {
         Self {
             role: None,
@@ -359,6 +362,7 @@ impl ChunkDelta {
         }
     }
 
+    #[must_use]
     pub fn tool_calls(calls: Vec<ToolCall>) -> Self {
         Self {
             role: None,
@@ -411,6 +415,7 @@ pub enum StringOrArray {
 }
 
 impl StringOrArray {
+    #[must_use]
     pub fn as_string(&self) -> String {
         match self {
             Self::Single(s) => s.clone(),
@@ -418,6 +423,7 @@ impl StringOrArray {
         }
     }
 
+    #[must_use]
     pub fn into_vec(self) -> Vec<String> {
         match self {
             Self::Single(s) => vec![s],

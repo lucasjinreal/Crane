@@ -116,6 +116,7 @@ pub enum StringOrList {
 
 #[allow(dead_code)]
 impl StringOrList {
+    #[must_use]
     pub fn into_vec(self) -> Vec<String> {
         match self {
             Self::Single(s) => vec![s],
