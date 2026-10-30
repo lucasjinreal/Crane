@@ -73,17 +73,20 @@ impl GdnDims {
     }
 
     /// Same dims, but reading weights stored in `order`'s value-head layout.
+    #[must_use]
     pub fn with_v_head_order(mut self, order: VHeadOrder) -> Self {
         self.v_head_order = order;
         self
     }
 
     /// Output dimension of the QKV/Z fused projection (Q + K + V + Z concatenated).
+    #[must_use]
     pub fn qkvz_out_dim(&self) -> usize {
         self.key_dim * 2 + self.value_dim * 2
     }
 
     /// Output dimension of the B/A fused projection (B + A concatenated).
+    #[must_use]
     pub fn ba_out_dim(&self) -> usize {
         self.num_v_heads * 2
     }
@@ -124,18 +127,22 @@ pub trait GdnConfig {
 /// Default values for HF `config.json` fields that are sometimes missing.
 #[allow(dead_code)]
 pub mod defaults {
+    #[must_use]
     pub fn conv_kernel() -> usize {
         4
     }
 
+    #[must_use]
     pub fn partial_rotary_factor() -> f64 {
         0.25
     }
 
+    #[must_use]
     pub fn rope_theta() -> f64 {
         10_000_000.0
     }
 
+    #[must_use]
     pub fn full_attention_interval() -> usize {
         4
     }

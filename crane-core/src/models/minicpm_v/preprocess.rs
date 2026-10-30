@@ -338,6 +338,7 @@ pub struct PlaceholderTokens {
 /// vision pipeline halves each spatial axis twice — the window merger, then
 /// the `Merger` — so `downsample_mode: "16x"` means `h_patches*w_patches/16`
 /// tokens per image/slice).
+#[must_use]
 pub fn build_placeholder(
     image: &ProcessedImage,
     tokens: &PlaceholderTokens,
@@ -377,6 +378,7 @@ pub fn build_placeholder(
     placeholder
 }
 
+#[must_use]
 pub fn downsample_divisor(cfg: &Config) -> usize {
     if cfg.downsample_mode == "4x" { 4 } else { 16 }
 }

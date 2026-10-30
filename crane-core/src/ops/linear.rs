@@ -20,6 +20,7 @@ pub struct QuantizedLinear {
 }
 
 impl QuantizedLinear {
+    #[must_use]
     pub fn new(qmm: QMatMul) -> Self {
         Self {
             matmul: qmm,
@@ -27,6 +28,7 @@ impl QuantizedLinear {
         }
     }
 
+    #[must_use]
     pub fn with_bias(qmm: QMatMul, bias: Tensor) -> Self {
         Self {
             matmul: qmm,
@@ -93,6 +95,7 @@ pub enum LinearLayer {
 impl LinearLayer {
     /// Construct a bias-free [`LinearLayer::Quantized`] (the common case —
     /// GGUF loaders for non-Qwen2 models, etc.).
+    #[must_use]
     pub fn quantized(qmm: QMatMul) -> Self {
         Self::Quantized(QuantizedLinear::new(qmm))
     }
@@ -100,6 +103,7 @@ impl LinearLayer {
     /// Construct a [`LinearLayer::Quantized`] with a bias carried over
     /// unquantized. Used by Qwen2's Q/K/V projections — `QMatMul` has no
     /// bias of its own, so the bias lives alongside in the wrapper.
+    #[must_use]
     pub fn quantized_with_bias(qmm: QMatMul, bias: Tensor) -> Self {
         Self::Quantized(QuantizedLinear::with_bias(qmm, bias))
     }

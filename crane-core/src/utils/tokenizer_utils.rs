@@ -210,6 +210,7 @@ pub fn load_tokenizer_from_model_dir<P: AsRef<Path>>(model_dir: P) -> Result<Tok
 ///
 /// Newer llama.cpp quantizers always emit these; older / third-party ones may
 /// not, in which case callers should fall back to a sibling `tokenizer.json`.
+#[must_use]
 pub fn gguf_has_embedded_tokenizer(ct: &Content) -> bool {
     ct.metadata.contains_key("tokenizer.ggml.tokens")
         && ct.metadata.contains_key("tokenizer.ggml.merges")
@@ -217,6 +218,7 @@ pub fn gguf_has_embedded_tokenizer(ct: &Content) -> bool {
 
 /// Read `tokenizer.chat_template` (the Jinja string llama.cpp embeds alongside
 /// the weights) if present.
+#[must_use]
 pub fn extract_chat_template_from_gguf(ct: &Content) -> Option<String> {
     ct.metadata
         .get("tokenizer.chat_template")

@@ -29,6 +29,7 @@ impl Embedding {
         Ok(Self { inner, span })
     }
 
+    #[must_use]
     pub fn embeddings(&self) -> &Tensor {
         self.inner.embeddings()
     }
@@ -54,11 +55,13 @@ impl Linear {
         Self { inner, span }
     }
 
+    #[must_use]
     pub fn weight(&self) -> &Tensor {
         self.inner.weight()
     }
 
     /// Returns the layer's bias tensor, if any.
+    #[must_use]
     pub fn bias(&self) -> Option<&Tensor> {
         self.inner.bias()
     }

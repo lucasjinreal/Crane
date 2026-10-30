@@ -72,6 +72,7 @@ impl Session {
         })
     }
 
+    #[must_use]
     pub fn optimization_report(&self) -> &OptimizationReport {
         &self.optimization_report
     }

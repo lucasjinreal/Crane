@@ -191,6 +191,7 @@ fn fill_arange(row: &mut [i64], from: usize, to: usize, base: i64) {
 /// # Panics
 ///
 /// Panics if `target_sizes` has fewer entries than the prompt has crops.
+#[must_use]
 pub fn canvas_position_ids(
     input_ids: &[u32],
     image_token_id: u32,

@@ -124,10 +124,12 @@ pub struct Gemma4TextConfig {
 }
 
 impl Gemma4TextConfig {
+    #[must_use]
     pub fn global_head_dim(&self) -> usize {
         self.global_head_dim.unwrap_or(self.head_dim)
     }
 
+    #[must_use]
     pub fn parsed_layer_types(&self) -> Vec<LayerType> {
         self.layer_types
             .iter()
@@ -139,11 +141,13 @@ impl Gemma4TextConfig {
             .collect()
     }
 
+    #[must_use]
     pub fn first_kv_shared_layer(&self) -> usize {
         let n_shared = self.num_kv_shared_layers.unwrap_or(0);
         self.num_hidden_layers.saturating_sub(n_shared)
     }
 
+    #[must_use]
     pub fn kv_sharing_map(&self) -> Vec<Option<usize>> {
         let layer_types = self.parsed_layer_types();
         let first_shared = self.first_kv_shared_layer();
@@ -1436,10 +1440,12 @@ impl Gemma4Model {
         }
     }
 
+    #[must_use]
     pub fn num_layers(&self) -> usize {
         self.layers.len()
     }
 
+    #[must_use]
     pub fn active_kv_cache_bytes(&self) -> u64 {
         self.layers
             .iter()
@@ -1457,10 +1463,12 @@ impl Gemma4Model {
             .sum()
     }
 
+    #[must_use]
     pub fn config(&self) -> &Gemma4TextConfig {
         &self.config
     }
 
+    #[must_use]
     pub fn model_dtype(&self) -> DType {
         self.dtype
     }

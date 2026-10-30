@@ -35,14 +35,17 @@ pub struct VisionConfig {
 }
 
 impl VisionConfig {
+    #[must_use]
     pub fn num_patches_per_side(&self) -> usize {
         self.image_size / self.patch_size
     }
 
+    #[must_use]
     pub fn num_patches(&self) -> usize {
         self.num_patches_per_side() * self.num_patches_per_side()
     }
 
+    #[must_use]
     pub fn head_dim(&self) -> usize {
         self.hidden_size / self.num_attention_heads
     }
@@ -124,6 +127,7 @@ pub struct Config {
 impl Config {
     /// Marker ids for canvas M-RoPE, or `None` when this checkpoint uses plain
     /// sequential positions (4.6) — or declares `canvas` without all ids.
+    #[must_use]
     pub fn canvas_token_ids(&self) -> Option<super::canvas_rope::CanvasTokenIds> {
         if self.mrope_mode.as_deref() != Some("canvas") {
             return None;

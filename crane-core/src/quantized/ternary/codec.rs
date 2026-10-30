@@ -11,6 +11,7 @@ pub enum TernaryEncoding {
 }
 
 impl TernaryEncoding {
+    #[must_use]
     pub const fn ggml_type_id(self) -> u32 {
         match self {
             Self::Pq2_0 => 142,
@@ -18,6 +19,7 @@ impl TernaryEncoding {
         }
     }
 
+    #[must_use]
     pub const fn block_bytes(self) -> usize {
         match self {
             Self::Pq2_0 => 34,
@@ -25,6 +27,7 @@ impl TernaryEncoding {
         }
     }
 
+    #[must_use]
     pub fn from_ggml_type_id(id: u32) -> Option<Self> {
         match id {
             142 => Some(Self::Pq2_0),

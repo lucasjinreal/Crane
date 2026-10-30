@@ -76,6 +76,7 @@ pub enum IQuantType {
 
 impl IQuantType {
     /// Map a ggml type id to a decodable i-quant, if this module supports it.
+    #[must_use]
     pub fn from_ggml_type_id(id: u32) -> Option<Self> {
         match id {
             18 => Some(Self::Iq3Xxs),
@@ -101,6 +102,7 @@ impl IQuantType {
         }
     }
 
+    #[must_use]
     pub fn name(self) -> &'static str {
         match self {
             Self::Iq4Nl => "IQ4_NL",
@@ -138,6 +140,7 @@ impl IQuantType {
     }
 
     /// Number of weights per block.
+    #[must_use]
     pub fn block_size(self) -> usize {
         match self {
             Self::Iq4Nl => QK4_NL,
@@ -153,6 +156,7 @@ impl IQuantType {
     }
 
     /// Bytes per block.
+    #[must_use]
     pub fn block_bytes(self) -> usize {
         match self {
             Self::Iq4Nl => 2 + QK4_NL / 2,
@@ -189,6 +193,7 @@ impl IQuantType {
 
 /// Human-readable name for ggml type ids Candle cannot parse, for error
 /// messages. Mirrors `enum ggml_type` in `ggml.h`.
+#[must_use]
 pub fn ggml_type_name(id: u32) -> Option<&'static str> {
     Some(match id {
         16 => "IQ2_XXS",
@@ -391,6 +396,7 @@ fn dequantize_q2_0(blocks: &[u8], out: &mut [f32]) {
 /// the native kernels (CUDA / SYCL / Metal / `ROCm`). True unless
 /// `CRANE_IQ_REQUANT` names an explicit target, which forces re-quantization
 /// everywhere (handy for A/B comparisons).
+#[must_use]
 pub fn native_enabled() -> bool {
     std::env::var("CRANE_IQ_REQUANT").map_or(true, |v| v.eq_ignore_ascii_case("native"))
 }
@@ -565,22 +571,27 @@ impl IQuantLinear {
         })
     }
 
+    #[must_use]
     pub fn ty(&self) -> IQuantType {
         self.ty
     }
 
+    #[must_use]
     pub fn rows(&self) -> usize {
         self.rows
     }
 
+    #[must_use]
     pub fn cols(&self) -> usize {
         self.cols
     }
 
+    #[must_use]
     pub fn device(&self) -> &Device {
         self.packed.device()
     }
 
+    #[must_use]
     pub fn size_in_bytes(&self) -> usize {
         self.packed.elem_count()
     }

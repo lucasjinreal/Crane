@@ -222,6 +222,7 @@ pub fn pack_images(images: &[ProcessedImage]) -> Result<(Tensor, Vec<(usize, usi
 /// expand afterward). Every image/slice gets exactly `cfg.image_feature_size`
 /// placeholder tokens, regardless of its patch-grid size — direct port of
 /// `get_slice_image_placeholder`/`get_grid_placeholder`.
+#[must_use]
 pub fn build_placeholder(
     image: &ProcessedImage,
     cfg: &PreprocessorConfig,

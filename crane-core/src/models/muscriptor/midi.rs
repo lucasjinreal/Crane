@@ -117,6 +117,7 @@ impl MidiWriter {
     /// Splits drums onto channel 9 and per-program notes onto the lowest
     /// unused non-drum channel, matching the upstream `note_event2midi`
     /// channel-allocation policy.
+    #[must_use]
     pub fn write(&self, notes: &[MidiNote]) -> Vec<u8> {
         let mut out = Vec::with_capacity(8 * 1024);
         self.write_to(&mut out, notes);

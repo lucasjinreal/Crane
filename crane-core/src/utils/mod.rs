@@ -44,6 +44,7 @@ pub fn select_device(force_cpu: bool) -> Result<Device> {
     }
 }
 
+#[must_use]
 pub fn cuda_is_available() -> bool {
     candle_cuda_is_available()
 }

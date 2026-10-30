@@ -50,6 +50,7 @@ pub struct AsyncTextStreamer {
 }
 
 impl AsyncTextStreamer {
+    #[must_use]
     pub fn new(
         decode: Box<dyn Fn(u32) -> Result<String> + Send + Sync>,
     ) -> (Self, mpsc::Receiver<StreamerMessage>) {

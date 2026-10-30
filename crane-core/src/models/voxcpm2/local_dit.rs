@@ -171,6 +171,7 @@ impl VoxCpmLocDit {
             .contiguous()
     }
 
+    #[must_use]
     pub fn in_channels(&self) -> usize {
         self.in_channels
     }

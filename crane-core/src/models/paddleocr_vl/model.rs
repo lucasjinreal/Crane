@@ -32,6 +32,7 @@ pub enum OcrTask {
 }
 
 impl OcrTask {
+    #[must_use]
     pub fn prompt(&self) -> &'static str {
         match self {
             OcrTask::Ocr => "OCR:",

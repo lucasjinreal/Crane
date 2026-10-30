@@ -52,15 +52,18 @@ fn default_true() -> bool {
 }
 
 impl Config {
+    #[must_use]
     pub fn head_dim(&self) -> usize {
         self.head_dim
             .unwrap_or(self.hidden_size / self.num_attention_heads)
     }
 
+    #[must_use]
     pub fn attention_bias(&self) -> bool {
         self.attention_bias.unwrap_or(false)
     }
 
+    #[must_use]
     pub fn rope_theta(&self) -> f64 {
         self.rope_theta.unwrap_or(10000.0)
     }
@@ -829,6 +832,7 @@ impl MiniCpm5Model {
     /// Native maximum context length this checkpoint was trained/configured
     /// for — the precomputed rotary table's row count, since `Config` itself
     /// isn't retained after construction.
+    #[must_use]
     pub fn max_position_embeddings(&self) -> usize {
         self.rotary_emb.max_pos()
     }

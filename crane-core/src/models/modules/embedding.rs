@@ -98,10 +98,12 @@ impl EmbeddingLayer {
         Ok(Self::Dense(candle_nn::Embedding::new(w, hidden_size)))
     }
 
+    #[must_use]
     pub fn dense_from_tensor(weight: Tensor, hidden_size: usize) -> Self {
         Self::Dense(candle_nn::Embedding::new(weight, hidden_size))
     }
 
+    #[must_use]
     pub fn from_ternary(
         weight: Arc<crate::quantized::ternary::TernaryWeight>,
         signs: Arc<Vec<f32>>,
@@ -202,6 +204,7 @@ impl EmbeddingLayer {
     }
 
     /// The dense weight, when this table is dense.
+    #[must_use]
     pub fn dense_weight(&self) -> Option<&Tensor> {
         match self {
             Self::Dense(e) => Some(e.embeddings()),
@@ -238,6 +241,7 @@ impl EmbeddingLayer {
     }
 
     /// Resident size of the table in bytes.
+    #[must_use]
     pub fn size_in_bytes(&self) -> usize {
         match self {
             Self::Dense(e) => e.embeddings().elem_count() * e.embeddings().dtype().size_in_bytes(),
@@ -246,6 +250,7 @@ impl EmbeddingLayer {
         }
     }
 
+    #[must_use]
     pub fn is_quantized(&self) -> bool {
         matches!(self, Self::Quantized { .. } | Self::Ternary { .. })
     }

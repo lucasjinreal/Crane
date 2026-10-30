@@ -79,18 +79,22 @@ impl TernaryWeight {
         })
     }
 
+    #[must_use]
     pub fn rows(&self) -> usize {
         self.rows
     }
 
+    #[must_use]
     pub fn cols(&self) -> usize {
         self.cols
     }
 
+    #[must_use]
     pub fn size_in_bytes(&self) -> usize {
         self.packed_cpu.len()
     }
 
+    #[must_use]
     pub fn device(&self) -> Device {
         self.device.clone()
     }
@@ -199,6 +203,7 @@ impl TernaryLinear {
         })
     }
 
+    #[must_use]
     pub fn weight(&self) -> &Arc<TernaryWeight> {
         &self.weight
     }

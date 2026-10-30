@@ -25,6 +25,7 @@ pub struct UnifiedCfm {
 }
 
 impl UnifiedCfm {
+    #[must_use]
     pub fn new(estimator: VoxCpmLocDit, mean_mode: bool) -> Self {
         let in_channels = estimator.in_channels();
         Self {

@@ -35,15 +35,18 @@ pub struct ExtendedGgufInfo {
 }
 
 impl ExtendedGgufInfo {
+    #[must_use]
     pub fn is_ternary(&self) -> bool {
         !self.tensors.is_empty()
     }
 
+    #[must_use]
     pub fn has_iquant(&self) -> bool {
         !self.iquant.is_empty()
     }
 
     /// Whether any tensor needs Crane-side decoding.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.tensors.is_empty() && self.iquant.is_empty()
     }

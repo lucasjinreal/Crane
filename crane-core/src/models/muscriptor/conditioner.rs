@@ -328,6 +328,7 @@ pub struct ConditioningProvider {
 }
 
 impl ConditioningProvider {
+    #[must_use]
     pub fn new(
         mel: HashMap<String, Arc<MelSpectrogramConditioner>>,
         class: HashMap<String, Arc<ClassConditioner>>,

@@ -86,6 +86,7 @@ pub struct DeviceAssignment {
 
 impl DeviceAssignment {
     /// All weights, including `MoE` experts, on the same device.
+    #[must_use]
     pub fn uniform(device: &Device) -> Self {
         Self {
             main: device.clone(),
@@ -228,6 +229,7 @@ pub fn greedy_fit_layers(layer_costs: &[u64], budget: u64) -> Vec<usize> {
 }
 
 /// Formats a byte count for log messages (e.g. `"8.5G"`, `"512M"`, `"1024B"`).
+#[must_use]
 pub fn format_budget(bytes: u64) -> String {
     if bytes >= 1 << 30 {
         let gb = bytes as f64 / (1u64 << 30) as f64;

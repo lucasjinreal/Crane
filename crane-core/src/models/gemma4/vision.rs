@@ -60,6 +60,7 @@ fn default_rope_theta() -> f64 {
 }
 
 impl Gemma4VisionConfig {
+    #[must_use]
     pub fn rope_theta(&self) -> f64 {
         self.rope_parameters
             .as_ref()
@@ -739,6 +740,7 @@ impl Default for ImagePreprocessConfig {
 }
 
 impl ImagePreprocessConfig {
+    #[must_use]
     pub fn max_patches(&self) -> usize {
         self.max_soft_tokens * self.pooling_kernel_size * self.pooling_kernel_size
     }

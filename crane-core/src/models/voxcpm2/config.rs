@@ -62,6 +62,7 @@ fn default_true() -> bool {
 }
 
 impl MiniCpm4Config {
+    #[must_use]
     pub fn head_dim(&self) -> usize {
         self.kv_channels
             .unwrap_or(self.hidden_size / self.num_attention_heads)
@@ -72,6 +73,7 @@ impl MiniCpm4Config {
     /// `vocab_size = 0` (no token embedding — these consume precomputed
     /// hidden vectors, matching HF's `nn.Identity()` `embed_tokens` when
     /// `vocab_size == 0`).
+    #[must_use]
     pub fn derive(&self, sub: &SubNetworkConfig) -> Self {
         Self {
             hidden_size: sub.hidden_dim,
@@ -87,6 +89,7 @@ impl MiniCpm4Config {
     /// Build a derived config for `residual_lm`: same `lm_config` base,
     /// `num_hidden_layers` overridden, `vocab_size = 0`, `no_rope` set from
     /// the top-level `residual_lm_no_rope` flag.
+    #[must_use]
     pub fn derive_residual_lm(&self, num_hidden_layers: usize, no_rope: bool) -> Self {
         Self {
             num_hidden_layers,

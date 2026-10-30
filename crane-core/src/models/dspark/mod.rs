@@ -69,15 +69,18 @@ struct RopeParameters {
 }
 
 impl DSparkConfig {
+    #[must_use]
     pub fn rope_theta(&self) -> f64 {
         self.rope_parameters.rope_theta
     }
 
     /// Target decoder layers whose outputs feed the drafter's context.
+    #[must_use]
     pub fn target_layer_ids(&self) -> &[usize] {
         &self.dflash_config.target_layer_ids
     }
 
+    #[must_use]
     pub fn mask_token_id(&self) -> u32 {
         self.dflash_config.mask_token_id
     }
@@ -326,11 +329,13 @@ impl DSparkDrafter {
         })
     }
 
+    #[must_use]
     pub fn config(&self) -> &DSparkConfig {
         &self.cfg
     }
 
     /// Number of context positions currently cached.
+    #[must_use]
     pub fn ctx_len(&self) -> usize {
         self.ctx_len
     }

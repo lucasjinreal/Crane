@@ -68,6 +68,7 @@ impl RmsNormGated {
 
     /// Construct from an already-loaded weight (e.g. dequantized from GGUF).
     #[allow(clippy::cast_possible_truncation)]
+    #[must_use]
     pub fn from_weight(weight: Tensor, eps: f64, activation: GateActivation) -> Self {
         Self {
             weight,
@@ -127,6 +128,7 @@ impl RmsNormGated {
     /// Length of the learned per-channel weight vector. Exposed so that
     /// callers (e.g. `GatedDeltaNet`) can recover the per-head value dim
     /// without a separate config field.
+    #[must_use]
     pub fn weight_len(&self) -> usize {
         self.weight.dim(0).unwrap_or(0)
     }

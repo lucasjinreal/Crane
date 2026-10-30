@@ -16,6 +16,7 @@ use std::collections::{HashMap, HashSet};
 
 pub type Value = Tensor;
 
+#[must_use]
 pub fn dtype(dt: DataType) -> Option<DType> {
     match dt {
         DataType::Uint8 => Some(DType::U8),

@@ -82,6 +82,7 @@ pub fn release_load_staging(device: &Device) {
 /// This process's physical memory footprint in bytes (macOS's
 /// `ri_phys_footprint`), excluding reclaimable file-backed pages like a
 /// mmaped checkpoint. Returns `None` off macOS or on syscall failure.
+#[must_use]
 pub fn phys_footprint_bytes() -> Option<u64> {
     #[cfg(target_os = "macos")]
     {

@@ -563,6 +563,7 @@ impl Model {
     }
 
     /// Resample `samples` from `in_sr` to [`SAMPLE_RATE`] Hz (linear).
+    #[must_use]
     pub fn resample_to_target(samples: &[f32], in_sr: u32) -> Vec<f32> {
         if in_sr == SAMPLE_RATE as u32 {
             return samples.to_vec();
@@ -605,6 +606,7 @@ impl Model {
     }
 
     /// Convenience: instrument-group token IDs that must be masked.
+    #[must_use]
     pub fn forbidden_tokens_for(&self, instruments: &[&str]) -> Vec<u32> {
         self.tokenizer.forbidden_token_ids(instruments)
     }
@@ -626,6 +628,7 @@ impl Model {
         instrument_group_from_names(names)
     }
 
+    #[must_use]
     pub const fn default_max_gen_len() -> usize {
         2000
     }
@@ -671,6 +674,7 @@ pub struct TranscriptionModel {
 }
 
 impl TranscriptionModel {
+    #[must_use]
     pub fn new(model: Model) -> Self {
         Self { model }
     }
