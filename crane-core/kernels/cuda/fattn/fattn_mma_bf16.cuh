@@ -403,7 +403,7 @@ static __device__ __forceinline__ void flash_attn_ext_bf16_iter(
         const nv_bfloat162 * const __restrict__ V_h2,
         const half   * const __restrict__ mask_h,
         const int32_t * const __restrict__ indices,
-        float2       * const __restrict__ dstk,
+        nv_bfloat162 * const __restrict__ dstk,
         float2       * const __restrict__ dstk_fixup,
         const float scale,
         const float slope,
@@ -736,7 +736,7 @@ static __device__ __forceinline__ void flash_attn_ext_bf16_process_tile(
         const half   * const __restrict__ mask_h,
         const int32_t * const __restrict__ indices,
         const float  * const __restrict__ sinks_f,
-        float2       * const __restrict__ dstk,
+        nv_bfloat162 * const __restrict__ dstk,
         float2       * const __restrict__ dstk_fixup,
         const float scale,
         const float slope,
@@ -1176,10 +1176,20 @@ static __device__ __forceinline__ void flash_attn_ext_bf16_process_tile(
                             dstk_val.y /= KQ_rowsum_j;
                         }
 
-                        if (is_fixup) {
+                        if constexpr (is_fixup) {
                             dstk_fixup_data[jc_dst*(DV/2) + k00 + k] = dstk_val;
+                        } else if constexpr (needs_fixup) {
+                            // dst holds the final bf16 output, so it can't
+                            // hold a needs_fixup block's unnormalized float
+                            // partials. Trap rather than silently corrupt
+                            // the output if a launch ever splits a tile
+                            // across blocks. Also update
+                            // flash_attn_combine_results in
+                            // fattn_common.cuh, which still writes
+                            // float* dst.
+                            NO_DEVICE_CODE;
                         } else {
-                            dstk[((jt*ncols1 + j_dst)*ne02 + c_dst)*(DV/2) + k00 + k] = dstk_val;
+                            dstk[((jt*ncols1 + j_dst)*ne02 + c_dst)*(DV/2) + k00 + k] = __float22bfloat162_rn(dstk_val);
                         }
                     }
                 }
@@ -1223,7 +1233,7 @@ static __device__ __forceinline__ void flash_attn_ext_bf16(
         const char * mask_ptr,
         const char * sinks_ptr,
         const int  * KV_max_ptr,
-        float      * dst_ptr,
+        nv_bfloat16 * dst_ptr,
         float2     * dst_meta_ptr,
         const float scale,
         const float max_bias,
@@ -1247,7 +1257,7 @@ static __device__ __forceinline__ void flash_attn_ext_bf16(
     const char * GGML_CUDA_RESTRICT mask           = mask_ptr;
     const char * GGML_CUDA_RESTRICT sinks          = sinks_ptr;
     const int  * GGML_CUDA_RESTRICT KV_max         = KV_max_ptr;
-    float      * GGML_CUDA_RESTRICT dst            = dst_ptr;
+    nv_bfloat16 * GGML_CUDA_RESTRICT dst           = dst_ptr;
     float2     * GGML_CUDA_RESTRICT dst_meta       = dst_meta_ptr;
 
 #if defined(AMD_WMMA_AVAILABLE)
@@ -1308,7 +1318,7 @@ static __device__ __forceinline__ void flash_attn_ext_bf16(
         const nv_bfloat162 * K_h2 = (const nv_bfloat162 *) (K + nb13*sequence + nb12*z_KV);
         const half   * mask_h = !mask ? nullptr :
             (const half *) (mask + nb33*(sequence % ne33));
-        float2       * dstk   = ((float2 *) dst) + (sequence*ne01.z*ne02 + zt_Q) * (DV/2);
+        nv_bfloat162 * dstk   = ((nv_bfloat162 *) dst) + (sequence*ne01.z*ne02 + zt_Q) * (DV/2);
 
         const nv_bfloat162 * V_h2 = V_is_K_view ? K_h2 : (const nv_bfloat162 *) (V + nb23*sequence + nb22*z_KV);
         const float * sinks_f = sinks ? (const float *) sinks + zt_Q : nullptr;
@@ -1354,7 +1364,7 @@ static __device__ __forceinline__ void flash_attn_ext_bf16(
     const nv_bfloat162 * K_h2 = (const nv_bfloat162 *) (K + nb13*sequence + nb12*z_KV);
     const half   * mask_h = !mask ? nullptr :
         (const half *) (mask + nb33*(sequence % ne33));
-    float2       * dstk   = ((float2 *) dst) + (sequence*ne01.z*ne02 + zt_Q) * (DV/2);
+    nv_bfloat162 * dstk   = ((nv_bfloat162 *) dst) + (sequence*ne01.z*ne02 + zt_Q) * (DV/2);
 
     const nv_bfloat162 * V_h2 = V_is_K_view ? K_h2 : (const nv_bfloat162 *) (V + nb23*sequence + nb22*z_KV);
     const float * sinks_f = sinks ? (const float *) sinks + zt_Q : nullptr;
@@ -1392,7 +1402,7 @@ static __device__ __forceinline__ void flash_attn_ext_bf16(
     void crane_fattn_mma_bf16_d##DKQ_##_v##DV_##_c##ncols1_##_s##ncols2_(                              \
         const char * Q, const char * K, const char * V,                                                \
         const char * mask, const char * sinks, const int * KV_max,                                     \
-        float * dst, float2 * dst_meta,                                                                \
+        nv_bfloat16 * dst, float2 * dst_meta,                                                          \
         float scale, float max_bias, float m0, float m1,                                               \
         uint32_t n_head_log2, float logit_softcap,                                                     \
         int32_t ne00, uint3 ne01, int32_t ne02, int32_t ne03,                                          \

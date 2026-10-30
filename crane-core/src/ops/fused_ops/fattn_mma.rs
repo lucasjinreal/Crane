@@ -1284,7 +1284,7 @@ mod cuda {
         let causal_kv_offset = super::kernel_causal_offset(causal_kv_offset)?;
 
         let n_out = b * seq_q * h_q * d;
-        let dst = unsafe { dev.alloc::<f32>(n_out) }?;
+        let dst = unsafe { dev.alloc::<half::f16>(n_out) }?;
 
         let cfg = LaunchConfig {
             grid_dim: geometry.grid,
@@ -1357,16 +1357,15 @@ mod cuda {
         unsafe { builder.launch(cfg) }.w()?;
 
         let dst = CudaStorage {
-            slice: CudaStorageSlice::F32(dst),
+            slice: CudaStorageSlice::F16(dst),
             device: dev,
         };
-        Tensor::from_storage(
+        Ok(Tensor::from_storage(
             Storage::Cuda(dst),
             (b, seq_q, h_q, d),
             candle_core::op::BackpropOp::none(),
             false,
-        )
-        .to_dtype(candle_core::DType::F16)
+        ))
     }
 
     /// bf16 counterpart of [`fattn_mma_prefill_cuda`]: `k`/`v` stay BF16
@@ -1374,8 +1373,7 @@ mod cuda {
     /// module/kernel name come from the `_bf16` instantiation files, and
     /// the kernel selection uses [`select_mma_ncols_bf16`] (never resolves
     /// to `ncols1*ncols2 == 8`, see that function's doc comment). The
-    /// output buffer is still F32 internally (the kernel always accumulates
-    /// in F32), cast to BF16 instead of F16 at the end.
+    /// kernel writes the output in BF16 instead of F16.
     #[allow(clippy::too_many_lines, clippy::many_single_char_names)]
     pub(super) fn fattn_mma_bf16_prefill_cuda(
         q: &Tensor,
@@ -1457,7 +1455,7 @@ mod cuda {
         let causal_kv_offset = super::kernel_causal_offset(causal_kv_offset)?;
 
         let n_out = b * seq_q * h_q * d;
-        let dst = unsafe { dev.alloc::<f32>(n_out) }?;
+        let dst = unsafe { dev.alloc::<half::bf16>(n_out) }?;
 
         let cfg = LaunchConfig {
             grid_dim: geometry.grid,
@@ -1522,16 +1520,15 @@ mod cuda {
         unsafe { builder.launch(cfg) }.w()?;
 
         let dst = CudaStorage {
-            slice: CudaStorageSlice::F32(dst),
+            slice: CudaStorageSlice::BF16(dst),
             device: dev,
         };
-        Tensor::from_storage(
+        Ok(Tensor::from_storage(
             Storage::Cuda(dst),
             (b, seq_q, h_q, d),
             candle_core::op::BackpropOp::none(),
             false,
-        )
-        .to_dtype(candle_core::DType::BF16)
+        ))
     }
 }
 
@@ -1728,7 +1725,7 @@ mod rocm {
         let causal_kv_offset = super::kernel_causal_offset(causal_kv_offset)?;
 
         let n_out = b * seq_q * h_q * d;
-        let dst = dev.alloc::<f32>(n_out)?;
+        let dst = dev.alloc::<half::f16>(n_out)?;
         let dst_ptr = dst.as_ptr();
         let dst_meta_ptr: *mut c_void = std::ptr::null_mut();
         let sinks_ptr: *mut c_void = std::ptr::null_mut();
@@ -1797,8 +1794,7 @@ mod rocm {
             )
         }?;
 
-        let out = rocm::wrap_f32(dst, &dev, (b, seq_q, h_q, d));
-        out.to_dtype(DType::F16)
+        Ok(rocm::wrap_f16(dst, &dev, (b, seq_q, h_q, d)))
     }
 
     /// bf16 counterpart of [`fattn_mma_prefill_rocm`]: `k`/`v` stay BF16
@@ -1806,8 +1802,8 @@ mod rocm {
     /// the kernel source/name come from the `_bf16` instantiation files and
     /// [`rocm_mma_bf16_source`], and the kernel selection uses
     /// [`select_mma_ncols_bf16`] (never resolves to `ncols1*ncols2 == 8`,
-    /// see that function's doc comment). The output buffer is still F32
-    /// internally, cast to BF16 instead of F16 at the end.
+    /// see that function's doc comment). The kernel writes the output in
+    /// BF16 instead of F16.
     #[allow(clippy::too_many_lines, clippy::many_single_char_names)]
     pub(super) fn fattn_mma_bf16_prefill_rocm(
         q: &Tensor,
@@ -1880,7 +1876,7 @@ mod rocm {
         let causal_kv_offset = super::kernel_causal_offset(causal_kv_offset)?;
 
         let n_out = b * seq_q * h_q * d;
-        let dst = dev.alloc::<f32>(n_out)?;
+        let dst = dev.alloc::<half::bf16>(n_out)?;
         let dst_ptr = dst.as_ptr();
         let dst_meta_ptr: *mut c_void = std::ptr::null_mut();
         let sinks_ptr: *mut c_void = std::ptr::null_mut();
@@ -1947,8 +1943,7 @@ mod rocm {
             )
         }?;
 
-        let out = rocm::wrap_f32(dst, &dev, (b, seq_q, h_q, d));
-        out.to_dtype(DType::BF16)
+        Ok(rocm::wrap_bf16(dst, &dev, (b, seq_q, h_q, d)))
     }
 }
 
