@@ -215,9 +215,8 @@ fn check_case(
 /// The inputs of one [`Case`], on the GPU as the kernels read them and on
 /// the host for the references.
 struct Inputs {
-    /// F32 BSHD, as the kernels read it.
+    /// BSHD in the input dtype, as the kernels read them.
     q: Tensor,
-    /// BSHD in the input dtype.
     k: Tensor,
     v: Tensor,
     /// `q` pre-scaled as the kernels hold it, which both references take.
@@ -238,7 +237,7 @@ impl Inputs {
             long_seq_inputs(seq, d, case.dist, case.seed).map(|h| round_to(h, dtype));
         let bshd = |h: &[f32], heads| Tensor::from_slice(h, (1, seq, heads, d), gpu).unwrap();
         Self {
-            q: bshd(&q_host, HQ),
+            q: bshd(&q_host, HQ).to_dtype(dtype).unwrap(),
             k: bshd(&k_host, HKV).to_dtype(dtype).unwrap(),
             v: bshd(&v_host, HKV).to_dtype(dtype).unwrap(),
             q_ref: scaled_q(&q_host, scale, dtype),

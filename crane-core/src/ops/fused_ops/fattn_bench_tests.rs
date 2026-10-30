@@ -10,10 +10,8 @@
 //! warm-up, so the first row isn't measured while the GPU is still leaving
 //! its idle clocks. Each number is the median wall-clock time per call over
 //! batches of back-to-back calls with one sync per batch, so it includes the
-//! wrapper's own allocations and uploads. The `mma` columns take Q as F32 and
-//! convert it inside the wrapper, so only they pay for that conversion.
-//! Outputs drop after every call. If the backend frees synchronously, that
-//! adds the same sync to every column.
+//! wrapper's own allocations and uploads. Outputs drop after every call. If
+//! the backend frees synchronously, that adds the same sync to every column.
 //!
 //! ```text
 //! cargo test -p crane-core --no-default-features \
@@ -98,16 +96,14 @@ fn bench_table(dtype: DType) {
         let [q_host, k_host, v_host] =
             long_seq_inputs(seq, HEAD_DIM, LongSeqDist::Normal, 0).map(|h| round_to(h, dtype));
         let bshd = |h: &[f32], heads| Tensor::from_slice(h, (1, seq, heads, HEAD_DIM), &gpu);
-        // The MMA entries read q as F32. Every other path takes it in dtype.
-        let q = bshd(&q_host, HQ).unwrap();
-        let q_dt = q.to_dtype(dtype).unwrap();
+        let q = bshd(&q_host, HQ).unwrap().to_dtype(dtype).unwrap();
         let k = bshd(&k_host, HKV).unwrap().to_dtype(dtype).unwrap();
         let v = bshd(&v_host, HKV).unwrap().to_dtype(dtype).unwrap();
         let mask = build_additive_mask_f16(seq, seq, 0, None, 0, &gpu).unwrap();
         // Qwen3.5 builds its mask once per forward, in the attention dtype.
         let sdpa_mask = mask.to_dtype(dtype).unwrap();
         let bhsd = |t: &Tensor| t.transpose(1, 2).unwrap().contiguous().unwrap();
-        let (q_h, k_h, v_h) = (bhsd(&q_dt), bhsd(&k), bhsd(&v));
+        let (q_h, k_h, v_h) = (bhsd(&q), bhsd(&k), bhsd(&v));
         let bf16 = dtype == DType::BF16;
 
         let mma = time_us(&gpu, || {
@@ -136,14 +132,14 @@ fn bench_table(dtype: DType) {
         });
         #[cfg(feature = "flash-attn-rocm")]
         let ck = Some(time_us(&gpu, || {
-            candle_flash_attn_rocm::flash_attn(&q_dt, &k, &v, scale, true)
+            candle_flash_attn_rocm::flash_attn(&q, &k, &v, scale, true)
         }));
         #[cfg(not(feature = "flash-attn-rocm"))]
         let ck = None;
         #[cfg(feature = "flash-attn-ab")]
         let fa2_split = bf16.then(|| {
             time_us(&gpu, || {
-                crate::ops::flash_split::causal_bf16_256_auto(&q_dt, &k, &v)
+                crate::ops::flash_split::causal_bf16_256_auto(&q, &k, &v)
             })
         });
         #[cfg(not(feature = "flash-attn-ab"))]

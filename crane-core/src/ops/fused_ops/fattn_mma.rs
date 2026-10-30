@@ -10,21 +10,17 @@
 //! kernel's scalar arguments by hand, and launch through
 //! `candle_core::cuda_backend`/`rocm_backend`'s raw launch API.
 //!
-//! `q` is F32, `k`/`v`/`mask` are F16. This is a mixed-precision contract
-//! upstream bakes into this kernel family itself (`GGML_ASSERT(Q->type ==
-//! GGML_TYPE_F32)` in llama.cpp's `launch_fattn`, not vendored; the kernel
-//! body casts `Q`'s raw bytes straight to `float2`/`float`, confirmed by a
-//! real GPU hardware exception before this was caught), unlike every other
-//! Crane flash-attention kernel (F16 throughout). `head_dim` in {64, 128,
-//! 256, 512}, `parallel_blocks=1` (see `fattn.rs`'s module doc). Unlike
-//! `ops::fused_ops::flash_attn_mma`'s
-//! kernel (which masks purely via a `kv_offset` scalar and never reads a
-//! mask tensor), this kernel family branches on whether `mask`/`KV_max` are
-//! null (`if (mask_h)` in `fattn_mma_f16.cuh`), so `mask` being `None` is a
-//! real, intentional "no masking at all" mode, not an unsupported case.
-//! The plain `*_causal` entries pass no mask and a `causal_kv_offset`, and
-//! the kernel masks the diagonal itself. Callers always pass the caller's
-//! actual mask intent through, never silently drop it.
+//! `q`, `k` and `v` share one dtype: F16 for the f16 kernel, BF16 for the
+//! bf16 one. `mask` is F16 for both. `head_dim` in {64, 128, 256, 512},
+//! `parallel_blocks=1` (see `fattn.rs`'s module doc). Unlike
+//! `ops::fused_ops::flash_attn_mma`'s kernel (which masks purely via a
+//! `kv_offset` scalar and never reads a mask tensor), this kernel family
+//! branches on whether `mask`/`KV_max` are null (`if (mask_h)` in
+//! `fattn_mma_f16.cuh`), so `mask` being `None` is a real, intentional "no
+//! masking at all" mode, not an unsupported case. The plain `*_causal`
+//! entries pass no mask and a `causal_kv_offset`, and the kernel masks the
+//! diagonal itself. Callers always pass the caller's actual mask intent
+//! through, never silently drop it.
 //!
 //! Gated the same way as `fattn.rs`: every item here exists solely to
 //! support CUDA/ROCm kernel dispatch, so there is no CPU-relevant content
@@ -157,15 +153,12 @@ impl LaunchScalars {
         seq_kv: usize,
         h_kv: usize,
         scale: f32,
+        q_dtype: DType,
     ) -> Result<Self> {
-        // Upstream requires Q to stay F32 (`GGML_ASSERT(Q->type ==
-        // GGML_TYPE_F32)` in `launch_fattn`, not vendored, see this
-        // module's doc comment). Only K/V/mask are F16. A real GPU
-        // hardware exception (out-of-bounds Q read, since Q's actual
-        // buffer is half the byte size the kernel's F32-stride math
-        // expects) confirmed this before the fix.
+        // K/V/mask are 16-bit. Q is 16-bit for the MMA kernels but F32 for
+        // the tile kernel, so its size comes from its dtype.
         const F16_BYTES: usize = 2;
-        const F32_BYTES: usize = 4;
+        let q_elem_bytes = q_dtype.size_in_bytes();
         let (mp, l, dv) = init_fastdiv_values(to_u64(seq_q)?);
         // ggml's `ne`/`nb` arrays are innermost-axis-first (`ne[0]` = kv_len,
         // the fastest-varying axis), the opposite of Candle's `dims()`
@@ -215,13 +208,13 @@ impl LaunchScalars {
             ne01: super::fattn::Uint3 { x: mp, y: l, z: dv },
             ne02: to_i32(h_q, "ne02")?,
             ne03: to_i32(l_q.shape().dims4()?.0, "ne03")?,
-            nb01: byte_stride(l_q, 1, F32_BYTES, "nb01")?
+            nb01: byte_stride(l_q, 1, q_elem_bytes, "nb01")?
                 .try_into()
                 .map_err(|_| candle_core::Error::Msg("fattn_mma: q stride overflow".into()))?,
-            nb02: byte_stride(l_q, 2, F32_BYTES, "nb02")?
+            nb02: byte_stride(l_q, 2, q_elem_bytes, "nb02")?
                 .try_into()
                 .map_err(|_| candle_core::Error::Msg("fattn_mma: q stride overflow".into()))?,
-            nb03: byte_stride(l_q, 0, F32_BYTES, "nb03")?
+            nb03: byte_stride(l_q, 0, q_elem_bytes, "nb03")?
                 .try_into()
                 .map_err(|_| candle_core::Error::Msg("fattn_mma: q stride overflow".into()))?,
             ne10: to_i32(d, "ne10")?,
@@ -351,15 +344,14 @@ impl LaunchGeometry {
     }
 }
 
-/// Tensor-core flash-attention prefill: `softmax(q @ k^T * scale [+ mask])
-/// @ v`, always honoring `mask` when given (unlike
-/// `ops::fused_ops::flash_attn_mma`'s kernel). `k`/`v` are BSHD F16, `q` is
-/// BSHD F32 (see this module's doc comment), `head_dim` in {64, 128, 256,
-/// 512}; `mask` (F16, additive) must broadcast as `[.., seq_q, seq_kv]`
-/// when given. `kv_max` (I32), when given, is one entry per query tile per
-/// batch element. See `ops::fused_ops::fattn`'s `q_tiles`/`gqa_z_tiles`
-/// for the tile layout; it bounds each tile's KV loop (`fattn_mma_f16.cuh`'s
-/// `kb0_stop`).
+/// Tensor-core flash-attention prefill: `softmax(q @ k^T * scale [+ mask]) @
+/// v`, always honoring `mask` when given (unlike
+/// `ops::fused_ops::flash_attn_mma`'s kernel). `q`/`k`/`v` are BSHD F16,
+/// `head_dim` in {64, 128, 256, 512}; `mask` (F16, additive) must broadcast as
+/// `[.., seq_q, seq_kv]` when given. `kv_max` (I32), when given, is one entry
+/// per query tile per batch element. See `ops::fused_ops::fattn`'s
+/// `q_tiles`/`gqa_z_tiles` for the tile layout; it bounds each tile's KV loop
+/// (`fattn_mma_f16.cuh`'s `kb0_stop`).
 ///
 /// **`mask = None` is only accepted when the internally-selected `ncols2`
 /// (see [`super::fattn::select_mma_ncols`]) resolves to `1`; this is
@@ -390,14 +382,10 @@ pub fn fattn_mma_prefill(
     kv_max: Option<&Tensor>,
     scale: f32,
 ) -> Result<Tensor> {
-    // See this module's doc comment: upstream requires q to stay F32 while
-    // k/v are F16. This is not a uniform-F16 contract like Crane's other kernels.
-    if q.dtype() != DType::F32 {
-        candle_core::bail!("fattn_mma: q must be F32, got {:?}", q.dtype());
-    }
-    if k.dtype() != DType::F16 || v.dtype() != DType::F16 {
+    if q.dtype() != DType::F16 || k.dtype() != DType::F16 || v.dtype() != DType::F16 {
         candle_core::bail!(
-            "fattn_mma: k/v must be F16, got k={:?} v={:?}",
+            "fattn_mma: q/k/v must be F16, got q={:?} k={:?} v={:?}",
+            q.dtype(),
             k.dtype(),
             v.dtype()
         );
@@ -443,23 +431,22 @@ fn prefill_dispatch(
     }
 }
 
-/// Native-bf16 counterpart of [`fattn_mma_prefill`]: `k`/`v` stay BF16
-/// instead of being downcast to F16, avoiding the overflow-to-`inf` risk
-/// that downcast carries for BF16-range activation values outside F16's
-/// narrower dynamic range (see `kernels/cuda/fattn/fattn_mma_bf16.cuh`'s
-/// module doc). `q` is still F32 (same mixed-precision contract as the f16
-/// kernel), `mask` is still F16 (the mask is an additive bias independent
-/// of K/V's dtype). Same masking/`kv_max`/error contract as
-/// [`fattn_mma_prefill`]; the one additional failure mode is no
-/// instantiated kernel for this `(head_dim, GQA ratio, seq_q, seq_kv)`
-/// shape under [`super::fattn::select_mma_ncols_bf16`] (narrower than the
-/// f16 kernel's coverage — see that function's doc comment), in which case
-/// callers fall back to the F16 cast path, not the tile kernel directly.
+/// Native-bf16 counterpart of [`fattn_mma_prefill`]: `k`/`v` stay BF16 instead
+/// of being downcast to F16, avoiding the overflow-to-`inf` risk that downcast
+/// carries for BF16-range activation values outside F16's narrower dynamic
+/// range (see `kernels/cuda/fattn/fattn_mma_bf16.cuh`'s module doc). `q` is
+/// BF16 like `k`/`v`, `mask` is still F16 (the mask is an additive bias
+/// independent of K/V's dtype). Same masking/`kv_max`/error contract as
+/// [`fattn_mma_prefill`]; the one additional failure mode is no instantiated
+/// kernel for this `(head_dim, GQA ratio, seq_q, seq_kv)` shape under
+/// [`super::fattn::select_mma_ncols_bf16`] (narrower than the f16 kernel's
+/// coverage — see that function's doc comment), in which case callers fall
+/// back to the F16 cast path, not the tile kernel directly.
 ///
 /// # Errors
 ///
-/// Returns an error if shapes/dtypes are invalid (`q` must be F32, `k`/`v`
-/// must be BF16, `mask` must be F16, `kv_max` must be I32), `mask = None`
+/// Returns an error if shapes/dtypes are invalid (`q`/`k`/`v` must be
+/// BF16, `mask` must be F16, `kv_max` must be I32), `mask = None`
 /// while the selected `ncols2 != 1`, no instantiated bf16 kernel covers
 /// this shape, or the device is CPU.
 pub fn fattn_mma_bf16_prefill(
@@ -470,12 +457,10 @@ pub fn fattn_mma_bf16_prefill(
     kv_max: Option<&Tensor>,
     scale: f32,
 ) -> Result<Tensor> {
-    if q.dtype() != DType::F32 {
-        candle_core::bail!("fattn_mma_bf16: q must be F32, got {:?}", q.dtype());
-    }
-    if k.dtype() != DType::BF16 || v.dtype() != DType::BF16 {
+    if q.dtype() != DType::BF16 || k.dtype() != DType::BF16 || v.dtype() != DType::BF16 {
         candle_core::bail!(
-            "fattn_mma_bf16: k/v must be BF16, got k={:?} v={:?}",
+            "fattn_mma_bf16: q/k/v must be BF16, got q={:?} k={:?} v={:?}",
+            q.dtype(),
             k.dtype(),
             v.dtype()
         );
@@ -880,10 +865,14 @@ fn causal_in_kernel(
     scale: f32,
     kv_offset: usize,
 ) -> Result<Tensor> {
-    // Same mixed-precision contract as fattn_mma_prefill/fattn_mma_bf16_prefill:
-    // q stays F32, k/v share a single F16 or BF16 dtype.
-    if q.dtype() != DType::F32 {
-        candle_core::bail!("fattn_mma causal: q must be F32, got {:?}", q.dtype());
+    // Same dtype contract as fattn_mma_prefill/fattn_mma_bf16_prefill: q/k/v
+    // all share a single F16 or BF16 dtype.
+    if q.dtype() != k.dtype() {
+        candle_core::bail!(
+            "fattn_mma causal: q must match k/v dtype, got q={:?} k={:?}",
+            q.dtype(),
+            k.dtype()
+        );
     }
     if v.dtype() != k.dtype() {
         candle_core::bail!(
@@ -1215,21 +1204,6 @@ mod cuda {
         }
     }
 
-    // See this module's doc comment: q stays F32 (never F16) for this
-    // kernel family.
-    fn f32_slice<'a>(
-        storage: &'a Storage,
-        what: &str,
-    ) -> Result<&'a candle_core::cuda_backend::cudarc::driver::CudaSlice<f32>> {
-        match storage {
-            Storage::Cuda(c) => match &c.slice {
-                CudaStorageSlice::F32(s) => Ok(s),
-                _ => candle_core::bail!("fattn_mma: {what} must be F32"),
-            },
-            _ => candle_core::bail!("fattn_mma: {what} must be a cuda tensor"),
-        }
-    }
-
     #[allow(clippy::too_many_lines, clippy::many_single_char_names)]
     pub(super) fn fattn_mma_prefill_cuda(
         q: &Tensor,
@@ -1243,7 +1217,7 @@ mod cuda {
         let (q_s, q_l) = q.storage_and_layout();
         let (k_s, k_l) = k.storage_and_layout();
         let (v_s, v_l) = v.storage_and_layout();
-        let (b, seq_q, h_q, d, seq_kv, h_kv) = validate_fattn_bshd(q_l, k_l, v_l)?;
+        let (b, seq_q, h_q, d, seq_kv, h_kv) = validate_fattn_bshd(q_l, k_l, v_l, q.dtype())?;
         let gqa_ratio = h_q / h_kv;
         let dev = q.device().as_cuda_device()?.clone();
         let is_amd = false;
@@ -1267,7 +1241,7 @@ mod cuda {
         let module_name = format!("crane_fattn_mma_hd{d}");
         let func = dev.get_or_load_custom_func(&kernel_name, &module_name, ptx_for(d)?)?;
 
-        let q_sl = f32_slice(&q_s, "q")?.slice(q_l.start_offset()..);
+        let q_sl = f16_slice(&q_s, "q")?.slice(q_l.start_offset()..);
         let k_sl = f16_slice(&k_s, "k")?.slice(k_l.start_offset()..);
         let v_sl = f16_slice(&v_s, "v")?.slice(v_l.start_offset()..);
 
@@ -1304,6 +1278,7 @@ mod cuda {
             seq_kv,
             h_kv,
             scale,
+            q.dtype(),
         )?;
 
         let causal_kv_offset = super::kernel_causal_offset(causal_kv_offset)?;
@@ -1414,7 +1389,7 @@ mod cuda {
         let (q_s, q_l) = q.storage_and_layout();
         let (k_s, k_l) = k.storage_and_layout();
         let (v_s, v_l) = v.storage_and_layout();
-        let (b, seq_q, h_q, d, seq_kv, h_kv) = validate_fattn_bshd(q_l, k_l, v_l)?;
+        let (b, seq_q, h_q, d, seq_kv, h_kv) = validate_fattn_bshd(q_l, k_l, v_l, q.dtype())?;
         let gqa_ratio = h_q / h_kv;
         let dev = q.device().as_cuda_device()?.clone();
         let is_amd = false;
@@ -1439,7 +1414,7 @@ mod cuda {
         let module_name = format!("crane_fattn_mma_bf16_hd{d}");
         let func = dev.get_or_load_custom_func(&kernel_name, &module_name, ptx_for_bf16(d)?)?;
 
-        let q_sl = f32_slice(&q_s, "q")?.slice(q_l.start_offset()..);
+        let q_sl = bf16_slice(&q_s, "q")?.slice(q_l.start_offset()..);
         let k_sl = bf16_slice(&k_s, "k")?.slice(k_l.start_offset()..);
         let v_sl = bf16_slice(&v_s, "v")?.slice(v_l.start_offset()..);
 
@@ -1476,6 +1451,7 @@ mod cuda {
             seq_kv,
             h_kv,
             scale,
+            q.dtype(),
         )?;
 
         let causal_kv_offset = super::kernel_causal_offset(causal_kv_offset)?;
@@ -1694,7 +1670,7 @@ mod rocm {
         let (q_s, q_l) = q.storage_and_layout();
         let (k_s, k_l) = k.storage_and_layout();
         let (v_s, v_l) = v.storage_and_layout();
-        let (b, seq_q, h_q, d, seq_kv, h_kv) = validate_fattn_bshd(q_l, k_l, v_l)?;
+        let (b, seq_q, h_q, d, seq_kv, h_kv) = validate_fattn_bshd(q_l, k_l, v_l, q.dtype())?;
         let gqa_ratio = h_q / h_kv;
         let dev = q.device().as_rocm_device()?.clone();
         let is_amd = true;
@@ -1718,9 +1694,7 @@ mod rocm {
         let module_name = format!("crane_fattn_mma_hd{d}");
         let source = source_for(d)?;
 
-        // See this module's doc comment: q stays F32 (never F16) for this
-        // kernel family.
-        let q_ptr = rocm::strided_device_ptr(&q_s, q_l, DType::F32, "fattn_mma q")?;
+        let q_ptr = rocm::strided_device_ptr(&q_s, q_l, DType::F16, "fattn_mma q")?;
         let k_ptr = rocm::strided_device_ptr(&k_s, k_l, DType::F16, "fattn_mma k")?;
         let v_ptr = rocm::strided_device_ptr(&v_s, v_l, DType::F16, "fattn_mma v")?;
 
@@ -1748,6 +1722,7 @@ mod rocm {
             seq_kv,
             h_kv,
             scale,
+            q.dtype(),
         )?;
 
         let causal_kv_offset = super::kernel_causal_offset(causal_kv_offset)?;
@@ -1846,7 +1821,7 @@ mod rocm {
         let (q_s, q_l) = q.storage_and_layout();
         let (k_s, k_l) = k.storage_and_layout();
         let (v_s, v_l) = v.storage_and_layout();
-        let (b, seq_q, h_q, d, seq_kv, h_kv) = validate_fattn_bshd(q_l, k_l, v_l)?;
+        let (b, seq_q, h_q, d, seq_kv, h_kv) = validate_fattn_bshd(q_l, k_l, v_l, q.dtype())?;
         let gqa_ratio = h_q / h_kv;
         let dev = q.device().as_rocm_device()?.clone();
         let is_amd = true;
@@ -1871,9 +1846,7 @@ mod rocm {
         let module_name = format!("crane_fattn_mma_bf16_hd{d}");
         let source = source_for_bf16(d)?;
 
-        // See this module's doc comment: q stays F32 (never F16/BF16) for
-        // this kernel family.
-        let q_ptr = rocm::strided_device_ptr(&q_s, q_l, DType::F32, "fattn_mma_bf16 q")?;
+        let q_ptr = rocm::strided_device_ptr(&q_s, q_l, DType::BF16, "fattn_mma_bf16 q")?;
         let k_ptr = rocm::strided_device_ptr(&k_s, k_l, DType::BF16, "fattn_mma_bf16 k")?;
         let v_ptr = rocm::strided_device_ptr(&v_s, v_l, DType::BF16, "fattn_mma_bf16 v")?;
 
@@ -1901,6 +1874,7 @@ mod rocm {
             seq_kv,
             h_kv,
             scale,
+            q.dtype(),
         )?;
 
         let causal_kv_offset = super::kernel_causal_offset(causal_kv_offset)?;
@@ -2001,26 +1975,34 @@ mod tests {
         );
     }
 
+    // q must be in the k/v dtype for both kernel families. F32 q, which
+    // upstream takes, is rejected rather than cast.
     #[test]
-    fn rejects_non_f32_q() {
+    fn rejects_q_not_in_kv_dtype() {
         let dev = Device::Cpu;
-        let q = Tensor::zeros((1, 4, 2, 64), DType::F16, &dev).unwrap();
-        let k = q.clone();
-        let v = q.clone();
-        let err = fattn_mma_prefill(&q, &k, &v, None, None, 0.125).expect_err("must reject F16 q");
-        assert!(err.to_string().contains("q must be F32"));
+        let zeros = |dtype| Tensor::zeros((1, 4, 2, 64), dtype, &dev).unwrap();
+        let (f32_q, f16, bf16) = (zeros(DType::F32), zeros(DType::F16), zeros(DType::BF16));
+        let err = fattn_mma_prefill(&f32_q, &f16, &f16, None, None, 0.125)
+            .expect_err("must reject F32 q");
+        assert!(err.to_string().contains("q/k/v must be F16"));
+        let err = fattn_mma_bf16_prefill(&f32_q, &bf16, &bf16, None, None, 0.125)
+            .expect_err("must reject F32 q");
+        assert!(err.to_string().contains("q/k/v must be BF16"));
+        let err = fattn_mma_bf16_prefill(&f16, &bf16, &bf16, None, None, 0.125)
+            .expect_err("must reject F16 q");
+        assert!(err.to_string().contains("q/k/v must be BF16"));
     }
 
-    // k/v must be F16. q, by contrast, must be F32 (see rejects_non_f32_q).
+    // k/v must be F16 for the f16 kernel family.
     #[test]
     fn rejects_non_f16_kv() {
         let dev = Device::Cpu;
-        let q = Tensor::zeros((1, 4, 2, 64), DType::F32, &dev).unwrap();
+        let q = Tensor::zeros((1, 4, 2, 64), DType::F16, &dev).unwrap();
         let k = Tensor::zeros((1, 4, 2, 64), DType::F32, &dev).unwrap();
         let v = k.clone();
         let err =
             fattn_mma_prefill(&q, &k, &v, None, None, 0.125).expect_err("must reject F32 k/v");
-        assert!(err.to_string().contains("k/v must be F16"));
+        assert!(err.to_string().contains("q/k/v must be F16"));
     }
 
     // The causal entries use the host mask exactly when the diagonal of the
@@ -2110,7 +2092,7 @@ mod gpu_tests {
 
         let want = naive_attention(&q_f32, &k_f32, &v_f32, scale, MaskMode::Full, 0, 0, 0);
 
-        let q = q_f32.to_device(&gpu).unwrap(); // q stays F32 for this kernel family
+        let q = q_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
         let k = k_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
         let v = v_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
         let zero_mask = Tensor::zeros((1, sq, skv), DType::F16, &gpu).unwrap();
@@ -2155,7 +2137,7 @@ mod gpu_tests {
             0,
         );
 
-        let q = q_f32.to_device(&gpu).unwrap(); // q stays F32 for this kernel family
+        let q = q_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
         let k = k_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
         let v = v_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
         let mask = causal_mask(sq, skv, kv_offset, &gpu);
@@ -2198,7 +2180,11 @@ mod gpu_tests {
 
         let want = naive_attention(&q_f32, &k_f32, &v_f32, scale, MaskMode::Full, 0, 0, 0);
 
-        let q = q_f32.to_device(&gpu).unwrap(); // q stays F32 for this kernel family
+        let q = q_f32
+            .to_dtype(DType::BF16)
+            .unwrap()
+            .to_device(&gpu)
+            .unwrap();
         let k = k_f32
             .to_dtype(DType::BF16)
             .unwrap()
@@ -2254,7 +2240,11 @@ mod gpu_tests {
 
         // fattn_mma_bf16_causal takes BSHD like fattn_mma_causal (see this
         // module's doc comment); q_f32/k_f32/v_f32 above are already BSHD.
-        let q = q_f32.to_device(&gpu).unwrap(); // q stays F32 for this kernel family
+        let q = q_f32
+            .to_dtype(DType::BF16)
+            .unwrap()
+            .to_device(&gpu)
+            .unwrap();
         let k = k_f32
             .to_dtype(DType::BF16)
             .unwrap()
@@ -2345,7 +2335,7 @@ mod gpu_tests {
         let gpu = test_gpu_device();
         let d = 64usize;
         let scale = 1.0f32 / (d as f32).sqrt();
-        let q = Tensor::zeros((1, 16, 2, d), DType::F32, &gpu).unwrap();
+        let q = Tensor::zeros((1, 16, 2, d), DType::F16, &gpu).unwrap();
         let k = Tensor::zeros((1, 16, 2, d), DType::F16, &gpu).unwrap();
         let v = k.clone();
         let result = fattn_mma_prefill(&q, &k, &v, None, None, scale);
@@ -2368,7 +2358,7 @@ mod gpu_tests {
         let gpu = test_gpu_device();
         let d = 128usize;
         let scale = 1.0f32 / (d as f32).sqrt();
-        let q = Tensor::zeros((1, 32, 8, d), DType::F32, &gpu).unwrap();
+        let q = Tensor::zeros((1, 32, 8, d), DType::F16, &gpu).unwrap();
         let k = Tensor::zeros((1, 256, 2, d), DType::F16, &gpu).unwrap();
         let v = k.clone();
         let err = fattn_mma_prefill(&q, &k, &v, None, None, scale)
@@ -2445,7 +2435,7 @@ mod gpu_tests {
             0,
         );
 
-        let q = q_f32.to_device(&gpu).unwrap();
+        let q = q_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
         let k = k_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
         let v = v_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
 
@@ -2480,7 +2470,7 @@ mod gpu_tests {
             0,
         );
 
-        let q = q_f32.to_device(&gpu).unwrap();
+        let q = q_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
         let k = k_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
         let v = v_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
 
@@ -2513,7 +2503,11 @@ mod gpu_tests {
             0,
         );
 
-        let q = q_f32.to_device(&gpu).unwrap();
+        let q = q_f32
+            .to_dtype(DType::BF16)
+            .unwrap()
+            .to_device(&gpu)
+            .unwrap();
         let k = k_f32
             .to_dtype(DType::BF16)
             .unwrap()
@@ -2543,7 +2537,10 @@ mod gpu_tests {
         let kv_offset = skv - sq;
         let kv_dtype = if bf16 { DType::BF16 } else { DType::F16 };
 
-        let q = Tensor::randn(0f32, 1f32, (b, sq, hq, d), &gpu).unwrap();
+        let q = Tensor::randn(0f32, 1f32, (b, sq, hq, d), &gpu)
+            .unwrap()
+            .to_dtype(kv_dtype)
+            .unwrap();
         let k = Tensor::randn(0f32, 1f32, (b, skv, hkv, d), &gpu)
             .unwrap()
             .to_dtype(kv_dtype)
@@ -2650,7 +2647,7 @@ mod gpu_tests {
         );
 
         let kv_dtype = if bf16 { DType::BF16 } else { DType::F16 };
-        let q = q_f32.to_device(&gpu).unwrap();
+        let q = q_f32.to_dtype(kv_dtype).unwrap().to_device(&gpu).unwrap();
         let k = k_f32.to_dtype(kv_dtype).unwrap().to_device(&gpu).unwrap();
         let v = v_f32.to_dtype(kv_dtype).unwrap().to_device(&gpu).unwrap();
 
@@ -2691,7 +2688,7 @@ mod gpu_tests {
                 .transpose(1, 2)
                 .unwrap()
         };
-        let q = bshd(sq, hq, DType::F32);
+        let q = bshd(sq, hq, kv_dtype);
         let k = bshd(skv, hkv, kv_dtype);
         let v = bshd(skv, hkv, kv_dtype);
         assert!(!q.is_contiguous() && !k.is_contiguous() && !v.is_contiguous());
@@ -2787,7 +2784,7 @@ mod gpu_tests {
             window_right,
         );
 
-        let q = q_f32.to_device(&gpu).unwrap();
+        let q = q_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
         let k = k_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
         let v = v_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
 
@@ -2808,7 +2805,7 @@ mod gpu_tests {
         let v_f32 = Tensor::randn(0f32, 1f32, (b, skv, hkv, d), &Device::Cpu).unwrap();
         let want = naive_attention(&q_f32, &k_f32, &v_f32, scale, MaskMode::Full, 0, 0, 0);
 
-        let q = q_f32.to_device(&gpu).unwrap();
+        let q = q_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
         let k = k_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
         let v = v_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
 
@@ -2833,7 +2830,7 @@ mod gpu_tests {
         let k_f32 = Tensor::randn(0f32, 1f32, (1, skv, hkv, d), &Device::Cpu).unwrap();
         let v_f32 = Tensor::randn(0f32, 1f32, (1, skv, hkv, d), &Device::Cpu).unwrap();
 
-        let q = q_f32.to_device(&gpu).unwrap();
+        let q = q_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
         let k = k_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
         let v = v_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
 
@@ -2940,8 +2937,8 @@ mod ck_parity {
         let v_f32 = Tensor::randn(0f32, 1f32, (b, skv, hkv, d), &Device::Cpu).unwrap();
         let want = naive_attention(&q_f32, &k_f32, &v_f32, scale, MaskMode::Full, 0, 0, 0);
 
-        // crane's fattn_mma_full: q stays F32, k/v cast to F16.
-        let q = q_f32.to_device(&gpu).unwrap();
+        // crane's fattn_mma_full: q/k/v cast to F16.
+        let q = q_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
         let k = k_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
         let v = v_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
         let crane_out = got_vec(fattn_mma_full(&q, &k, &v, scale).unwrap());
@@ -2987,7 +2984,7 @@ mod ck_parity {
             0,
         );
 
-        let q = q_f32.to_device(&gpu).unwrap();
+        let q = q_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
         let k = k_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
         let v = v_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
         let crane_out = got_vec(fattn_mma_causal(&q, &k, &v, scale, kv_offset).unwrap());
@@ -3058,8 +3055,12 @@ mod ck_parity {
         let v_f32 = Tensor::randn(0f32, 1f32, (b, skv, hkv, d), &Device::Cpu).unwrap();
         let want = naive_attention(&q_f32, &k_f32, &v_f32, scale, MaskMode::Full, 0, 0, 0);
 
-        // crane's fattn_mma_bf16_full: q stays F32, k/v cast to BF16.
-        let q = q_f32.to_device(&gpu).unwrap();
+        // crane's fattn_mma_bf16_full: q/k/v cast to BF16.
+        let q = q_f32
+            .to_dtype(DType::BF16)
+            .unwrap()
+            .to_device(&gpu)
+            .unwrap();
         let k = k_f32
             .to_dtype(DType::BF16)
             .unwrap()
@@ -3117,7 +3118,11 @@ mod ck_parity {
             0,
         );
 
-        let q = q_f32.to_device(&gpu).unwrap();
+        let q = q_f32
+            .to_dtype(DType::BF16)
+            .unwrap()
+            .to_device(&gpu)
+            .unwrap();
         let k = k_f32
             .to_dtype(DType::BF16)
             .unwrap()
@@ -3257,8 +3262,8 @@ mod flashattn2_parity {
         let v_f32 = Tensor::randn(0f32, 1f32, (b, skv, hkv, d), &Device::Cpu).unwrap();
         let want = naive_attention(&q_f32, &k_f32, &v_f32, scale, MaskMode::Full, 0, 0, 0);
 
-        // crane's fattn_mma_full: q stays F32, k/v cast to F16.
-        let q = q_f32.to_device(&gpu).unwrap();
+        // crane's fattn_mma_full: q/k/v cast to F16.
+        let q = q_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
         let k = k_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
         let v = v_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
         let crane_out = got_vec(fattn_mma_full(&q, &k, &v, scale).unwrap());
@@ -3303,7 +3308,7 @@ mod flashattn2_parity {
             0,
         );
 
-        let q = q_f32.to_device(&gpu).unwrap();
+        let q = q_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
         let k = k_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
         let v = v_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
         let crane_out = got_vec(fattn_mma_causal(&q, &k, &v, scale, kv_offset).unwrap());
@@ -3378,8 +3383,12 @@ mod flashattn2_parity {
         let v_f32 = Tensor::randn(0f32, 1f32, (b, skv, hkv, d), &Device::Cpu).unwrap();
         let want = naive_attention(&q_f32, &k_f32, &v_f32, scale, MaskMode::Full, 0, 0, 0);
 
-        // crane's fattn_mma_bf16_full: q stays F32, k/v cast to BF16.
-        let q = q_f32.to_device(&gpu).unwrap();
+        // crane's fattn_mma_bf16_full: q/k/v cast to BF16.
+        let q = q_f32
+            .to_dtype(DType::BF16)
+            .unwrap()
+            .to_device(&gpu)
+            .unwrap();
         let k = k_f32
             .to_dtype(DType::BF16)
             .unwrap()
@@ -3444,7 +3453,11 @@ mod flashattn2_parity {
             0,
         );
 
-        let q = q_f32.to_device(&gpu).unwrap();
+        let q = q_f32
+            .to_dtype(DType::BF16)
+            .unwrap()
+            .to_device(&gpu)
+            .unwrap();
         let k = k_f32
             .to_dtype(DType::BF16)
             .unwrap()

@@ -532,8 +532,9 @@ pub(crate) fn gqa_z_tiles(gqa_ratio: usize, ncols2: usize) -> usize {
 
 /// Shared shape/stride validation for the fattn kernels: checks k/v
 /// shapes match, `head_dim` is one of {64, 128, 256, 512}, GQA head-count
-/// divisibility, and last-axis contiguity. Returns `(batch, seq_q,
-/// num_heads_q, head_dim, seq_kv, num_heads_kv)`.
+/// divisibility, and last-axis contiguity. `q_dtype` is Q's dtype, which
+/// sets the element size its strides are checked against. Returns `(batch,
+/// seq_q, num_heads_q, head_dim, seq_kv, num_heads_kv)`.
 ///
 /// # Errors
 ///
@@ -542,6 +543,7 @@ pub(crate) fn validate_fattn_bshd(
     l_q: &Layout,
     l_k: &Layout,
     l_v: &Layout,
+    q_dtype: DType,
 ) -> Result<(usize, usize, usize, usize, usize, usize)> {
     let (b, seq_q, h_q, d) = l_q.shape().dims4()?;
     let (b_kv, seq_kv, h_kv, d_kv) = l_k.shape().dims4()?;
@@ -576,14 +578,11 @@ pub(crate) fn validate_fattn_bshd(
         }
     }
     // Q's batch offset is 32-bit in the kernels, K/V's is 64-bit.
-    check_kernel_layout(l_q, Q_ELEM_BYTES, true, "q")?;
+    check_kernel_layout(l_q, q_dtype.size_in_bytes(), true, "q")?;
     check_kernel_layout(l_k, KV_ELEM_BYTES, false, "k")?;
     check_kernel_layout(l_v, KV_ELEM_BYTES, false, "v")?;
     Ok((b, seq_q, h_q, d, seq_kv, h_kv))
 }
-
-/// Element size of Q, which every fattn entry takes in F32.
-pub(crate) const Q_ELEM_BYTES: usize = 4;
 
 /// Element size of K/V, which every fattn entry takes in F16 or BF16.
 pub(crate) const KV_ELEM_BYTES: usize = 2;
@@ -1007,7 +1006,8 @@ mod tests {
         let (k_s, k_l) = k.storage_and_layout();
         let (v_s, v_l) = v.storage_and_layout();
         drop((q_s, k_s, v_s));
-        let err = validate_fattn_bshd(&q_l, &k_l, &v_l).expect_err("head_dim=100 must be rejected");
+        let err = validate_fattn_bshd(q_l, k_l, v_l, DType::F16)
+            .expect_err("head_dim=100 must be rejected");
         assert!(err.to_string().contains("head_dim in"));
     }
 
@@ -1025,7 +1025,22 @@ mod tests {
     fn validate_fattn_bshd_rejects_misaligned_k() {
         let q = Layout::contiguous((1, 64, 2, 128));
         let k = Layout::contiguous_with_offset((1, 64, 2, 128), 1);
-        assert_unsupported(validate_fattn_bshd(&q, &k, &q).map(|_| ()));
+        assert_unsupported(validate_fattn_bshd(&q, &k, &q, DType::F16).map(|_| ()));
+    }
+
+    // Q's strides are checked in Q's own element size. A 132-element head
+    // stride is 264 bytes in F16, off the 16-byte grid the kernels' vector
+    // loads need, but 528 bytes in F32, which is on it.
+    #[test]
+    fn validate_fattn_bshd_checks_q_in_its_dtype() {
+        let kv = Layout::contiguous((1, 64, 2, 128));
+        let q = Layout::new(
+            (1, 64, 2, 128).into(),
+            vec![64 * 2 * 132, 2 * 132, 132, 1],
+            0,
+        );
+        assert_unsupported(validate_fattn_bshd(&q, &kv, &kv, DType::F16).map(|_| ()));
+        validate_fattn_bshd(&q, &kv, &kv, DType::F32).unwrap();
     }
 
     // A BSHD view of a BHSD tensor, and one of a narrowed KV-cache buffer

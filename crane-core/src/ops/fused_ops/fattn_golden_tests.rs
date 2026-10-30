@@ -265,8 +265,7 @@ fn run_variant(
         (k_host, v_host, HKV)
     };
     let bshd = |h: &[f32], rows, heads| Tensor::from_slice(h, (1, rows, heads, d), gpu).unwrap();
-    // The kernels read q as F32 and k/v in the input dtype.
-    let q = bshd(q_host, seq, HQ);
+    let q = bshd(q_host, seq, HQ).to_dtype(dtype).unwrap();
     let k = bshd(k_host, seq, hkv).to_dtype(dtype).unwrap();
     let v = bshd(v_host, seq, hkv).to_dtype(dtype).unwrap();
     let bf16 = dtype == DType::BF16;
@@ -276,7 +275,9 @@ fn run_variant(
         Variant::Offset => {
             let seq_q = seq / 4;
             let offset = seq - seq_q;
-            let q = bshd(&q_host[offset * HQ * d..], seq_q, HQ);
+            let q = bshd(&q_host[offset * HQ * d..], seq_q, HQ)
+                .to_dtype(dtype)
+                .unwrap();
             if bf16 {
                 fattn_mma_bf16_causal(&q, &k, &v, scale, offset)
             } else {

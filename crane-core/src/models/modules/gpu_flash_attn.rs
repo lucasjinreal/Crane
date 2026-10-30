@@ -245,14 +245,15 @@ static TILE_HD64_SKIPPED: Once = Once::new();
 /// Runs one kernel over BHSD inputs and returns a BHSD result, or `None`
 /// when that kernel has no instance for the shape.
 ///
-/// BF16 inputs go to the native-bf16 MMA kernel with `k`/`v` passed through
-/// unchanged. F16 and F32 inputs take the cast path: it widens `q` to F32
-/// and narrows `k`/`v` to F16, which is the mixed-precision contract of the
-/// F16 kernels, runs `mma` and casts the F16 result back to the caller's
-/// dtype. A shape the chosen kernel does not cover returns `None`, so the
-/// caller's SDPA serves it. There is no fall-through to another kernel,
-/// because the cast path and the tile kernel are slower or less trusted
-/// than SDPA. Only the debug variables in this module's docs select them.
+/// BF16 inputs go to the native-bf16 MMA kernel with `q`/`k`/`v` passed
+/// through unchanged (or to the F16 kernel below when
+/// `CRANE_DISABLE_BF16_FLASH_ATTN` is set). F16 and F32 inputs go to the F16
+/// kernel: F32 is narrowed to F16, and the F16 result is cast back to the
+/// caller's dtype. The tile kernel instead takes `q` in F32. A shape the
+/// chosen kernel does not cover returns `None`, so the caller's SDPA serves
+/// it. There is no fall-through to another kernel, because the cast path and
+/// the tile kernel are slower or less trusted than SDPA. Only the debug
+/// variables in this module's docs select them.
 ///
 /// A kernel failure tagged as unsupported-config becomes `Ok(None)`. Any
 /// other failure propagates. A kernel that launches but computes wrong
@@ -267,7 +268,6 @@ fn run(
     mma: impl FnOnce(&Tensor, &Tensor, &Tensor) -> Result<Tensor>,
     tile: impl FnOnce(&Tensor, &Tensor, &Tensor) -> Result<Tensor>,
 ) -> Result<Option<Tensor>> {
-    use crate::ops::fused_ops::fattn::{KV_ELEM_BYTES, Q_ELEM_BYTES};
     use ribo::utils::log;
 
     let orig_dtype = q.dtype();
@@ -276,11 +276,11 @@ fn run(
     let v_bshd = v.transpose(1, 2)?;
 
     if orig_dtype == DType::BF16 && !bf16_disabled() {
-        // The kernels read the strided BSHD views of k/v directly.
-        let q_f32 = q_bshd.to_dtype(DType::F32)?;
-        let k_bf16 = addressable(k_bshd, KV_ELEM_BYTES, false)?;
-        let v_bf16 = addressable(v_bshd, KV_ELEM_BYTES, false)?;
-        return match mma_bf16(&q_f32, &k_bf16, &v_bf16) {
+        // The kernels read the strided BSHD views directly.
+        let q_bf16 = addressable(q_bshd, true)?;
+        let k_bf16 = addressable(k_bshd, false)?;
+        let v_bf16 = addressable(v_bshd, false)?;
+        return match mma_bf16(&q_bf16, &k_bf16, &v_bf16) {
             Ok(out_bshd) => out_bshd.transpose(1, 2).map(Some),
             Err(e) => unsupported_to_none(e),
         };
@@ -288,17 +288,8 @@ fn run(
 
     // Inputs already in the kernel's dtype go in as strided views. Only the
     // others pay a cast.
-    let q_f32 = if orig_dtype == DType::F32 {
-        addressable(q_bshd, Q_ELEM_BYTES, true)?
-    } else {
-        log_cast_once(orig_dtype);
-        q_bshd.to_dtype(DType::F32)?
-    };
     let (k_f16, v_f16) = if orig_dtype == DType::F16 {
-        (
-            addressable(k_bshd, KV_ELEM_BYTES, false)?,
-            addressable(v_bshd, KV_ELEM_BYTES, false)?,
-        )
+        (addressable(k_bshd, false)?, addressable(v_bshd, false)?)
     } else {
         log_cast_once(orig_dtype);
         (k_bshd.to_dtype(DType::F16)?, v_bshd.to_dtype(DType::F16)?)
@@ -316,14 +307,21 @@ fn run(
     };
 
     if !mma_disabled() {
-        return match mma(&q_f32, &k_f16, &v_f16) {
+        // The MMA kernels have no F32 Q path, so F32 callers pay a Q cast
+        // here as they do for K/V. Models hold Q in BF16 or F16.
+        let q_f16 = if orig_dtype == DType::F16 {
+            addressable(q_bshd, true)?
+        } else {
+            q_bshd.to_dtype(DType::F16)?
+        };
+        return match mma(&q_f16, &k_f16, &v_f16) {
             Ok(out_bshd) => finish(out_bshd),
             Err(e) => unsupported_to_none(e),
         };
     }
 
     // Only `CRANE_DISABLE_MMA_FLASH_ATTN` gets here.
-    if matches!(q_f32.dim(3), Ok(64)) {
+    if matches!(q_bshd.dim(3), Ok(64)) {
         TILE_HD64_SKIPPED.call_once(|| {
             log::debug!(
                 "gpu_flash_attn: the head_dim=64 tile kernel is known to produce wrong output on ROCm, leaving the call to the caller (logged once)"
@@ -332,6 +330,12 @@ fn run(
         return Ok(None);
     }
 
+    let q_f32 = if orig_dtype == DType::F32 {
+        addressable(q_bshd, true)?
+    } else {
+        log_cast_once(orig_dtype);
+        q_bshd.to_dtype(DType::F32)?
+    };
     match tile(&q_f32, &k_f16, &v_f16) {
         Ok(out_bshd) => finish(out_bshd),
         Err(e) => unsupported_to_none(e),
@@ -361,7 +365,7 @@ fn unsupported_to_none(err: candle_core::Error) -> Result<Option<Tensor>> {
 fn log_cast_once(orig_dtype: DType) {
     CAST_WARNED.call_once(|| {
         ribo::utils::log::debug!(
-            "gpu_flash_attn: casting {orig_dtype:?} q to F32 and k/v to F16 for the vendored kernels (logged once)"
+            "gpu_flash_attn: casting {orig_dtype:?} inputs for the vendored kernels (logged once)"
         );
     });
 }
@@ -370,9 +374,10 @@ fn log_cast_once(orig_dtype: DType) {
 /// reaches them uncopied. Any other layout gets a fresh contiguous copy.
 /// A non-4D `t` passes through, so the kernel's own validation rejects it.
 #[cfg(crane_fattn)]
-fn addressable(t: Tensor, elem_bytes: usize, batch_in_i32: bool) -> Result<Tensor> {
+fn addressable(t: Tensor, batch_in_i32: bool) -> Result<Tensor> {
     use crate::ops::fused_ops::fattn::check_kernel_layout;
 
+    let elem_bytes = t.dtype().size_in_bytes();
     if t.rank() != 4 || check_kernel_layout(t.layout(), elem_bytes, batch_in_i32, "").is_ok() {
         return Ok(t);
     }
@@ -700,29 +705,30 @@ mod gpu_tests {
         }
     }
 
-    // K/V at an element offset the kernels cannot address are copied and
+    // Q/K/V at an element offset the kernels cannot address are copied and
     // still served by the kernel, not left to the caller's SDPA.
     #[test]
     #[allow(clippy::many_single_char_names)]
-    fn try_causal_misaligned_kv_still_served() {
+    fn try_causal_misaligned_inputs_still_served() {
         let dev = test_gpu_device();
         let (b, hq, hkv, s, d) = (1, 8, 2, 256, 128);
-        let misaligned = |dtype: DType| {
-            let n = b * hkv * s * d;
+        let misaligned = |heads: usize, dtype: DType| {
+            let n = b * heads * s * d;
             Tensor::randn(0f32, 1f32, n + 1, &dev)
                 .unwrap()
                 .to_dtype(dtype)
                 .unwrap()
                 .narrow(0, 1, n)
                 .unwrap()
-                .reshape((b, hkv, s, d))
+                .reshape((b, heads, s, d))
                 .unwrap()
         };
-        // F32 K/V are cast to fresh F16 tensors, so only these two reach
+        // F32 inputs are cast to fresh F16 tensors, so only these two reach
         // the copy.
         for dtype in [DType::BF16, DType::F16] {
-            let q = narrowed_bhsd((b, hq, s, d), dtype, &dev);
-            let (k, v) = (misaligned(dtype), misaligned(dtype));
+            let q = misaligned(hq, dtype);
+            let (k, v) = (misaligned(hkv, dtype), misaligned(hkv, dtype));
+            assert_eq!(q.layout().start_offset(), 1);
             assert_eq!(k.layout().start_offset(), 1);
             assert_matches_contiguous_bitwise(&q, &k, &v);
         }
@@ -873,6 +879,41 @@ mod gpu_tests {
         let inp = inputs((1, 4, 2, 5, 11, 64), DType::F16);
         let [q, k, v] = &inp.gpu;
         assert!(try_causal(q, k, v, inp.scale).is_none());
+    }
+
+    // BF16 inputs on the cast path still match the reference, with Q cast
+    // straight to F16 like K/V. `bf16_disabled()` caches its env var for
+    // the life of the process, so run this alone:
+    // `cargo test -p crane-core --no-default-features --features
+    // "rocm,onnx" -- --ignored --exact
+    // models::modules::gpu_flash_attn::gpu_tests::bf16_disabled_matches_reference`
+    #[test]
+    #[ignore = "sets a process-global env var cached by bf16_disabled(), run alone"]
+    fn bf16_disabled_matches_reference() {
+        // SAFETY: run with `--exact`, alone in its own process, before any
+        // other code reads `CRANE_DISABLE_BF16_FLASH_ATTN`.
+        unsafe {
+            std::env::set_var("CRANE_DISABLE_BF16_FLASH_ATTN", "1");
+        }
+        check_try_causal((1, 4, 2, 8, 8, 128), DType::BF16, 3e-2);
+    }
+
+    // The tile kernel takes Q in F32. F32 Q reaches it uncast and F16 Q is
+    // widened, and both still match the reference. `mma_disabled()` caches
+    // its env var for the life of the process, so run this alone:
+    // `cargo test -p crane-core --no-default-features --features
+    // "rocm,onnx" -- --ignored --exact
+    // models::modules::gpu_flash_attn::gpu_tests::mma_disabled_matches_reference`
+    #[test]
+    #[ignore = "sets a process-global env var cached by mma_disabled(), run alone"]
+    fn mma_disabled_matches_reference() {
+        // SAFETY: run with `--exact`, alone in its own process, before any
+        // other code reads `CRANE_DISABLE_MMA_FLASH_ATTN`.
+        unsafe {
+            std::env::set_var("CRANE_DISABLE_MMA_FLASH_ATTN", "1");
+        }
+        check_try_causal((1, 4, 2, 20, 150, 128), DType::F16, 3e-2);
+        check_try_causal((1, 4, 2, 8, 8, 128), DType::F32, 6e-2);
     }
 
     /// Times `try_causal_with_mask` at the chunked-prefill `seq_kv` lengths
