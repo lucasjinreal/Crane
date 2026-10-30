@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use candle_core::{DType, Device, Result, Tensor, bail};
 
+#[cfg(not(feature = "rocm"))]
 use crate::utils::DeviceExt;
 
 use super::codec::{TernaryEncoding, dot_row};
@@ -370,7 +371,9 @@ pub(crate) fn fwht_blocks(values: &mut [f32], block_size: usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{GdnPermutation, HadamardMode, TernaryLinear, TernaryWeight, permute_gdn};
+    use super::{GdnPermutation, permute_gdn};
+    #[cfg(feature = "cuda")]
+    use super::{HadamardMode, TernaryLinear, TernaryWeight};
     #[cfg(feature = "cuda")]
     use crate::quantized::ternary::TernaryEncoding;
     #[cfg(feature = "cuda")]

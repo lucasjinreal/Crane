@@ -1,5 +1,7 @@
 //! CUDA vector-four Welford LayerNorm with explicit rounding order.
-use candle_core::{DType, Module, Result, Tensor};
+#[cfg(feature = "cuda")]
+use candle_core::DType;
+use candle_core::{Module, Result, Tensor};
 
 pub fn forward(norm: &candle_nn::LayerNorm, x: &Tensor) -> Result<Tensor> {
     #[cfg(feature = "cuda")]

@@ -2,8 +2,10 @@
 #[cfg(feature = "cuda")]
 mod cuda;
 #[cfg(feature = "cuda")]
+use candle_core::DType;
+#[cfg(feature = "cuda")]
 use candle_core::cuda_backend::cudarc::cublaslt::CudaBlasLT;
-use candle_core::{DType, Module, Result, Tensor};
+use candle_core::{Module, Result, Tensor};
 use candle_nn::VarBuilder;
 #[cfg(feature = "cuda")]
 use std::sync::Arc;
@@ -126,7 +128,7 @@ impl BiasedLinear {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::Device;
+    use candle_core::{DType, Device};
     fn check(device: &Device, dtype: DType) -> Result<()> {
         let w = (1..=8)
             .flat_map(|r| std::iter::repeat_n(r as f32, 8))
