@@ -575,7 +575,80 @@ pub(crate) fn validate_fattn_bshd(
             candle_core::bail!("fattn: {name} head_dim (last axis) must be contiguous");
         }
     }
+    // Q's batch offset is 32-bit in the kernels, K/V's is 64-bit.
+    check_kernel_layout(l_q, Q_ELEM_BYTES, true, "q")?;
+    check_kernel_layout(l_k, KV_ELEM_BYTES, false, "k")?;
+    check_kernel_layout(l_v, KV_ELEM_BYTES, false, "v")?;
     Ok((b, seq_q, h_q, d, seq_kv, h_kv))
+}
+
+/// Element size of Q, which every fattn entry takes in F32.
+pub(crate) const Q_ELEM_BYTES: usize = 4;
+
+/// Element size of K/V, which every fattn entry takes in F16 or BF16.
+pub(crate) const KV_ELEM_BYTES: usize = 2;
+
+/// Byte alignment the kernels' vector loads need for every row and head
+/// base address (llama.cpp's `nb[i] % 16` check in `fattn.cu`).
+const KERNEL_ALIGN_BYTES: usize = 16;
+
+/// Checks that the fattn kernels can address a `[B, S, H, D]` operand in any
+/// layout, not only a contiguous one. The kernels form head offsets (and Q's
+/// batch offset) as 32-bit `nb * index` products, and load rows with 16-byte
+/// vector reads. Axes of size 1 are skipped, since their stride is never
+/// multiplied by a nonzero index.
+///
+/// # Arguments
+///
+/// * `layout` - The operand's layout. It must be 4D, with a contiguous last
+///   axis (both checked by [`validate_fattn_bshd`]).
+/// * `elem_bytes` - Size of one element in bytes.
+/// * `batch_in_i32` - Whether the batch offset is also 32-bit (Q's `nb03`).
+/// * `what` - Operand name for the error message.
+///
+/// # Errors
+///
+/// Returns an unsupported-config error if the start offset or a stride is
+/// not a multiple of [`KERNEL_ALIGN_BYTES`], or if the largest 32-bit byte
+/// offset exceeds `i32::MAX`. The caller then copies the operand or falls
+/// back to SDPA.
+pub(crate) fn check_kernel_layout(
+    layout: &Layout,
+    elem_bytes: usize,
+    batch_in_i32: bool,
+    what: &str,
+) -> Result<()> {
+    let dims = layout.dims();
+    let stride = layout.stride();
+    let aligned = |n: usize| {
+        n.checked_mul(elem_bytes)
+            .is_some_and(|bytes| bytes % KERNEL_ALIGN_BYTES == 0)
+    };
+    let misaligned = !aligned(layout.start_offset())
+        || (0..3).any(|axis| dims[axis] > 1 && !aligned(stride[axis]));
+    if misaligned {
+        return Err(unsupported_config(format!(
+            "fattn: {what} start offset or strides {stride:?} not {KERNEL_ALIGN_BYTES}-byte aligned"
+        )));
+    }
+    // `None` once any product or sum overflows usize.
+    let mut extent = dims[3].checked_mul(elem_bytes);
+    for axis in usize::from(!batch_in_i32)..3 {
+        if dims[axis] > 1 {
+            extent = extent.and_then(|sum| {
+                (dims[axis] - 1)
+                    .checked_mul(stride[axis])?
+                    .checked_mul(elem_bytes)?
+                    .checked_add(sum)
+            });
+        }
+    }
+    if extent.is_none_or(|bytes| i32::try_from(bytes).is_err()) {
+        return Err(unsupported_config(format!(
+            "fattn: {what} spans past the kernel's 32-bit offsets (strides {stride:?})"
+        )));
+    }
+    Ok(())
 }
 
 /// CUDA/HIP cap the grid's y and z dimensions at 65535. The tile kernel puts
@@ -938,6 +1011,81 @@ mod tests {
         assert!(err.to_string().contains("head_dim in"));
     }
 
+    fn assert_unsupported(result: Result<()>) {
+        let err = result.expect_err("layout must be rejected");
+        assert!(
+            is_unsupported_config(&err),
+            "not an unsupported-config error: {err}"
+        );
+    }
+
+    // A misaligned K is rejected as unsupported-config by the shared
+    // validator, before any kernel-specific launch setup.
+    #[test]
+    fn validate_fattn_bshd_rejects_misaligned_k() {
+        let q = Layout::contiguous((1, 64, 2, 128));
+        let k = Layout::contiguous_with_offset((1, 64, 2, 128), 1);
+        assert_unsupported(validate_fattn_bshd(&q, &k, &q).map(|_| ()));
+    }
+
+    // A BSHD view of a BHSD tensor, and one of a narrowed KV-cache buffer
+    // with a nonzero start offset, are addressable without a copy.
+    #[test]
+    fn check_kernel_layout_accepts_strided_views() {
+        let bhsd = Layout::contiguous((2, 8, 1024, 128));
+        check_kernel_layout(&bhsd.transpose(1, 2).unwrap(), 4, true, "q").unwrap();
+        let cache = Layout::contiguous((2, 2, 4096, 256))
+            .narrow(2, 64, 1024)
+            .unwrap()
+            .transpose(1, 2)
+            .unwrap();
+        check_kernel_layout(&cache, 2, false, "k").unwrap();
+    }
+
+    // A start offset or a stride off the 16-byte grid is rejected as an
+    // unsupported config, not launched.
+    #[test]
+    fn check_kernel_layout_rejects_misaligned_layouts() {
+        let odd_offset = Layout::contiguous_with_offset((1, 64, 2, 128), 1);
+        assert_unsupported(check_kernel_layout(&odd_offset, 2, false, "k"));
+        // 68 F16 elements per row is 136 bytes, not a multiple of 16.
+        let odd_stride = Layout::new((1, 64, 1, 64).into(), vec![64 * 68, 68, 64, 1], 0);
+        assert_unsupported(check_kernel_layout(&odd_stride, 2, false, "k"));
+    }
+
+    // The stride of a size-1 axis is never used, so a misaligned one (as
+    // a single decode step can leave on the seq axis) is accepted.
+    #[test]
+    fn check_kernel_layout_ignores_size_one_axes() {
+        let decode = Layout::new((1, 1, 2, 64).into(), vec![7, 3, 64, 1], 0);
+        check_kernel_layout(&decode, 2, false, "k").unwrap();
+    }
+
+    // The 32-bit head offset bounds K, and Q's batch offset bounds Q only.
+    #[test]
+    fn check_kernel_layout_rejects_offsets_past_i32() {
+        // Two heads 2^30 F16 elements apart put the second head at 2^31 bytes.
+        let far_heads = Layout::new((1, 4, 2, 64).into(), vec![1 << 31, 64, 1 << 30, 1], 0);
+        assert_unsupported(check_kernel_layout(&far_heads, 2, false, "k"));
+        // Batch 2 of 2^29 F32 elements per item starts at 2^31 bytes.
+        let far_batch = Layout::new((2, 4, 2, 64).into(), vec![1 << 29, 128, 64, 1], 0);
+        assert_unsupported(check_kernel_layout(&far_batch, 4, true, "q"));
+        check_kernel_layout(&far_batch, 4, false, "k").unwrap();
+    }
+
+    // Strides whose byte products overflow usize are rejected, not wrapped
+    // into a small value that passes the i32 check.
+    #[test]
+    fn check_kernel_layout_rejects_overflowing_strides() {
+        // stride * 2 itself overflows.
+        let wrap = Layout::new((1, 4, 2, 64).into(), vec![0, 64, 1 << 63, 1], 0);
+        assert_unsupported(check_kernel_layout(&wrap, 2, false, "k"));
+        // stride * 2 fits and is aligned, but (heads - 1) * stride * 2 wraps
+        // to exactly 0.
+        let span = Layout::new((1, 4, 3, 64).into(), vec![0, 64, 1 << 62, 1], 0);
+        assert_unsupported(check_kernel_layout(&span, 2, false, "k"));
+    }
+
     // A fully-visible (no kv_offset/window) causal mask: entry (i, j) is 0
     // for j <= i, -inf for j > i.
     #[test]
@@ -1065,7 +1213,7 @@ mod tests {
 /// sibling modules reuse the same reference rather than duplicating it.
 #[cfg(all(test, crane_fattn))]
 pub(crate) mod test_support {
-    use candle_core::{Device, Tensor};
+    use candle_core::{DType, Device, Tensor};
     use candle_nn::ops::softmax_last_dim;
 
     /// The real GPU device these tests run against: CUDA when built with
@@ -1080,6 +1228,22 @@ pub(crate) mod test_support {
     #[cfg(all(feature = "rocm", not(feature = "cuda")))]
     pub(crate) fn test_gpu_device() -> Device {
         Device::new_rocm(0).expect("rocm device")
+    }
+
+    /// Random `[b, h, s, d]` view of a `[b, h, s + 16, d]` buffer narrowed
+    /// past its first 16 rows, like a model's KV cache. Its BSHD transpose
+    /// is the strided layout the kernels read without a copy.
+    pub(crate) fn narrowed_bhsd(
+        (b, h, s, d): (usize, usize, usize, usize),
+        dtype: DType,
+        dev: &Device,
+    ) -> Tensor {
+        Tensor::randn(0f32, 1f32, (b, h, s + 16, d), dev)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap()
+            .narrow(2, 16, s)
+            .unwrap()
     }
 
     /// Mask mode for [`naive_attention`], mirroring the fattn kernels' own

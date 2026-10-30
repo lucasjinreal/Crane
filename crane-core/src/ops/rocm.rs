@@ -51,6 +51,24 @@ pub fn device_ptr(
     slice_ptr(rocm_slice(storage, what)?, layout, dtype, what)
 }
 
+/// [`device_ptr`] for kernels that take explicit strides: any layout is
+/// accepted, not only a contiguous one. The caller must check that the
+/// kernel can address `layout` first. For the fattn kernels, that is
+/// `fattn::check_kernel_layout`, run by `fattn::validate_fattn_bshd`.
+///
+/// # Errors
+///
+/// Returns an error if `storage` is not `ROCm` storage, or if the slice's
+/// dtype is not `dtype`.
+pub(crate) fn strided_device_ptr(
+    storage: &Storage,
+    layout: &Layout,
+    dtype: DType,
+    what: &str,
+) -> Result<*mut c_void> {
+    ptr_at_start(rocm_slice(storage, what)?, layout, dtype, what)
+}
+
 /// [`device_ptr`] for a slice already unwrapped from its `Storage`/`RocmStorage`
 /// wrapper — what `CustomOp2::rocm_fwd` implementations receive directly.
 ///
@@ -67,6 +85,16 @@ pub fn slice_ptr(
     if !layout.is_contiguous() {
         candle_core::bail!("{what} must be contiguous");
     }
+    ptr_at_start(slice, layout, dtype, what)
+}
+
+/// Pointer to `layout`'s first element, after checking `slice`'s dtype.
+fn ptr_at_start(
+    slice: &RocmStorageSlice,
+    layout: &Layout,
+    dtype: DType,
+    what: &str,
+) -> Result<*mut c_void> {
     if slice.dtype() != dtype {
         candle_core::bail!("{what} must be {dtype:?}, got {:?}", slice.dtype());
     }
