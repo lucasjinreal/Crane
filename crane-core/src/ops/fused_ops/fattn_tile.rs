@@ -3,9 +3,9 @@
 //! kernel (`kernels/cuda/fattn/fattn_tile.cuh`), the MMA kernel's fallback.
 //! See `fattn_tile.cuh`'s module doc for why only one `(ncols1, ncols2) =
 //! (16, 1)` tier per `head_dim` is instantiated. Same manual-dispatch
-//! rationale, mixed-precision contract (`q` F32, `k`/`v`/`mask` F16, see
-//! `fattn_mma`'s module doc for why), and mask/`KV_max`-honoring contract as
+//! rationale and mask/`KV_max`-honoring contract as
 //! [`super::fattn_mma::fattn_mma_prefill`]; see that module's doc comment.
+//! `q` is F32 and `k`/`v`/`mask` are F16, unlike the MMA kernels.
 //!
 //! Unlike the MMA kernel, the tile kernel needs no dynamic shared memory
 //! (`nbytes_shared = 0` in upstream's `launch_fattn_tile_switch_ncols1`),
@@ -104,8 +104,7 @@ pub fn fattn_tile_prefill(
     kv_max: Option<&Tensor>,
     scale: f32,
 ) -> Result<Tensor> {
-    // See fattn_mma's doc comment: upstream requires q to stay F32 while
-    // k/v are F16, the same mixed-precision contract this kernel shares.
+    // See this module's doc comment: q stays F32 while k/v are F16.
     if q.dtype() != DType::F32 {
         candle_core::bail!("fattn_tile: q must be F32, got {:?}", q.dtype());
     }
@@ -351,7 +350,7 @@ mod cuda {
         let (q_s, q_l) = q.storage_and_layout();
         let (k_s, k_l) = k.storage_and_layout();
         let (v_s, v_l) = v.storage_and_layout();
-        let (b, seq_q, h_q, d, seq_kv, h_kv) = validate_fattn_bshd(q_l, k_l, v_l)?;
+        let (b, seq_q, h_q, d, seq_kv, h_kv) = validate_fattn_bshd(q_l, k_l, v_l, q.dtype())?;
         let gqa_ratio = h_q / h_kv;
         let dev = q.device().as_cuda_device()?.clone();
         let is_amd = false;
@@ -399,6 +398,7 @@ mod cuda {
             seq_kv,
             h_kv,
             scale,
+            q.dtype(),
         )?;
 
         let n_out = b * seq_q * h_q * d;
@@ -532,7 +532,7 @@ mod rocm {
         let (q_s, q_l) = q.storage_and_layout();
         let (k_s, k_l) = k.storage_and_layout();
         let (v_s, v_l) = v.storage_and_layout();
-        let (b, seq_q, h_q, d, seq_kv, h_kv) = validate_fattn_bshd(q_l, k_l, v_l)?;
+        let (b, seq_q, h_q, d, seq_kv, h_kv) = validate_fattn_bshd(q_l, k_l, v_l, q.dtype())?;
         let gqa_ratio = h_q / h_kv;
         let dev = q.device().as_rocm_device()?.clone();
         let is_amd = true;
@@ -570,6 +570,7 @@ mod rocm {
             seq_kv,
             h_kv,
             scale,
+            q.dtype(),
         )?;
 
         let n_out = b * seq_q * h_q * d;
