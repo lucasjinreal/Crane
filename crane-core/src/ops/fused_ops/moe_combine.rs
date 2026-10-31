@@ -150,7 +150,9 @@ mod sycl_impl {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "sycl")]
     use super::*;
+    #[cfg(feature = "sycl")]
     use candle_core::Device;
 
     /// The SYCL kernel against the portable chain, with and without a row
