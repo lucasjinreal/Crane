@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 //! Shared types, per-architecture tuning tables, and kernel-selection logic
 //! for the vendored flash-attention MMA ([`super::fattn_mma`]) and tile
-//! ([`super::fattn_tile`]) kernel dispatchers. Currently supports only (see
-//! `kernels/cuda/fattn/`'s module docs): `parallel_blocks=1`, no stream-K,
-//! F16 only, `head_dim` in {64, 128, 256, 512}.
+//! ([`super::fattn_tile`]) kernel dispatchers. Supports (see
+//! `kernels/cuda/fattn/`'s module docs): `parallel_blocks=1`, stream-K for the
+//! MMA kernels, F16 and BF16, `head_dim` in {64, 128, 256, 512}.
 //!
 //! Ports llama.cpp's `ggml_cuda_fattn_mma_get_config_{ampere,rdna}` tuning
 //! tables (`kernels/cuda/fattn/fattn_mma_f16.cuh`) and its
@@ -96,15 +96,14 @@ pub(crate) const FATTN_KQ_STRIDE: usize = 256;
 
 /// Mirrors llama.cpp's `fattn_mma_config` (`fattn_mma_f16.cuh`): per-launch
 /// tuning knobs selected by `(head_dim, ncols1*ncols2)`. Fields map directly
-/// to the kernel's `__launch_bounds__`/shared-memory sizing. Upstream's
-/// `occupancy` field (a hint for `cudaOccupancyMaxActiveBlocksPerMultiprocessor`-
-/// driven `parallel_blocks` tuning) is dropped: `parallel_blocks=1`
-/// unconditionally (see this module's doc comment), so occupancy is never
-/// consulted.
+/// to the kernel's `__launch_bounds__`/shared-memory sizing.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FattnMmaConfig {
     /// Threads per block (`block_dim.x * block_dim.y`).
     pub nthreads: usize,
+    /// Targeted blocks per SM/CU, the kernel's `__launch_bounds__` hint. It
+    /// sizes the stream-K grid (see [`stream_k_grid`]).
+    pub occupancy: usize,
     /// KV rows processed per inner-loop iteration.
     pub nbatch_fa: usize,
     /// K rows staged in shared memory per `nbatch_fa` chunk.
@@ -129,16 +128,16 @@ pub(crate) struct FattnMmaConfig {
 fn mma_config_ampere(dkq: usize, ncols: usize) -> Option<FattnMmaConfig> {
     use FattnMmaConfig as C;
     Some(match (dkq, ncols) {
-        (64, 8) => C { nthreads: 128, nbatch_fa: 128, nbatch_k2: 32, nbatch_v2: 32, nbatch_combine: 32, nstages_target: 2, q_in_reg: true },
-        (64, 16 | 32 | 64) => C { nthreads: 128, nbatch_fa: 64, nbatch_k2: 32, nbatch_v2: 32, nbatch_combine: 32, nstages_target: 2, q_in_reg: true },
-        (128, 8) => C { nthreads: 128, nbatch_fa: 128, nbatch_k2: 64, nbatch_v2: 64, nbatch_combine: 64, nstages_target: 2, q_in_reg: true },
-        (128, 16 | 32 | 64) => C { nthreads: 128, nbatch_fa: 64, nbatch_k2: 64, nbatch_v2: 64, nbatch_combine: 64, nstages_target: 2, q_in_reg: true },
-        (256, 8) => C { nthreads: 128, nbatch_fa: 64, nbatch_k2: 128, nbatch_v2: 128, nbatch_combine: 128, nstages_target: 2, q_in_reg: true },
-        (256, 16) => C { nthreads: 64, nbatch_fa: 32, nbatch_k2: 128, nbatch_v2: 128, nbatch_combine: 128, nstages_target: 2, q_in_reg: true },
-        (256, 32 | 64) => C { nthreads: 128, nbatch_fa: 32, nbatch_k2: 128, nbatch_v2: 128, nbatch_combine: 128, nstages_target: 2, q_in_reg: true },
-        (512, 8 | 16) => C { nthreads: 64, nbatch_fa: 32, nbatch_k2: 256, nbatch_v2: 256, nbatch_combine: 128, nstages_target: 1, q_in_reg: false },
-        (512, 32) => C { nthreads: 128, nbatch_fa: 32, nbatch_k2: 128, nbatch_v2: 128, nbatch_combine: 128, nstages_target: 1, q_in_reg: false },
-        (512, 64) => C { nthreads: 256, nbatch_fa: 32, nbatch_k2: 128, nbatch_v2: 128, nbatch_combine: 128, nstages_target: 1, q_in_reg: false },
+        (64, 8) => C { nthreads: 128, occupancy: 2, nbatch_fa: 128, nbatch_k2: 32, nbatch_v2: 32, nbatch_combine: 32, nstages_target: 2, q_in_reg: true },
+        (64, 16 | 32 | 64) => C { nthreads: 128, occupancy: 2, nbatch_fa: 64, nbatch_k2: 32, nbatch_v2: 32, nbatch_combine: 32, nstages_target: 2, q_in_reg: true },
+        (128, 8) => C { nthreads: 128, occupancy: 2, nbatch_fa: 128, nbatch_k2: 64, nbatch_v2: 64, nbatch_combine: 64, nstages_target: 2, q_in_reg: true },
+        (128, 16 | 32 | 64) => C { nthreads: 128, occupancy: 2, nbatch_fa: 64, nbatch_k2: 64, nbatch_v2: 64, nbatch_combine: 64, nstages_target: 2, q_in_reg: true },
+        (256, 8) => C { nthreads: 128, occupancy: 2, nbatch_fa: 64, nbatch_k2: 128, nbatch_v2: 128, nbatch_combine: 128, nstages_target: 2, q_in_reg: true },
+        (256, 16) => C { nthreads: 64, occupancy: 4, nbatch_fa: 32, nbatch_k2: 128, nbatch_v2: 128, nbatch_combine: 128, nstages_target: 2, q_in_reg: true },
+        (256, 32 | 64) => C { nthreads: 128, occupancy: 2, nbatch_fa: 32, nbatch_k2: 128, nbatch_v2: 128, nbatch_combine: 128, nstages_target: 2, q_in_reg: true },
+        (512, 8 | 16) => C { nthreads: 64, occupancy: 4, nbatch_fa: 32, nbatch_k2: 256, nbatch_v2: 256, nbatch_combine: 128, nstages_target: 1, q_in_reg: false },
+        (512, 32) => C { nthreads: 128, occupancy: 2, nbatch_fa: 32, nbatch_k2: 128, nbatch_v2: 128, nbatch_combine: 128, nstages_target: 1, q_in_reg: false },
+        (512, 64) => C { nthreads: 256, occupancy: 1, nbatch_fa: 32, nbatch_k2: 128, nbatch_v2: 128, nbatch_combine: 128, nstages_target: 1, q_in_reg: false },
         _ => return None,
     })
 }
@@ -149,13 +148,13 @@ fn mma_config_ampere(dkq: usize, ncols: usize) -> Option<FattnMmaConfig> {
 fn mma_config_rdna(dkq: usize, ncols: usize) -> Option<FattnMmaConfig> {
     use FattnMmaConfig as C;
     Some(match (dkq, ncols) {
-        (64, 8 | 16 | 32 | 64) => C { nthreads: 128, nbatch_fa: 64, nbatch_k2: 32, nbatch_v2: 32, nbatch_combine: 32, nstages_target: 1, q_in_reg: true },
-        (128, 8 | 16) => C { nthreads: 64, nbatch_fa: 32, nbatch_k2: 64, nbatch_v2: 64, nbatch_combine: 64, nstages_target: 1, q_in_reg: true },
-        (128, 32 | 64) => C { nthreads: 128, nbatch_fa: 64, nbatch_k2: 64, nbatch_v2: 64, nbatch_combine: 64, nstages_target: 1, q_in_reg: true },
-        (256, 8 | 16) => C { nthreads: 64, nbatch_fa: 32, nbatch_k2: 128, nbatch_v2: 128, nbatch_combine: 128, nstages_target: 1, q_in_reg: true },
-        (256, 32 | 64) => C { nthreads: 256, nbatch_fa: 64, nbatch_k2: 128, nbatch_v2: 128, nbatch_combine: 64, nstages_target: 1, q_in_reg: true },
-        (512, 8 | 16) => C { nthreads: 128, nbatch_fa: 64, nbatch_k2: 96, nbatch_v2: 64, nbatch_combine: 128, nstages_target: 1, q_in_reg: true },
-        (512, 32 | 64) => C { nthreads: 128, nbatch_fa: 32, nbatch_k2: 128, nbatch_v2: 128, nbatch_combine: 128, nstages_target: 1, q_in_reg: true },
+        (64, 8 | 16 | 32 | 64) => C { nthreads: 128, occupancy: 2, nbatch_fa: 64, nbatch_k2: 32, nbatch_v2: 32, nbatch_combine: 32, nstages_target: 1, q_in_reg: true },
+        (128, 8 | 16) => C { nthreads: 64, occupancy: 2, nbatch_fa: 32, nbatch_k2: 64, nbatch_v2: 64, nbatch_combine: 64, nstages_target: 1, q_in_reg: true },
+        (128, 32 | 64) => C { nthreads: 128, occupancy: 2, nbatch_fa: 64, nbatch_k2: 64, nbatch_v2: 64, nbatch_combine: 64, nstages_target: 1, q_in_reg: true },
+        (256, 8 | 16) => C { nthreads: 64, occupancy: 2, nbatch_fa: 32, nbatch_k2: 128, nbatch_v2: 128, nbatch_combine: 128, nstages_target: 1, q_in_reg: true },
+        (256, 32 | 64) => C { nthreads: 256, occupancy: 2, nbatch_fa: 64, nbatch_k2: 128, nbatch_v2: 128, nbatch_combine: 64, nstages_target: 1, q_in_reg: true },
+        (512, 8 | 16) => C { nthreads: 128, occupancy: 3, nbatch_fa: 64, nbatch_k2: 96, nbatch_v2: 64, nbatch_combine: 128, nstages_target: 1, q_in_reg: true },
+        (512, 32 | 64) => C { nthreads: 128, occupancy: 2, nbatch_fa: 32, nbatch_k2: 128, nbatch_v2: 128, nbatch_combine: 128, nstages_target: 1, q_in_reg: true },
         _ => return None,
     })
 }
@@ -197,13 +196,13 @@ pub(crate) fn mma_config(dkq: usize, ncols: usize, is_amd: bool) -> Result<Fattn
 fn mma_config_bf16_rdna(dkq: usize, ncols: usize) -> Option<FattnMmaConfig> {
     use FattnMmaConfig as C;
     Some(match (dkq, ncols) {
-        (64, 8 | 16 | 32 | 64) => C { nthreads: 128, nbatch_fa: 64, nbatch_k2: 32, nbatch_v2: 32, nbatch_combine: 32, nstages_target: 1, q_in_reg: true },
-        (128, 8 | 16) => C { nthreads: 64, nbatch_fa: 32, nbatch_k2: 64, nbatch_v2: 64, nbatch_combine: 64, nstages_target: 1, q_in_reg: true },
-        (128, 32 | 64) => C { nthreads: 128, nbatch_fa: 32, nbatch_k2: 64, nbatch_v2: 64, nbatch_combine: 64, nstages_target: 1, q_in_reg: true },
-        (256, 8 | 16) => C { nthreads: 64, nbatch_fa: 32, nbatch_k2: 128, nbatch_v2: 128, nbatch_combine: 128, nstages_target: 1, q_in_reg: true },
-        (256, 32 | 64) => C { nthreads: 256, nbatch_fa: 64, nbatch_k2: 128, nbatch_v2: 128, nbatch_combine: 64, nstages_target: 1, q_in_reg: true },
-        (512, 8 | 16) => C { nthreads: 128, nbatch_fa: 64, nbatch_k2: 96, nbatch_v2: 64, nbatch_combine: 128, nstages_target: 1, q_in_reg: true },
-        (512, 32 | 64) => C { nthreads: 128, nbatch_fa: 32, nbatch_k2: 128, nbatch_v2: 128, nbatch_combine: 128, nstages_target: 1, q_in_reg: true },
+        (64, 8 | 16 | 32 | 64) => C { nthreads: 128, occupancy: 2, nbatch_fa: 64, nbatch_k2: 32, nbatch_v2: 32, nbatch_combine: 32, nstages_target: 1, q_in_reg: true },
+        (128, 8 | 16) => C { nthreads: 64, occupancy: 2, nbatch_fa: 32, nbatch_k2: 64, nbatch_v2: 64, nbatch_combine: 64, nstages_target: 1, q_in_reg: true },
+        (128, 32 | 64) => C { nthreads: 128, occupancy: 2, nbatch_fa: 32, nbatch_k2: 64, nbatch_v2: 64, nbatch_combine: 64, nstages_target: 1, q_in_reg: true },
+        (256, 8 | 16) => C { nthreads: 64, occupancy: 2, nbatch_fa: 32, nbatch_k2: 128, nbatch_v2: 128, nbatch_combine: 128, nstages_target: 1, q_in_reg: true },
+        (256, 32 | 64) => C { nthreads: 256, occupancy: 2, nbatch_fa: 64, nbatch_k2: 128, nbatch_v2: 128, nbatch_combine: 64, nstages_target: 1, q_in_reg: true },
+        (512, 8 | 16) => C { nthreads: 128, occupancy: 3, nbatch_fa: 64, nbatch_k2: 96, nbatch_v2: 64, nbatch_combine: 128, nstages_target: 1, q_in_reg: true },
+        (512, 32 | 64) => C { nthreads: 128, occupancy: 2, nbatch_fa: 32, nbatch_k2: 128, nbatch_v2: 128, nbatch_combine: 128, nstages_target: 1, q_in_reg: true },
         _ => return None,
     })
 }
@@ -528,6 +527,87 @@ pub(crate) fn q_tiles(seq_q: usize, ncols1: usize) -> usize {
 /// GQA-group tile count along the grid's z axis: `ceil(gqa_ratio / ncols2)`.
 pub(crate) fn gqa_z_tiles(gqa_ratio: usize, ncols2: usize) -> usize {
     gqa_ratio.div_ceil(ncols2)
+}
+
+///// Stream-K ////////////////////////////////////////////////////////////
+
+/// Grid size of a stream-K MMA launch splitting `ntiles` output tiles of
+/// `iter_k` KV blocks each evenly across `max_blocks` resident blocks.
+/// Rounds down to a multiple of `ntiles` when that costs at most 5% of the
+/// blocks, otherwise uses `min(max_blocks, ntiles * iter_k)` as-is.
+///
+/// Port of llama.cpp's `launch_fattn` rule (`fattn-common.cuh`) for AMD at
+/// `head_dim` 64, the only shape that still auto-splits (see
+/// `LaunchGeometry::new`); every other shape uses one block per tile.
+///
+/// # Errors
+///
+/// Returns an error if `ntiles * iter_k` overflows `usize`.
+pub(crate) fn stream_k_grid(ntiles: usize, iter_k: usize, max_blocks: usize) -> Result<usize> {
+    let total = ntiles.checked_mul(iter_k).ok_or_else(|| {
+        candle_core::Error::Msg(format!(
+            "fattn_mma: ntiles ({ntiles}) * iter_k ({iter_k}) overflows usize"
+        ))
+    })?;
+    let raw = max_blocks.min(total);
+    let rounded = raw / ntiles * ntiles;
+    let loss_percent = if rounded > 0 {
+        100 * (raw - rounded) / raw
+    } else {
+        100
+    };
+    Ok(if loss_percent <= 5 { rounded } else { raw })
+}
+
+/// Whether a block boundary of a `grid`-block launch over `total` units
+/// (`ntiles * iter_k`) falls inside a tile of `iter_k` units. Only then do
+/// blocks share a tile and need the fixup pass. The boundaries are the
+/// kernel's own, `b * total / grid`.
+///
+/// # Errors
+///
+/// Returns an error if `b * total` overflows `usize` for some block index
+/// `b` in `1..grid`.
+pub(crate) fn stream_k_needs_fixup(total: usize, grid: usize, iter_k: usize) -> Result<bool> {
+    for b in 1..grid {
+        let boundary = b.checked_mul(total).ok_or_else(|| {
+            candle_core::Error::Msg(format!(
+                "fattn_mma: b ({b}) * total ({total}) overflows usize"
+            ))
+        })?;
+        if !(boundary / grid).is_multiple_of(iter_k) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// F32 elements of the fixup scratch buffer for `grid` blocks of `ncols`
+/// columns at `head_dim`. See `kernels/cuda/fattn/fattn_fixup.cuh` for the
+/// layout.
+///
+/// # Errors
+///
+/// Returns an error if the scratch length overflows `usize`.
+pub(crate) fn fixup_scratch_len(grid: usize, ncols: usize, head_dim: usize) -> Result<usize> {
+    2usize
+        .checked_mul(grid)
+        .and_then(|n| n.checked_mul(ncols))
+        .and_then(|n| n.checked_mul(2 + head_dim))
+        .ok_or_else(|| {
+            candle_core::Error::Msg(format!(
+                "fattn_mma: fixup scratch length overflows usize \
+                 (grid={grid}, ncols={ncols}, head_dim={head_dim})"
+            ))
+        })
+}
+
+/// `crane_fattn_fixup_{f16,bf16}_d{dkq}_c{ncols1}_s{ncols2}`, the fixup entry
+/// of the matching MMA kernel. See `fattn_fixup.cuh`'s
+/// `DECL_CRANE_FATTN_FIXUP`.
+pub(crate) fn fixup_kernel_name(dkq: usize, ncols1: usize, ncols2: usize, bf16: bool) -> String {
+    let tag = if bf16 { "bf16" } else { "f16" };
+    format!("crane_fattn_fixup_{tag}_d{dkq}_c{ncols1}_s{ncols2}")
 }
 
 /// Shared shape/stride validation for the fattn kernels: checks k/v
@@ -1219,6 +1299,73 @@ mod tests {
                 "tile {t} bound {bound} must be a FATTN_KQ_STRIDE multiple, not truncated to the unaligned seq_kv={seq_kv}"
             );
         }
+    }
+
+    // With more tiles than resident blocks the grid is the resident block
+    // count.
+    #[test]
+    fn stream_k_grid_uses_the_resident_block_count() {
+        assert_eq!(stream_k_grid(512, 4, 140).unwrap(), 140);
+        assert_eq!(stream_k_grid(128, 4, 128).unwrap(), 128);
+    }
+
+    // The grid rounds down to a multiple of `ntiles` only when that costs at
+    // most 5% of the blocks.
+    #[test]
+    fn stream_k_rounds_to_whole_tiles_within_five_percent() {
+        assert_eq!(stream_k_grid(30, 8, 124).unwrap(), 120);
+        assert_eq!(stream_k_grid(30, 8, 128).unwrap(), 128);
+    }
+
+    // The grid never exceeds the number of units to hand out.
+    #[test]
+    fn stream_k_grid_is_capped_by_the_work() {
+        assert_eq!(stream_k_grid(4, 2, 128).unwrap(), 8);
+    }
+
+    // `ntiles * iter_k` overflowing `usize` is reported, not wrapped.
+    #[test]
+    fn stream_k_grid_reports_overflow() {
+        assert!(stream_k_grid(usize::MAX, 2, 128).is_err());
+    }
+
+    // A seam inside a tile exists exactly when some block boundary is not a
+    // multiple of `iter_k`.
+    #[test]
+    fn needs_fixup_only_for_seams_inside_tiles() {
+        // 30 tiles of 4 blocks.
+        assert!(stream_k_needs_fixup(120, 120, 4).unwrap());
+        assert!(stream_k_needs_fixup(120, 60, 4).unwrap());
+        assert!(stream_k_needs_fixup(120, 31, 4).unwrap());
+        assert!(stream_k_needs_fixup(120, 29, 4).unwrap());
+        assert!(!stream_k_needs_fixup(120, 30, 4).unwrap());
+        assert!(!stream_k_needs_fixup(120, 1, 4).unwrap());
+        assert!(!stream_k_needs_fixup(120, 15, 4).unwrap());
+    }
+
+    // The scratch holds both meta arrays and both data regions.
+    #[test]
+    fn fixup_scratch_len_covers_meta_and_both_data_regions() {
+        let (grid, ncols, d) = (120, 64, 256);
+        let meta_floats = 2 * 2 * grid * ncols;
+        let data_floats = 2 * grid * ncols * d;
+        assert_eq!(
+            fixup_scratch_len(grid, ncols, d).unwrap(),
+            meta_floats + data_floats
+        );
+    }
+
+    // The fixup entry carries the dtype tag and the kernel's tile shape.
+    #[test]
+    fn fixup_kernel_name_matches_decl_macro_naming() {
+        assert_eq!(
+            fixup_kernel_name(256, 16, 4, false),
+            "crane_fattn_fixup_f16_d256_c16_s4"
+        );
+        assert_eq!(
+            fixup_kernel_name(128, 8, 2, true),
+            "crane_fattn_fixup_bf16_d128_c8_s2"
+        );
     }
 }
 

@@ -57,6 +57,7 @@
 #include "cp_async.cuh"
 #include "mma.cuh"
 #include "fattn_common.cuh"
+#include "fattn_fixup.cuh"
 #include "swizzle.cuh"
 
 using namespace ggml_cuda_mma;
@@ -1734,15 +1735,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                         if constexpr (is_fixup) {
                             dstk_fixup_data[jc_dst*(DV/2) + k00 + k] = dstk_val;
                         } else if constexpr (needs_fixup) {
-                            // dst holds the final half output, so it can't
-                            // hold a needs_fixup block's unnormalized float
-                            // partials. Trap rather than silently corrupt
-                            // the output if a launch ever splits a tile
-                            // across blocks. Also update
-                            // flash_attn_combine_results in
-                            // fattn_common.cuh, which still writes
-                            // float* dst.
-                            NO_DEVICE_CODE;
+                            // dst holds the final half output, so this
+                            // block's unnormalized float partial goes to
+                            // its own data region of the fixup buffer
+                            // (see fattn_fixup.cuh).
+                            dstk_fixup_data[gridDim.x*(ncols*(DV/2)) + jc_dst*(DV/2) + k00 + k] = dstk_val;
                         } else {
                             dstk[((jt*ncols1 + j_dst)*ne02 + c_dst)*(DV/2) + k00 + k] = __float22half2_rn(dstk_val);
                         }
@@ -1750,9 +1747,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 }
             }
         }
-        if (np > 1) {
-            __syncthreads();
-        }
+        // Unconditional: when a stream-K block's kbc range spans more
+        // than one tile, this function is called again for the next
+        // tile of the same block, reusing `tile_Q`/`tile_mask`.
+        // Skipping this barrier when `np == 1` let the next call's Q
+        // load race the still-in-flight reads of this call's combine
+        // stage above. Observed on AMD hd64.
+        __syncthreads();
     }
 #else
     GGML_UNUSED_VARS(Q_h2, K_h2, V_h2, mask_h, indices, sinks_f, dstk, dstk_fixup,
@@ -1918,6 +1919,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16(
             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup>
                 (Q_h2, K_h2, V_h2, mask_h, indices, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
                  ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop, causal_kv_offset);
+        } else if (kb0_start >= kb0_stop) {
+            // The causal bound ends the tile before this segment starts.
+            crane_fattn_write_empty_partial<DV, ncols>(dst_meta, blockIdx.x, gridDim.x + blockIdx.x);
         } else {
             constexpr bool needs_fixup = true; // CUDA block is missing the beginning of a tile.
             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup>
@@ -1962,6 +1966,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16(
     if (causal_kv_offset >= 0) {
         const int kv_end = min((jt + 1)*ncols1, (int) ne01.z) + causal_kv_offset;
         kb0_stop = min(kb0_stop, (kv_end + nbatch_fa - 1) / nbatch_fa);
+    }
+
+    if (kb0_start >= kb0_stop) {
+        // The causal bound ends the tile before this segment starts.
+        crane_fattn_write_empty_partial<DV, ncols>(dst_meta, gridDim.x + blockIdx.x, blockIdx.x);
+        return;
     }
 
     constexpr bool is_fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
@@ -2010,4 +2020,5 @@ static __device__ __forceinline__ void flash_attn_ext_f16(
             ne10, ne11, ne12, ne13, nb11, nb12, nb13,                                                    \
             nb21, nb22, nb23, ne31, ne32, ne33, nb31, nb32, nb33,                                        \
             causal_kv_offset);                                                                          \
-    }
+    }                                                                                                    \
+    DECL_CRANE_FATTN_FIXUP(f16, half, DV_, ncols1_, ncols2_)

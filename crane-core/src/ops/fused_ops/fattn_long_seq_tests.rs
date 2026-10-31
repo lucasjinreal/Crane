@@ -360,7 +360,7 @@ fn check_f64(
 /// on peaked softmax rows, so it gets a looser limit than BF16 despite the
 /// longer mantissa. Real bugs have been off by whole units, far outside
 /// either.
-fn tolerance(dtype: DType) -> Tolerance {
+pub(super) fn tolerance(dtype: DType) -> Tolerance {
     if dtype == DType::BF16 {
         Tolerance {
             atol: 1e-2,
@@ -600,7 +600,7 @@ impl Report {
 /// 256), that is one more rounding of Q, and on peaked rows it costs more
 /// than the tolerance. The product of two 16-bit values is exact in an f32,
 /// so rounding it once reproduces the kernels' result.
-fn scaled_q(q: &[f32], scale: f32, dtype: DType) -> Vec<f32> {
+pub(super) fn scaled_q(q: &[f32], scale: f32, dtype: DType) -> Vec<f32> {
     let scale = round_to(vec![scale], dtype)[0];
     round_to(q.iter().map(|x| x * scale).collect(), dtype)
 }
@@ -630,7 +630,7 @@ pub(super) fn to_host(t: &Tensor) -> Vec<f32> {
 }
 
 /// Whether `a` and `b` hold the same bits, NaN payloads included.
-fn bitwise_eq(a: &[f32], b: &[f32]) -> bool {
+pub(super) fn bitwise_eq(a: &[f32], b: &[f32]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
 }
 

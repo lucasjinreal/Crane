@@ -35,10 +35,9 @@
  * `quantize_q8_1_to_shared`, `dequantize_V_*`, `get_vec_dot_KQ`,
  * `get_dequantize_V`. Only `vec_dot_fattn_vec_KQ_f16` is kept.
  *
- * `flash_attn_combine_results` and the stream-K fixup kernels are kept
- * unused in Phase 1 (`parallel_blocks=1`, no stream-K) but compile as-is:
- * they take raw pointers with no `ggml` dependency, ready for the
- * follow-up phase that adds parallel blocks/stream-K.
+ * `flash_attn_combine_results` and the stream-K fixup kernels below are
+ * unused (`parallel_blocks=1`). The MMA kernels use `fattn_fixup.cuh`'s
+ * fixup instead, which keeps the partials in an F32 buffer.
  */
 #pragma once
 

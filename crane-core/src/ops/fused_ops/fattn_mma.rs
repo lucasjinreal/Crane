@@ -27,12 +27,13 @@
 //! to keep unconditional.
 #![cfg(crane_fattn)]
 
-use candle_core::{DType, Layout, Result, Tensor};
+use candle_core::{DType, Device, Layout, Result, Tensor};
 
 use super::fattn::{
-    FATTN_KQ_STRIDE, MAX_GRID_X_DIM, gqa_z_tiles, init_fastdiv_values, is_amd_backend, mma_config,
-    mma_config_bf16, mma_shared_mem_bytes, mma_shared_mem_bytes_bf16, q_tiles, select_mma_ncols,
-    select_mma_ncols_bf16, unsupported_config,
+    FATTN_KQ_STRIDE, FattnMmaConfig, MAX_GRID_X_DIM, fixup_scratch_len, gqa_z_tiles,
+    init_fastdiv_values, is_amd_backend, mma_config, mma_config_bf16, mma_shared_mem_bytes,
+    mma_shared_mem_bytes_bf16, q_tiles, select_mma_ncols, select_mma_ncols_bf16, stream_k_grid,
+    stream_k_needs_fixup, unsupported_config,
 };
 
 /// Bounds-checked scalar arguments for a `crane_fattn_mma_f16_*` launch,
@@ -250,98 +251,309 @@ fn to_u64(n: usize) -> Result<u64> {
         .map_err(|_| candle_core::Error::Msg(format!("fattn_mma: {n} exceeds u64::MAX")))
 }
 
-/// Grid/launch geometry for `parallel_blocks=1`: port of `launch_fattn`'s
-/// `block_dim`/`blocks_num` computation (`fattn-common.cuh`, not vendored,
-/// see `fattn.rs`'s module doc). Fixed at one block per (query tile, GQA
-/// group, KV head, batch element) rather than upstream's occupancy-driven
-/// `parallel_blocks` search.
+/// Shape of one launch, everything [`LaunchGeometry::new`] needs besides the
+/// kernel choice. `seq_kv` is `k`'s length after any GQA padding.
+#[derive(Debug, Clone, Copy)]
+struct LaunchShape {
+    /// Q's sequence length.
+    seq_q: usize,
+    /// K/V's sequence length, after any GQA padding.
+    seq_kv: usize,
+    /// Number of KV heads.
+    h_kv: usize,
+    /// Batch size.
+    batch: usize,
+    /// Q heads per KV head (`num_heads_q / h_kv`).
+    gqa_ratio: usize,
+}
+
+/// Which instantiated MMA kernel a launch targets, everything
+/// [`LaunchGeometry::new`] needs to pick the config table and shared-memory
+/// sizing besides the launch's shape/target.
+#[derive(Debug, Clone, Copy)]
+struct KernelVariant {
+    /// `head_dim`, one of {64, 128, 256, 512}.
+    dkq: usize,
+    /// Q rows per tile.
+    ncols1: usize,
+    /// GQA heads per tile.
+    ncols2: usize,
+    /// Whether this dispatch targets the AMD/ROCm backend.
+    is_amd: bool,
+    /// Whether `q`/`k`/`v` are BF16 (picks the BF16 config table).
+    bf16: bool,
+}
+
+/// What the stream-K grid choice needs from the device.
+#[derive(Debug, Clone, Copy)]
+struct GridTarget {
+    /// SMs (NVIDIA) or CUs (AMD).
+    n_sm: usize,
+    /// Overrides the policy's grid size. Tests only.
+    forced_grid: Option<usize>,
+}
+
+/// Grid/launch geometry of an MMA launch, with the stream-K fixup pass when
+/// the grid splits tiles across blocks.
 struct LaunchGeometry {
     grid: (u32, u32, u32),
     block: (u32, u32, u32),
     shared_mem_bytes: u32,
+    /// The fixup launch and its scratch buffer, or `None` when every block
+    /// owns whole tiles.
+    fixup: Option<FixupPlan>,
+}
+
+/// The fixup launch of a stream-K grid, see `fattn_fixup.cuh`.
+struct FixupPlan {
+    /// F32 elements of the scratch buffer, passed to the kernel as `dst_meta`.
+    scratch_len: usize,
+    /// `(main blocks, Q rows per tile, GQA heads per tile)`.
+    grid: (u32, u32, u32),
+    /// `(head_dim, 1, 1)`: one thread per output element of a row.
+    block: (u32, u32, u32),
+    /// `seq_q` (ggml `ne[1]`), bounds a block's Q-row/GQA-head index.
+    ne01: i32,
+    /// `num_heads_q` (`h_kv * gqa_ratio`).
+    ne02: i32,
+    /// Q heads per KV head.
+    gqa_ratio: i32,
+    /// Total `(tile, KV block)` units across the whole batch, the kernel's
+    /// `b * total_work / gridDim.x` seam formula divides this by.
+    total_work: i32,
+    /// `Uint3` fast-division constants for `iter_k * iter_j * iter_z * h_kv`.
+    fd_k_j_z_ne12: super::fattn::Uint3,
+    /// `Uint3` fast-division constants for `iter_k * iter_j * iter_z`.
+    fd_k_j_z: super::fattn::Uint3,
+    /// `Uint3` fast-division constants for `iter_k * iter_j`.
+    fd_k_j: super::fattn::Uint3,
+    /// `Uint3` fast-division constants for `iter_k`.
+    fd_k: super::fattn::Uint3,
 }
 
 impl LaunchGeometry {
-    /// Upstream's `ggml_cuda_flash_attn_ext_mma_f16_case` always calls
-    /// `launch_fattn` with `stream_k=true` (confirmed from `fattn.cu`'s exact
-    /// call site: the 9th positional argument is a literal `true`). This
-    /// holds even though this dispatcher never uses stream-K's
-    /// multi-block-per-tile splitting.
-    /// `launch_fattn`'s stream-K branch launches a **1D** grid
-    /// (`blocks_num = (ntiles_dst, 1, 1)`) and the kernel body confirms this:
-    /// `flash_attn_ext_f16` only ever reads `blockIdx.x`/`gridDim.x`, never
-    /// `.y`/`.z`. It decomposes the full `(query tile, GQA group, KV head,
-    /// batch)` space from a single linear `kbc` work-range computed purely
-    /// from `blockIdx.x`. A 3D grid (as the *non*-stream-K branch, and this
-    /// kernel's own tile-kernel sibling, uses) launches redundant blocks
-    /// that silently race on the same output and corrupts every later
-    /// kernel argument's effective grid-relative addressing. This was
-    /// confirmed by a real "`HSA_STATUS_ERROR_EXCEPTION` ... hardware
-    /// exception" on real `ROCm` hardware before this fix. One block per unit of work (`ntiles_dst`
-    /// total, matching this design's "one block handles its tile's full KV
-    /// range, no fixup/combine pass" approach) is the degenerate,
-    /// stream-K-disabled case: `gridDim.x = ntiles_dst`, `gridDim.y =
-    /// gridDim.z = 1`.
-    #[allow(clippy::too_many_arguments)]
+    /// Port of `launch_fattn`'s grid choice (`fattn-common.cuh`, not
+    /// vendored, see `fattn.rs`'s module doc). The kernel walks one
+    /// continuous `(tile, GQA group, KV head, batch, KV block)` space, so a
+    /// 1D grid of any size up to the unit count covers it. Never a 3D grid:
+    /// the kernel reads only `blockIdx.x`, and extra blocks would race on
+    /// the same output.
+    ///
+    /// The grid is one block per tile, except `target.forced_grid` (tests)
+    /// or AMD at `head_dim` 64, which always splits via [`stream_k_grid`]
+    /// (llama.cpp's own rule for that shape). With one block per tile
+    /// `fixup` is `None` and the kernel never reads `dst_meta`. Otherwise
+    /// every block holding a tile's tail needs the fixup pass to merge the
+    /// partial softmax states of its tile. `bf16` picks the bf16 config
+    /// table and shared-memory sizing.
+    ///
+    /// `real_occupancy(threads, shared_mem_bytes)` lets a caller substitute
+    /// the config table's `occupancy` guess with the driver's own answer
+    /// (`None`, or a reported `0`, keeps the table value instead — a grid
+    /// sized on zero resident blocks would launch nothing and silently
+    /// return an uninitialized `dst`); see
+    /// `ops::rocm::occupancy_max_active_blocks`. Only called for AMD at
+    /// `head_dim` 64, the one shape that still computes a split grid.
+    ///
+    /// # Errors
+    ///
+    /// Returns unsupported-config when the tile count exceeds the grid x
+    /// limit, an error when the forced grid is outside `1..=ntiles*iter_k`
+    /// or a size overflows the kernel's 32-bit arguments.
+    fn new(
+        variant: &KernelVariant,
+        shape: &LaunchShape,
+        target: &GridTarget,
+        real_occupancy: impl FnOnce(usize, usize) -> Option<usize>,
+    ) -> Result<Self> {
+        let &KernelVariant {
+            dkq,
+            ncols1,
+            ncols2,
+            is_amd,
+            bf16,
+        } = variant;
+        let ncols = ncols1 * ncols2;
+        let cfg = if bf16 {
+            mma_config_bf16(dkq, ncols, is_amd)?
+        } else {
+            mma_config(dkq, ncols, is_amd)?
+        };
+        let nwarps = cfg.nthreads / 32;
+        let (ntiles, iter_k) = tile_counts(&cfg, ncols1, ncols2, shape)?;
+        if ntiles > MAX_GRID_X_DIM {
+            return Err(unsupported_config(format!(
+                "fattn_mma: grid size ({ntiles}) exceeds the CUDA/HIP grid x-dimension limit ({MAX_GRID_X_DIM})"
+            )));
+        }
+        let shared_mem_bytes = if bf16 {
+            mma_shared_mem_bytes_bf16(dkq, ncols1, ncols2, &cfg)
+        } else {
+            mma_shared_mem_bytes(dkq, ncols1, ncols2, &cfg, is_amd)
+        };
+        let total = ntiles.checked_mul(iter_k).ok_or_else(|| {
+            candle_core::Error::Msg(format!(
+                "fattn_mma: ntiles ({ntiles}) * iter_k ({iter_k}) overflows usize"
+            ))
+        })?;
+        let grid = match target.forced_grid {
+            Some(g) if (1..=total).contains(&g) => g,
+            Some(g) => candle_core::bail!("fattn_mma: forced grid {g} outside 1..={total}"),
+            None if is_amd && dkq == 64 => {
+                let occupancy = real_occupancy(cfg.nthreads, shared_mem_bytes)
+                    .filter(|&o| o > 0)
+                    .unwrap_or(cfg.occupancy);
+                stream_k_grid(ntiles, iter_k, occupancy * target.n_sm)?
+            },
+            None => ntiles,
+        };
+        let fixup = stream_k_needs_fixup(total, grid, iter_k)?
+            .then(|| FixupPlan::new(dkq, ncols1, ncols2, shape, iter_k, grid))
+            .transpose()?;
+        Ok(Self {
+            grid: (to_u32(grid, "grid")?, 1, 1),
+            block: (32, to_u32(nwarps, "nwarps")?, 1),
+            shared_mem_bytes: to_u32(shared_mem_bytes, "shared_mem_bytes")?,
+            fixup,
+        })
+    }
+}
+
+impl FixupPlan {
+    /// The fixup launch for a `grid`-block stream-K launch: one block per
+    /// (main block, Q row, GQA head of the tile), `head_dim` threads each.
     fn new(
         dkq: usize,
         ncols1: usize,
         ncols2: usize,
-        seq_q: usize,
-        h_kv: usize,
-        batch: usize,
-        gqa_ratio: usize,
-        is_amd: bool,
+        shape: &LaunchShape,
+        iter_k: usize,
+        grid: usize,
     ) -> Result<Self> {
-        let cfg = mma_config(dkq, ncols1 * ncols2, is_amd)?;
-        let nwarps = cfg.nthreads / 32;
-        let ntiles_dst = q_tiles(seq_q, ncols1) * gqa_z_tiles(gqa_ratio, ncols2) * h_kv * batch;
-        if ntiles_dst > MAX_GRID_X_DIM {
-            return Err(unsupported_config(format!(
-                "fattn_mma: grid size ({ntiles_dst}) exceeds the CUDA/HIP grid x-dimension limit ({MAX_GRID_X_DIM})"
-            )));
-        }
-        let shared_mem_bytes = mma_shared_mem_bytes(dkq, ncols1, ncols2, &cfg, is_amd);
+        let iter_j = q_tiles(shape.seq_q, ncols1);
+        let iter_z = gqa_z_tiles(shape.gqa_ratio, ncols2);
+        let fastdiv = |n: usize| -> Result<super::fattn::Uint3> {
+            let (x, y, z) = init_fastdiv_values(to_u64(n)?);
+            Ok(super::fattn::Uint3 { x, y, z })
+        };
+        let mul = |a: usize, b: usize, what: &str| -> Result<usize> {
+            a.checked_mul(b).ok_or_else(|| {
+                candle_core::Error::Msg(format!("fattn_mma: {what} overflows usize"))
+            })
+        };
+        let iter_k_j = mul(iter_k, iter_j, "iter_k * iter_j")?;
+        let per_head = mul(iter_k_j, iter_z, "iter_k * iter_j * iter_z")?;
+        let per_head_h_kv = mul(per_head, shape.h_kv, "per_head * h_kv")?;
+        let total_work = mul(per_head_h_kv, shape.batch, "total_work")?;
+        let ne02 = mul(shape.h_kv, shape.gqa_ratio, "h_kv * gqa_ratio")?;
+        let ncols = mul(ncols1, ncols2, "ncols1 * ncols2")?;
         Ok(Self {
-            grid: (to_u32(ntiles_dst, "ntiles_dst")?, 1, 1),
-            block: (32, to_u32(nwarps, "nwarps")?, 1),
-            shared_mem_bytes: to_u32(shared_mem_bytes, "shared_mem_bytes")?,
+            scratch_len: fixup_scratch_len(grid, ncols, dkq)?,
+            grid: (
+                to_u32(grid, "grid")?,
+                to_u32(ncols1, "ncols1")?,
+                to_u32(ncols2, "ncols2")?,
+            ),
+            block: (to_u32(dkq, "head_dim")?, 1, 1),
+            ne01: to_i32(shape.seq_q, "ne01")?,
+            ne02: to_i32(ne02, "ne02")?,
+            gqa_ratio: to_i32(shape.gqa_ratio, "gqa_ratio")?,
+            total_work: to_i32(total_work, "total_work")?,
+            fd_k_j_z_ne12: fastdiv(per_head_h_kv)?,
+            fd_k_j_z: fastdiv(per_head)?,
+            fd_k_j: fastdiv(iter_k_j)?,
+            fd_k: fastdiv(iter_k)?,
         })
     }
+}
 
-    /// bf16 counterpart of [`LaunchGeometry::new`]: identical grid/block
-    /// derivation, but looks up `mma_config_bf16` (its own tuning table,
-    /// see that function's doc comment for how/why it now differs from
-    /// `mma_config` at `(128, 32 | 64)`) and sizes shared memory via
-    /// `mma_shared_mem_bytes_bf16` instead, since `fattn_mma_bf16.cuh`
-    /// never enables shared-memory swizzle even on NVIDIA (see that file's
-    /// module doc).
-    #[allow(clippy::too_many_arguments)]
-    fn new_bf16(
-        dkq: usize,
-        ncols1: usize,
-        ncols2: usize,
-        seq_q: usize,
-        h_kv: usize,
-        batch: usize,
-        gqa_ratio: usize,
-        is_amd: bool,
-    ) -> Result<Self> {
-        let cfg = mma_config_bf16(dkq, ncols1 * ncols2, is_amd)?;
-        let nwarps = cfg.nthreads / 32;
-        let ntiles_dst = q_tiles(seq_q, ncols1) * gqa_z_tiles(gqa_ratio, ncols2) * h_kv * batch;
-        if ntiles_dst > MAX_GRID_X_DIM {
-            return Err(unsupported_config(format!(
-                "fattn_mma_bf16: grid size ({ntiles_dst}) exceeds the CUDA/HIP grid x-dimension limit ({MAX_GRID_X_DIM})"
-            )));
-        }
-        let shared_mem_bytes = mma_shared_mem_bytes_bf16(dkq, ncols1, ncols2, &cfg);
-        Ok(Self {
-            grid: (to_u32(ntiles_dst, "ntiles_dst")?, 1, 1),
-            block: (32, to_u32(nwarps, "nwarps")?, 1),
-            shared_mem_bytes: to_u32(shared_mem_bytes, "shared_mem_bytes")?,
-        })
+/// `(output tiles, KV blocks per tile)` of a launch: the units the grid
+/// splits. Matches the kernel's `iter_k` and its tile decomposition.
+///
+/// # Errors
+///
+/// Returns an error if the tile count overflows `usize`.
+fn tile_counts(
+    cfg: &FattnMmaConfig,
+    ncols1: usize,
+    ncols2: usize,
+    shape: &LaunchShape,
+) -> Result<(usize, usize)> {
+    let ntiles = q_tiles(shape.seq_q, ncols1)
+        .checked_mul(gqa_z_tiles(shape.gqa_ratio, ncols2))
+        .and_then(|n| n.checked_mul(shape.h_kv))
+        .and_then(|n| n.checked_mul(shape.batch))
+        .ok_or_else(|| {
+            candle_core::Error::Msg(format!(
+                "fattn_mma: tile count overflows usize (seq_q={}, ncols1={ncols1}, \
+                 gqa_ratio={}, ncols2={ncols2}, h_kv={}, batch={})",
+                shape.seq_q, shape.gqa_ratio, shape.h_kv, shape.batch
+            ))
+        })?;
+    Ok((ntiles, shape.seq_kv.div_ceil(cfg.nbatch_fa)))
+}
+
+/// The device facts [`LaunchGeometry::new`] needs, queried from `device`.
+///
+/// # Errors
+///
+/// Returns an error if the attribute query fails or the device is not a
+/// GPU of the enabled backend.
+fn grid_target(device: &Device, forced_grid: Option<usize>) -> Result<GridTarget> {
+    #[cfg(feature = "cuda")]
+    {
+        cuda::grid_target(device, forced_grid)
     }
+    #[cfg(all(feature = "rocm", not(feature = "cuda")))]
+    {
+        rocm::grid_target(device, forced_grid)
+    }
+    #[cfg(not(any(feature = "cuda", feature = "rocm")))]
+    {
+        let _ = (device, forced_grid);
+        candle_core::bail!("fattn_mma: requires the cuda or rocm feature")
+    }
+}
+
+/// The kernel and module name for an MMA dispatch, cached as `&'static str`
+/// after the first call for a given `(dkq, ncols1, ncols2, bf16)`. Every
+/// dispatch used to rebuild both strings with `format!`, even though the
+/// domain is small and fixed: the config tables in `fattn.rs` only cover
+/// `dkq` in {64, 128, 256, 512} and a handful of `ncols1`/`ncols2` pairs
+/// per `dkq`, well under 100 combinations total. Leaking each string once
+/// into `&'static str` is a one-time, bounded cost that turns the
+/// per-call allocation into a cache hit; shared by both the CUDA and ROCm
+/// dispatch functions below, since the naming scheme is backend-agnostic.
+fn cached_mma_names(
+    dkq: usize,
+    ncols1: usize,
+    ncols2: usize,
+    bf16: bool,
+) -> (&'static str, &'static str) {
+    use std::collections::HashMap;
+    use std::sync::{OnceLock, RwLock};
+
+    static CACHE: OnceLock<
+        RwLock<HashMap<(usize, usize, usize, bool), (&'static str, &'static str)>>,
+    > = OnceLock::new();
+    let cache = CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+    let key = (dkq, ncols1, ncols2, bf16);
+    if let Some(&names) = cache.read().unwrap().get(&key) {
+        return names;
+    }
+    *cache.write().unwrap().entry(key).or_insert_with(|| {
+        let kernel_name = if bf16 {
+            crate::ops::fused_ops::fattn::mma_bf16_kernel_name(dkq, ncols1, ncols2)
+        } else {
+            crate::ops::fused_ops::fattn::mma_kernel_name(dkq, ncols1, ncols2)
+        };
+        let module_name = if bf16 {
+            format!("crane_fattn_mma_bf16_hd{dkq}")
+        } else {
+            format!("crane_fattn_mma_hd{dkq}")
+        };
+        (&*String::leak(kernel_name), &*String::leak(module_name))
+    })
 }
 
 /// Tensor-core flash-attention prefill: `softmax(q @ k^T * scale [+ mask]) @
@@ -400,13 +612,14 @@ pub fn fattn_mma_prefill(
     {
         candle_core::bail!("fattn_mma: kv_max must be I32, got {:?}", kv.dtype());
     }
-    prefill_dispatch(q, k, v, mask, kv_max, scale, None)
+    prefill_dispatch(q, k, v, mask, kv_max, scale, None, None)
 }
 
 /// Backend dispatch shared by [`fattn_mma_prefill`] and the in-kernel causal
 /// entries. `causal_kv_offset = Some(o)` makes the kernel mask keys `j > i +
 /// o` itself, in addition to any `mask`. Callers validate dtypes before
 /// calling this.
+#[allow(clippy::too_many_arguments)] // one launch's worth of inputs, not separable
 fn prefill_dispatch(
     q: &Tensor,
     k: &Tensor,
@@ -415,18 +628,19 @@ fn prefill_dispatch(
     kv_max: Option<&Tensor>,
     scale: f32,
     causal_kv_offset: Option<usize>,
+    forced_grid: Option<usize>,
 ) -> Result<Tensor> {
     #[cfg(feature = "cuda")]
     {
-        cuda::fattn_mma_prefill_cuda(q, k, v, mask, kv_max, scale, causal_kv_offset)
+        cuda::fattn_mma_prefill_cuda(q, k, v, mask, kv_max, scale, causal_kv_offset, forced_grid)
     }
     #[cfg(all(feature = "rocm", not(feature = "cuda")))]
     {
-        rocm::fattn_mma_prefill_rocm(q, k, v, mask, kv_max, scale, causal_kv_offset)
+        rocm::fattn_mma_prefill_rocm(q, k, v, mask, kv_max, scale, causal_kv_offset, forced_grid)
     }
     #[cfg(not(any(feature = "cuda", feature = "rocm")))]
     {
-        let _ = (q, k, v, mask, kv_max, scale, causal_kv_offset);
+        let _ = (q, k, v, mask, kv_max, scale, causal_kv_offset, forced_grid);
         candle_core::bail!("fattn_mma_prefill: requires the cuda or rocm feature")
     }
 }
@@ -475,10 +689,11 @@ pub fn fattn_mma_bf16_prefill(
     {
         candle_core::bail!("fattn_mma_bf16: kv_max must be I32, got {:?}", kv.dtype());
     }
-    prefill_dispatch_bf16(q, k, v, mask, kv_max, scale, None)
+    prefill_dispatch_bf16(q, k, v, mask, kv_max, scale, None, None)
 }
 
 /// bf16 counterpart of [`prefill_dispatch`].
+#[allow(clippy::too_many_arguments)] // one launch's worth of inputs, not separable
 fn prefill_dispatch_bf16(
     q: &Tensor,
     k: &Tensor,
@@ -487,18 +702,37 @@ fn prefill_dispatch_bf16(
     kv_max: Option<&Tensor>,
     scale: f32,
     causal_kv_offset: Option<usize>,
+    forced_grid: Option<usize>,
 ) -> Result<Tensor> {
     #[cfg(feature = "cuda")]
     {
-        cuda::fattn_mma_bf16_prefill_cuda(q, k, v, mask, kv_max, scale, causal_kv_offset)
+        cuda::fattn_mma_bf16_prefill_cuda(
+            q,
+            k,
+            v,
+            mask,
+            kv_max,
+            scale,
+            causal_kv_offset,
+            forced_grid,
+        )
     }
     #[cfg(all(feature = "rocm", not(feature = "cuda")))]
     {
-        rocm::fattn_mma_bf16_prefill_rocm(q, k, v, mask, kv_max, scale, causal_kv_offset)
+        rocm::fattn_mma_bf16_prefill_rocm(
+            q,
+            k,
+            v,
+            mask,
+            kv_max,
+            scale,
+            causal_kv_offset,
+            forced_grid,
+        )
     }
     #[cfg(not(any(feature = "cuda", feature = "rocm")))]
     {
-        let _ = (q, k, v, mask, kv_max, scale, causal_kv_offset);
+        let _ = (q, k, v, mask, kv_max, scale, causal_kv_offset, forced_grid);
         candle_core::bail!("fattn_mma_bf16_prefill: requires the cuda or rocm feature")
     }
 }
@@ -902,9 +1136,9 @@ fn causal_in_kernel(
         None => (k.clone(), v.clone()),
     };
     if bf16 {
-        prefill_dispatch_bf16(q, &k, &v, None, None, scale, Some(kv_offset))
+        prefill_dispatch_bf16(q, &k, &v, None, None, scale, Some(kv_offset), None)
     } else {
-        prefill_dispatch(q, &k, &v, None, None, scale, Some(kv_offset))
+        prefill_dispatch(q, &k, &v, None, None, scale, Some(kv_offset), None)
     }
 }
 
@@ -1121,12 +1355,12 @@ mod cuda {
     use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
     use candle_core::cuda_backend::{CudaStorage, CudaStorageSlice, WrapErr};
 
-    use super::{LaunchGeometry, LaunchScalars};
+    use super::{FixupPlan, GridTarget, KernelVariant, LaunchGeometry, LaunchScalars, LaunchShape};
     use crate::ops::fused_ops::fattn::{
-        mma_bf16_kernel_name, mma_kernel_name, select_mma_ncols, select_mma_ncols_bf16,
-        unsupported_config, validate_fattn_bshd,
+        fixup_kernel_name, select_mma_ncols, select_mma_ncols_bf16, unsupported_config,
+        validate_fattn_bshd,
     };
-    use candle_core::{Result, Tensor};
+    use candle_core::{Device, Result, Tensor};
 
     mod ptx {
         include!(concat!(env!("OUT_DIR"), "/crane_kernels_ptx.rs"));
@@ -1178,7 +1412,58 @@ mod cuda {
         }
     }
 
-    #[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+    /// Raises `func`'s dynamic shared memory limit to `shared_mem_bytes`.
+    ///
+    /// `cudaFuncSetAttribute(MaxDynamicSharedMemorySize)` is required
+    /// whenever a kernel requests more than the default static 48 KiB
+    /// per-block limit; `cudarc`'s `launch`/`launch_builder` never calls
+    /// it, it only forwards `shared_mem_bytes` to `cuLaunchKernel`, which
+    /// fails with `CUDA_ERROR_INVALID_VALUE` past that limit. llama.cpp
+    /// (this kernel's origin) raises it unconditionally for every launch,
+    /// cached per device (`common.cuh`'s `CUDA_SET_SHARED_MEMORY_LIMIT`).
+    /// `head_dim=512` and GQA-narrow F16 tiles with 2-stage `cp.async`
+    /// both exceed 48 KiB; `head_dim<=256` with 1 GQA head per tile stays
+    /// under it, which is why this never surfaced before real CUDA
+    /// hardware ran these shapes.
+    ///
+    /// Always raises; does not cache by `func`'s raw `CUfunction` pointer.
+    /// An earlier version did, keyed on that pointer, but
+    /// `CudaDevice::new` (`candle_core`) opens a brand new `CudaContext`
+    /// every call with no per-ordinal caching, and `test_gpu_device()`
+    /// calls it fresh for every GPU test; once a context is torn down its
+    /// module/function addresses can be reused by the next one. A process-
+    /// wide cache keyed on that address could then find a stale "already
+    /// raised" entry left by a since-dropped context's unrelated, smaller
+    /// kernel, and skip the real call for a function whose limit was never
+    /// actually raised, launching with an insufficient shared-memory limit
+    /// and failing with `CUDA_ERROR_INVALID_VALUE`. `cuFuncSetAttribute` is
+    /// a cheap, idempotent driver call (no launch, no sync), so paying it
+    /// on every dispatch is the safe default.
+    fn raise_dynamic_shared_mem_limit(
+        func: &candle_core::cuda_backend::cudarc::driver::CudaFunction,
+        shared_mem_bytes: u32,
+    ) -> Result<()> {
+        use candle_core::cuda_backend::cudarc::driver::result::function::set_function_attribute;
+        use candle_core::cuda_backend::cudarc::driver::sys::CUfunction_attribute;
+
+        let bytes = super::to_i32(shared_mem_bytes as usize, "shared_mem_bytes")?;
+        // SAFETY: `func` is a function handle freshly resolved from a
+        // loaded module (`get_or_load_custom_func`), valid for this call.
+        unsafe {
+            set_function_attribute(
+                func.cu_function(),
+                CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                bytes,
+            )
+        }
+        .w()
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        clippy::many_single_char_names,
+        clippy::too_many_arguments
+    )]
     pub(super) fn fattn_mma_prefill_cuda(
         q: &Tensor,
         k: &Tensor,
@@ -1187,6 +1472,7 @@ mod cuda {
         kv_max: Option<&Tensor>,
         scale: f32,
         causal_kv_offset: Option<usize>,
+        forced_grid: Option<usize>,
     ) -> Result<Tensor> {
         let (q_s, q_l) = q.storage_and_layout();
         let (k_s, k_l) = k.storage_and_layout();
@@ -1210,10 +1496,29 @@ mod cuda {
                  pass an explicit all-zero mask for unmasked attention with this GQA shape"
             )));
         }
-        let geometry = LaunchGeometry::new(d, ncols1, ncols2, seq_q, h_kv, b, gqa_ratio, is_amd)?;
-        let kernel_name = mma_kernel_name(d, ncols1, ncols2);
-        let module_name = format!("crane_fattn_mma_hd{d}");
-        let func = dev.get_or_load_custom_func(&kernel_name, &module_name, ptx_for(d)?)?;
+        let shape = LaunchShape {
+            seq_q,
+            seq_kv,
+            h_kv,
+            batch: b,
+            gqa_ratio,
+        };
+        let target = super::grid_target(q.device(), forced_grid)?;
+        let variant = KernelVariant {
+            dkq: d,
+            ncols1,
+            ncols2,
+            is_amd,
+            bf16: false,
+        };
+        let geometry = LaunchGeometry::new(&variant, &shape, &target, |_, _| {
+            // CUDA's real occupancy query is unverified here (no CUDA
+            // device in this environment); keep the config table's
+            // guess until it is checked on real hardware.
+            None
+        })?;
+        let (kernel_name, module_name) = super::cached_mma_names(d, ncols1, ncols2, false);
+        let func = dev.get_or_load_custom_func(kernel_name, module_name, ptx_for(d)?)?;
 
         let q_sl = f16_slice(&q_s, "q")?.slice(q_l.start_offset()..);
         let k_sl = f16_slice(&k_s, "k")?.slice(k_l.start_offset()..);
@@ -1259,7 +1564,15 @@ mod cuda {
 
         let n_out = b * seq_q * h_q * d;
         let dst = unsafe { dev.alloc::<half::f16>(n_out) }?;
+        // The stream-K fixup scratch, written in full by the main kernel
+        // before the fixup kernel reads it. Null when no tile is split.
+        let scratch = geometry
+            .fixup
+            .as_ref()
+            .map(|f| unsafe { dev.alloc::<f32>(f.scratch_len) })
+            .transpose()?;
 
+        raise_dynamic_shared_mem_limit(&func, geometry.shared_mem_bytes)?;
         let cfg = LaunchConfig {
             grid_dim: geometry.grid,
             block_dim: geometry.block,
@@ -1290,7 +1603,10 @@ mod cuda {
             None => builder.arg(&0u64),
         };
         builder.arg(&dst);
-        builder.arg(&0u64); // dst_meta: unused, parallel_blocks=1 never needs the combine pass
+        match &scratch {
+            Some(s) => builder.arg(s),
+            None => builder.arg(&0u64),
+        };
         builder.arg(&p.scale);
         builder.arg(&p.max_bias);
         builder.arg(&p.m0);
@@ -1330,6 +1646,34 @@ mod cuda {
         // output element (`geometry`'s tile counts).
         unsafe { builder.launch(cfg) }.w()?;
 
+        if let (Some(f), Some(scratch)) = (&geometry.fixup, &scratch) {
+            let fixup_name = fixup_kernel_name(d, ncols1, ncols2, false);
+            let fixup_func = dev.get_or_load_custom_func(&fixup_name, module_name, ptx_for(d)?)?;
+            let mut fixup_builder = fixup_func.builder();
+            fixup_builder.arg(&dst);
+            fixup_builder.arg(scratch);
+            fixup_builder.arg(&f.ne01);
+            fixup_builder.arg(&f.ne02);
+            fixup_builder.arg(&f.gqa_ratio);
+            fixup_builder.arg(&f.total_work);
+            fixup_builder.arg(&f.fd_k_j_z_ne12);
+            fixup_builder.arg(&f.fd_k_j_z);
+            fixup_builder.arg(&f.fd_k_j);
+            fixup_builder.arg(&f.fd_k);
+            // SAFETY: the argument list matches `crane_fattn_fixup_*`'s
+            // `extern "C"` signature in `fattn_fixup.cuh`. `dst` and
+            // `scratch` outlive the launch, and the grid covers one block
+            // per (main block, Q row, GQA head).
+            unsafe {
+                fixup_builder.launch(LaunchConfig {
+                    grid_dim: f.grid,
+                    block_dim: f.block,
+                    shared_mem_bytes: 0,
+                })
+            }
+            .w()?;
+        }
+
         let dst = CudaStorage {
             slice: CudaStorageSlice::F16(dst),
             device: dev,
@@ -1348,7 +1692,11 @@ mod cuda {
     /// the kernel selection uses [`select_mma_ncols_bf16`] (never resolves
     /// to `ncols1*ncols2 == 8`, see that function's doc comment). The
     /// kernel writes the output in BF16 instead of F16.
-    #[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+    #[allow(
+        clippy::too_many_lines,
+        clippy::many_single_char_names,
+        clippy::too_many_arguments
+    )]
     pub(super) fn fattn_mma_bf16_prefill_cuda(
         q: &Tensor,
         k: &Tensor,
@@ -1357,6 +1705,7 @@ mod cuda {
         kv_max: Option<&Tensor>,
         scale: f32,
         causal_kv_offset: Option<usize>,
+        forced_grid: Option<usize>,
     ) -> Result<Tensor> {
         let (q_s, q_l) = q.storage_and_layout();
         let (k_s, k_l) = k.storage_and_layout();
@@ -1380,11 +1729,29 @@ mod cuda {
                  pass an explicit all-zero mask for unmasked attention with this GQA shape"
             )));
         }
-        let geometry =
-            LaunchGeometry::new_bf16(d, ncols1, ncols2, seq_q, h_kv, b, gqa_ratio, is_amd)?;
-        let kernel_name = mma_bf16_kernel_name(d, ncols1, ncols2);
-        let module_name = format!("crane_fattn_mma_bf16_hd{d}");
-        let func = dev.get_or_load_custom_func(&kernel_name, &module_name, ptx_for_bf16(d)?)?;
+        let shape = LaunchShape {
+            seq_q,
+            seq_kv,
+            h_kv,
+            batch: b,
+            gqa_ratio,
+        };
+        let target = super::grid_target(q.device(), forced_grid)?;
+        let variant = KernelVariant {
+            dkq: d,
+            ncols1,
+            ncols2,
+            is_amd,
+            bf16: true,
+        };
+        let geometry = LaunchGeometry::new(&variant, &shape, &target, |_, _| {
+            // CUDA's real occupancy query is unverified here (no CUDA
+            // device in this environment); keep the config table's
+            // guess until it is checked on real hardware.
+            None
+        })?;
+        let (kernel_name, module_name) = super::cached_mma_names(d, ncols1, ncols2, true);
+        let func = dev.get_or_load_custom_func(kernel_name, module_name, ptx_for_bf16(d)?)?;
 
         let q_sl = bf16_slice(&q_s, "q")?.slice(q_l.start_offset()..);
         let k_sl = bf16_slice(&k_s, "k")?.slice(k_l.start_offset()..);
@@ -1430,7 +1797,15 @@ mod cuda {
 
         let n_out = b * seq_q * h_q * d;
         let dst = unsafe { dev.alloc::<half::bf16>(n_out) }?;
+        // The stream-K fixup scratch, written in full by the main kernel
+        // before the fixup kernel reads it. Null when no tile is split.
+        let scratch = geometry
+            .fixup
+            .as_ref()
+            .map(|f| unsafe { dev.alloc::<f32>(f.scratch_len) })
+            .transpose()?;
 
+        raise_dynamic_shared_mem_limit(&func, geometry.shared_mem_bytes)?;
         let cfg = LaunchConfig {
             grid_dim: geometry.grid,
             block_dim: geometry.block,
@@ -1453,7 +1828,10 @@ mod cuda {
             None => builder.arg(&0u64),
         };
         builder.arg(&dst);
-        builder.arg(&0u64); // dst_meta: unused, parallel_blocks=1 never needs the combine pass
+        match &scratch {
+            Some(s) => builder.arg(s),
+            None => builder.arg(&0u64),
+        };
         builder.arg(&p.scale);
         builder.arg(&p.max_bias);
         builder.arg(&p.m0);
@@ -1493,6 +1871,35 @@ mod cuda {
         // output element (`geometry`'s tile counts).
         unsafe { builder.launch(cfg) }.w()?;
 
+        if let (Some(f), Some(scratch)) = (&geometry.fixup, &scratch) {
+            let fixup_name = fixup_kernel_name(d, ncols1, ncols2, true);
+            let fixup_func =
+                dev.get_or_load_custom_func(&fixup_name, module_name, ptx_for_bf16(d)?)?;
+            let mut fixup_builder = fixup_func.builder();
+            fixup_builder.arg(&dst);
+            fixup_builder.arg(scratch);
+            fixup_builder.arg(&f.ne01);
+            fixup_builder.arg(&f.ne02);
+            fixup_builder.arg(&f.gqa_ratio);
+            fixup_builder.arg(&f.total_work);
+            fixup_builder.arg(&f.fd_k_j_z_ne12);
+            fixup_builder.arg(&f.fd_k_j_z);
+            fixup_builder.arg(&f.fd_k_j);
+            fixup_builder.arg(&f.fd_k);
+            // SAFETY: the argument list matches `crane_fattn_fixup_*`'s
+            // `extern "C"` signature in `fattn_fixup.cuh`. `dst` and
+            // `scratch` outlive the launch, and the grid covers one block
+            // per (main block, Q row, GQA head).
+            unsafe {
+                fixup_builder.launch(LaunchConfig {
+                    grid_dim: f.grid,
+                    block_dim: f.block,
+                    shared_mem_bytes: 0,
+                })
+            }
+            .w()?;
+        }
+
         let dst = CudaStorage {
             slice: CudaStorageSlice::BF16(dst),
             device: dev,
@@ -1504,19 +1911,32 @@ mod cuda {
             false,
         ))
     }
+
+    /// The device facts for the stream-K grid choice. `n_sm` only feeds
+    /// [`LaunchGeometry::new`]'s AMD `head_dim == 64` split, which never
+    /// runs on a CUDA build (`KernelVariant::is_amd` is always `false`
+    /// here), so this skips the `MULTIPROCESSOR_COUNT` driver query
+    /// entirely rather than caching a value nothing reads.
+    pub(super) fn grid_target(device: &Device, forced_grid: Option<usize>) -> Result<GridTarget> {
+        let _ = device.as_cuda_device()?;
+        Ok(GridTarget {
+            n_sm: 0,
+            forced_grid,
+        })
+    }
 }
 
 #[cfg(all(feature = "rocm", not(feature = "cuda")))]
 mod rocm {
     use std::ffi::c_void;
 
-    use candle_core::rocm_backend::rocm_rs;
-    use candle_core::{DType, Result, Tensor};
+    use candle_core::rocm_backend::{SendSyncDeviceMemory, rocm_rs};
+    use candle_core::{DType, Device, Result, Tensor};
 
-    use super::{LaunchGeometry, LaunchScalars};
+    use super::{FixupPlan, GridTarget, KernelVariant, LaunchGeometry, LaunchScalars, LaunchShape};
     use crate::ops::fused_ops::fattn::{
-        mma_bf16_kernel_name, mma_kernel_name, select_mma_ncols, select_mma_ncols_bf16,
-        unsupported_config, validate_fattn_bshd,
+        fixup_kernel_name, select_mma_ncols, select_mma_ncols_bf16, unsupported_config,
+        validate_fattn_bshd,
     };
     use crate::ops::rocm;
 
@@ -1555,6 +1975,8 @@ mod rocm {
             .replace("#include \"crane_fattn_shim.cuh\"", "");
         let common = include_str!("../../../kernels/cuda/fattn/fattn_common.cuh")
             .replace("#include \"crane_fattn_shim.cuh\"", "");
+        let fixup = include_str!("../../../kernels/cuda/fattn/fattn_fixup.cuh")
+            .replace("#include \"fattn_common.cuh\"", "");
         let swizzle = include_str!("../../../kernels/cuda/fattn/swizzle.cuh")
             .replace("#include \"crane_fattn_shim.cuh\"", "")
             .replace("#include \"mma.cuh\"", "");
@@ -1563,6 +1985,7 @@ mod rocm {
         let mma_f16 = splice_once(&mma_f16, "#include \"cp_async.cuh\"", &cp_async);
         let mma_f16 = splice_once(&mma_f16, "#include \"mma.cuh\"", &mma_h);
         let mma_f16 = splice_once(&mma_f16, "#include \"fattn_common.cuh\"", &common);
+        let mma_f16 = splice_once(&mma_f16, "#include \"fattn_fixup.cuh\"", &fixup);
         let mma_f16 = splice_once(&mma_f16, "#include \"swizzle.cuh\"", &swizzle);
         splice_once(instance_source, "#include \"fattn_mma_f16.cuh\"", &mma_f16)
     }
@@ -1600,10 +2023,13 @@ mod rocm {
             .replace("#include \"crane_fattn_shim.cuh\"", "");
         let common = include_str!("../../../kernels/cuda/fattn/fattn_common.cuh")
             .replace("#include \"crane_fattn_shim.cuh\"", "");
+        let fixup = include_str!("../../../kernels/cuda/fattn/fattn_fixup.cuh")
+            .replace("#include \"fattn_common.cuh\"", "");
         let mma_bf16 = include_str!("../../../kernels/cuda/fattn/fattn_mma_bf16.cuh");
         let mma_bf16 = splice_once(mma_bf16, "#include \"crane_fattn_shim.cuh\"", shim);
         let mma_bf16 = splice_once(&mma_bf16, "#include \"mma.cuh\"", &mma_h);
         let mma_bf16 = splice_once(&mma_bf16, "#include \"fattn_common.cuh\"", &common);
+        let mma_bf16 = splice_once(&mma_bf16, "#include \"fattn_fixup.cuh\"", &fixup);
         splice_once(
             instance_source,
             "#include \"fattn_mma_bf16.cuh\"",
@@ -1628,7 +2054,11 @@ mod rocm {
         })
     }
 
-    #[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+    #[allow(
+        clippy::too_many_lines,
+        clippy::many_single_char_names,
+        clippy::too_many_arguments
+    )]
     pub(super) fn fattn_mma_prefill_rocm(
         q: &Tensor,
         k: &Tensor,
@@ -1637,6 +2067,7 @@ mod rocm {
         kv_max: Option<&Tensor>,
         scale: f32,
         causal_kv_offset: Option<usize>,
+        forced_grid: Option<usize>,
     ) -> Result<Tensor> {
         let (q_s, q_l) = q.storage_and_layout();
         let (k_s, k_l) = k.storage_and_layout();
@@ -1660,10 +2091,34 @@ mod rocm {
                  pass an explicit all-zero mask for unmasked attention with this GQA shape"
             )));
         }
-        let geometry = LaunchGeometry::new(d, ncols1, ncols2, seq_q, h_kv, b, gqa_ratio, is_amd)?;
-        let kernel_name = mma_kernel_name(d, ncols1, ncols2);
-        let module_name = format!("crane_fattn_mma_hd{d}");
+        let shape = LaunchShape {
+            seq_q,
+            seq_kv,
+            h_kv,
+            batch: b,
+            gqa_ratio,
+        };
+        let target = super::grid_target(q.device(), forced_grid)?;
+        let (kernel_name, module_name) = super::cached_mma_names(d, ncols1, ncols2, false);
         let source = source_for(d)?;
+        let variant = KernelVariant {
+            dkq: d,
+            ncols1,
+            ncols2,
+            is_amd,
+            bf16: false,
+        };
+        let geometry =
+            LaunchGeometry::new(&variant, &shape, &target, |threads, shared_mem_bytes| {
+                real_occupancy(
+                    &dev,
+                    module_name,
+                    kernel_name,
+                    source,
+                    threads,
+                    shared_mem_bytes,
+                )
+            })?;
 
         let q_ptr = rocm::strided_device_ptr(&q_s, q_l, DType::F16, "fattn_mma q")?;
         let k_ptr = rocm::strided_device_ptr(&k_s, k_l, DType::F16, "fattn_mma k")?;
@@ -1701,7 +2156,16 @@ mod rocm {
         let n_out = b * seq_q * h_q * d;
         let dst = dev.alloc::<half::f16>(n_out)?;
         let dst_ptr = dst.as_ptr();
-        let dst_meta_ptr: *mut c_void = std::ptr::null_mut();
+        // The stream-K fixup scratch, written in full by the main kernel
+        // before the fixup kernel reads it. Null when no tile is split.
+        let scratch = geometry
+            .fixup
+            .as_ref()
+            .map(|f| dev.alloc::<f32>(f.scratch_len))
+            .transpose()?;
+        let dst_meta_ptr: *mut c_void = scratch
+            .as_ref()
+            .map_or(std::ptr::null_mut(), SendSyncDeviceMemory::as_ptr);
         let sinks_ptr: *mut c_void = std::ptr::null_mut();
         let grid = rocm_rs::hip::Dim3::new_3d(geometry.grid.0, geometry.grid.1, geometry.grid.2);
         let block =
@@ -1756,10 +2220,10 @@ mod rocm {
         // `kv_max` (and the storage they borrow from) outlive this call; the
         // grid covers every output element (`geometry`'s tile counts).
         unsafe {
-            rocm::launch_2d(
+            rocm::launch_2d_cached(
                 &dev,
-                &module_name,
-                &kernel_name,
+                module_name,
+                kernel_name,
                 source,
                 grid,
                 block,
@@ -1767,6 +2231,17 @@ mod rocm {
                 &mut args,
             )
         }?;
+
+        if let Some(f) = &geometry.fixup {
+            launch_fixup(
+                &dev,
+                module_name,
+                source,
+                (d, ncols1, ncols2, false),
+                f,
+                (&dst_ptr, &dst_meta_ptr),
+            )?;
+        }
 
         Ok(rocm::wrap_f16(dst, &dev, (b, seq_q, h_q, d)))
     }
@@ -1778,7 +2253,11 @@ mod rocm {
     /// [`select_mma_ncols_bf16`] (never resolves to `ncols1*ncols2 == 8`,
     /// see that function's doc comment). The kernel writes the output in
     /// BF16 instead of F16.
-    #[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+    #[allow(
+        clippy::too_many_lines,
+        clippy::many_single_char_names,
+        clippy::too_many_arguments
+    )]
     pub(super) fn fattn_mma_bf16_prefill_rocm(
         q: &Tensor,
         k: &Tensor,
@@ -1787,6 +2266,7 @@ mod rocm {
         kv_max: Option<&Tensor>,
         scale: f32,
         causal_kv_offset: Option<usize>,
+        forced_grid: Option<usize>,
     ) -> Result<Tensor> {
         let (q_s, q_l) = q.storage_and_layout();
         let (k_s, k_l) = k.storage_and_layout();
@@ -1810,11 +2290,34 @@ mod rocm {
                  pass an explicit all-zero mask for unmasked attention with this GQA shape"
             )));
         }
-        let geometry =
-            LaunchGeometry::new_bf16(d, ncols1, ncols2, seq_q, h_kv, b, gqa_ratio, is_amd)?;
-        let kernel_name = mma_bf16_kernel_name(d, ncols1, ncols2);
-        let module_name = format!("crane_fattn_mma_bf16_hd{d}");
+        let shape = LaunchShape {
+            seq_q,
+            seq_kv,
+            h_kv,
+            batch: b,
+            gqa_ratio,
+        };
+        let target = super::grid_target(q.device(), forced_grid)?;
+        let (kernel_name, module_name) = super::cached_mma_names(d, ncols1, ncols2, true);
         let source = source_for_bf16(d)?;
+        let variant = KernelVariant {
+            dkq: d,
+            ncols1,
+            ncols2,
+            is_amd,
+            bf16: true,
+        };
+        let geometry =
+            LaunchGeometry::new(&variant, &shape, &target, |threads, shared_mem_bytes| {
+                real_occupancy(
+                    &dev,
+                    module_name,
+                    kernel_name,
+                    source,
+                    threads,
+                    shared_mem_bytes,
+                )
+            })?;
 
         let q_ptr = rocm::strided_device_ptr(&q_s, q_l, DType::BF16, "fattn_mma_bf16 q")?;
         let k_ptr = rocm::strided_device_ptr(&k_s, k_l, DType::BF16, "fattn_mma_bf16 k")?;
@@ -1852,7 +2355,16 @@ mod rocm {
         let n_out = b * seq_q * h_q * d;
         let dst = dev.alloc::<half::bf16>(n_out)?;
         let dst_ptr = dst.as_ptr();
-        let dst_meta_ptr: *mut c_void = std::ptr::null_mut();
+        // The stream-K fixup scratch, written in full by the main kernel
+        // before the fixup kernel reads it. Null when no tile is split.
+        let scratch = geometry
+            .fixup
+            .as_ref()
+            .map(|f| dev.alloc::<f32>(f.scratch_len))
+            .transpose()?;
+        let dst_meta_ptr: *mut c_void = scratch
+            .as_ref()
+            .map_or(std::ptr::null_mut(), SendSyncDeviceMemory::as_ptr);
         let sinks_ptr: *mut c_void = std::ptr::null_mut();
         let grid = rocm_rs::hip::Dim3::new_3d(geometry.grid.0, geometry.grid.1, geometry.grid.2);
         let block =
@@ -1905,10 +2417,10 @@ mod rocm {
         // "C"` signature (`DECL_FATTN_MMA_BF16_CASE` in
         // `fattn_mma_bf16.cuh`) exactly instead.
         unsafe {
-            rocm::launch_2d(
+            rocm::launch_2d_cached(
                 &dev,
-                &module_name,
-                &kernel_name,
+                module_name,
+                kernel_name,
                 source,
                 grid,
                 block,
@@ -1917,7 +2429,132 @@ mod rocm {
             )
         }?;
 
+        if let Some(f) = &geometry.fixup {
+            launch_fixup(
+                &dev,
+                module_name,
+                source,
+                (d, ncols1, ncols2, true),
+                f,
+                (&dst_ptr, &dst_meta_ptr),
+            )?;
+        }
+
         Ok(rocm::wrap_bf16(dst, &dev, (b, seq_q, h_q, d)))
+    }
+
+    /// The device facts for the stream-K grid choice: the CU count of
+    /// `device`. `n_sm` is a static fact about a device for the process's
+    /// lifetime, but this used to query the driver on every single kernel
+    /// dispatch; cached per device ordinal. CUDA has no equivalent cache:
+    /// `n_sm` only feeds the AMD `head_dim == 64` split, so CUDA's
+    /// `grid_target` skips the query entirely.
+    pub(super) fn grid_target(device: &Device, forced_grid: Option<usize>) -> Result<GridTarget> {
+        use std::collections::HashMap;
+        use std::sync::{OnceLock, RwLock};
+
+        static CACHE: OnceLock<RwLock<HashMap<usize, usize>>> = OnceLock::new();
+        let cache = CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+
+        let candle_core::DeviceLocation::Rocm { gpu_id } = device.location() else {
+            candle_core::bail!("grid_target: not a rocm device");
+        };
+        if let Some(&n_sm) = cache.read().unwrap().get(&gpu_id) {
+            return Ok(GridTarget { n_sm, forced_grid });
+        }
+        let n_sm = rocm::multiprocessor_count(device)?;
+        cache.write().unwrap().insert(gpu_id, n_sm);
+        Ok(GridTarget { n_sm, forced_grid })
+    }
+
+    /// The driver's real occupancy for this kernel, or `None` if the query
+    /// fails (the config table's guess is then used instead; a failed
+    /// query here should not break the launch). A successful query can
+    /// still report `0` (register/LDS pressure leaves no room for even one
+    /// block); [`LaunchGeometry::new`] is the one that turns that into a
+    /// table-value fallback, since it also has to handle a test-supplied
+    /// closure, not just this driver-backed one. See
+    /// [`rocm::occupancy_max_active_blocks`] and [`LaunchGeometry::new`]'s
+    /// doc comment.
+    ///
+    /// Cached per `(module_name, kernel_name)`: both are the `&'static str`
+    /// [`super::cached_mma_names`] leaks once per `(dkq, ncols1, ncols2,
+    /// bf16)`, so the same kernel always hits the same cache entry instead
+    /// of re-querying the driver on every dispatch.
+    fn real_occupancy(
+        dev: &candle_core::rocm_backend::RocmDevice,
+        module_name: &'static str,
+        kernel_name: &'static str,
+        source: &'static str,
+        threads: usize,
+        shared_mem_bytes: usize,
+    ) -> Option<usize> {
+        use std::collections::HashMap;
+        use std::sync::{OnceLock, RwLock};
+
+        static CACHE: OnceLock<RwLock<HashMap<(&'static str, &'static str), Option<usize>>>> =
+            OnceLock::new();
+        let cache = CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+        let key = (module_name, kernel_name);
+        if let Some(&occupancy) = cache.read().unwrap().get(&key) {
+            return occupancy;
+        }
+        let occupancy = rocm::occupancy_max_active_blocks(
+            dev,
+            module_name,
+            kernel_name,
+            source,
+            u32::try_from(threads).ok()?,
+            u32::try_from(shared_mem_bytes).ok()?,
+        )
+        .ok();
+        cache.write().unwrap().insert(key, occupancy);
+        occupancy
+    }
+
+    /// Launches the stream-K fixup kernel that pairs with the MMA kernel of
+    /// `(head_dim, ncols1, ncols2, bf16)`. It merges the partials the main
+    /// kernel left in `dst_meta` into `dst`.
+    fn launch_fixup(
+        dev: &candle_core::rocm_backend::RocmDevice,
+        module_name: &str,
+        source: &'static str,
+        (d, ncols1, ncols2, bf16): (usize, usize, usize, bool),
+        f: &FixupPlan,
+        (dst_ptr, dst_meta_ptr): (&*mut c_void, &*mut c_void),
+    ) -> Result<()> {
+        let kernel_name = fixup_kernel_name(d, ncols1, ncols2, bf16);
+        let grid = rocm_rs::hip::Dim3::new_3d(f.grid.0, f.grid.1, f.grid.2);
+        let block = rocm_rs::hip::Dim3::new_3d(f.block.0, f.block.1, f.block.2);
+        let mut args = [
+            rocm::arg(dst_ptr),
+            rocm::arg(dst_meta_ptr),
+            rocm::arg(&f.ne01),
+            rocm::arg(&f.ne02),
+            rocm::arg(&f.gqa_ratio),
+            rocm::arg(&f.total_work),
+            rocm::arg(&f.fd_k_j_z_ne12),
+            rocm::arg(&f.fd_k_j_z),
+            rocm::arg(&f.fd_k_j),
+            rocm::arg(&f.fd_k),
+        ];
+        // SAFETY: the argument list matches `crane_fattn_fixup_*`'s `extern
+        // "C"` signature in `fattn_fixup.cuh`. `dst_ptr` and `dst_meta_ptr`
+        // stay valid until the launch completes because the caller holds
+        // `dst` and the scratch buffer across this call. The grid covers
+        // one block per (main block, Q row, GQA head).
+        unsafe {
+            rocm::launch_2d_cached(
+                dev,
+                module_name,
+                &kernel_name,
+                source,
+                grid,
+                block,
+                0,
+                &mut args,
+            )
+        }
     }
 }
 
@@ -1999,6 +2636,35 @@ mod tests {
     fn narrow_bitwise_shapes_select_ncols_8_on_nvidia() {
         assert_eq!(select_mma_ncols(128, 4, 2, 256, false), Some((2, 4)));
         assert_eq!(select_mma_ncols(128, 1, 8, 64, false), Some((8, 1)));
+    }
+
+    // A driver occupancy query reporting zero active blocks must fall back
+    // to the config table's guess, the same as a failed query. Sizing the
+    // stream-K grid on zero resident blocks would launch nothing and still
+    // hand back an uninitialized `dst` tensor as if it were real output.
+    #[test]
+    fn zero_driver_occupancy_falls_back_to_table_value() {
+        let variant = KernelVariant {
+            dkq: 64,
+            ncols1: 8,
+            ncols2: 1,
+            is_amd: true,
+            bf16: false,
+        };
+        let shape = LaunchShape {
+            seq_q: 64,
+            seq_kv: 256,
+            h_kv: 1,
+            batch: 1,
+            gqa_ratio: 1,
+        };
+        let target = GridTarget {
+            n_sm: 60,
+            forced_grid: None,
+        };
+        let zero = LaunchGeometry::new(&variant, &shape, &target, |_, _| Some(0)).unwrap();
+        let table = LaunchGeometry::new(&variant, &shape, &target, |_, _| None).unwrap();
+        assert_eq!(zero.grid, table.grid);
     }
 }
 
@@ -3508,3 +4174,7 @@ mod golden_tests;
 #[cfg(all(test, crane_fattn))]
 #[path = "fattn_bench_tests.rs"]
 mod bench_tests;
+
+#[cfg(all(test, crane_fattn))]
+#[path = "fattn_stream_k_tests.rs"]
+mod stream_k_tests;
