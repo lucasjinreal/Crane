@@ -1907,6 +1907,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16(
         if (KV_max) {
             kb0_stop = min(kb0_stop, KV_max[sequence*iter_j + jt] / nbatch_fa);
         }
+        // KV tiles past the diagonal of the tile's last row are fully masked.
+        if (causal_kv_offset >= 0) {
+            const int kv_end = min((jt + 1)*ncols1, (int) ne01.z) + causal_kv_offset;
+            kb0_stop = min(kb0_stop, (kv_end + nbatch_fa - 1) / nbatch_fa);
+        }
         constexpr bool is_fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
         if (kb0_start == 0) {
             constexpr bool needs_fixup = false; // CUDA block is working on an entire tile.
@@ -1953,6 +1958,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16(
 
     if (KV_max) {
         kb0_stop = min(kb0_stop, KV_max[sequence*iter_j + jt] / nbatch_fa);
+    }
+    if (causal_kv_offset >= 0) {
+        const int kv_end = min((jt + 1)*ncols1, (int) ne01.z) + causal_kv_offset;
+        kb0_stop = min(kb0_stop, (kv_end + nbatch_fa - 1) / nbatch_fa);
     }
 
     constexpr bool is_fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.

@@ -750,8 +750,10 @@ fn pad_for_gqa_batching_bf16(
     }
 }
 
-/// Causal flash-attention: `j <= i + kv_offset`. The kernel masks the
-/// diagonal itself from `kv_offset`, so no mask tensor is built or read.
+/// Causal flash-attention: `j <= i + kv_offset`. The common case builds no
+/// mask or `KV_max` tensor: the kernel masks the diagonal and bounds the KV
+/// loop itself from `kv_offset`. See [`causal_needs_host_mask`] for when a
+/// host mask (and `KV_max`) is still required instead.
 /// Output is bitwise equal to [`fattn_mma_causal_with_mask`] given a plain
 /// causal mask.
 ///
@@ -855,9 +857,10 @@ fn causal_needs_host_mask(seq_q: usize, seq_kv: usize, kv_offset: usize) -> bool
 }
 
 /// Shared body of [`fattn_mma_causal`] and [`fattn_mma_bf16_causal`]: pads
-/// `k`/`v` for GQA batching and launches with no mask, so the kernel masks
-/// the diagonal from `kv_offset`. Picks the native-bf16 kernels when `k`/`v`
-/// are `BF16`, the plain F16 kernels when they are `F16`.
+/// `k`/`v` for GQA batching and launches with no mask and no `KV_max`, so
+/// the kernel masks the diagonal and bounds each tile's KV loop from
+/// `kv_offset`. Picks the native-bf16 kernels when `k`/`v` are `BF16`, the
+/// plain F16 kernels when they are `F16`.
 fn causal_in_kernel(
     q: &Tensor,
     k: &Tensor,
@@ -886,7 +889,7 @@ fn causal_in_kernel(
         DType::BF16 => true,
         other => candle_core::bail!("fattn_mma causal: k/v must be F16 or BF16, got {other:?}"),
     };
-    let (batch, seq_q, _, _) = q.dims4()?;
+    let (_, seq_q, _, _) = q.dims4()?;
     let (head_dim, gqa_ratio, _, seq_kv, is_amd) = mma_shape_params(q, k)?;
     let padded = if bf16 {
         padded_seq_kv_for_gqa_batching_bf16(head_dim, gqa_ratio, seq_q, seq_kv, is_amd)
@@ -898,40 +901,11 @@ fn causal_in_kernel(
         Some(padded) => pad_kv(k, v, padded)?,
         None => (k.clone(), v.clone()),
     };
-    let ncols1 = if bf16 {
-        mma_ncols1_for_bf16(q, &k)?
-    } else {
-        mma_ncols1_for(q, &k)?
-    };
-    let kv_max = causal_kv_max(batch, seq_q, ncols1, kv_offset, &k, q.device())?;
     if bf16 {
-        prefill_dispatch_bf16(q, &k, &v, None, Some(&kv_max), scale, Some(kv_offset))
+        prefill_dispatch_bf16(q, &k, &v, None, None, scale, Some(kv_offset))
     } else {
-        prefill_dispatch(q, &k, &v, None, Some(&kv_max), scale, Some(kv_offset))
+        prefill_dispatch(q, &k, &v, None, None, scale, Some(kv_offset))
     }
-}
-
-/// `KV_max` for a causal launch over `k`'s (possibly padded) `seq_kv`. See
-/// [`fattn_mma_causal_with_mask`]'s comment on the rounded cap.
-fn causal_kv_max(
-    batch: usize,
-    seq_q: usize,
-    ncols1: usize,
-    kv_offset: usize,
-    k: &Tensor,
-    device: &candle_core::Device,
-) -> Result<Tensor> {
-    let seq_kv = k.dims4()?.1;
-    super::fattn::build_analytic_kv_max(
-        batch,
-        seq_q,
-        ncols1,
-        kv_offset,
-        seq_kv,
-        0,
-        seq_kv.next_multiple_of(FATTN_KQ_STRIDE),
-        device,
-    )
 }
 
 /// Native-bf16 counterpart of [`fattn_mma_causal_with_mask`]. Like its f16
@@ -2573,13 +2547,16 @@ mod gpu_tests {
     }
 
     // Shapes cover an unaligned seq_kv with GQA padding, a decode-like
-    // offset, padding with an offset, and batch 2. MHA (ncols2 == 1) has no
-    // AMD kernel, so it only runs on NVIDIA.
-    const CAUSAL_BITWISE_SHAPES: [(usize, usize, usize, usize, usize, usize); 4] = [
+    // offset, padding with an offset, batch 2, and a partial last Q tile
+    // whose in-kernel KV bound stops several tiles before the host
+    // `KV_max`'s `FATTN_KQ_STRIDE`-rounded one. MHA (ncols2 == 1) has no AMD
+    // kernel, so it only runs on NVIDIA.
+    const CAUSAL_BITWISE_SHAPES: [(usize, usize, usize, usize, usize, usize); 5] = [
         (1, 231, 231, 8, 2, 256),
         (1, 16, 256, 8, 2, 128),
         (1, 100, 300, 8, 2, 64),
         (2, 64, 64, 8, 2, 128),
+        (1, 300, 1100, 8, 2, 256),
     ];
 
     // NVIDIA-only f16 shapes with `ncols1 * ncols2 == 8`, the narrow
