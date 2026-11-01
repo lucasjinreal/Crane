@@ -375,5 +375,5 @@ curl http://localhost:8080/abort_request \
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/health` | GET | Liveness check, returns `{"status": "ok"}` |
-| `/v1/stats` | GET | Engine stats snapshot (requests, throughput, active sequences) |
+| `/v1/stats` | GET | Engine stats snapshot: request counts, throughput, `avg_ttft_ms` (from submit), `avg_queue_ms`, `avg_tpot_ms`, `avg_decode_batch_size`, `total_preemptions` |
 | `/flush_cache` | GET, POST | KV cache flush (reserved for compatibility; caches are managed automatically) |

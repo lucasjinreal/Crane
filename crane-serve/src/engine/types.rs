@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use tokio::sync::mpsc;
 
@@ -25,6 +26,9 @@ pub struct EngineRequest {
     /// grammar constraint on the tool-call XML skeleton. Empty when no
     /// tools were offered.
     pub tool_names: Vec<String>,
+    /// When [`EngineHandle::submit`] was called, before the request entered
+    /// the engine channel.
+    pub arrived_at: Instant,
     pub response_tx: mpsc::UnboundedSender<EngineResponse>,
 }
 
@@ -107,6 +111,7 @@ impl EngineHandle {
                 "Engine is unavailable due to a fatal GPU error: {err}"
             ));
         }
+        let arrived_at = Instant::now();
         let (response_tx, response_rx) = mpsc::unbounded_channel();
         self.request_tx
             .send(EngineRequest {
@@ -122,6 +127,7 @@ impl EngineHandle {
                 eos_token_id: params.eos_token_id,
                 stop: params.stop,
                 tool_names: params.tool_names,
+                arrived_at,
                 response_tx,
             })
             .map_err(|_| anyhow::anyhow!("Engine thread has shut down"))?;
@@ -172,6 +178,32 @@ mod tests {
             },
         );
         assert!(rx.is_ok());
+    }
+
+    #[test]
+    fn submit_stamps_arrival_time() {
+        let (handle, mut rx) = make_handle();
+        let before = Instant::now();
+        let _ = handle
+            .submit(
+                "t".into(),
+                vec![1],
+                GenerationParams {
+                    max_tokens: 10,
+                    temperature: None,
+                    top_p: None,
+                    top_k: None,
+                    repetition_penalty: 1.0,
+                    frequency_penalty: 0.0,
+                    presence_penalty: 0.0,
+                    eos_token_id: vec![0],
+                    stop: vec![],
+                    tool_names: vec![],
+                },
+            )
+            .unwrap();
+        let req = rx.try_recv().unwrap();
+        assert!(req.arrived_at >= before && req.arrived_at <= Instant::now());
     }
 
     #[test]

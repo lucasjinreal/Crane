@@ -731,6 +731,8 @@ impl InferenceEngine {
                 "Preempting sequence (KV cache eviction) — will re-prefill later",
             );
 
+            self.stats.total_preemptions.fetch_add(1, Ordering::Relaxed);
+
             // If this sequence's KV is currently loaded in the model, clear it.
             if self.active_seq_id.as_deref() == Some(&victim_id) {
                 self.clear_kv_cache_best_effort("eviction");
@@ -917,7 +919,8 @@ impl InferenceEngine {
             stop_sequences: req.stop,
             unsent_text: String::new(),
             decode_start: None,
-            created_at: Instant::now(),
+            created_at: req.arrived_at,
+            prefill_started_at: None,
             first_token_at: None,
             response_tx: req.response_tx,
         };
@@ -1102,6 +1105,17 @@ impl InferenceEngine {
 
     fn step_prefill(&mut self, seq_id: String) {
         let t0 = Instant::now();
+
+        if let Some(seq) = self.sequences.get_mut(&seq_id)
+            && seq.mark_prefill_started()
+            && let Some(d) = seq.queue_time()
+        {
+            #[allow(clippy::cast_possible_truncation)]
+            self.stats
+                .total_queue_us
+                .fetch_add(d.as_micros() as u64, Ordering::Relaxed);
+            self.stats.queue_count.fetch_add(1, Ordering::Relaxed);
+        }
 
         // Reuse the state already in the model when this prompt extends it.
         // Must be decided before `swap_in`, which is what would otherwise
@@ -1513,6 +1527,9 @@ impl InferenceEngine {
                 },
             };
 
+            self.stats
+                .total_decode_forwards
+                .fetch_add(1, Ordering::Relaxed);
             rounds_done += 1;
 
             for (i, seq_id) in batch.iter().enumerate() {
@@ -1650,6 +1667,10 @@ impl InferenceEngine {
                         break;
                     },
                 };
+
+                self.stats
+                    .total_decode_forwards
+                    .fetch_add(1, Ordering::Relaxed);
 
                 let next_token = {
                     let seq = self.sequences.get_mut(seq_id).unwrap();
@@ -1888,6 +1909,7 @@ impl InferenceEngine {
     }
 
     fn finish_sequence(&mut self, seq_id: &str) {
+        let finished_at = Instant::now();
         // A stop sequence has already been produced, so flushing the
         // tokenizer's remaining buffered text would stream part of the stop
         // sequence itself to the client. Only the text preceding the match
@@ -2001,6 +2023,13 @@ impl InferenceEngine {
             self.stats
                 .completed_requests
                 .fetch_add(1, Ordering::Relaxed);
+            if let Some(tpot) = seq.tpot(finished_at, completion_tokens) {
+                #[allow(clippy::cast_possible_truncation)]
+                self.stats
+                    .total_tpot_us
+                    .fetch_add(tpot.as_micros() as u64, Ordering::Relaxed);
+                self.stats.tpot_count.fetch_add(1, Ordering::Relaxed);
+            }
             if let Some(ttft) = ttft_ms {
                 self.stats
                     .total_ttft_us

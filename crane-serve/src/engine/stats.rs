@@ -22,6 +22,24 @@ pub struct EngineStats {
     pub total_ttft_us: AtomicU64,
     /// Number of requests that have contributed a TTFT sample.
     pub ttft_count: AtomicU64,
+    /// Cumulative wait from submit to first prefill start, in microseconds.
+    /// Paired with `queue_count` to compute `avg_queue_ms`.
+    pub total_queue_us: AtomicU64,
+    /// Number of requests that have contributed a queue-time sample.
+    pub queue_count: AtomicU64,
+    /// Cumulative time per output token (after the first) across completed
+    /// requests with at least two tokens, in microseconds. Paired with
+    /// `tpot_count` to compute `avg_tpot_ms`.
+    pub total_tpot_us: AtomicU64,
+    /// Number of requests that have contributed a TPOT sample.
+    pub tpot_count: AtomicU64,
+    /// Number of sequences evicted from the KV cache and sent back to
+    /// waiting.
+    pub total_preemptions: AtomicU64,
+    /// Number of successful decode forward passes (one per batched round or
+    /// sequential token). Divides `total_decode_steps` for
+    /// `avg_decode_batch_size`.
+    pub total_decode_forwards: AtomicU64,
     /// Set once a fatal, device-context-poisoning error occurs (e.g. an
     /// illegal GPU memory access). Unset means the engine is healthy.
     /// First occurrence wins; later errors don't overwrite it.
@@ -52,6 +70,12 @@ impl EngineStats {
             waiting_sequences: AtomicU64::new(0),
             total_ttft_us: AtomicU64::new(0),
             ttft_count: AtomicU64::new(0),
+            total_queue_us: AtomicU64::new(0),
+            queue_count: AtomicU64::new(0),
+            total_tpot_us: AtomicU64::new(0),
+            tpot_count: AtomicU64::new(0),
+            total_preemptions: AtomicU64::new(0),
+            total_decode_forwards: AtomicU64::new(0),
             fatal_error: OnceLock::new(),
         }
     }
@@ -93,6 +117,26 @@ impl EngineStats {
         } else {
             0.0
         };
+        let queue_count = self.queue_count.load(Ordering::Relaxed);
+        let total_queue_us = self.total_queue_us.load(Ordering::Relaxed);
+        let avg_queue_ms = if queue_count > 0 {
+            (total_queue_us as f64 / 1000.0) / queue_count as f64
+        } else {
+            0.0
+        };
+        let tpot_count = self.tpot_count.load(Ordering::Relaxed);
+        let total_tpot_us = self.total_tpot_us.load(Ordering::Relaxed);
+        let avg_tpot_ms = if tpot_count > 0 {
+            (total_tpot_us as f64 / 1000.0) / tpot_count as f64
+        } else {
+            0.0
+        };
+        let decode_forwards = self.total_decode_forwards.load(Ordering::Relaxed);
+        let avg_decode_batch_size = if decode_forwards > 0 {
+            total_decode as f64 / decode_forwards as f64
+        } else {
+            0.0
+        };
         StatsSnapshot {
             total_requests: self.total_requests.load(Ordering::Relaxed),
             completed_requests: self.completed_requests.load(Ordering::Relaxed),
@@ -106,6 +150,10 @@ impl EngineStats {
             avg_decode_tokens_per_sec: avg_decode_tok_s,
             avg_prefill_tokens_per_sec: avg_prefill_tok_s,
             avg_ttft_ms,
+            avg_queue_ms,
+            avg_tpot_ms,
+            avg_decode_batch_size,
+            total_preemptions: self.total_preemptions.load(Ordering::Relaxed),
             fatal_error: self.get_fatal_error(),
         }
     }
@@ -127,6 +175,19 @@ pub struct StatsSnapshot {
     /// Average time-to-first-token across completed requests, in
     /// milliseconds. `0.0` until at least one request has completed.
     pub avg_ttft_ms: f64,
+    /// Average wait from submit to first prefill start, ms. Counts every
+    /// request that reached prefill, including ones later cancelled or
+    /// failed. `0.0` until a request has started prefill.
+    pub avg_queue_ms: f64,
+    /// Average time per output token after the first, ms, across completed
+    /// requests with >= 2 tokens. `0.0` until one such request has
+    /// completed.
+    pub avg_tpot_ms: f64,
+    /// Average tokens generated per decode forward pass. `0.0` until a
+    /// decode forward has run.
+    pub avg_decode_batch_size: f64,
+    /// Sequences evicted from the KV cache since startup.
+    pub total_preemptions: u64,
     /// Recorded fatal GPU error message, if the engine has hit one. Omitted
     /// from the JSON response entirely when the engine is healthy.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -257,6 +318,74 @@ mod tests {
         {
             assert_eq!(snap.avg_ttft_ms, 0.0);
         }
+    }
+
+    #[test]
+    fn snapshot_avg_queue_ms_calculation() {
+        let s = EngineStats::new();
+        s.total_queue_us.store(600_000, Ordering::Relaxed);
+        s.queue_count.store(3, Ordering::Relaxed);
+
+        let snap = s.snapshot();
+        assert!((snap.avg_queue_ms - 200.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn snapshot_avg_queue_ms_zero_when_no_samples() {
+        let s = EngineStats::new();
+        let snap = s.snapshot();
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(snap.avg_queue_ms, 0.0);
+        }
+    }
+
+    #[test]
+    fn snapshot_avg_tpot_ms_calculation() {
+        let s = EngineStats::new();
+        s.total_tpot_us.store(50_000, Ordering::Relaxed);
+        s.tpot_count.store(5, Ordering::Relaxed);
+
+        let snap = s.snapshot();
+        assert!((snap.avg_tpot_ms - 10.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn snapshot_avg_tpot_ms_zero_when_no_samples() {
+        let s = EngineStats::new();
+        let snap = s.snapshot();
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(snap.avg_tpot_ms, 0.0);
+        }
+    }
+
+    #[test]
+    fn snapshot_avg_decode_batch_size() {
+        let s = EngineStats::new();
+        s.total_decode_steps.store(64, Ordering::Relaxed);
+        s.total_decode_forwards.store(16, Ordering::Relaxed);
+
+        let snap = s.snapshot();
+        assert!((snap.avg_decode_batch_size - 4.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn snapshot_avg_decode_batch_size_zero_when_no_forwards() {
+        let s = EngineStats::new();
+        s.total_decode_steps.store(64, Ordering::Relaxed);
+        let snap = s.snapshot();
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(snap.avg_decode_batch_size, 0.0);
+        }
+    }
+
+    #[test]
+    fn snapshot_reports_total_preemptions() {
+        let s = EngineStats::new();
+        s.total_preemptions.store(3, Ordering::Relaxed);
+        assert_eq!(s.snapshot().total_preemptions, 3);
     }
 
     #[test]
