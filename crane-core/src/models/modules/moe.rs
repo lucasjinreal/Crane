@@ -4,6 +4,7 @@ use crate::device::{format_budget, query_gpu_memory};
 use crate::models::hunyuan_dense::modeling::Gguf;
 use crate::ops::linear::LinearLayer;
 use crate::quantized::iquant::IQuantExperts;
+#[cfg(not(feature = "rocm"))]
 use crate::utils::DeviceExt;
 use crate::utils::prof::{self, Span};
 use candle_core::quantized::k_quants::{
