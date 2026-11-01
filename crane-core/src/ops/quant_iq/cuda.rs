@@ -7,7 +7,7 @@
 use candle_core::cuda_backend::cudarc::driver::{DeviceRepr, LaunchConfig, PushKernelArg};
 use candle_core::cuda_backend::{CudaDType, WrapErr};
 use candle_core::op::BackpropOp;
-use candle_core::{CudaDevice, CudaStorage, DType, Result, Storage, Tensor, bail};
+use candle_core::{CudaDevice, CudaStorage, DType, Result, Storage, StorageRef, Tensor, bail};
 
 use crate::quantized::iquant::IQuantType;
 
@@ -23,7 +23,7 @@ const WARPS: usize = 4;
 /// `ROWS_PER_BLOCK` in `quant_iq.cu`.
 const ROWS_PER_BLOCK: usize = 4;
 
-fn packed_slice(packed: &Tensor) -> Result<(std::sync::RwLockReadGuard<'_, Storage>, usize)> {
+fn packed_slice(packed: &Tensor) -> Result<(StorageRef<'_>, usize)> {
     let (storage, layout) = packed.storage_and_layout();
     if !matches!(&*storage, Storage::Cuda(_)) {
         bail!("i-quant packed weight must be a CUDA u8 tensor")
@@ -324,7 +324,7 @@ fn to_i32(n: usize, what: &str) -> Result<i32> {
 }
 
 /// Flattened contiguous `U32` expert ids on a CUDA device.
-fn ids_slice(ids: &Tensor) -> Result<(std::sync::RwLockReadGuard<'_, Storage>, usize)> {
+fn ids_slice(ids: &Tensor) -> Result<(StorageRef<'_>, usize)> {
     let (storage, layout) = ids.storage_and_layout();
     if !matches!(&*storage, Storage::Cuda(_)) || ids.dtype() != DType::U32 {
         bail!("expert ids must be a CUDA U32 tensor")

@@ -132,7 +132,7 @@ impl candle_core::CustomOp1 for TopKIndicesOp {
         storage: &CudaStorage,
         layout: &candle_core::Layout,
     ) -> Result<(CudaStorage, Shape)> {
-        use candle_core::cuda_backend::{CudaDType, WrapErr};
+        use candle_core::cuda_backend::WrapErr;
 
         if !layout.is_contiguous() {
             candle_core::bail!("topk_indices requires contiguous layout");

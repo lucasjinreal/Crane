@@ -20,7 +20,7 @@
 //! direct tensor method call. Callers broadcast `y`/`x` to matching shapes
 //! before calling `atan2()`.
 
-#[cfg(any(feature = "cuda", feature = "rocm"))]
+#[cfg(feature = "cuda")]
 use candle_core::DType;
 #[cfg(feature = "cuda")]
 use candle_core::backend::BackendStorage;
@@ -32,6 +32,7 @@ use candle_core::cuda_backend::{CudaStorage, CudaStorageSlice, WrapErr};
 use candle_core::rocm_backend::RocmStorage;
 use candle_core::{CpuStorage, CustomOp2, Layout, Result, Shape, Tensor, WithDType};
 
+#[cfg(not(feature = "rocm"))]
 use crate::utils::DeviceExt;
 
 // PTX compiled from kernels/cuda/atan2.cu — embedded at build time.

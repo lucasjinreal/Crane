@@ -6,7 +6,7 @@
 use candle_core::backend::BackendStorage;
 use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
 use candle_core::cuda_backend::{CudaStorage, CudaStorageSlice, WrapErr};
-use candle_core::{CudaDevice, DType, Device, Layout, Result, Shape, Tensor, WithDType};
+use candle_core::{DType, Device, Layout, Result, Shape, Tensor, WithDType};
 
 // PTX compiled from kernels/cuda/*.cu — embedded at build time. One const per
 // source file, so `topk.cu` is `ptx::TOPK`; [`super::cuda_topk`] reads it here.

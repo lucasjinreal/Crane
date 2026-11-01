@@ -28,7 +28,7 @@
 //! module (SYCL storage has no per-dtype slice enum for `sycl_fwd` to match
 //! on, unlike CUDA's `CudaStorageSlice`).
 
-#[cfg(any(feature = "cuda", feature = "rocm"))]
+#[cfg(feature = "cuda")]
 use candle_core::DType;
 #[cfg(feature = "cuda")]
 use candle_core::backend::BackendStorage;

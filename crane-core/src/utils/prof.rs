@@ -29,7 +29,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use candle_core::Device;
-use ribo::utils::log::{self, tracing};
+use ribo::utils::log::tracing;
 
 /// Emit a line through `tracing` if the current subscriber would actually
 /// surface it at `INFO` for this module, otherwise `eprintln!` it directly.
