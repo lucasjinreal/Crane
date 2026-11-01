@@ -5073,6 +5073,156 @@ mod tests {
         }
     }
 
+    // Exercises `SparseMoeBlock::cached_forward`'s mixed-path dispatch:
+    // experts 0/1 are seeded GPU-resident (see `ExpertCache::new`'s
+    // seed-by-index placement) while 2/3 stay CPU-resident, and with the
+    // same routing as `gpu_offload_forward_matches_cpu_batched` (token 0 ->
+    // experts 0+2, token 1 -> experts 1+3) every token hits one GPU-resident
+    // and one CPU-resident expert, so this covers both `indexed_moe_forward`
+    // dispatch and the weighted `index_add` combine across the two paths,
+    // not just `partition_by_residency`'s CPU-side classification (which
+    // `test_partition_by_residency_mixed` already covers without a GPU).
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
+    #[test]
+    #[ignore]
+    #[allow(clippy::too_many_lines)]
+    fn cached_forward_matches_cpu_batched() {
+        #[cfg(feature = "cuda")]
+        let device = Device::new_cuda(0).expect("cuda device");
+        #[cfg(all(feature = "rocm", not(feature = "cuda")))]
+        let device = Device::new_rocm(0).expect("rocm device");
+
+        const N: usize = 32;
+
+        let identity = |n: usize| -> Vec<f32> {
+            let mut v = vec![0.0f32; n * n];
+            for i in 0..n {
+                v[i * n + i] = 1.0;
+            }
+            v
+        };
+        let scaled = |n: usize, c: f32| -> Vec<f32> {
+            let mut v = vec![0.0f32; n * n];
+            for i in 0..n {
+                v[i * n + i] = c;
+            }
+            v
+        };
+        let expert_data = vec![
+            (identity(N), scaled(N, 1.0), identity(N)),
+            (identity(N), scaled(N, 3.0), identity(N)),
+            (identity(N), scaled(N, 2.0), identity(N)),
+            (identity(N), scaled(N, 5.0), identity(N)),
+        ];
+
+        let gate_row = |w: f32| -> Vec<f32> {
+            let mut v = vec![0.0f32; N];
+            v[0] = w;
+            v
+        };
+        let gate_data: Vec<f32> = [2.0f32, -2.0, 1.5, -1.5]
+            .into_iter()
+            .flat_map(gate_row)
+            .collect();
+        let moe = make_packed_sparse_moe(N, N, 4, 2, false, gate_data, &expert_data);
+
+        let token = |first: f32, seed: f32| -> Vec<f32> {
+            let mut v: Vec<f32> = (0..N).map(|j| ((j as f32 + seed) * 0.037).sin()).collect();
+            v[0] = first;
+            v
+        };
+        let x_data: Vec<f32> = [token(1.0, 0.0), token(-0.5, 7.0)].concat();
+        let x = Tensor::from_vec(x_data, (2, N), &Device::Cpu).expect("tensor");
+
+        let expected = moe
+            .forward(&x)
+            .expect("cpu batched forward")
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+
+        let xs_f32 = x.to_dtype(DType::F32).expect("to_dtype");
+        let logits = moe.gate.forward(&xs_f32).expect("gate forward");
+        let (topk_ids, topk_weights) =
+            crate::ops::fused_ops::topk_moe::topk_moe_routing(&logits, 2, false).expect("routing");
+
+        // `cached_forward` dispatches off `xs_f32.device()` without moving
+        // anything itself, unlike `gpu_offload_forward` — the real caller
+        // only reaches it once the input already lives on the GPU (see the
+        // `input_device.is_cuda() || input_device.is_rocm()` guard above
+        // its call site), so this test must move inputs there too.
+        let xs_f32 = xs_f32.to_device(&device).expect("xs_f32 to device");
+        let topk_ids = topk_ids.to_device(&device).expect("topk_ids to device");
+        let topk_weights = topk_weights
+            .to_device(&device)
+            .expect("topk_weights to device");
+
+        // Re-quantize to Q8_0 (the only dtype `indexed_moe_forward`'s GPU
+        // kernel supports) so this exercises the real dispatch path.
+        let gate_up_f32 = moe.packed_gate_up_exps.as_ref().expect("packed gate_up");
+        let down_f32 = moe.packed_down_exps.as_ref().expect("packed down");
+        let gate_up_q8 = Arc::new(
+            QTensor::quantize(
+                &gate_up_f32
+                    .dequantize(&Device::Cpu)
+                    .expect("dequantize gate_up"),
+                GgmlDType::Q8_0,
+            )
+            .expect("quantize gate_up q8_0"),
+        );
+        let down_q8 = Arc::new(
+            QTensor::quantize(
+                &down_f32.dequantize(&Device::Cpu).expect("dequantize down"),
+                GgmlDType::Q8_0,
+            )
+            .expect("quantize down q8_0"),
+        );
+
+        // Seeds experts 0/1 GPU-resident, 2/3 CPU-resident (see
+        // `ExpertCache::new`'s seed-by-index placement).
+        let slots_per_layer = 2;
+        let gu_blob = 2 * N * N * GgmlDType::Q8_0.type_size() / GgmlDType::Q8_0.block_size();
+        let dn_blob = N * N * GgmlDType::Q8_0.type_size() / GgmlDType::Q8_0.block_size();
+        let budget = ExpertCacheBudget {
+            raw_budget_slots: slots_per_layer,
+            slots_per_layer,
+            gate_up_blob_bytes: gu_blob,
+            down_blob_bytes: dn_blob,
+            n_layers: 1,
+            n_experts: 4,
+        };
+        let cache = ExpertCache::new(
+            budget,
+            vec![gate_up_q8.clone()],
+            vec![down_q8.clone()],
+            &device,
+        )
+        .expect("ExpertCache::new");
+
+        let got = moe
+            .cached_forward(
+                &xs_f32,
+                &topk_ids,
+                &topk_weights,
+                &gate_up_q8,
+                &down_q8,
+                &cache,
+                DType::F32,
+                &[2, N],
+            )
+            .expect("cached_forward")
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+
+        // Same Q8_0 tolerance as `gpu_offload_forward_matches_cpu_batched`.
+        for (e, g) in expected.iter().zip(got.iter()) {
+            assert!((e - g).abs() < 0.1, "expected {expected:?}, got {got:?}");
+        }
+    }
+
     // Verifies the packed-CPU dispatch path handles both 2D and 3D inputs,
     // mirroring `test_sparse_moe_output_shape_2d`/`_3d` for the per-expert
     // path.
