@@ -36,21 +36,21 @@
 //!    — Q, K, V weights fused into one matmul; gate and up weights fused into
 //!    one matmul — halves the number of linear-layer dispatches per layer.
 
-use candle_core::quantized::gguf_file;
+use candle_core::quantized::{QTensor, gguf_file};
 use candle_core::{D, DType, Device, Module, Result, Tensor};
 use candle_nn::attention::AttnMask;
 use candle_nn::rotary_emb::rope_thd;
 use candle_nn::{Linear, RmsNorm, VarBuilder, linear_no_bias};
 use serde::Deserialize;
 use std::io::{Read, Seek};
+use std::sync::Arc;
 
-use crate::device::{DeviceAssignment, format_budget, greedy_fit_layers, query_gpu_memory};
+use crate::device::{DeviceAssignment, format_budget, query_gpu_memory};
 use crate::models::modules::embedding::EmbeddingLayer;
+use crate::models::modules::expert_cache::{ExpertCache, ExpertCacheBudget, blob_bytes_per_expert};
 use crate::models::modules::flash_attn::dispatch_flash_attn;
 use crate::models::modules::kv_cache;
-use crate::models::modules::moe::{
-    MlpOrMoe, MoeConfig, SparseMoeBlock, offload_reservation_bytes_for,
-};
+use crate::models::modules::moe::{MlpOrMoe, MoeConfig, SparseMoeBlock};
 use crate::models::modules::rotary::RotaryEmbedding;
 use crate::quantized::gguf_metadata::GgufMetadata;
 use crate::utils::DeviceExt;
@@ -893,6 +893,12 @@ fn read_moe_metadata<R: Read + Seek>(gg: &Gguf<R>, arch: &str) -> GgufMoeMetadat
     }
 }
 
+/// Fixed margin for allocator fragmentation and transient compute
+/// allocations on top of an [`ExpertCache`]'s own pool byte budget. Does
+/// not cover KV-cache growth — `runtime_reservation_bytes` already does
+/// that (see [`Qwen3Model::seed_expert_cache`]'s caller in `model.rs`).
+const EXPERT_CACHE_SAFETY_MARGIN_BYTES: u64 = 512 * (1 << 20);
+
 impl Qwen3Model {
     /// Construct from safetensors / `HuggingFace` checkpoint. Expert weights
     /// (if `MoE`) go on the same device as the rest of the model; use
@@ -1167,17 +1173,27 @@ impl Qwen3Model {
 
     /// Runs a probe forward pass to force GPU backends' lazy first-use
     /// library initialization (rocBLAS/hipRAND/JIT-compiled kernels), then
-    /// live-queries free VRAM and greedily promotes CPU-placed `MoE` expert
-    /// layers to `main_device` up to `vram_ceiling_bytes` (minus
-    /// `runtime_reservation_bytes` for the KV cache, and minus a `MoE`
-    /// CPU-offload reservation sized for a `chunk_tokens`-token prefill
-    /// chunk — see [`crate::models::modules::moe::offload_reservation_bytes_for`]).
-    /// Reserving the offload headroom here, not just when later sizing the
-    /// KV budget, is what keeps `baseline + kv_budget + offload_reservation`
-    /// from exceeding `vram_ceiling_bytes`: once a layer is promoted its
-    /// weight cost becomes part of the (fixed) baseline, so the ceiling must
-    /// already account for the reservation before promotion decides how
-    /// many layers to place. No-op for non-`MoE` checkpoints.
+    /// live-queries free VRAM and seeds a per-expert [`ExpertCache`] sized
+    /// to fit within `vram_ceiling_bytes` (minus `runtime_reservation_bytes`
+    /// for the KV cache, and minus a `MoE` CPU-offload reservation sized for
+    /// a `chunk_tokens`-token prefill chunk — see
+    /// [`Self::moe_offload_reservation_bytes`]). Reserving the offload
+    /// headroom here, not just when later sizing the KV budget, is what
+    /// keeps `baseline + kv_budget + offload_reservation` from exceeding
+    /// `vram_ceiling_bytes`: once the cache pool is allocated its byte cost
+    /// becomes part of the (fixed) baseline, so the ceiling must already
+    /// account for the reservation before sizing the pool. `Ok(None)` for
+    /// non-`MoE` checkpoints, a CPU main device, or checkpoints whose
+    /// experts aren't stored as a packed `QTensor` pair (the only layout
+    /// [`ExpertCache`] supports today).
+    ///
+    /// The seed placement is arbitrary — each layer's first `slots_per_layer`
+    /// experts by index, not ranked by any calibration pass. Correctness
+    /// comes from live traffic correcting the seed via
+    /// [`ExpertCache::decay_and_swap`], not from getting the seed right.
+    /// Callers must still drive the returned cache's token clock (e.g. the
+    /// scheduler's per-step loop calling [`ExpertCache::on_step`]), or
+    /// placement never improves past this arbitrary seed.
     ///
     /// A static pre-load VRAM estimate consistently undershoots real usage:
     /// rocBLAS/hipRAND/CUDA JIT lazily initialize on first use, so the real
@@ -1187,160 +1203,81 @@ impl Qwen3Model {
     ///
     /// # Errors
     ///
-    /// Returns an error only if a tensor op unrelated to the promotion
-    /// itself fails; an out-of-memory promotion attempt is caught and
-    /// logged instead — remaining layers just stay on CPU.
-    // One sequential pipeline (probe -> cost estimate -> budget -> promote)
-    // sharing local state (`gpu_location`, `layer_costs`) throughout;
+    /// Returns an error only if a tensor op unrelated to the probe fails, or
+    /// if [`ExpertCache::new`] fails to build the initial pools; an
+    /// out-of-memory probe forward pass is caught and logged instead,
+    /// falling back to `Ok(None)`.
+    // One sequential pipeline (probe -> cost estimate -> budget -> seed)
+    // sharing local state (`gpu_location`, `moe_layer_count`) throughout;
     // splitting it up would scatter that shared context across several
     // small functions without simplifying the control flow itself.
     #[allow(clippy::too_many_lines)]
-    pub fn promote_experts_to_gpu(
+    pub fn seed_expert_cache(
         &mut self,
         main_device: &Device,
         vram_ceiling_bytes: u64,
         runtime_reservation_bytes: u64,
         chunk_tokens: usize,
-    ) -> Result<()> {
+    ) -> Result<Option<Arc<ExpertCache>>> {
         let Some(moe_config) = self.config.moe_config() else {
-            return Ok(());
+            return Ok(None);
         };
         if matches!(main_device, Device::Cpu) {
-            return Ok(());
+            return Ok(None);
         }
         let gpu_location = main_device.location();
+
+        let moe_layer_count = self
+            .layers
+            .iter()
+            .filter(|l| matches!(l.mlp, MlpOrMoe::Moe(_)))
+            .count();
+        if moe_layer_count == 0 {
+            // `moe_config()` only reports checkpoint-level MoE fields; a
+            // `decoder_sparse_step` larger than `num_hidden_layers` can
+            // still leave every individual layer Dense (see `DecoderLayer::
+            // new`'s `is_moe_layer` stride check). Nothing to cache.
+            return Ok(None);
+        }
+        let all_packed = self.layers.iter().all(|l| match &l.mlp {
+            MlpOrMoe::Moe(block) => block.has_packed_qtensor_experts(),
+            MlpOrMoe::Dense(_) => true,
+        });
+        if !all_packed {
+            log::warn!(
+                "Expert cache: not every MoE layer stores experts as a packed QTensor pair \
+                 (i-quant or dequantized per-expert storage); skipping per-expert caching, \
+                 all experts stay on CPU"
+            );
+            return Ok(None);
+        }
+
         log::info!(
-            "Expert placement: running probe forward pass + live VRAM query on {gpu_location:?} \
-             before deciding MoE GPU/CPU split (may take a few seconds)"
+            "Expert cache: running probe forward pass + live VRAM query on {gpu_location:?} \
+             before sizing the per-expert cache (may take a few seconds)"
         );
         let probe_ids = Tensor::new(&[45u32, 546, 456], main_device)?.unsqueeze(0)?;
         if let Err(e) = self.forward(&probe_ids, 0) {
             self.clear_kv_cache();
             log::warn!(
-                "expert-placement probe forward failed on {gpu_location:?} (non-fatal, all \
-                 experts stay on CPU): {e}"
+                "expert-cache probe forward failed on {gpu_location:?} (non-fatal, all experts \
+                 stay on CPU): {e}"
             );
-            return Ok(());
+            return Ok(None);
         }
         self.clear_kv_cache();
 
-        let is_moe_layer: Vec<bool> = self
-            .layers
-            .iter()
-            .map(|l| matches!(l.mlp, MlpOrMoe::Moe(_)))
-            .collect();
-        let total_moe_layers = is_moe_layer.iter().filter(|&&m| m).count();
-        // Dynamic-quant checkpoints (e.g. Unsloth's "UD" GGUFs) can mix
-        // quantization levels across MoE layers, so each layer's packed
-        // expert-weight byte size is read individually rather than assumed
-        // uniform. Prefer the packed weights' actual quantized byte size
-        // (what `upload_qtensor` copies, or the raw i-quant buffer size)
-        // over the compute-dtype estimate below. For sub-byte-per-element
-        // quantizations like Q4K the compute-dtype estimate overcounts by
-        // ~3.5x, and even more for i-quant formats like IQ2_S. Fall back to
-        // the compute-dtype formula per layer for dequantized per-expert
-        // tensors (no packed `QTensor`s or i-quant experts).
-        let bf16_per_layer_cost = moe_config.num_experts as u64
-            * moe_config.moe_intermediate_size as u64
-            * self.config.hidden_size as u64
-            * 3
-            * self.dtype.size_in_bytes() as u64;
-        // `None` for non-MoE layers; `Some(cost)` for MoE layers, indexed
-        // in lockstep with `self.layers` for the `layer_costs` zip below.
-        let layer_raw_costs: Vec<Option<u64>> = self
-            .layers
-            .iter()
-            .map(|l| match &l.mlp {
-                MlpOrMoe::Moe(block) => Some(
-                    block
-                        .packed_expert_weight_bytes()
-                        .unwrap_or(bf16_per_layer_cost),
-                ),
-                MlpOrMoe::Dense(_) => None,
-            })
-            .collect();
-        let max_layer_cost = layer_raw_costs.iter().filter_map(|c| *c).max().unwrap_or(0);
-        if max_layer_cost != bf16_per_layer_cost {
-            log::debug!(
-                "MoE budget: max quantized per-layer cost {} (vs. compute-dtype estimate {})",
-                format_budget(max_layer_cost),
-                format_budget(bf16_per_layer_cost),
-            );
-        }
-        // Layers whose experts already live on `gpu_location` (e.g. a
-        // re-promotion pass after `max_seq_len` shrinks and frees headroom)
-        // cost 0: they're already promoted, so charging them again would
-        // waste budget on a no-op and starve layers still on CPU.
-        let layer_costs: Vec<u64> = self
-            .layers
-            .iter()
-            .zip(layer_raw_costs.iter())
-            .map(|(l, cost)| match &l.mlp {
-                MlpOrMoe::Moe(block) if block.expert_device().location() != gpu_location => {
-                    cost.unwrap_or(0)
-                },
-                _ => 0,
-            })
-            .collect();
-        log::debug!(
-            "MoE layout: {total_moe_layers} layers, max per-layer expert cost estimate={}",
-            format_budget(max_layer_cost),
-        );
-
         let Some((free, total)) = query_gpu_memory(main_device) else {
             log::warn!(
-                "No live VRAM query available for {gpu_location:?}; skipping expert promotion \
+                "No live VRAM query available for {gpu_location:?}; skipping expert cache \
                  (all experts stay on CPU)"
             );
-            return Ok(());
+            return Ok(None);
         };
         let used = total.saturating_sub(free);
         let ceiling = vram_ceiling_bytes.min(total);
         let remaining = ceiling.saturating_sub(used);
-        // Reserved even though no layer is known to be CPU-resident yet:
-        // the offload path is only unreachable if every layer ends up
-        // promoted, which the greedy fit below can't guarantee in advance.
-        // Leaving this unreserved would let promotion spend it on GPU
-        // experts, inflating the (fixed) baseline with no room left for the
-        // transient burst once some layers inevitably stay on CPU. Only
-        // charged when the burst is structurally reachable at all: the main
-        // device must support `indexed_moe_forward` (CUDA/ROCm only — Metal
-        // and SYCL always fall through to the CPU batched path) and at
-        // least one MoE layer must store experts as a packed `QTensor`
-        // pair (i-quant and dequantized per-expert storage never use the
-        // burst either). Sized from the max cost among *those* packed-QTensor
-        // layers specifically, not `max_layer_cost` above: a dequantized
-        // per-expert layer's `bf16_per_layer_cost` fallback is always >= any
-        // quantized layer's real cost, so on a checkpoint mixing storage
-        // representations it would otherwise inflate this reservation with a
-        // layer that can never reach the burst path, under-promoting
-        // GPU-resident experts for no benefit. Mirrors the per-layer filter
-        // `moe_offload_reservation_bytes` (the post-promotion counterpart)
-        // already applies via `SparseMoeBlock::offload_reservation_bytes`.
-        let max_packed_layer_cost = self
-            .layers
-            .iter()
-            .zip(layer_raw_costs.iter())
-            .filter_map(|(l, cost)| match &l.mlp {
-                MlpOrMoe::Moe(block) if block.has_packed_qtensor_experts() => *cost,
-                _ => None,
-            })
-            .max();
-        let moe_offload_reservation =
-            if total_moe_layers > 0 && (main_device.is_cuda() || main_device.is_rocm()) {
-                match max_packed_layer_cost {
-                    Some(cost) => offload_reservation_bytes_for(
-                        cost,
-                        chunk_tokens,
-                        moe_config.num_experts_per_tok,
-                        moe_config.moe_intermediate_size,
-                        self.config.hidden_size,
-                    ),
-                    None => 0,
-                }
-            } else {
-                0
-            };
+        let moe_offload_reservation = self.moe_offload_reservation_bytes(chunk_tokens, main_device);
         let available = remaining
             .saturating_sub(runtime_reservation_bytes)
             .saturating_sub(moe_offload_reservation);
@@ -1355,59 +1292,117 @@ impl Qwen3Model {
             format_budget(moe_offload_reservation),
         );
 
-        let promoted: std::collections::HashSet<usize> = greedy_fit_layers(&layer_costs, available)
-            .into_iter()
-            .filter(|&i| is_moe_layer[i])
-            .collect();
-        log::debug!(
-            "Attempting promotion of {} of {total_moe_layers} MoE layers to {gpu_location:?}: {:?}",
-            promoted.len(),
-            {
-                let mut sorted: Vec<usize> = promoted.iter().copied().collect();
-                sorted.sort_unstable();
-                sorted
-            },
-        );
+        let (gate_up_sources, down_sources): (Vec<Arc<QTensor>>, Vec<Arc<QTensor>>) = self
+            .layers
+            .iter()
+            .filter_map(|l| match &l.mlp {
+                MlpOrMoe::Moe(block) => Some((
+                    block.packed_gate_up_source()?.clone(),
+                    block.packed_down_source()?.clone(),
+                )),
+                MlpOrMoe::Dense(_) => None,
+            })
+            .unzip();
+        // `all_packed` above already guarantees every MoE layer yielded a pair.
+        debug_assert_eq!(gate_up_sources.len(), moe_layer_count);
 
-        // The greedy budget above is a heuristic upper bound on what to
-        // *attempt* — allocator fragmentation and per-expert allocation
-        // overhead mean actual usage can still exceed it even though
-        // `promote_experts_to` is itself atomic per layer. A failed
-        // promotion here (e.g. real GPU out-of-memory) must not abort
-        // model load: stop promoting further layers and leave the rest on
-        // CPU — degraded, not fatal.
-        let mut gpu_layers = 0usize;
-        for (i, layer) in self.layers.iter_mut().enumerate() {
-            if !promoted.contains(&i) {
-                continue;
-            }
-            let MlpOrMoe::Moe(block) = &mut layer.mlp else {
-                continue;
-            };
-            match block.promote_experts_to(main_device, self.dtype) {
-                Ok(()) => {
-                    gpu_layers += 1;
-                    log::debug!(
-                        "layer {i}: promoted to {gpu_location:?} (cost={})",
-                        format_budget(layer_costs[i]),
-                    );
-                },
-                Err(e) => {
-                    log::warn!(
-                        "expert promotion stopped at layer {i} on {gpu_location:?} (device \
-                         allocation failed, this and remaining layers stay on CPU): {e}"
-                    );
-                    break;
-                },
+        // ExpertCache tolerates per-layer GGML dtype variation (e.g.
+        // Unsloth's "UD" dynamic-quant GGUFs, which can mix quantization
+        // levels across MoE layers -- see `moe_offload_reservation_bytes`'s
+        // own per-layer cost comment above), but still requires every
+        // layer's tensor *shape* to match layer 0's -- `ExpertCache::new`
+        // enforces this as a hard error, so check it here first to degrade
+        // to all-CPU instead of failing model load outright.
+        let gate_up_dims = gate_up_sources[0].shape().dims().to_vec();
+        let down_dims = down_sources[0].shape().dims().to_vec();
+        let gate_up_mismatch = gate_up_sources
+            .iter()
+            .position(|t| t.shape().dims() != gate_up_dims);
+        let down_mismatch = down_sources
+            .iter()
+            .position(|t| t.shape().dims() != down_dims);
+        if let Some(i) = gate_up_mismatch {
+            log::warn!(
+                "Expert cache: the {i}th MoE layer's gate_up projection has shape {:?}, but \
+                 the first MoE layer's is shape {gate_up_dims:?}; ExpertCache requires a \
+                 uniform tensor shape across layers (GGML dtype may vary), skipping \
+                 per-expert caching, all experts stay on CPU",
+                gate_up_sources[i].shape().dims(),
+            );
+            return Ok(None);
+        }
+        if let Some(i) = down_mismatch {
+            log::warn!(
+                "Expert cache: the {i}th MoE layer's down projection has shape {:?}, but the \
+                 first MoE layer's is shape {down_dims:?}; ExpertCache requires a uniform \
+                 tensor shape across layers (GGML dtype may vary), skipping per-expert \
+                 caching, all experts stay on CPU",
+                down_sources[i].shape().dims(),
+            );
+            return Ok(None);
+        }
+
+        let gate_up_blob_bytes = gate_up_sources
+            .iter()
+            .map(|t| blob_bytes_per_expert(t))
+            .max()
+            .unwrap_or(0);
+        let down_blob_bytes = down_sources
+            .iter()
+            .map(|t| blob_bytes_per_expert(t))
+            .max()
+            .unwrap_or(0);
+
+        let Some(budget) = ExpertCacheBudget::compute(
+            available,
+            EXPERT_CACHE_SAFETY_MARGIN_BYTES,
+            gate_up_blob_bytes,
+            down_blob_bytes,
+            moe_layer_count,
+            moe_config.num_experts,
+        ) else {
+            log::warn!(
+                "Expert cache: {} available after reservations is too little for even one \
+                 slot per layer ({moe_layer_count} layers, {} bytes/expert); all experts stay \
+                 on CPU",
+                format_budget(available),
+                format_budget((gate_up_blob_bytes + down_blob_bytes) as u64),
+            );
+            return Ok(None);
+        };
+
+        let cache = Arc::new(ExpertCache::new(
+            budget,
+            gate_up_sources,
+            down_sources,
+            main_device,
+        )?);
+
+        for layer in &mut self.layers {
+            if let MlpOrMoe::Moe(block) = &mut layer.mlp {
+                block.set_expert_cache(cache.clone());
             }
         }
 
         log::info!(
-            "Expert placement: {gpu_layers}/{total_moe_layers} MoE layers on {gpu_location:?}, \
-             {} on CPU",
-            total_moe_layers - gpu_layers,
+            "Expert cache: seeded {} of {} experts/layer on {gpu_location:?} across \
+             {moe_layer_count} MoE layers",
+            budget.slots_per_layer,
+            moe_config.num_experts,
         );
-        Ok(())
+        Ok(Some(cache))
+    }
+
+    /// Drops every `MoE` layer's [`ExpertCache`] reference. Called before
+    /// [`Self::seed_expert_cache`] re-runs with an updated policy, so the
+    /// old cache's GPU tensors are freed before the new one's live VRAM
+    /// query runs.
+    pub(crate) fn clear_expert_cache(&mut self) {
+        for layer in &mut self.layers {
+            if let MlpOrMoe::Moe(block) = &mut layer.mlp {
+                block.clear_expert_cache();
+            }
+        }
     }
 
     /// Worst-case transient VRAM one in-flight `MoE` CPU-offload call needs:
@@ -2087,20 +2082,21 @@ mod tests {
         );
     }
 
-    // On a CPU-only model, `promote_experts_to_gpu` must return `Ok(())`
+    // On a CPU-only model, `seed_expert_cache` must return `Ok(None)`
     // without panicking (no live VRAM query is possible on CPU, so it
     // takes the early-return path before running the probe forward pass).
     #[test]
-    fn test_promote_experts_to_gpu_is_noop_on_cpu() {
+    fn test_seed_expert_cache_is_noop_on_cpu() {
         let cfg = moe_layer_config(2, None);
         let device = Device::Cpu;
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
         let mut model = Qwen3Model::new(&cfg, vb).expect("new");
 
-        model
-            .promote_experts_to_gpu(&device, 1 << 30, 0, 2048)
-            .expect("promote_experts_to_gpu");
+        let cache = model
+            .seed_expert_cache(&device, 1 << 30, 0, 2048)
+            .expect("seed_expert_cache");
+        assert!(cache.is_none());
     }
 
     fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {

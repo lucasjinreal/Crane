@@ -276,6 +276,20 @@ impl TextConfig {
             .collect()
     }
 
+    /// Bytes of KV cache one sequence consumes per generated token, summed
+    /// across every full-attention layer. Only full-attention layers hold a
+    /// K/V cache that grows with context length; linear-attention (GDN)
+    /// layers carry a constant-size recurrent state instead (see
+    /// `crate::ops::gdn::GdnLayerCache`), so they contribute nothing here.
+    #[must_use]
+    pub fn kv_bytes_per_token(&self, dtype_bytes: usize) -> u64 {
+        let full_attn_layers = (self.num_hidden_layers / self.full_attention_interval) as u64;
+        2 * full_attn_layers
+            * self.num_key_value_heads as u64
+            * self.head_dim as u64
+            * dtype_bytes as u64
+    }
+
     #[must_use]
     pub fn linear_key_dim(&self) -> usize {
         self.linear_num_key_heads * self.linear_key_head_dim
@@ -466,5 +480,14 @@ mod tests {
         );
         assert!(moe.norm_topk_prob);
         assert_eq!(cfg.intermediate_size, 0);
+    }
+
+    /// Only the 16 full-attention layers (of 64) contribute per-token KV
+    /// growth; the 48 GDN layers carry constant-size state instead. At BF16
+    /// (2 bytes): `2 * 16 * 4 * 256 * 2 = 65,536` bytes/token.
+    #[test]
+    fn kv_bytes_per_token_counts_only_full_attention_layers() {
+        let cfg = qwen3_8();
+        assert_eq!(cfg.kv_bytes_per_token(2), 65_536);
     }
 }

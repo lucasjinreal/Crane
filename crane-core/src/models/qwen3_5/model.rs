@@ -2,12 +2,16 @@
 //! wrapper used by the engine (config + weights + tokenizer).
 
 use std::io::Write;
+use std::sync::Arc;
 
 use anyhow::{Context, Error as E, Result};
-use candle_core::quantized::GgmlDType;
+use candle_core::quantized::{GgmlDType, QTensor};
 use candle_core::{DType, Device, Module, Tensor};
 use candle_nn::{Linear, VarBuilder, embedding};
+use ribo::utils::log;
 
+use crate::device::{DeviceAssignment, format_budget, kv_vram_overhead, query_gpu_memory};
+use crate::models::modules::expert_cache::{ExpertCache, ExpertCacheBudget, blob_bytes_per_expert};
 use crate::ops::linear::{LinearLayer, parse_ggml_dtype, quantize_linear};
 use crate::quantized::gguf_metadata::GgufMetadata;
 use crate::utils::DeviceExt;
@@ -36,6 +40,12 @@ pub struct StateSnapshot {
 
 /// Longest speculative pass that runs the GDN recurrence on the serial kernel.
 const SPEC_SERIAL_MAX: usize = 64;
+
+/// Fixed margin for allocator fragmentation and transient compute
+/// allocations on top of an [`ExpertCache`]'s own pool byte budget. Does not
+/// cover KV-cache growth — `runtime_reservation_bytes` already does that
+/// (see [`Model::seed_expert_cache`]'s caller).
+const EXPERT_CACHE_SAFETY_MARGIN_BYTES: u64 = 512 * (1 << 20);
 
 /// Text-only Qwen 3.5 transformer.
 ///
@@ -85,6 +95,25 @@ impl Qwen3_5TextModel {
         dtype: DType,
         quant: Option<GgmlDType>,
     ) -> Result<Self> {
+        Self::new_with_expert_device(cfg, vb, device, dtype, quant, device)
+    }
+
+    /// Like [`Self::new`], but places `MoE` expert weights on `expert_device`
+    /// rather than `device`. Used for `MoE` `CPU` offload (see
+    /// [`crate::device::DeviceAssignment`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a required weight tensor is missing or has an
+    /// unexpected shape.
+    pub fn new_with_expert_device(
+        cfg: &Config,
+        vb: &VarBuilder,
+        device: &Device,
+        dtype: DType,
+        quant: Option<GgmlDType>,
+        expert_device: &Device,
+    ) -> Result<Self> {
         disable_cuda_event_tracking(device);
         let text_cfg = cfg.text().clone();
         // HF saves Qwen 3.5 weights with the prefix
@@ -114,13 +143,15 @@ impl Qwen3_5TextModel {
         let layer_types = text_cfg.layer_types();
         let mut layers = Vec::with_capacity(text_cfg.num_hidden_layers);
         for (idx, &layer_type) in layer_types.iter().enumerate() {
-            layers.push(DecoderLayer::load(
+            let mut layer = DecoderLayer::load_with_expert_device(
                 &text_cfg,
                 idx,
                 layer_type,
                 vb_lm.pp("layers").pp(idx),
                 quant,
-            )?);
+                expert_device,
+            )?;
+            layers.push(layer);
         }
 
         let norm = Qwen35RmsNorm::load(
@@ -211,7 +242,7 @@ impl Qwen3_5TextModel {
         reader: &mut R,
         device: &Device,
     ) -> Result<Self> {
-        Self::from_gguf_impl(ct, reader, device, None)
+        Self::from_gguf_impl(ct, reader, &DeviceAssignment::uniform(device), None)
     }
 
     /// # Errors
@@ -223,15 +254,51 @@ impl Qwen3_5TextModel {
         device: &Device,
         extended: crate::quantized::extended_gguf::ExtendedGgufInfo,
     ) -> Result<Self> {
-        Self::from_gguf_impl(ct, reader, device, Some(extended))
+        Self::from_gguf_impl(
+            ct,
+            reader,
+            &DeviceAssignment::uniform(device),
+            Some(extended),
+        )
+    }
+
+    /// Like [`Self::from_gguf`], but places `MoE` expert weights on
+    /// `devices.expert` rather than `devices.main`. Used for `MoE` `CPU`
+    /// offload (see [`DeviceAssignment`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if required GGUF metadata or tensors are missing or malformed.
+    pub fn from_gguf_with_devices<R: std::io::Read + std::io::Seek>(
+        ct: candle_core::quantized::gguf_file::Content,
+        reader: &mut R,
+        devices: &DeviceAssignment,
+    ) -> Result<Self> {
+        Self::from_gguf_impl(ct, reader, devices, None)
+    }
+
+    /// Like [`Self::from_gguf_extended`], but places `MoE` expert weights on
+    /// `devices.expert` rather than `devices.main`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if required GGUF metadata or tensors are missing or malformed.
+    pub fn from_gguf_extended_with_devices<R: std::io::Read + std::io::Seek>(
+        ct: candle_core::quantized::gguf_file::Content,
+        reader: &mut R,
+        devices: &DeviceAssignment,
+        extended: crate::quantized::extended_gguf::ExtendedGgufInfo,
+    ) -> Result<Self> {
+        Self::from_gguf_impl(ct, reader, devices, Some(extended))
     }
 
     fn from_gguf_impl<R: std::io::Read + std::io::Seek>(
         ct: candle_core::quantized::gguf_file::Content,
         reader: &mut R,
-        device: &Device,
+        devices: &DeviceAssignment,
         extended: Option<crate::quantized::extended_gguf::ExtendedGgufInfo>,
     ) -> Result<Self> {
+        let device = &devices.main;
         disable_cuda_event_tracking(device);
         // QMatMul handles quantized weights internally; dequantized side
         // tensors (norms, conv kernels) use the compute dtype, while the
@@ -371,7 +438,8 @@ impl Qwen3_5TextModel {
 
         let mut layers = Vec::with_capacity(num_hidden_layers);
         for (idx, &layer_type) in layer_types.iter().enumerate() {
-            let mut layer = DecoderLayer::from_gguf(&text_cfg, layer_type, &mut gg, idx, device)?;
+            let mut layer =
+                DecoderLayer::from_gguf(&text_cfg, layer_type, &mut gg, idx, &devices.expert)?;
             layer.set_attention_dtype(attn_dtype);
             layers.push(layer);
         }
@@ -451,6 +519,229 @@ impl Qwen3_5TextModel {
     #[must_use]
     pub fn attention_dtype(&self) -> DType {
         self.attn_dtype.unwrap_or(self.dtype)
+    }
+
+    /// Runs a probe forward pass, live-queries free VRAM, and seeds a
+    /// per-expert [`ExpertCache`] sized to fit within `vram_ceiling_bytes`
+    /// (minus `runtime_reservation_bytes` and a `MoE` `CPU`-offload
+    /// reservation for a `chunk_tokens`-token prefill chunk — see
+    /// [`Self::moe_offload_reservation_bytes`]). `Ok(None)` for non-`MoE`
+    /// checkpoints. See `crate::models::qwen3::modeling::Qwen3Model::
+    /// seed_expert_cache` for the pattern this mirrors.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if a tensor op unrelated to the probe fails; an
+    /// out-of-memory probe forward pass is caught and logged instead,
+    /// falling back to `Ok(None)`.
+    // One sequential pipeline (probe -> cost estimate -> budget -> seed)
+    // sharing local state (`gpu_location`, `moe_layer_count`) throughout;
+    // splitting it up would scatter that shared context across several
+    // small functions without simplifying the control flow itself.
+    #[allow(clippy::too_many_lines)]
+    pub fn seed_expert_cache(
+        &mut self,
+        main_device: &Device,
+        vram_ceiling_bytes: u64,
+        runtime_reservation_bytes: u64,
+        chunk_tokens: usize,
+    ) -> Result<Option<Arc<ExpertCache>>> {
+        let Some(moe_config) = self.cfg.moe_config() else {
+            return Ok(None);
+        };
+        if matches!(main_device, Device::Cpu) {
+            return Ok(None);
+        }
+        let gpu_location = main_device.location();
+
+        let moe_layer_count = self
+            .layers
+            .iter()
+            .filter(|l| l.moe_block().is_some())
+            .count();
+        if moe_layer_count == 0 {
+            return Ok(None);
+        }
+        #[allow(clippy::redundant_closure_for_method_calls)]
+        let all_packed = self
+            .layers
+            .iter()
+            .all(|l| l.moe_block().is_none_or(|b| b.has_packed_qtensor_experts()));
+        if !all_packed {
+            eprintln!(
+                "[qwen3_5] Expert cache: not every MoE layer stores experts as a packed QTensor \
+                 pair (i-quant or dequantized per-expert storage); skipping per-expert caching, \
+                 all experts stay on CPU"
+            );
+            return Ok(None);
+        }
+
+        eprintln!(
+            "[qwen3_5] Expert cache: running probe forward pass + live VRAM query on \
+             {gpu_location:?} before sizing the per-expert cache (may take a few seconds)"
+        );
+        let probe_ids = Tensor::new(&[45u32, 546, 456], main_device)?.unsqueeze(0)?;
+        if let Err(e) = self.forward(&probe_ids, 0, None) {
+            let _ = self.reset_gdn_caches();
+            eprintln!(
+                "[qwen3_5] expert-cache probe forward failed on {gpu_location:?} (non-fatal, \
+                 all experts stay on CPU): {e}"
+            );
+            return Ok(None);
+        }
+        self.reset_gdn_caches()?;
+
+        let Some((free, total)) = query_gpu_memory(main_device) else {
+            eprintln!(
+                "[qwen3_5] No live VRAM query available for {gpu_location:?}; skipping expert \
+                 cache (all experts stay on CPU)"
+            );
+            return Ok(None);
+        };
+        let used = total.saturating_sub(free);
+        let ceiling = vram_ceiling_bytes.min(total);
+        let remaining = ceiling.saturating_sub(used);
+        let moe_offload_reservation = self.moe_offload_reservation_bytes(chunk_tokens, main_device);
+        let available = remaining
+            .saturating_sub(runtime_reservation_bytes)
+            .saturating_sub(moe_offload_reservation);
+        eprintln!(
+            "[qwen3_5] Live VRAM on {gpu_location:?} after probe: free={}, total={}, used={}, \
+             available_for_experts={} (configured limit={}, moe_offload_reservation={})",
+            format_budget(free),
+            format_budget(total),
+            format_budget(used),
+            format_budget(available),
+            format_budget(vram_ceiling_bytes),
+            format_budget(moe_offload_reservation),
+        );
+
+        let (gate_up_sources, down_sources): (Vec<Arc<QTensor>>, Vec<Arc<QTensor>>) = self
+            .layers
+            .iter()
+            .filter_map(|l| {
+                let block = l.moe_block()?;
+                Some((
+                    block.packed_gate_up_source()?.clone(),
+                    block.packed_down_source()?.clone(),
+                ))
+            })
+            .unzip();
+        debug_assert_eq!(gate_up_sources.len(), moe_layer_count);
+
+        let gate_up_dims = gate_up_sources[0].shape().dims().to_vec();
+        let down_dims = down_sources[0].shape().dims().to_vec();
+        let gate_up_mismatch = gate_up_sources
+            .iter()
+            .position(|t| t.shape().dims() != gate_up_dims);
+        let down_mismatch = down_sources
+            .iter()
+            .position(|t| t.shape().dims() != down_dims);
+        if let Some(i) = gate_up_mismatch {
+            eprintln!(
+                "[qwen3_5] Expert cache: the {i}th MoE layer's gate_up projection has shape \
+                 {:?}, but the first MoE layer's is shape {gate_up_dims:?}; ExpertCache requires \
+                 a uniform tensor shape across layers, skipping per-expert caching, all experts \
+                 stay on CPU",
+                gate_up_sources[i].shape().dims(),
+            );
+            return Ok(None);
+        }
+        if let Some(i) = down_mismatch {
+            eprintln!(
+                "[qwen3_5] Expert cache: the {i}th MoE layer's down projection has shape {:?}, \
+                 but the first MoE layer's is shape {down_dims:?}; ExpertCache requires a \
+                 uniform tensor shape across layers, skipping per-expert caching, all experts \
+                 stay on CPU",
+                down_sources[i].shape().dims(),
+            );
+            return Ok(None);
+        }
+
+        let gate_up_blob_bytes = gate_up_sources
+            .iter()
+            .map(|t| blob_bytes_per_expert(t))
+            .max()
+            .unwrap_or(0);
+        let down_blob_bytes = down_sources
+            .iter()
+            .map(|t| blob_bytes_per_expert(t))
+            .max()
+            .unwrap_or(0);
+
+        let Some(budget) = ExpertCacheBudget::compute(
+            available,
+            EXPERT_CACHE_SAFETY_MARGIN_BYTES,
+            gate_up_blob_bytes,
+            down_blob_bytes,
+            moe_layer_count,
+            moe_config.num_experts,
+        ) else {
+            eprintln!(
+                "[qwen3_5] Expert cache: {} available after reservations is too little for even \
+                 one slot per layer ({moe_layer_count} layers, {} bytes/expert); all experts \
+                 stay on CPU",
+                format_budget(available),
+                format_budget((gate_up_blob_bytes + down_blob_bytes) as u64),
+            );
+            return Ok(None);
+        };
+
+        let cache = Arc::new(ExpertCache::new(
+            budget,
+            gate_up_sources,
+            down_sources,
+            main_device,
+        )?);
+
+        for layer in &mut self.layers {
+            if let Some(block) = layer.moe_block_mut() {
+                block.set_expert_cache(cache.clone());
+            }
+        }
+
+        eprintln!(
+            "[qwen3_5] Expert cache: seeded {} of {} experts/layer on {gpu_location:?} across \
+             {moe_layer_count} MoE layers",
+            budget.slots_per_layer, moe_config.num_experts,
+        );
+        Ok(Some(cache))
+    }
+
+    /// Drops every `MoE` layer's [`ExpertCache`] reference, reverting to
+    /// all-CPU expert dispatch. Call before [`Self::seed_expert_cache`] to
+    /// re-run it with an updated policy, so the old cache's GPU memory is
+    /// freed before the new one's live VRAM query runs.
+    pub(crate) fn clear_expert_cache(&mut self) {
+        for layer in &mut self.layers {
+            if let Some(block) = layer.moe_block_mut() {
+                block.clear_expert_cache();
+            }
+        }
+    }
+
+    /// Worst-case transient VRAM one in-flight `MoE` CPU-offload call needs
+    /// for a `chunk_tokens`-token prefill chunk. 0 if every `MoE` layer is
+    /// already GPU-resident, this isn't a `MoE` model, or `main_device`
+    /// doesn't support the GPU offload burst (CUDA/ROCm only).
+    #[must_use]
+    pub(crate) fn moe_offload_reservation_bytes(
+        &self,
+        chunk_tokens: usize,
+        main_device: &Device,
+    ) -> u64 {
+        if !(main_device.is_cuda() || main_device.is_rocm()) {
+            return 0;
+        }
+        let hidden_size = self.cfg.hidden_size;
+        self.layers
+            .iter()
+            .filter_map(|l| {
+                l.moe_block()?
+                    .offload_reservation_bytes(chunk_tokens, hidden_size)
+            })
+            .max()
+            .unwrap_or(0)
     }
 
     /// Capture the layer state so a later request replaying this token prefix
@@ -1029,7 +1320,29 @@ impl Model {
         dtype: &DType,
         format: ModelFormat,
     ) -> Result<Self> {
-        Self::new_with_options(model_path, device, dtype, format, isq_from_env())
+        Self::new_with_format_and_devices(
+            model_path,
+            &DeviceAssignment::uniform(device),
+            dtype,
+            format,
+        )
+    }
+
+    /// Like [`Self::new_with_format`], but `devices.expert` places `MoE`
+    /// expert weights on a different device than the rest of the model
+    /// (`MoE` `CPU` offload); callers that don't need that should pass
+    /// [`DeviceAssignment::uniform`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the model or tokenizer cannot be loaded from `model_path`.
+    pub fn new_with_format_and_devices(
+        model_path: &str,
+        devices: &DeviceAssignment,
+        dtype: &DType,
+        format: ModelFormat,
+    ) -> Result<Self> {
+        Self::new_with_options_and_devices(model_path, devices, dtype, format, isq_from_env())
     }
 
     /// Load with an explicit in-situ quantization level (`quant`). `None`
@@ -1042,6 +1355,30 @@ impl Model {
     pub fn new_with_options(
         model_path: &str,
         device: &Device,
+        dtype: &DType,
+        format: ModelFormat,
+        quant: Option<GgmlDType>,
+    ) -> Result<Self> {
+        Self::new_with_options_and_devices(
+            model_path,
+            &DeviceAssignment::uniform(device),
+            dtype,
+            format,
+            quant,
+        )
+    }
+
+    /// Like [`Self::new_with_options`], but `devices.expert` places `MoE`
+    /// expert weights on a different device than the rest of the model
+    /// (`MoE` `CPU` offload); callers that don't need that should pass
+    /// [`DeviceAssignment::uniform`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the model or tokenizer cannot be loaded from `model_path`.
+    pub fn new_with_options_and_devices(
+        model_path: &str,
+        devices: &DeviceAssignment,
         dtype: &DType,
         format: ModelFormat,
         quant: Option<GgmlDType>,
@@ -1060,14 +1397,14 @@ impl Model {
             other => other,
         };
         match format {
-            ModelFormat::Safetensors => Self::from_pretrained(model_path, device, *dtype, quant),
+            ModelFormat::Safetensors => Self::from_pretrained(model_path, devices, *dtype, quant),
             ModelFormat::Gguf => {
                 if quant.is_some() {
                     eprintln!(
                         "[qwen3_5] --quant/CRANE_ISQ ignored: GGUF weights are already quantized"
                     );
                 }
-                Self::from_gguf_file(model_path, device)
+                Self::from_gguf_file(model_path, devices)
             },
             ModelFormat::Auto => unreachable!("Auto is resolved above"),
         }
@@ -1077,7 +1414,8 @@ impl Model {
     /// (`tokenizer.ggml.tokens` / `tokenizer.ggml.merges` / `token_type`);
     /// a sibling `tokenizer.json` is only consulted if the GGUF lacks the
     /// embedded metadata (older / third-party quantizers).
-    fn from_gguf_file(model_path: &str, device: &Device) -> Result<Self> {
+    fn from_gguf_file(model_path: &str, devices: &DeviceAssignment) -> Result<Self> {
+        let device = &devices.main;
         use crate::utils::tokenizer_utils::resolve_gguf_tokenizer;
 
         let gguf_path = std::path::Path::new(model_path);
@@ -1113,9 +1451,9 @@ impl Model {
                     extended.tensors.len()
                 );
             }
-            Qwen3_5TextModel::from_gguf_extended(ct, &mut cursor, device, extended)?
+            Qwen3_5TextModel::from_gguf_extended_with_devices(ct, &mut cursor, devices, extended)?
         } else {
-            Qwen3_5TextModel::from_gguf(ct, &mut cursor, device)?
+            Qwen3_5TextModel::from_gguf_with_devices(ct, &mut cursor, devices)?
         };
         let dtype = inner.dtype();
 
@@ -1130,10 +1468,11 @@ impl Model {
 
     fn from_pretrained(
         model_path: &str,
-        device: &Device,
+        devices: &DeviceAssignment,
         dtype: DType,
         quant: Option<GgmlDType>,
     ) -> Result<Self> {
+        let device = &devices.main;
         // When ISQ is requested, memory is the caller's priority: on Metal,
         // keep the non-quantized side tensors (embedding, norms, conv) in F16
         // instead of the server's F32 default — the 248k-vocab embedding
@@ -1160,7 +1499,14 @@ impl Model {
         if let Some(dt) = quant {
             eprintln!("[qwen3_5] in-situ quantization enabled: {dt:?}");
         }
-        let inner = Qwen3_5TextModel::new(&cfg, &vb, device, dtype, quant)?;
+        let inner = Qwen3_5TextModel::new_with_expert_device(
+            &cfg,
+            &vb,
+            device,
+            dtype,
+            quant,
+            &devices.expert,
+        )?;
 
         Ok(Self {
             tokenizer: TokenOutputStream::new(tokenizer),
@@ -1243,6 +1589,83 @@ impl Model {
     /// Total bytes held by the full-attention K/V caches (context-scaling term).
     pub fn attn_cache_bytes(&self) -> usize {
         self.inner.attn_cache_bytes()
+    }
+
+    /// Bytes of KV cache one sequence consumes per generated token. Counts
+    /// only full-attention layers — GDN layers carry constant-size state
+    /// instead (see [`TextConfig::kv_bytes_per_token`]). Uses the KV cache's
+    /// actual storage dtype ([`Qwen3_5TextModel::attention_dtype`]), not the
+    /// model's compute dtype — on CUDA these differ (BF16 cache, F32 compute).
+    #[must_use]
+    pub fn kv_bytes_per_token(&self) -> u64 {
+        self.inner
+            .config()
+            .kv_bytes_per_token(self.inner.attention_dtype().size_in_bytes())
+    }
+
+    /// Runs a probe forward pass, live-queries free VRAM, and seeds a
+    /// per-expert [`ExpertCache`] sized to fit within `vram_ceiling_bytes`
+    /// (minus a KV-cache reservation derived from `max_concurrent`/
+    /// `max_seq_len`, and minus a `MoE` `CPU`-offload reservation sized for a
+    /// `chunk_tokens`-token prefill chunk). `Ok(None)` for non-`MoE`
+    /// checkpoints.
+    ///
+    /// The returned cache must still be driven by the caller: advance its
+    /// token clock once per scheduler step via [`ExpertCache::on_step`], or
+    /// placement never improves past the arbitrary initial seed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if a tensor op unrelated to the probe fails; an
+    /// out-of-memory probe forward pass is caught and logged instead,
+    /// falling back to `Ok(None)`.
+    pub fn seed_expert_cache(
+        &mut self,
+        vram_ceiling_bytes: u64,
+        max_concurrent: Option<usize>,
+        max_seq_len: Option<usize>,
+        chunk_tokens: usize,
+    ) -> Result<Option<Arc<ExpertCache>>> {
+        let config = self.inner.config();
+        let max_concurrent = max_concurrent.unwrap_or(1);
+        let effective_seq_len = max_seq_len
+            .filter(|&n| n > 0)
+            .unwrap_or(config.max_position_embeddings) as u64;
+        let kv_dtype_bytes = self.inner.attention_dtype().size_in_bytes();
+        let kv_storage = effective_seq_len * config.kv_bytes_per_token(kv_dtype_bytes);
+        let runtime_reservation_bytes = kv_vram_overhead(kv_storage, max_concurrent);
+        log::tracing::trace!(
+            "KV reservation: vram_ceiling={}, max_concurrent={max_concurrent}, \
+             effective_seq_len={effective_seq_len}, kv_storage={} \
+             (batch_factor={}, safety_margin={}), runtime_reservation={}",
+            format_budget(vram_ceiling_bytes),
+            format_budget(kv_storage),
+            crate::device::kv_batch_factor(max_concurrent),
+            format_budget(crate::device::KV_SAFETY_MARGIN_BYTES),
+            format_budget(runtime_reservation_bytes),
+        );
+        self.inner.seed_expert_cache(
+            &self.device,
+            vram_ceiling_bytes,
+            runtime_reservation_bytes,
+            chunk_tokens,
+        )
+    }
+
+    /// Drops every `MoE` layer's [`ExpertCache`] reference, reverting to
+    /// all-CPU expert dispatch. Call before [`Self::seed_expert_cache`] to
+    /// re-run it with an updated policy, so the old cache's GPU memory is
+    /// freed before the new one's live VRAM query runs.
+    pub fn clear_expert_cache(&mut self) {
+        self.inner.clear_expert_cache();
+    }
+
+    /// Worst-case transient VRAM one in-flight `MoE` CPU-offload call needs
+    /// for a `chunk_tokens`-token prefill chunk.
+    #[must_use]
+    pub fn moe_offload_reservation_bytes(&self, chunk_tokens: usize) -> u64 {
+        self.inner
+            .moe_offload_reservation_bytes(chunk_tokens, &self.device)
     }
 
     /// Warm up the model with a small forward pass.
@@ -1378,7 +1801,10 @@ fn disable_cuda_event_tracking(device: &Device) {
 
 #[cfg(test)]
 mod tests {
-    use super::merge_canonical_eos_ids;
+    use super::*;
+    use candle_core::Shape;
+    use candle_nn::Init;
+    use candle_nn::var_builder::SimpleBackend;
     use std::collections::HashMap;
 
     #[test]
@@ -1420,6 +1846,91 @@ mod tests {
         let vocab: HashMap<String, u32> = [("<|other|>".to_string(), 1)].into_iter().collect();
         merge_canonical_eos_ids(&mut eos_token_ids, &vocab);
         assert_eq!(eos_token_ids, vec![7]);
+    }
+
+    /// Random weights for any requested tensor name: good enough for a
+    /// construction-only test that never runs a forward pass.
+    struct RandWeights;
+
+    impl SimpleBackend for RandWeights {
+        fn get(
+            &self,
+            s: Shape,
+            _name: &str,
+            _h: Init,
+            dtype: DType,
+            dev: &Device,
+        ) -> candle_core::Result<Tensor> {
+            let fan_in = s.dims().last().copied().unwrap_or(1) as f64;
+            Tensor::randn(0f32, (1.0 / fan_in.sqrt()) as f32, s, dev)?.to_dtype(dtype)
+        }
+
+        fn get_unchecked(&self, _n: &str, _d: DType, _v: &Device) -> candle_core::Result<Tensor> {
+            candle_core::bail!("RandWeights requires a shape")
+        }
+
+        fn contains_tensor(&self, _name: &str) -> bool {
+            false
+        }
+    }
+
+    /// Small hybrid MoE config: 8 layers, 2 full-attention (interval 4),
+    /// every layer `MoE` (`num_experts: 2`).
+    fn moe_tiny_config() -> Config {
+        Config {
+            text_config: TextConfig {
+                head_dim: 16,
+                vocab_size: 64,
+                hidden_size: 32,
+                intermediate_size: 48,
+                num_hidden_layers: 8,
+                num_attention_heads: 4,
+                num_key_value_heads: 2,
+                hidden_act: HiddenAct::Silu,
+                max_position_embeddings: 128,
+                rms_norm_eps: 1e-6,
+                rope_parameters: RopeParameters {
+                    rope_theta: 10_000.0,
+                    mrope_section: Vec::new(),
+                    partial_rotary_factor: 0.5,
+                    mrope_interleaved: true,
+                },
+                full_attention_interval: 4,
+                linear_conv_kernel_dim: 4,
+                linear_key_head_dim: 8,
+                linear_value_head_dim: 8,
+                linear_num_key_heads: 2,
+                linear_num_value_heads: 4,
+                tie_word_embeddings: true,
+                attn_output_gate: true,
+                output_gate_type: None,
+                num_experts: 2,
+                num_experts_per_tok: 1,
+                moe_intermediate_size: 32,
+            },
+            vision_config: None,
+            image_token_id: None,
+            video_token_id: None,
+            vision_start_token_id: None,
+            vision_end_token_id: None,
+            tie_word_embeddings: true,
+        }
+    }
+
+    // On a CPU-only model, `seed_expert_cache` must return `Ok(None)`
+    // without panicking (no live VRAM query is possible on CPU, so it
+    // takes the early-return path before running the probe forward pass).
+    #[test]
+    fn seed_expert_cache_is_noop_on_cpu() {
+        let cfg = moe_tiny_config();
+        let dev = Device::Cpu;
+        let vb = VarBuilder::from_backend(Box::new(RandWeights), DType::F32, dev.clone());
+        let mut model = Qwen3_5TextModel::new(&cfg, &vb, &dev, DType::F32, None).expect("build");
+
+        let cache = model
+            .seed_expert_cache(&dev, 1 << 30, 0, 2048)
+            .expect("seed_expert_cache");
+        assert!(cache.is_none());
     }
 }
 

@@ -208,25 +208,6 @@ pub fn query_gpu_memory(_device: &Device) -> Option<(u64, u64)> {
     None
 }
 
-/// Greedily selects layer indices (in order) whose cumulative
-/// `layer_costs` fit within `budget`.
-///
-/// First-fit in index order: earlier layers are preferred when not
-/// everything fits, matching the existing placement heuristic (early
-/// layers on GPU, later layers fall back to CPU).
-#[must_use]
-pub fn greedy_fit_layers(layer_costs: &[u64], budget: u64) -> Vec<usize> {
-    let mut remaining = budget;
-    let mut selected = Vec::new();
-    for (idx, &cost) in layer_costs.iter().enumerate() {
-        if cost <= remaining {
-            remaining -= cost;
-            selected.push(idx);
-        }
-    }
-    selected
-}
-
 /// Formats a byte count for log messages (e.g. `"8.5G"`, `"512M"`, `"1024B"`).
 pub fn format_budget(bytes: u64) -> String {
     if bytes >= 1 << 30 {
@@ -314,39 +295,5 @@ mod tests {
         assert_eq!(format_budget(3 * (1 << 30) / 2), "1.5G");
         assert_eq!(format_budget(1 << 20), "1M");
         assert_eq!(format_budget(512), "512B");
-    }
-
-    // Verifies every layer is selected when the budget comfortably covers
-    // the total cost.
-    #[test]
-    fn greedy_fit_layers_all_fit() {
-        assert_eq!(greedy_fit_layers(&[10, 20, 30], 100), vec![0, 1, 2]);
-    }
-
-    // Verifies first-fit-in-order: earlier layers are preferred, but a
-    // layer that doesn't fit is skipped (not a hard stop) — a smaller
-    // layer further along can still fit in the leftover space.
-    #[test]
-    fn greedy_fit_layers_skips_layers_that_do_not_fit() {
-        assert_eq!(greedy_fit_layers(&[10, 10, 10, 1], 25), vec![0, 1, 3]);
-    }
-
-    // Verifies a zero budget selects nothing.
-    #[test]
-    fn greedy_fit_layers_zero_budget_selects_none() {
-        assert_eq!(greedy_fit_layers(&[1, 2, 3], 0), Vec::<usize>::new());
-    }
-
-    // Verifies a single layer costing exactly the budget is still selected
-    // (boundary: `cost <= remaining`, not `cost < remaining`).
-    #[test]
-    fn greedy_fit_layers_exact_fit_boundary() {
-        assert_eq!(greedy_fit_layers(&[50], 50), vec![0]);
-    }
-
-    // Verifies an empty cost list selects nothing regardless of budget.
-    #[test]
-    fn greedy_fit_layers_empty_costs() {
-        assert_eq!(greedy_fit_layers(&[], 1000), Vec::<usize>::new());
     }
 }
