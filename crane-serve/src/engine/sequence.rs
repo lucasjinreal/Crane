@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crane_core::{LogitsProcessor, Tensor};
 use tokio::sync::mpsc;
@@ -92,9 +92,12 @@ pub struct Sequence {
     /// so `decode_tokens_per_sec` reflects only the most recent decode
     /// stint rather than cumulative throughput across preemptions.
     pub decode_start: Option<Instant>,
-    /// Set at request arrival (sequence construction). Used with
+    /// Set when `EngineHandle::submit` was called. Used with
     /// `first_token_at` to compute [`Self::ttft_ms`].
     pub created_at: Instant,
+    /// Set once, at the first `step_prefill`; never reset by eviction.
+    /// Used with `created_at` to compute [`Self::queue_time`].
+    pub prefill_started_at: Option<Instant>,
     /// Set once, the first time a generated-text chunk is sent to the
     /// client via `EngineResponse::Token`. `None` until then.
     pub first_token_at: Option<Instant>,
@@ -284,6 +287,35 @@ impl Sequence {
         #[allow(clippy::cast_possible_truncation)]
         Some(duration.as_millis() as u64)
     }
+
+    /// Time per output token after the first:
+    /// `(finished_at - first_token_at) / (completion_tokens - 1)`. `None`
+    /// before the first token or with fewer than two completion tokens.
+    #[must_use]
+    pub fn tpot(&self, finished_at: Instant, completion_tokens: usize) -> Option<Duration> {
+        let first = self.first_token_at?;
+        let gaps = u32::try_from(completion_tokens.checked_sub(1)?).ok()?;
+        if gaps == 0 {
+            return None;
+        }
+        Some(finished_at.duration_since(first) / gaps)
+    }
+
+    /// Records the first prefill start. Returns `true` only the first time.
+    pub fn mark_prefill_started(&mut self) -> bool {
+        if self.prefill_started_at.is_some() {
+            return false;
+        }
+        self.prefill_started_at = Some(Instant::now());
+        true
+    }
+
+    /// Wait between request arrival ([`Self::created_at`]) and the first
+    /// prefill start. `None` until prefill has started.
+    #[must_use]
+    pub fn queue_time(&self) -> Option<Duration> {
+        Some(self.prefill_started_at?.duration_since(self.created_at))
+    }
 }
 
 #[cfg(test)]
@@ -320,12 +352,63 @@ mod tests {
             decode_start: None,
             created_at: Instant::now(),
             first_token_at: None,
+            prefill_started_at: None,
             repetition_penalty: 1.0,
             frequency_penalty: 0.0,
             presence_penalty: 0.0,
             repeat_last_n: 64,
             response_tx: tx,
         }
+    }
+
+    #[test]
+    fn tpot_none_before_first_token() {
+        let seq = make_seq(&[1], &[], 10, 0, SequenceStatus::Running);
+        assert_eq!(seq.tpot(Instant::now(), 10), None);
+    }
+
+    #[test]
+    fn tpot_none_with_fewer_than_two_tokens() {
+        let mut seq = make_seq(&[1], &[], 10, 0, SequenceStatus::Running);
+        let t = Instant::now();
+        seq.first_token_at = Some(t);
+        assert_eq!(seq.tpot(t, 0), None);
+        assert_eq!(seq.tpot(t, 1), None);
+    }
+
+    #[test]
+    fn tpot_divides_by_completion_minus_one() {
+        let mut seq = make_seq(&[1], &[], 10, 0, SequenceStatus::Running);
+        let t = Instant::now();
+        seq.first_token_at = Some(t);
+        let finished = t + Duration::from_millis(900);
+        assert_eq!(seq.tpot(finished, 10), Some(Duration::from_millis(100)));
+    }
+
+    #[test]
+    fn queue_time_none_before_prefill() {
+        let seq = make_seq(&[1, 2], &[], 10, 0, SequenceStatus::Waiting);
+        assert_eq!(seq.queue_time(), None);
+    }
+
+    #[test]
+    fn queue_time_measures_arrival_to_prefill_start() {
+        let mut seq = make_seq(&[1, 2], &[], 10, 0, SequenceStatus::Waiting);
+        let t = Instant::now();
+        seq.created_at = t;
+        seq.prefill_started_at = Some(t + Duration::from_millis(300));
+        assert_eq!(seq.queue_time(), Some(Duration::from_millis(300)));
+    }
+
+    #[test]
+    fn queue_time_unchanged_by_second_prefill_start() {
+        let mut seq = make_seq(&[1, 2], &[], 10, 0, SequenceStatus::Waiting);
+        seq.created_at = Instant::now() - Duration::from_millis(100);
+        assert!(seq.mark_prefill_started());
+        let first = seq.queue_time().unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(!seq.mark_prefill_started());
+        assert_eq!(seq.queue_time().unwrap(), first);
     }
 
     #[test]
