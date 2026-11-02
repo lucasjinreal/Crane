@@ -37,9 +37,11 @@ use super::super::fattn::test_support::{
 use super::long_seq_tests::{SEQS, round_to};
 use super::{
     fattn_mma_bf16_causal, fattn_mma_bf16_causal_with_mask, fattn_mma_causal,
-    fattn_mma_causal_with_mask,
+    fattn_mma_causal_with_mask, pad_kv, padded_seq_kv_for_gqa_batching,
+    padded_seq_kv_for_gqa_batching_bf16, prefill_dispatch, prefill_dispatch_bf16,
 };
 use crate::models::qwen3_5::grouped_sdpa;
+use crate::ops::fused_ops::fattn::{gqa_z_tiles, q_tiles, select_mma_ncols, select_mma_ncols_bf16};
 
 const HEAD_DIM: usize = 256;
 const BATCHES: usize = 20;
@@ -63,6 +65,105 @@ fn fattn_bench_bf16_hd256() {
 #[ignore = "needs a CUDA/ROCm GPU, long-running"]
 fn fattn_bench_f16_hd256() {
     bench_table(DType::F16);
+}
+
+// Compares today's auto-selected stream-K grid against a forced
+// single-wave (one block per tile, no fixup) grid at the shapes stream-K
+// targets, printing a bitwise-match check between the two.
+#[test]
+#[ignore = "needs a CUDA/ROCm GPU"]
+fn forced_grid_split_vs_no_split_hd256() {
+    let gpu = test_gpu_device();
+    #[allow(clippy::cast_precision_loss)]
+    let scale = (HEAD_DIM as f32).sqrt().recip();
+    let gqa_ratio = HQ / HKV;
+    for seq in [
+        231usize, 238, 257, 311, 401, 503, 601, 701, 809, 907, 1009, 1103, 1301, 1511, 1709, 2003,
+        2503, 3001, 3511, 4001, 4201, 4507, 5003, 6007, 8009, 10007,
+    ] {
+        for bf16 in [false, true] {
+            let dtype = if bf16 { DType::BF16 } else { DType::F16 };
+            let [q_host, k_host, v_host] =
+                long_seq_inputs(seq, HEAD_DIM, LongSeqDist::Normal, 0).map(|h| round_to(h, dtype));
+            let bshd = |h: &[f32], heads| Tensor::from_slice(h, (1, seq, heads, HEAD_DIM), &gpu);
+            let q = bshd(&q_host, HQ).unwrap().to_dtype(dtype).unwrap();
+            let k = bshd(&k_host, HKV).unwrap().to_dtype(dtype).unwrap();
+            let v = bshd(&v_host, HKV).unwrap().to_dtype(dtype).unwrap();
+
+            // Mirrors `causal_in_kernel`'s padding, since production never
+            // calls the dispatch function below with an unpadded, unaligned
+            // `seq_kv`.
+            let padded = if bf16 {
+                padded_seq_kv_for_gqa_batching_bf16(HEAD_DIM, gqa_ratio, seq, seq, false)
+            } else {
+                padded_seq_kv_for_gqa_batching(HEAD_DIM, gqa_ratio, seq, seq, false)
+            };
+            let (k, v) = match padded {
+                Some(p) => pad_kv(&k, &v, p).unwrap(),
+                None => (k, v),
+            };
+            let seq_kv = k.dims4().unwrap().1;
+
+            let ncols = if bf16 {
+                select_mma_ncols_bf16(HEAD_DIM, gqa_ratio, seq, seq_kv, false)
+            } else {
+                select_mma_ncols(HEAD_DIM, gqa_ratio, seq, seq_kv, false)
+            };
+            let Some((ncols1, ncols2)) = ncols else {
+                eprintln!("[fattn_grid_trace] seq={seq} bf16={bf16}: no kernel variant, skipped");
+                continue;
+            };
+            let ntiles = q_tiles(seq, ncols1) * gqa_z_tiles(gqa_ratio, ncols2) * HKV;
+
+            let mut last_output = Vec::new();
+            for (mode, forced_grid) in [("auto", None), ("no_split", Some(ntiles))] {
+                eprintln!(
+                    "[fattn_grid_trace] seq={seq} bf16={bf16} mode={mode} ntiles={ntiles} ---"
+                );
+                let dispatch_once = || {
+                    if bf16 {
+                        prefill_dispatch_bf16(&q, &k, &v, None, None, scale, Some(0), forced_grid)
+                    } else {
+                        prefill_dispatch(&q, &k, &v, None, None, scale, Some(0), forced_grid)
+                    }
+                    .unwrap()
+                };
+                // Warm up (HIPRTC JIT, allocator) before timing.
+                for _ in 0..10 {
+                    dispatch_once();
+                }
+                gpu.synchronize().unwrap();
+                const CALLS: u32 = 50;
+                let start = std::time::Instant::now();
+                let mut out = None;
+                for _ in 0..CALLS {
+                    out = Some(dispatch_once());
+                }
+                gpu.synchronize().unwrap();
+                let per_call_us = start.elapsed().as_secs_f64() * 1e6 / f64::from(CALLS);
+                eprintln!(
+                    "[fattn_grid_trace] seq={seq} bf16={bf16} mode={mode}: {per_call_us:.1} us/call"
+                );
+                let vec = out
+                    .unwrap()
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+                if mode == "auto" {
+                    last_output = vec;
+                } else {
+                    let matches = last_output == vec;
+                    eprintln!(
+                        "[fattn_grid_trace] seq={seq} bf16={bf16}: auto vs no_split bitwise \
+                         match={matches}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 // The median is the middle value, or the mean of the two middle values.
