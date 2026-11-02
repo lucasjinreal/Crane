@@ -741,8 +741,6 @@ impl InferenceEngine {
             if let Some(seq) = self.sequences.get_mut(&victim_id) {
                 seq.kv_caches = vec![None; self.num_layers];
                 seq.status = SequenceStatus::Waiting;
-                // Reset tokens to just the prompt to allow re-prefill.
-                seq.tokens.truncate(seq.prompt_len);
             }
 
             self.tracked_kv_bytes = self.tracked_kv_bytes.saturating_sub(freed);

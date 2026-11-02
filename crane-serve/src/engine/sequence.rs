@@ -209,11 +209,12 @@ impl Sequence {
 
     /// The KV cache covers tokens `0..start_pos` when we do the next forward.
     /// For a fresh sequence, `start_pos = 0`.
-    /// After prefill of N prompt tokens, `start_pos = N`.
+    /// After prefill of N tokens (the prompt, plus any output kept across an
+    /// eviction), `start_pos = N`.
     /// During decode, `start_pos = tokens.len() - 1` (everything except the latest token).
     #[must_use]
     pub fn start_pos(&self) -> usize {
-        // After prefill the kv_caches cover prompt_len tokens.
+        // After prefill the kv_caches cover every token fed in prefill.
         // During decode each step adds one token, so the cache covers
         // tokens.len() - 1 positions (the new token hasn't been cached yet).
         if self.status == SequenceStatus::Waiting {
@@ -227,8 +228,9 @@ impl Sequence {
     #[must_use]
     pub fn next_input_ids(&self) -> &[u32] {
         if self.status == SequenceStatus::Waiting {
-            // Prefill: feed the prompt tokens the model does not already hold.
-            &self.tokens[self.cached_prefix_len..self.prompt_len]
+            // Prefill: feed every token the model does not hold yet (the prompt,
+            // plus any output kept across an eviction).
+            &self.tokens[self.cached_prefix_len..]
         } else {
             // Decode: feed only the last generated token.
             &self.tokens[self.tokens.len() - 1..]
@@ -405,6 +407,12 @@ mod tests {
     fn next_input_ids_waiting_returns_prompt() {
         let seq = make_seq(&[1, 2, 3], &[], 10, 0, SequenceStatus::Waiting);
         assert_eq!(seq.next_input_ids(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn next_input_ids_waiting_after_eviction_includes_generated() {
+        let seq = make_seq(&[1, 2, 3], &[10, 11], 10, 0, SequenceStatus::Waiting);
+        assert_eq!(seq.next_input_ids(), &[1, 2, 3, 10, 11]);
     }
 
     #[test]
