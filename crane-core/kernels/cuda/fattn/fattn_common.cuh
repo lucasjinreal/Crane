@@ -56,6 +56,11 @@
 // The macro on the following line shifts it by a factor of 2**3=8, as was needed to fix https://github.com/ggml-org/llama.cpp/issues/18606 .
 #define FATTN_KQ_MAX_OFFSET (3.0f*0.6931f)
 
+// log2(e). exp(x) == exp2f(x * FATTN_LOG2E): exp2f maps directly to the
+// hardware EX2 instruction, while expf needs an extra multiply by log2(e)
+// first even under --use_fast_math.
+#define FATTN_LOG2E 1.4426950408889634f
+
 typedef void (* fattn_kernel_t)(
         const char * __restrict__ Q,
         const char * __restrict__ K,

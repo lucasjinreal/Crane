@@ -142,8 +142,8 @@ static __device__ __forceinline__ void crane_fattn_stream_k_fixup(
         const float diff_val = max_val - max_val_new;
         const float diff_add = tmp.x   - max_val_new;
 
-        const float scale_val = diff_val >= SOFTMAX_FTZ_THRESHOLD ? expf(diff_val) : 0.0f;
-        const float scale_add = diff_add >= SOFTMAX_FTZ_THRESHOLD ? expf(diff_add) : 0.0f;
+        const float scale_val = diff_val >= SOFTMAX_FTZ_THRESHOLD ? exp2f(diff_val*FATTN_LOG2E) : 0.0f;
+        const float scale_add = diff_add >= SOFTMAX_FTZ_THRESHOLD ? exp2f(diff_add*FATTN_LOG2E) : 0.0f;
 
         dst_val = scale_val*dst_val + scale_add*dst_add;
         rowsum  = scale_val*rowsum  + scale_add*tmp.y;
