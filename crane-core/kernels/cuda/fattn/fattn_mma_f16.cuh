@@ -796,7 +796,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     // Turing + Volta:
                     const int KQ_idx = l % 2;
 #endif // defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
-                    KQ_C[k0/(np*T_C_KQ::I)].x[l] = expf(KQ_C[k0/(np*T_C_KQ::I)].x[l] - KQ_max_new[KQ_idx]);
+                    KQ_C[k0/(np*T_C_KQ::I)].x[l] = exp2f((KQ_C[k0/(np*T_C_KQ::I)].x[l] - KQ_max_new[KQ_idx])*FATTN_LOG2E);
                     KQ_rowsum_add[KQ_idx] += KQ_C[k0/(np*T_C_KQ::I)].x[l];
                 } else {
                     KQ_C[k0/(np*T_C_KQ::I)].x[l] = 0.0f;
@@ -908,7 +908,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     // Turing + Volta:
                     const int KQ_idx = (l/2) % 2;
 #endif // defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
-                    KQ_C[(k0/(np*T_C_KQ::J))].x[l] = expf(KQ_C[(k0/(np*T_C_KQ::J))].x[l] - KQ_max_new[KQ_idx]);
+                    KQ_C[(k0/(np*T_C_KQ::J))].x[l] = exp2f((KQ_C[(k0/(np*T_C_KQ::J))].x[l] - KQ_max_new[KQ_idx])*FATTN_LOG2E);
                     KQ_rowsum_add[KQ_idx] += KQ_C[(k0/(np*T_C_KQ::J))].x[l];
                 } else {
                     KQ_C[(k0/(np*T_C_KQ::J))].x[l] = 0.0f;
@@ -922,7 +922,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 #pragma unroll
         for (int col = 0; col < cols_per_thread; ++col) {
             const float KQ_max_diff = KQ_max[col] - KQ_max_new[col];
-            KQ_max_scale[col] = expf(KQ_max_diff);
+            KQ_max_scale[col] = exp2f(KQ_max_diff*FATTN_LOG2E);
             KQ_max[col] = KQ_max_new[col];
 
             *((uint32_t *) &KQ_max_scale[col]) *= KQ_max_diff >= SOFTMAX_FTZ_THRESHOLD;
@@ -1402,12 +1402,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
             const float KQ_max_new = fmaxf(KQ_max[col], sink);
             const float KQ_max_diff = KQ_max[col] - KQ_max_new;
-            KQ_max_scale[col] = expf(KQ_max_diff);
+            KQ_max_scale[col] = exp2f(KQ_max_diff*FATTN_LOG2E);
             KQ_max[col] = KQ_max_new;
 
             *((uint32_t *) &KQ_max_scale[col]) *= KQ_max_diff >= SOFTMAX_FTZ_THRESHOLD;
 
-            const float KQ_max_add = expf(sink - KQ_max_new);
+            const float KQ_max_add = exp2f((sink - KQ_max_new)*FATTN_LOG2E);
             KQ_rowsum[col] = KQ_max_scale[col]*KQ_rowsum[col] + KQ_max_add;
         }
 
@@ -1576,7 +1576,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
 #pragma unroll
             for (int imeta = 0; imeta < nmeta; ++imeta) {
-                KQ_cms[imeta] = expf(meta[imeta].x - KQ_cmn);
+                KQ_cms[imeta] = exp2f((meta[imeta].x - KQ_cmn)*FATTN_LOG2E);
             }
 
             KQ_crs = KQ_cms[0]*meta[0].y; // KQ combine rowsum, scaled sum of all parallel warps.
