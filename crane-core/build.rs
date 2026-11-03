@@ -36,10 +36,10 @@ fn cu_files_in(dir: &str) -> Vec<std::path::PathBuf> {
     paths
 }
 
-/// Compiles `kernels/cuda/`'s (and `kernels/cuda/fattn/`'s) `.cu` sources
-/// into the `crane_kernels_ptx.rs` bindings `ops::fused_ops`'s CUDA
-/// dispatchers `include!`. `flash_attention/` holds a separately built host
-/// launch adapter (cudaforge + CUTLASS, gated behind
+/// Compiles `kernels/cuda/`'s `.cu` sources (and `kernels/cuda/fattn/`'s,
+/// with `flash-attn-intree`) into the `crane_kernels_ptx.rs` bindings
+/// `ops::fused_ops`'s CUDA dispatchers `include!`. `flash_attention/` holds
+/// a separately built host launch adapter (cudaforge + CUTLASS, gated behind
 /// `flash-attn`/`flash-inference`) that must not go through this PTX-only
 /// pipeline, so it's deliberately not globbed here.
 #[cfg(feature = "cuda")]
@@ -49,7 +49,9 @@ fn build_cuda_ptx() {
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
+    #[cfg_attr(not(feature = "flash-attn-intree"), allow(unused_mut))]
     let mut kernel_paths = cu_files_in("kernels/cuda");
+    #[cfg(feature = "flash-attn-intree")]
     kernel_paths.extend(cu_files_in("kernels/cuda/fattn"));
 
     let builder = bindgen_cuda::Builder::default()
@@ -66,6 +68,8 @@ fn build_cuda_ptx() {
 }
 
 fn main() {
+    emit_fattn_cfg();
+
     #[cfg(any(feature = "flash-attn", feature = "flash-inference"))]
     {
         use std::path::PathBuf;
@@ -198,4 +202,14 @@ fn main() {
             oneapi_runtime_dirs().join(":")
         );
     }
+}
+
+/// Sets the `crane_fattn` cfg that gates every item of the in-tree
+/// flash-attention kernels. CUDA needs the opt-in `flash-attn-intree`
+/// feature. `ROCm` compiles them at run time (HIPRTC), so they cost nothing
+/// to build there.
+fn emit_fattn_cfg() {
+    println!("cargo::rustc-check-cfg=cfg(crane_fattn)");
+    #[cfg(any(feature = "flash-attn-intree", feature = "rocm"))]
+    println!("cargo::rustc-cfg=crane_fattn");
 }

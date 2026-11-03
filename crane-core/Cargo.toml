@@ -157,6 +157,14 @@ flash-attn = ["cuda", "dep:candle-flash-attn", "dep:cudaforge"]
 # Inference adapters reuse this dependency's headers. It must be enabled so
 # Cargo fetches its sources on fresh machines, not just developer caches.
 flash-inference = ["cuda", "dep:candle-flash-attn", "dep:cudaforge"]
+# The in-tree flash-attention kernels (`kernels/cuda/fattn/`) as the CUDA
+# backend behind `enable_flash_causal()`. Mutually exclusive with
+# `flash-attn`/`flash-inference`. `rocm` always has these kernels, so it
+# needs no feature.
+flash-attn-intree = ["cuda"]
+# Builds both CUDA flash-attention backends, for A/B testing and the FA2
+# parity tests only. Not for production builds.
+flash-attn-ab = ["flash-attn", "flash-attn-intree"]
 # AMD ROCm/HIP backend (experimental fork). Also enables the fork's own
 # `rocm` feature — it's off by default there too. Build with
 # `--no-default-features`: this crate's `default` feature pulls in the

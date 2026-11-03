@@ -27,8 +27,21 @@
 //! | `accelerate` | Link against Apple Accelerate for CPU BLAS |
 //! | `mkl` | Link against Intel MKL for CPU BLAS |
 //! | `sycl` | Enable the Intel oneAPI / SYCL backend (POC; needs a candle fork, see README) |
+//! | `flash-attn-intree` | Compile the in-tree flash-attention kernels on CUDA (`ROCm` always has them) |
 
 include!("candle_backend.rs");
+
+// The two CUDA flash-attention backends are alternatives. Building both
+// doubles the kernel build cost, so only the A/B test feature may do it.
+#[cfg(all(
+    feature = "flash-attn-intree",
+    any(feature = "flash-attn", feature = "flash-inference"),
+    not(feature = "flash-attn-ab")
+))]
+compile_error!(
+    "`flash-attn-intree` and `flash-attn`/`flash-inference` are mutually exclusive. \
+     Pick one CUDA flash-attention backend, or enable `flash-attn-ab` to build both for A/B testing."
+);
 
 pub mod device;
 pub mod generation;

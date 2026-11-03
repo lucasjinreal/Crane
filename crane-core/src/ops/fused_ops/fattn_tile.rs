@@ -17,7 +17,7 @@
 //! Gated the same way as `fattn.rs`: every item here exists solely to
 //! support CUDA/ROCm kernel dispatch, so there is no CPU-relevant content
 //! to keep unconditional.
-#![cfg(any(feature = "cuda", feature = "rocm"))]
+#![cfg(crane_fattn)]
 
 use candle_core::{DType, Result, Tensor};
 
@@ -690,7 +690,7 @@ mod tests {
 
 /// Correctness against a real GPU: see
 /// [`super::fattn_mma::gpu_tests`]'s module doc for the shared rationale.
-#[cfg(all(test, any(feature = "cuda", feature = "rocm")))]
+#[cfg(all(test, crane_fattn))]
 mod gpu_tests {
     use candle_core::{DType, Device, Tensor};
 

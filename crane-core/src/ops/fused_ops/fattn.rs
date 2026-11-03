@@ -20,7 +20,7 @@
 //! dispatchers in [`super::fattn_mma`]/[`super::fattn_tile`] (unlike
 //! `flash_attn.rs`, there is no CPU-relevant content to keep unconditional),
 //! so the whole module is gated at once rather than per item.
-#![cfg(any(feature = "cuda", feature = "rocm"))]
+#![cfg(crane_fattn)]
 
 use candle_core::{DType, Device, Layout, Result, Tensor};
 
@@ -1056,7 +1056,7 @@ mod tests {
 /// [`super::fattn_tile`]'s `gpu_tests`: the naive matmul/mask/softmax/matmul
 /// reference and the test-only GPU device picker. `pub(crate)` so both
 /// sibling modules reuse the same reference rather than duplicating it.
-#[cfg(all(test, any(feature = "cuda", feature = "rocm")))]
+#[cfg(all(test, crane_fattn))]
 pub(crate) mod test_support {
     use candle_core::{Device, Tensor};
     use candle_nn::ops::softmax_last_dim;
