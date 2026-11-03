@@ -307,7 +307,7 @@ mod cuda {
     use candle_core::{Result, Tensor};
 
     mod ptx {
-        include!(concat!(env!("OUT_DIR"), "/crane_kernels_ptx.rs"));
+        include!(concat!(env!("OUT_DIR"), "/crane_fattn_ptx.rs"));
     }
 
     fn f16_slice<'a>(
