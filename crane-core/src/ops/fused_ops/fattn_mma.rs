@@ -28,7 +28,7 @@
 //! Gated the same way as `fattn.rs`: every item here exists solely to
 //! support CUDA/ROCm kernel dispatch, so there is no CPU-relevant content
 //! to keep unconditional.
-#![cfg(any(feature = "cuda", feature = "rocm"))]
+#![cfg(crane_fattn)]
 
 use candle_core::{DType, Layout, Result, Tensor};
 
@@ -1897,7 +1897,7 @@ mod tests {
 /// [`fattn_mma_prefill`] directly; [`fattn_mma_causal`]/[`fattn_mma_full`]/
 /// [`fattn_mma_windowed`] get their own separate end-to-end tests further
 /// down, covering the mask/`KV_max`-building logic those wrap around it.
-#[cfg(all(test, any(feature = "cuda", feature = "rocm")))]
+#[cfg(all(test, crane_fattn))]
 mod gpu_tests {
     use candle_core::{DType, Device, Tensor};
 
