@@ -1363,7 +1363,7 @@ mod cuda {
     use candle_core::{Device, Result, Tensor};
 
     mod ptx {
-        include!(concat!(env!("OUT_DIR"), "/crane_kernels_ptx.rs"));
+        include!(concat!(env!("OUT_DIR"), "/crane_fattn_ptx.rs"));
     }
 
     fn ptx_for(dkq: usize) -> Result<&'static str> {

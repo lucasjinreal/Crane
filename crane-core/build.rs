@@ -36,12 +36,14 @@ fn cu_files_in(dir: &str) -> Vec<std::path::PathBuf> {
     paths
 }
 
-/// Compiles `kernels/cuda/`'s `.cu` sources (and `kernels/cuda/fattn/`'s,
-/// with `flash-attn-intree`) into the `crane_kernels_ptx.rs` bindings
-/// `ops::fused_ops`'s CUDA dispatchers `include!`. `flash_attention/` holds
-/// a separately built host launch adapter (cudaforge + CUTLASS, gated behind
-/// `flash-attn`/`flash-inference`) that must not go through this PTX-only
-/// pipeline, so it's deliberately not globbed here.
+/// Compiles `kernels/cuda/`'s `.cu` sources into the `crane_kernels_ptx.rs`
+/// bindings `ops::fused_ops`'s CUDA dispatchers `include!`.
+/// `flash_attention/` holds a separately built host launch adapter
+/// (cudaforge + CUTLASS, gated behind `flash-attn`/`flash-inference`) that
+/// must not go through this PTX-only pipeline, so it's deliberately not
+/// globbed here. `kernels/cuda/fattn/` is compiled separately by
+/// [`build_fattn_ptx`] so it can use `--use_fast_math` without affecting
+/// every other kernel in this build.
 #[cfg(feature = "cuda")]
 fn build_cuda_ptx() {
     use std::env;
@@ -49,10 +51,7 @@ fn build_cuda_ptx() {
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
-    #[cfg_attr(not(feature = "flash-attn-intree"), allow(unused_mut))]
-    let mut kernel_paths = cu_files_in("kernels/cuda");
-    #[cfg(feature = "flash-attn-intree")]
-    kernel_paths.extend(cu_files_in("kernels/cuda/fattn"));
+    let kernel_paths = cu_files_in("kernels/cuda");
 
     let builder = bindgen_cuda::Builder::default()
         .kernel_paths(kernel_paths)
@@ -65,6 +64,39 @@ fn build_cuda_ptx() {
     bindings
         .write(out_dir.join("crane_kernels_ptx.rs"))
         .expect("Failed to write PTX bindings");
+}
+
+/// Compiles `kernels/cuda/fattn/`'s `.cu` sources (MMA and tile kernel
+/// instantiations) into `crane_fattn_ptx.rs`, `ops::fused_ops::fattn_mma`'s
+/// and `fattn_tile`'s CUDA dispatchers `include!`. Only built under
+/// `flash-attn-intree`. Compiled with `--use_fast_math`, unlike
+/// [`build_cuda_ptx`]'s kernels: llama.cpp (this kernel's origin, see
+/// `ggml-cuda/CMakeLists.txt`) and candle-flash-attn both build with it, and
+/// the fattn kernels already manage their own precision (FTZ threshold,
+/// `FATTN_KQ_MAX_OFFSET` range shift) under that assumption.
+#[cfg(all(feature = "cuda", feature = "flash-attn-intree"))]
+fn build_fattn_ptx() {
+    use std::env;
+    use std::path::PathBuf;
+
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+
+    let kernel_paths = cu_files_in("kernels/cuda/fattn");
+
+    let builder = bindgen_cuda::Builder::default()
+        .kernel_paths(kernel_paths)
+        .arg("--expt-relaxed-constexpr")
+        .arg("--extended-lambda")
+        .arg("-std=c++17")
+        .arg("-O3")
+        .arg("--use_fast_math");
+
+    let bindings = builder
+        .build_ptx()
+        .expect("Failed to compile fattn CUDA kernels");
+    bindings
+        .write(out_dir.join("crane_fattn_ptx.rs"))
+        .expect("Failed to write fattn PTX bindings");
 }
 
 fn main() {
@@ -131,6 +163,9 @@ fn main() {
     // Only compile CUDA kernels when the cuda feature is enabled.
     #[cfg(feature = "cuda")]
     build_cuda_ptx();
+
+    #[cfg(all(feature = "cuda", feature = "flash-attn-intree"))]
+    build_fattn_ptx();
 
     // Compile the fused SYCL kernels into `libcrane_gdn_sycl.so` with `icpx`.
     // Only when `--features sycl` — a plain build never needs oneAPI. The
