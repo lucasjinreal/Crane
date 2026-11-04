@@ -19,9 +19,7 @@ use super::super::fattn::{
 use super::super::fattn_long_seq_host::compare;
 use super::long_seq_tests::{bitwise_eq, round_to, scaled_q, to_host, tolerance};
 use super::{
-    LaunchShape, fattn_mma_bf16_causal, pad_for_gqa_batching, pad_for_gqa_batching_bf16, pad_kv,
-    padded_seq_kv_for_gqa_batching, padded_seq_kv_for_gqa_batching_bf16, prefill_dispatch,
-    prefill_dispatch_bf16, tile_counts,
+    LaunchShape, fattn_mma_bf16_causal, prefill_dispatch, prefill_dispatch_bf16, tile_counts,
 };
 
 /// `head_dim` 512 has no MMA kernel on AMD.
@@ -29,7 +27,8 @@ use super::{
 const HEAD_DIMS: [usize; 4] = [64, 128, 256, 512];
 #[cfg(not(feature = "cuda"))]
 const HEAD_DIMS: [usize; 3] = [64, 128, 256];
-/// One unaligned length (the K/V padding path) and one aligned one.
+/// One unaligned length (the kernel's partial-tile bounds-check path) and
+/// one aligned one.
 const SEQS: [usize; 2] = [231, 256];
 const DTYPES: [DType; 2] = [DType::BF16, DType::F16];
 
@@ -279,28 +278,12 @@ impl Case {
         );
 
         let (k, v, mask) = match mode {
-            Mode::Causal => {
-                let padded = if bf16 {
-                    padded_seq_kv_for_gqa_batching_bf16(d, gqa_ratio, seq, seq, is_amd)
-                } else {
-                    padded_seq_kv_for_gqa_batching(d, gqa_ratio, seq, seq, is_amd)
-                };
-                let (k, v) = match padded {
-                    Some(padded) => pad_kv(&k, &v, padded).unwrap(),
-                    None => (k, v),
-                };
-                (k, v, None)
-            },
+            Mode::Causal => (k, v, None),
             Mode::CausalWithMask | Mode::Full => {
                 let mask = if mode == Mode::Full {
                     Tensor::zeros((1, 1, seq, seq), DType::F16, gpu).unwrap()
                 } else {
                     build_additive_mask_f16(seq, seq, 0, None, 0, gpu).unwrap()
-                };
-                let (k, v, mask) = if bf16 {
-                    pad_for_gqa_batching_bf16(&q, &k, &v, &mask).unwrap()
-                } else {
-                    pad_for_gqa_batching(&q, &k, &v, &mask).unwrap()
                 };
                 (k, v, Some(mask))
             },
@@ -311,7 +294,7 @@ impl Case {
         } else {
             select_mma_ncols
         };
-        let (ncols1, ncols2) = select(d, gqa_ratio, seq, seq_kv, is_amd)
+        let (ncols1, ncols2) = select(d, gqa_ratio, seq, is_amd)
             .unwrap_or_else(|| panic!("{dtype:?} hd{d} seq={seq}: no MMA kernel"));
         let cfg = if bf16 {
             mma_config_bf16(d, ncols1 * ncols2, is_amd)

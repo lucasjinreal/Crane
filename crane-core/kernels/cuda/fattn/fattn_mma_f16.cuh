@@ -594,7 +594,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     constexpr int  nbatch_K2       = ggml_cuda_fattn_mma_get_nbatch_K2(DKQ, DV, ncols);
     constexpr int  nbatch_V2       = ggml_cuda_fattn_mma_get_nbatch_V2(DKQ, DV, ncols);
     constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg (DKQ, DV, ncols);
-    constexpr int  nstages         = ggml_cuda_fattn_mma_get_nstages  (DKQ, DV, ncols1, ncols2, use_sparse);
+    // Forced to 0 (synchronous loads, no pipelining) whenever oob_check is
+    // set: oob_check is only ever true for a genuinely partial KV tile
+    // (see flash_attn_ext_f16_process_tile), and the multi-stage cp.async
+    // pipeline below cannot predicate its loads, so it must not run for
+    // that tile regardless of what the config table targets.
+    constexpr int  nstages         = oob_check ? 0 : ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2, use_sparse);
 
     // swizzle the tile stride for K and V based on the batch size.
     constexpr int stride_tile_K = ggml_cuda_fattn_smem_swizzle::tile_stride(nbatch_K2);
@@ -1151,7 +1156,7 @@ template<int DV, int ncols> struct mma_tile_sizes {
 };
 #endif // defined(TURING_MMA_AVAILABLE)
 
-template<int DKQ, int DV, int ncols1, int ncols2, int nwarps, bool use_logit_softcap, bool V_is_K_view, bool use_sparse, bool needs_fixup, bool is_fixup>
+template<int DKQ, int DV, int ncols1, int ncols2, int nwarps, bool use_logit_softcap, bool V_is_K_view, bool use_sparse, bool needs_fixup, bool is_fixup, bool oob_tail>
 static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         const half2  * const __restrict__ Q_h2,
         const half2  * const __restrict__ K_h2,
@@ -1298,26 +1303,59 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
     int kb0 = kb0_start;
 
-    // Preload mask and K data for first iteration when using cp_async with multiple stages:
-    if constexpr (nstages > 1) {
-        static_assert(!use_sparse, "sparse gather not implemented for multi-stage loading");
-        static_assert(nbatch_K2 == DKQ/2, "batching not implemented for multi-stage pipeline");
-        constexpr bool use_cp_async = true;
-        constexpr bool oob_check    = false;
-        constexpr int  k_VKQ_sup    = nbatch_fa;
-        if (mask_h) {
-            flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
-                (mask_h, tile_mask, stride_mask, kb0*nbatch_fa, k_VKQ_sup, jt*ncols1, ne01, nullptr);
-        }
-        flash_attn_ext_f16_load_tile<stride_tile_K, swz_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
-            (K_h2, tile_K, nbatch_K2, stride_K, kb0*nbatch_fa, k_VKQ_sup, nullptr);
-    }
+    if constexpr (oob_tail) {
+        // oob_tail is only ever true for ncols2 > 1 (see
+        // DECL_FATTN_MMA_F16_TAIL_CASE, only emitted for ncols2 > 1
+        // combinations), so this branch never needs the ncols2 == 1 path.
+        // Kept entirely separate (via if constexpr, not a runtime branch)
+        // from the oob_tail = false branch below: that branch's compiled
+        // code must stay byte-for-byte what it was before this kernel
+        // supported unaligned seq_kv, so its register allocation never
+        // pays for this one's bounds-checked tail handling. See this
+        // file's call sites in DECL_FATTN_MMA_F16_TAIL_CASE for why this
+        // has to be a distinct kernel symbol rather than a runtime branch.
 
-    // kb0_start is always < kb0_stop so the last iter can be executed unconditionally.
-    if constexpr (ncols2 == 1 || use_sparse) {
-        constexpr bool oob_check = true;
-        for (; kb0 < kb0_stop-1; ++kb0) {
-            constexpr bool last_iter = false;
+        // Whether this launch's true final KV tile (not just the last tile
+        // this stream-K block happens to cover) is narrower than
+        // nbatch_fa. GQA batching (ncols2 > 1) no longer requires seq_kv
+        // padded to a multiple of nbatch_fa (see fattn.rs's
+        // select_mma_ncols) when this kernel symbol is selected.
+        const bool final_tile_is_partial = ne11 % nbatch_fa != 0 && kb0_stop*nbatch_fa >= ne11;
+        // The one-tile case: that tile is both the first and the partial
+        // last one, so the cp.async preload below (which always assumes a
+        // full tile) must not run for it at all.
+        const bool skip_initial_preload  = final_tile_is_partial && kb0_stop - kb0_start == 1;
+
+        // Preload mask and K data for first iteration when using cp_async with multiple stages:
+        if constexpr (nstages > 1) {
+            static_assert(!use_sparse, "sparse gather not implemented for multi-stage loading");
+            static_assert(nbatch_K2 == DKQ/2, "batching not implemented for multi-stage pipeline");
+            if (!skip_initial_preload) {
+                constexpr bool use_cp_async = true;
+                constexpr bool oob_check    = false;
+                constexpr int  k_VKQ_sup    = nbatch_fa;
+                if (mask_h) {
+                    flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
+                        (mask_h, tile_mask, stride_mask, kb0*nbatch_fa, k_VKQ_sup, jt*ncols1, ne01, nullptr);
+                }
+                flash_attn_ext_f16_load_tile<stride_tile_K, swz_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
+                    (K_h2, tile_K, nbatch_K2, stride_K, kb0*nbatch_fa, k_VKQ_sup, nullptr);
+            }
+        }
+
+        if (!final_tile_is_partial) {
+            constexpr bool oob_check = false;
+            for (; kb0 < kb0_stop-1; ++kb0) {
+                constexpr bool last_iter = false;
+                constexpr int  k_VKQ_sup = nbatch_fa;
+                flash_attn_ext_f16_iter
+                    <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
+                     T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
+                    (Q_h2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
+                     ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+                     KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, causal_kv_offset);
+            }
+            constexpr bool last_iter = true;
             constexpr int  k_VKQ_sup = nbatch_fa;
             flash_attn_ext_f16_iter
                 <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
@@ -1325,19 +1363,98 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 (Q_h2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
                  KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, causal_kv_offset);
+        } else {
+            // The true last KV tile is narrower than nbatch_fa. Stop the
+            // cp.async-pipelined loop one tile early so no preload ever
+            // targets the partial tile with an unconditional (non-oob)
+            // load, then process that tile synchronously with bounds
+            // checks (see flash_attn_ext_f16_iter's nstages shadowing on
+            // oob_check).
+            constexpr bool oob_check = false;
+            for (; kb0 < kb0_stop-2; ++kb0) {
+                constexpr bool last_iter = false;
+                constexpr int  k_VKQ_sup = nbatch_fa;
+                flash_attn_ext_f16_iter
+                    <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
+                     T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
+                    (Q_h2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
+                     ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+                     KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, causal_kv_offset);
+            }
+            if (kb0 < kb0_stop - 1) {
+                // Second-to-last tile is still full-sized: process it, but
+                // mark it last_iter so it doesn't preload the next
+                // (partial) tile.
+                constexpr bool last_iter = true;
+                constexpr int  k_VKQ_sup = nbatch_fa;
+                flash_attn_ext_f16_iter
+                    <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
+                     T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
+                    (Q_h2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
+                     ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+                     KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, causal_kv_offset);
+                ++kb0;
+            }
+            constexpr bool last_iter_final = true;
+            constexpr bool oob_check_final = true;
+            const     int  k_VKQ_sup = ne11 - kb0*nbatch_fa;
+            flash_attn_ext_f16_iter
+                <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter_final, oob_check_final,
+                 T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
+                (Q_h2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
+                 ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, causal_kv_offset);
         }
-        constexpr bool last_iter = true;
-        const     int  k_VKQ_sup = ne11 - kb0*nbatch_fa;
-        flash_attn_ext_f16_iter
-            <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
-              T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
-            (Q_h2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
-             ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-             KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, causal_kv_offset);
     } else {
-        constexpr bool oob_check = false;
-        for (; kb0 < kb0_stop-1; ++kb0) {
-            constexpr bool last_iter = false;
+        // Preload mask and K data for first iteration when using cp_async with multiple stages:
+        if constexpr (nstages > 1) {
+            static_assert(!use_sparse, "sparse gather not implemented for multi-stage loading");
+            static_assert(nbatch_K2 == DKQ/2, "batching not implemented for multi-stage pipeline");
+            constexpr bool use_cp_async = true;
+            constexpr bool oob_check    = false;
+            constexpr int  k_VKQ_sup    = nbatch_fa;
+            if (mask_h) {
+                flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
+                    (mask_h, tile_mask, stride_mask, kb0*nbatch_fa, k_VKQ_sup, jt*ncols1, ne01, nullptr);
+            }
+            flash_attn_ext_f16_load_tile<stride_tile_K, swz_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
+                (K_h2, tile_K, nbatch_K2, stride_K, kb0*nbatch_fa, k_VKQ_sup, nullptr);
+        }
+
+        // kb0_start is always < kb0_stop so the last iter can be executed unconditionally.
+        if constexpr (ncols2 == 1 || use_sparse) {
+            constexpr bool oob_check = true;
+            for (; kb0 < kb0_stop-1; ++kb0) {
+                constexpr bool last_iter = false;
+                constexpr int  k_VKQ_sup = nbatch_fa;
+                flash_attn_ext_f16_iter
+                    <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
+                     T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
+                    (Q_h2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
+                     ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+                     KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, causal_kv_offset);
+            }
+            constexpr bool last_iter = true;
+            const     int  k_VKQ_sup = ne11 - kb0*nbatch_fa;
+            flash_attn_ext_f16_iter
+                <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
+                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
+                (Q_h2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
+                 ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, causal_kv_offset);
+        } else {
+            constexpr bool oob_check = false;
+            for (; kb0 < kb0_stop-1; ++kb0) {
+                constexpr bool last_iter = false;
+                constexpr int  k_VKQ_sup = nbatch_fa;
+                flash_attn_ext_f16_iter
+                    <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
+                     T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
+                    (Q_h2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
+                     ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+                     KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, causal_kv_offset);
+            }
+            constexpr bool last_iter = true;
             constexpr int  k_VKQ_sup = nbatch_fa;
             flash_attn_ext_f16_iter
                 <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
@@ -1346,14 +1463,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
                  KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, causal_kv_offset);
         }
-        constexpr bool last_iter = true;
-        constexpr int  k_VKQ_sup = nbatch_fa;
-        flash_attn_ext_f16_iter
-            <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
-             T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
-            (Q_h2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
-             ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-             KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, causal_kv_offset);
     }
 
     // With multi-stage loading there is no __syncthreads at the end of the iter,
@@ -1775,7 +1884,7 @@ static constexpr __host__ __device__ bool ggml_cuda_flash_attn_ext_mma_f16_may_u
 // extern "C" wrapper calls this directly rather than through a <<<>>>
 // launch. __launch_bounds__ moves to that wrapper instead, since it is only
 // meaningful on an actual kernel entry point.
-template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool V_is_K_view, bool use_sparse>
+template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool V_is_K_view, bool use_sparse, bool oob_tail>
 static __device__ __forceinline__ void flash_attn_ext_f16(
         const char * Q_ptr,
         const char * K_ptr,
@@ -1916,7 +2025,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16(
         constexpr bool is_fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
         if (kb0_start == 0) {
             constexpr bool needs_fixup = false; // CUDA block is working on an entire tile.
-            flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup>
+            flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, oob_tail>
                 (Q_h2, K_h2, V_h2, mask_h, indices, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
                  ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop, causal_kv_offset);
         } else if (kb0_start >= kb0_stop) {
@@ -1924,7 +2033,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16(
             crane_fattn_write_empty_partial<DV, ncols>(dst_meta, blockIdx.x, gridDim.x + blockIdx.x);
         } else {
             constexpr bool needs_fixup = true; // CUDA block is missing the beginning of a tile.
-            flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup>
+            flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, oob_tail>
                 (Q_h2, K_h2, V_h2, mask_h, indices, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
                  ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop, causal_kv_offset);
         }
@@ -1976,7 +2085,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16(
 
     constexpr bool is_fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
     constexpr bool needs_fixup = false;
-    flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup>
+    flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, oob_tail>
         (Q_h2, K_h2, V_h2, mask_h, indices, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
          ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop, causal_kv_offset);
 #else
@@ -2013,7 +2122,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16(
         int32_t nb31, int32_t nb32, int64_t nb33,                                                       \
         int32_t causal_kv_offset)                                                                       \
     {                                                                                                    \
-        flash_attn_ext_f16<DKQ_, DV_, ncols1_, ncols2_, false, false, false>(                           \
+        flash_attn_ext_f16<DKQ_, DV_, ncols1_, ncols2_, false, false, false, false>(                    \
             Q, K, V, mask, sinks, KV_max, dst, dst_meta,                                                \
             scale, max_bias, m0, m1, n_head_log2, logit_softcap,                                        \
             ne00, ne01, ne02, ne03, nb01, nb02, nb03,                                                    \
@@ -2022,3 +2131,45 @@ static __device__ __forceinline__ void flash_attn_ext_f16(
             causal_kv_offset);                                                                          \
     }                                                                                                    \
     DECL_CRANE_FATTN_FIXUP(f16, half, DV_, ncols1_, ncols2_)
+
+// Same as DECL_FATTN_MMA_F16_CASE, but instantiates flash_attn_ext_f16 with
+// oob_tail = true: the GQA-batched (ncols2 > 1) kernel's final KV tile is
+// allowed to be narrower than nbatch_fa (see flash_attn_ext_f16_process_tile's
+// oob_tail branch). Kept as a separate macro, and a separate compiled kernel
+// symbol, rather than a parameter on DECL_FATTN_MMA_F16_CASE itself, so every
+// existing (oob_tail = false) symbol's compiled code and register footprint
+// stay exactly what they were before this macro existed. Only meaningful for
+// ncols2 > 1 (ncols2 == 1 already unconditionally bounds-checks its tail, see
+// flash_attn_ext_f16_process_tile's ncols2 == 1 branch), so this should only
+// ever be instantiated for ncols2 > 1 call sites. No DECL_CRANE_FATTN_FIXUP
+// here: the plain DECL_FATTN_MMA_F16_CASE for the same (DV_, ncols1_, ncols2_)
+// already declares that fixup kernel, and its merge logic doesn't depend on
+// oob_tail at all, so both kernel variants share it.
+#define DECL_FATTN_MMA_F16_TAIL_CASE(DKQ_, DV_, ncols1_, ncols2_)                                       \
+    extern "C" __global__                                                                              \
+    __launch_bounds__(                                                                                 \
+        ggml_cuda_fattn_mma_get_nthreads(DKQ_, DV_, (ncols1_) * (ncols2_)),                             \
+        ggml_cuda_fattn_mma_get_occupancy(DKQ_, DV_, (ncols1_) * (ncols2_)))                            \
+    void crane_fattn_mma_f16_d##DKQ_##_v##DV_##_c##ncols1_##_s##ncols2_##_tail(                        \
+        const char * Q, const char * K, const char * V,                                                \
+        const char * mask, const char * sinks, const int * KV_max,                                     \
+        half * dst, float2 * dst_meta,                                                                 \
+        float scale, float max_bias, float m0, float m1,                                               \
+        uint32_t n_head_log2, float logit_softcap,                                                     \
+        int32_t ne00, uint3 ne01, int32_t ne02, int32_t ne03,                                          \
+        int32_t nb01, int32_t nb02, int32_t nb03,                                                       \
+        int32_t ne10, int32_t ne11, int32_t ne12, int32_t ne13,                                         \
+        int32_t nb11, int32_t nb12, int64_t nb13,                                                       \
+        int32_t nb21, int32_t nb22, int64_t nb23,                                                       \
+        int32_t ne31, int32_t ne32, int32_t ne33,                                                       \
+        int32_t nb31, int32_t nb32, int64_t nb33,                                                       \
+        int32_t causal_kv_offset)                                                                       \
+    {                                                                                                    \
+        flash_attn_ext_f16<DKQ_, DV_, ncols1_, ncols2_, false, false, false, true>(                    \
+            Q, K, V, mask, sinks, KV_max, dst, dst_meta,                                                \
+            scale, max_bias, m0, m1, n_head_log2, logit_softcap,                                        \
+            ne00, ne01, ne02, ne03, nb01, nb02, nb03,                                                    \
+            ne10, ne11, ne12, ne13, nb11, nb12, nb13,                                                    \
+            nb21, nb22, nb23, ne31, ne32, ne33, nb31, nb32, nb33,                                        \
+            causal_kv_offset);                                                                          \
+    }

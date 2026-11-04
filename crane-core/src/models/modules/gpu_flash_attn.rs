@@ -852,7 +852,7 @@ mod gpu_tests {
 
         let shape = (1, 2, 2, 8, 8, 128);
         for dtype in [DType::F16, DType::BF16] {
-            if select_mma_ncols(128, 1, 8, 8, is_amd_backend()).is_some() {
+            if select_mma_ncols(128, 1, 8, is_amd_backend()).is_some() {
                 check_try_causal(shape, dtype, 3e-2);
             } else {
                 let inp = inputs(shape, dtype);

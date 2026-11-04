@@ -90,8 +90,8 @@ pub enum FattnKernelType {
 }
 
 /// `FATTN_KQ_STRIDE` in `fattn_common.cuh`: KV rows per tile, and the
-/// padding granularity `select_mma_ncols` requires of `seq_kv` before
-/// picking a GQA-batched `ncols2 > 1` (`gqa_opt_applies` below).
+/// rounding granularity [`build_analytic_kv_max`]'s `kv_max_cap` uses for its
+/// tile bounds.
 pub(crate) const FATTN_KQ_STRIDE: usize = 256;
 
 /// Mirrors llama.cpp's `fattn_mma_config` (`fattn_mma_f16.cuh`): per-launch
@@ -104,7 +104,10 @@ pub(crate) struct FattnMmaConfig {
     /// Targeted blocks per SM/CU, the kernel's `__launch_bounds__` hint. It
     /// sizes the stream-K grid (see [`stream_k_grid`]).
     pub occupancy: usize,
-    /// KV rows processed per inner-loop iteration.
+    /// KV rows processed per inner-loop iteration. Must match the
+    /// kernel's compile-time `NBATCH_FA` (set by each `.cuh` config
+    /// macro); a mismatch causes wrong tail-kernel selection and
+    /// out-of-bounds device reads since K/V is never padded.
     pub nbatch_fa: usize,
     /// K rows staged in shared memory per `nbatch_fa` chunk.
     pub nbatch_k2: usize,
@@ -240,12 +243,12 @@ pub(crate) fn mma_config_bf16(dkq: usize, ncols: usize, is_amd: bool) -> Result<
 /// Picks `ncols2` (how many GQA-sibling Q heads share one block's K/V load):
 /// port of `ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2`'s non-Volta
 /// branches. `ncols2=1` is always valid for any `gqa_ratio` (it divides
-/// every integer), so it is the universal fallback when `gqa_opt_applies`
-/// is `false` or `gqa_ratio` doesn't divide evenly into a larger tile.
-fn mma_ncols2(gqa_ratio: usize, gqa_opt_applies: bool, is_amd: bool) -> usize {
-    if !gqa_opt_applies {
-        return 1;
-    }
+/// every integer), so it is the fallback when `gqa_ratio` doesn't divide
+/// evenly into a larger tile. The kernel no longer requires `seq_kv` padded
+/// to a `FATTN_KQ_STRIDE` multiple to pick `ncols2 > 1` (the GQA-batched
+/// kernels handle a partial final KV tile with their own bounds checks, see
+/// `fattn_mma_f16.cuh`/`fattn_mma_bf16.cuh`'s `process_tile` dispatch).
+fn mma_ncols2(gqa_ratio: usize, is_amd: bool) -> usize {
     if is_amd {
         // RDNA prefers an exact-divisor ncols2 to avoid wasted compute on
         // padding lanes; only falls through to the generic thresholds below
@@ -290,8 +293,12 @@ fn mma_ncols1(head_dim: usize, seq_q: usize, ncols2: usize, is_amd: bool) -> usi
 }
 
 /// Selects `(ncols1, ncols2)` for the MMA kernel at this `(head_dim,
-/// gqa_ratio, seq_q, seq_kv)`, or `None` if no instantiated kernel covers
-/// it. Callers fall back to the tile kernel in that case.
+/// gqa_ratio, seq_q)`, or `None` if no instantiated kernel covers it.
+/// Callers fall back to the tile kernel in that case. `seq_kv` plays no part
+/// in the decision: the kernel handles a partial final KV tile with its own
+/// bounds checks (see `fattn_mma_f16.cuh`'s `process_tile` dispatch), so
+/// `ncols2 > 1` no longer requires `seq_kv` padded to a `FATTN_KQ_STRIDE`
+/// multiple.
 ///
 /// Two `None` cases, both confirmed directly against `fattn_mma_f16.cuh`'s
 /// kernel body (the `NO_DEVICE_CODE; return;` guards right after the
@@ -306,22 +313,20 @@ fn mma_ncols1(head_dim: usize, seq_q: usize, ncols2: usize, is_amd: bool) -> usi
 ///   additionally rejects `ncols2 == 1` specifically (RDNA always needs the
 ///   GQA-batching tile shape); `fattn_mma_hd512.cu` only instantiates
 ///   `ncols2` in `{2, 4, 8}` for this same reason on every backend. A caller
-///   with `gqa_ratio=1` (plain MHA) or an unpadded `seq_kv` resolves to
-///   `ncols2=1` (see [`mma_ncols2`]) and must use the tile kernel on AMD.
-///   NVIDIA has no such restriction (confirmed: the `AMD_WMMA_AVAILABLE`
-///   guard is absent on the non-AMD path), so `ncols2=1` stays valid there.
+///   with `gqa_ratio=1` (plain MHA) resolves to `ncols2=1` (see
+///   [`mma_ncols2`]) and must use the tile kernel on AMD. NVIDIA has no such
+///   restriction (confirmed: the `AMD_WMMA_AVAILABLE` guard is absent on the
+///   non-AMD path), so `ncols2=1` stays valid there.
 pub(crate) fn select_mma_ncols(
     head_dim: usize,
     gqa_ratio: usize,
     seq_q: usize,
-    seq_kv: usize,
     is_amd: bool,
 ) -> Option<(usize, usize)> {
     if is_amd && head_dim > 256 {
         return None;
     }
-    let gqa_opt_applies = seq_kv.is_multiple_of(FATTN_KQ_STRIDE);
-    let ncols2 = mma_ncols2(gqa_ratio, gqa_opt_applies, is_amd);
+    let ncols2 = mma_ncols2(gqa_ratio, is_amd);
     // AMD rejects ncols2==1 unconditionally (kernel-level, see this
     // function's doc comment). NVIDIA allows ncols2==1 in general, but
     // fattn_mma_hd512.cu only instantiates ncols2 in {2, 4, 8} for
@@ -373,14 +378,12 @@ pub(crate) fn select_mma_ncols_bf16(
     head_dim: usize,
     gqa_ratio: usize,
     seq_q: usize,
-    seq_kv: usize,
     is_amd: bool,
 ) -> Option<(usize, usize)> {
     if is_amd && head_dim > 256 {
         return None;
     }
-    let gqa_opt_applies = seq_kv.is_multiple_of(FATTN_KQ_STRIDE);
-    let ncols2 = mma_ncols2(gqa_ratio, gqa_opt_applies, is_amd);
+    let ncols2 = mma_ncols2(gqa_ratio, is_amd);
     if ncols2 == 1 && (is_amd || head_dim == 512) {
         return None;
     }
@@ -393,16 +396,18 @@ pub(crate) fn select_mma_ncols_bf16(
 }
 
 /// Which kernel family [`select_mma_ncols`] would pick for, i.e. whether a
-/// call with these shapes has an instantiated MMA kernel at all.
+/// call with these shapes has an instantiated MMA kernel at all. `seq_kv`
+/// is unused (see [`select_mma_ncols`]'s doc comment) but kept in the
+/// signature to mirror the dispatch call this answers for.
 #[must_use]
 pub fn select_kernel(
     head_dim: usize,
     gqa_ratio: usize,
     seq_q: usize,
-    seq_kv: usize,
+    _seq_kv: usize,
     is_amd: bool,
 ) -> FattnKernelType {
-    if select_mma_ncols(head_dim, gqa_ratio, seq_q, seq_kv, is_amd).is_some() {
+    if select_mma_ncols(head_dim, gqa_ratio, seq_q, is_amd).is_some() {
         FattnKernelType::MmaF16
     } else {
         FattnKernelType::Tile
@@ -419,6 +424,20 @@ pub(crate) fn mma_kernel_name(dkq: usize, ncols1: usize, ncols2: usize) -> Strin
 /// `fattn_mma_bf16.cuh`'s `DECL_FATTN_MMA_BF16_CASE` macro.
 pub(crate) fn mma_bf16_kernel_name(dkq: usize, ncols1: usize, ncols2: usize) -> String {
     format!("crane_fattn_mma_bf16_d{dkq}_v{dkq}_c{ncols1}_s{ncols2}")
+}
+
+/// `crane_fattn_mma_f16_d{dkq}_v{dkq}_c{ncols1}_s{ncols2}_tail`: the
+/// bounds-checked-tail counterpart of [`mma_kernel_name`], for launches
+/// whose `seq_kv` isn't a multiple of the selected config's `nbatch_fa`. See
+/// `fattn_mma_f16.cuh`'s `DECL_FATTN_MMA_F16_TAIL_CASE` macro.
+pub(crate) fn mma_kernel_name_tail(dkq: usize, ncols1: usize, ncols2: usize) -> String {
+    format!("crane_fattn_mma_f16_d{dkq}_v{dkq}_c{ncols1}_s{ncols2}_tail")
+}
+
+/// bf16 counterpart of [`mma_kernel_name_tail`]. See `fattn_mma_bf16.cuh`'s
+/// `DECL_FATTN_MMA_BF16_TAIL_CASE` macro.
+pub(crate) fn mma_bf16_kernel_name_tail(dkq: usize, ncols1: usize, ncols2: usize) -> String {
+    format!("crane_fattn_mma_bf16_d{dkq}_v{dkq}_c{ncols1}_s{ncols2}_tail")
 }
 
 /// `crane_fattn_tile_f16_d{dkq}_v{dkq}_c16_s1`. The single `(ncols1,
@@ -963,22 +982,19 @@ mod tests {
             for is_amd in [false, true] {
                 for gqa_ratio in [1usize, 2, 3, 4, 5, 6, 7, 8, 16, 32] {
                     for seq_q in [1usize, 2, 4, 8, 15, 16, 17, 31, 32, 63, 64, 65, 1024] {
-                        for seq_kv in [1usize, 255, 256, 257, 512, 4096] {
-                            let Some(pair) =
-                                select_mma_ncols(head_dim, gqa_ratio, seq_q, seq_kv, is_amd)
-                            else {
-                                continue;
-                            };
-                            assert!(
-                                instantiated_pairs(head_dim).contains(&pair),
-                                "head_dim={head_dim} is_amd={is_amd} gqa_ratio={gqa_ratio} \
-                                 seq_q={seq_q} seq_kv={seq_kv} picked uninstantiated pair {pair:?}"
-                            );
-                            // The chosen config must also actually exist.
-                            mma_config(head_dim, pair.0 * pair.1, is_amd).unwrap_or_else(|e| {
-                                panic!("head_dim={head_dim} is_amd={is_amd} pair={pair:?}: {e}")
-                            });
-                        }
+                        let Some(pair) = select_mma_ncols(head_dim, gqa_ratio, seq_q, is_amd)
+                        else {
+                            continue;
+                        };
+                        assert!(
+                            instantiated_pairs(head_dim).contains(&pair),
+                            "head_dim={head_dim} is_amd={is_amd} gqa_ratio={gqa_ratio} \
+                             seq_q={seq_q} picked uninstantiated pair {pair:?}"
+                        );
+                        // The chosen config must also actually exist.
+                        mma_config(head_dim, pair.0 * pair.1, is_amd).unwrap_or_else(|e| {
+                            panic!("head_dim={head_dim} is_amd={is_amd} pair={pair:?}: {e}")
+                        });
                     }
                 }
             }
@@ -1044,23 +1060,20 @@ mod tests {
             for is_amd in [false, true] {
                 for gqa_ratio in [1usize, 2, 3, 4, 5, 6, 7, 8, 16, 32] {
                     for seq_q in [1usize, 2, 4, 8, 15, 16, 17, 31, 32, 63, 64, 65, 1024] {
-                        for seq_kv in [1usize, 255, 256, 257, 512, 4096] {
-                            let Some(pair) =
-                                select_mma_ncols_bf16(head_dim, gqa_ratio, seq_q, seq_kv, is_amd)
-                            else {
-                                continue;
-                            };
-                            assert!(
-                                instantiated_pairs_bf16(head_dim).contains(&pair),
-                                "head_dim={head_dim} is_amd={is_amd} gqa_ratio={gqa_ratio} \
-                                 seq_q={seq_q} seq_kv={seq_kv} picked uninstantiated bf16 pair {pair:?}"
-                            );
-                            // The chosen config must also actually exist (bf16
-                            // reuses the same tuning tables as f16).
-                            mma_config(head_dim, pair.0 * pair.1, is_amd).unwrap_or_else(|e| {
-                                panic!("head_dim={head_dim} is_amd={is_amd} pair={pair:?}: {e}")
-                            });
-                        }
+                        let Some(pair) = select_mma_ncols_bf16(head_dim, gqa_ratio, seq_q, is_amd)
+                        else {
+                            continue;
+                        };
+                        assert!(
+                            instantiated_pairs_bf16(head_dim).contains(&pair),
+                            "head_dim={head_dim} is_amd={is_amd} gqa_ratio={gqa_ratio} \
+                             seq_q={seq_q} picked uninstantiated bf16 pair {pair:?}"
+                        );
+                        // The chosen config must also actually exist (bf16
+                        // reuses the same tuning tables as f16).
+                        mma_config(head_dim, pair.0 * pair.1, is_amd).unwrap_or_else(|e| {
+                            panic!("head_dim={head_dim} is_amd={is_amd} pair={pair:?}: {e}")
+                        });
                     }
                 }
             }

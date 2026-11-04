@@ -39,12 +39,12 @@ use super::super::fattn_long_seq_host::{
 };
 use super::{
     fattn_mma_bf16_causal, fattn_mma_bf16_causal_with_mask, fattn_mma_causal,
-    fattn_mma_causal_with_mask, padded_seq_kv_for_gqa_batching,
-    padded_seq_kv_for_gqa_batching_bf16,
+    fattn_mma_causal_with_mask,
 };
 use crate::models::modules::gpu_flash_attn::try_causal_prefill;
 
-/// Unaligned lengths take the K/V padding path, aligned ones do not.
+/// 231/238 are unaligned to `FATTN_KQ_STRIDE`, exercising the kernel's
+/// partial-tile bounds checks; 1024 and up are aligned.
 pub(super) const SEQS: [usize; 5] = [231, 238, 1024, 2048, 4096];
 /// Input distributions of the sweep.
 pub(super) const DISTS: [LongSeqDist; 3] =
@@ -391,8 +391,7 @@ struct Geometry {
 }
 
 impl Geometry {
-    /// The tiling the causal entries pick for `seq` at `head_dim` `d`,
-    /// after their K/V padding.
+    /// The tiling the causal entries pick for `seq` at `head_dim` `d`.
     ///
     /// # Panics
     ///
@@ -401,16 +400,12 @@ impl Geometry {
         const NO_KERNEL: &str = "no MMA kernel for this shape";
         let is_amd = is_amd_backend();
         let gqa = HQ / HKV;
-        // `None` means padding K/V would not unlock a different kernel, so
-        // the entries run on the live length.
         let (ncols1, ncols2, nbatch_fa) = if dtype == DType::BF16 {
-            let kv = padded_seq_kv_for_gqa_batching_bf16(d, gqa, seq, seq, is_amd).unwrap_or(seq);
-            let (n1, n2) = select_mma_ncols_bf16(d, gqa, seq, kv, is_amd).expect(NO_KERNEL);
+            let (n1, n2) = select_mma_ncols_bf16(d, gqa, seq, is_amd).expect(NO_KERNEL);
             let cfg = mma_config_bf16(d, n1 * n2, is_amd).expect(NO_KERNEL);
             (n1, n2, cfg.nbatch_fa)
         } else {
-            let kv = padded_seq_kv_for_gqa_batching(d, gqa, seq, seq, is_amd).unwrap_or(seq);
-            let (n1, n2) = select_mma_ncols(d, gqa, seq, kv, is_amd).expect(NO_KERNEL);
+            let (n1, n2) = select_mma_ncols(d, gqa, seq, is_amd).expect(NO_KERNEL);
             let cfg = mma_config(d, n1 * n2, is_amd).expect(NO_KERNEL);
             (n1, n2, cfg.nbatch_fa)
         };

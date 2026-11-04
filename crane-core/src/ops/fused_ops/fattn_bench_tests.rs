@@ -37,8 +37,7 @@ use super::super::fattn::test_support::{
 use super::long_seq_tests::{SEQS, round_to};
 use super::{
     fattn_mma_bf16_causal, fattn_mma_bf16_causal_with_mask, fattn_mma_causal,
-    fattn_mma_causal_with_mask, pad_kv, padded_seq_kv_for_gqa_batching,
-    padded_seq_kv_for_gqa_batching_bf16, prefill_dispatch, prefill_dispatch_bf16,
+    fattn_mma_causal_with_mask, prefill_dispatch, prefill_dispatch_bf16,
 };
 use crate::models::qwen3_5::grouped_sdpa;
 use crate::ops::fused_ops::fattn::{gqa_z_tiles, q_tiles, select_mma_ncols, select_mma_ncols_bf16};
@@ -90,24 +89,10 @@ fn forced_grid_split_vs_no_split_hd256() {
             let k = bshd(&k_host, HKV).unwrap().to_dtype(dtype).unwrap();
             let v = bshd(&v_host, HKV).unwrap().to_dtype(dtype).unwrap();
 
-            // Mirrors `causal_in_kernel`'s padding, since production never
-            // calls the dispatch function below with an unpadded, unaligned
-            // `seq_kv`.
-            let padded = if bf16 {
-                padded_seq_kv_for_gqa_batching_bf16(HEAD_DIM, gqa_ratio, seq, seq, false)
-            } else {
-                padded_seq_kv_for_gqa_batching(HEAD_DIM, gqa_ratio, seq, seq, false)
-            };
-            let (k, v) = match padded {
-                Some(p) => pad_kv(&k, &v, p).unwrap(),
-                None => (k, v),
-            };
-            let seq_kv = k.dims4().unwrap().1;
-
             let ncols = if bf16 {
-                select_mma_ncols_bf16(HEAD_DIM, gqa_ratio, seq, seq_kv, false)
+                select_mma_ncols_bf16(HEAD_DIM, gqa_ratio, seq, false)
             } else {
-                select_mma_ncols(HEAD_DIM, gqa_ratio, seq, seq_kv, false)
+                select_mma_ncols(HEAD_DIM, gqa_ratio, seq, false)
             };
             let Some((ncols1, ncols2)) = ncols else {
                 eprintln!("[fattn_grid_trace] seq={seq} bf16={bf16}: no kernel variant, skipped");
