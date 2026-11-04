@@ -19,6 +19,7 @@ use candle_core::{D, DType, Device, Module, Result, Tensor};
 use candle_nn::VarBuilder;
 use std::io::{Read, Seek};
 
+use crate::models::modules::gpu_flash_attn;
 use crate::models::modules::moe::{MlpOrMoe, SparseMoeBlock};
 use crate::ops::linear::{LinearLayer, linear_layer};
 use crate::quantized::gguf_file::Gguf;
@@ -420,6 +421,27 @@ fn legacy_attn_expand() -> bool {
     })
 }
 
+/// Whether `CRANE_FLASH_ATTN_INTREE` asks [`DecoderLayer::enable_flash_causal`]
+/// to use the vendored kernels instead of `flash_split` on CUDA builds with
+/// `flash-attn`/`flash-inference`. Read once per process.
+#[cfg_attr(
+    not(any(feature = "flash-attn", feature = "flash-inference")),
+    allow(dead_code)
+)]
+fn intree_flash_requested() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| env_flag_enabled(std::env::var("CRANE_FLASH_ATTN_INTREE").ok().as_deref()))
+}
+
+/// Parses an on/off environment value: unset, empty and `0` are off.
+#[cfg_attr(
+    not(any(feature = "flash-attn", feature = "flash-inference")),
+    allow(dead_code)
+)]
+fn env_flag_enabled(value: Option<&str>) -> bool {
+    value.is_some_and(|v| !matches!(v.trim(), "" | "0"))
+}
+
 /// Shape of a [`FullAttention`] layer, independent of which model config it
 /// comes from.
 #[derive(Debug, Clone, Copy)]
@@ -592,15 +614,30 @@ impl FullAttention {
     /// # Errors
     ///
     /// Returns an error if the forward pass fails.
-    // q/k/v/b/h/s/d are standard ML tensor-shape notation (query, key, value,
-    // batch, heads, seq_len, head_dim), matching the terminology used
-    // throughout this function's comments.
-    #[allow(clippy::many_single_char_names)]
     pub fn forward(
         &self,
         x: &Tensor,
         rope: RopeSlice<'_>,
         attention_mask: Option<&Tensor>,
+        kv_cache: Option<&mut KvCache>,
+    ) -> Result<Tensor> {
+        self.forward_with_flash_mask(x, rope, attention_mask, None, kv_cache)
+    }
+
+    /// [`Self::forward`] with the model's causal mask already cast to the
+    /// kernels' F16 (see [`gpu_flash_attn::prepare_mask`]), so the opted-in
+    /// path does not repeat the cast in every layer. Only the vendored
+    /// kernels read `flash_mask`.
+    // q/k/v/b/h/s/d are standard ML tensor-shape notation (query, key, value,
+    // batch, heads, seq_len, head_dim), matching the terminology used
+    // throughout this function's comments.
+    #[allow(clippy::many_single_char_names)]
+    fn forward_with_flash_mask(
+        &self,
+        x: &Tensor,
+        rope: RopeSlice<'_>,
+        attention_mask: Option<&Tensor>,
+        flash_mask: Option<&Tensor>,
         kv_cache: Option<&mut KvCache>,
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _) = x.dims3()?;
@@ -679,6 +716,7 @@ impl FullAttention {
 
         #[cfg(any(feature = "flash-attn", feature = "flash-inference"))]
         let flash_output = if self.flash_causal
+            && !intree_flash_requested()
             && q.device().is_cuda()
             && matches!(q.dtype(), DType::BF16 | DType::F16)
         {
@@ -703,6 +741,16 @@ impl FullAttention {
         };
         #[cfg(not(any(feature = "flash-attn", feature = "flash-inference")))]
         let flash_output: Option<Tensor> = None;
+        // The vendored kernels serve prefill when the block above did not.
+        let flash_output = if flash_output.is_none() && self.flash_causal && seq_len > 1 {
+            // The scale is 1/sqrt(head_dim), far inside f32's range.
+            #[allow(clippy::cast_possible_truncation)]
+            let scale = scale as f32;
+            let mask = flash_mask.or(attention_mask);
+            gpu_flash_attn::try_causal_prefill(&q, &k, &v, scale, mask)?
+        } else {
+            flash_output
+        };
         let y = if let Some(output) = flash_output {
             output
         } else if legacy_attn_expand() {
@@ -958,7 +1006,19 @@ enum LayerImpl {
 impl DecoderLayer {
     /// Enable fused causal attention. Caller guarantees an unpadded standard
     /// causal mask; arbitrary masks must retain the default attention path.
-    #[cfg(any(feature = "flash-attn", feature = "flash-inference"))]
+    ///
+    /// On CUDA builds with `flash-attn`/`flash-inference` this selects
+    /// `flash_split` for every call, unless `CRANE_FLASH_ATTN_INTREE` is
+    /// set to a value other than `0`. Everywhere else, and with that
+    /// variable set, it selects the vendored kernels, for prefill only, and
+    /// the default path keeps serving decode and any call the kernels
+    /// cannot serve.
+    ///
+    /// The vendored kernels compute `KV_max` analytically and skip KV tiles
+    /// past the causal diagonal. A non-causal mask is cut off silently
+    /// instead of honored, which is why the mask has to be plain causal.
+    /// An F32 model runs the kernel in F16, so its opted-in attention has
+    /// F16 precision.
     pub fn enable_flash_causal(&mut self) {
         if let LayerImpl::FullAttention(attention) = &mut self.layer_impl {
             attention.flash_causal = true;
@@ -1106,6 +1166,26 @@ impl DecoderLayer {
         gdn_cache: Option<&mut GdnLayerCache>,
         attn_cache: Option<&mut KvCache>,
     ) -> Result<Tensor> {
+        self.forward_with_flash_mask(x, rope, attention_mask, None, gdn_cache, attn_cache)
+    }
+
+    /// Whether [`Self::enable_flash_causal`] was called on a full-attention
+    /// layer. GDN layers never are.
+    pub(super) fn flash_causal_enabled(&self) -> bool {
+        matches!(&self.layer_impl, LayerImpl::FullAttention(a) if a.flash_causal)
+    }
+
+    /// [`Self::forward`] with the model's causal mask already cast to the
+    /// kernels' F16, see [`FullAttention::forward_with_flash_mask`].
+    pub(super) fn forward_with_flash_mask(
+        &self,
+        x: &Tensor,
+        rope: RopeSlice<'_>,
+        attention_mask: Option<&Tensor>,
+        flash_mask: Option<&Tensor>,
+        gdn_cache: Option<&mut GdnLayerCache>,
+        attn_cache: Option<&mut KvCache>,
+    ) -> Result<Tensor> {
         use crate::utils::prof::{Span, timed};
 
         let residual = x;
@@ -1118,7 +1198,13 @@ impl DecoderLayer {
                     "full-attention layer should not receive a GDN cache"
                 );
                 timed(Span::Attn, || {
-                    attn.forward(&normed, rope, attention_mask, attn_cache)
+                    attn.forward_with_flash_mask(
+                        &normed,
+                        rope,
+                        attention_mask,
+                        flash_mask,
+                        attn_cache,
+                    )
                 })?
             },
             LayerImpl::LinearAttention(gdn) => {
@@ -1152,6 +1238,17 @@ impl DecoderLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Unset, empty and `0` leave `flash_split` selected, anything else asks
+    /// for the vendored kernels.
+    #[test]
+    fn env_flag_enabled_parses_on_off_values() {
+        assert!(!env_flag_enabled(None));
+        assert!(!env_flag_enabled(Some("")));
+        assert!(!env_flag_enabled(Some(" 0 ")));
+        assert!(env_flag_enabled(Some("1")));
+        assert!(env_flag_enabled(Some("true")));
+    }
 
     /// Qwen3.8-Flash-Next has 24 query heads: full 512-query slices up to
     /// ~2.7k cells, then shrinking so scores stay within the budget.

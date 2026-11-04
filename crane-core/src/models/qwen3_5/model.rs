@@ -21,6 +21,7 @@ use super::modeling::{DecoderLayer, MRotaryEmbedding, Qwen35RmsNorm, RopeSlice};
 use crate::generation::GenerationConfig;
 use crate::generation::based::ModelForCausalLM;
 use crate::models::modules::embedding::EmbeddingLayer;
+use crate::models::modules::gpu_flash_attn;
 use crate::quantized::gguf_file::Gguf;
 use crate::utils::token_output_stream::TokenOutputStream;
 use crate::utils::utils;
@@ -426,6 +427,15 @@ impl Qwen3_5TextModel {
         self.layers.len()
     }
 
+    /// Enable fused causal attention on every full-attention layer. See
+    /// [`DecoderLayer::enable_flash_causal`] for the contract: the caller
+    /// guarantees an unpadded standard causal mask.
+    pub fn enable_flash_causal(&mut self) {
+        for layer in &mut self.layers {
+            layer.enable_flash_causal();
+        }
+    }
+
     /// Total bytes held by the full-attention K/V caches across all layers
     /// (incl. headroom + quant scales). The context-scaling memory term.
     #[must_use]
@@ -749,6 +759,16 @@ impl Qwen3_5TextModel {
         if xs.dim(1)? > 1 && xs.dtype() != self.attention_dtype() {
             xs = xs.to_dtype(self.attention_dtype())?;
         }
+        // One F16 copy of the causal mask for every opted-in layer, instead
+        // of a cast in each of them.
+        let flash_mask = match attention_mask {
+            Some(mask)
+                if xs.dim(1)? > 1 && self.layers.iter().any(DecoderLayer::flash_causal_enabled) =>
+            {
+                gpu_flash_attn::prepare_mask(mask)?
+            },
+            _ => None,
+        };
         let debug = std::env::var_os("CRANE_QWEN35_DEBUG_LAYERS").is_some();
         #[cfg(feature = "cuda")]
         let graphs = xs.dim(1)? == 1
@@ -768,7 +788,14 @@ impl Qwen3_5TextModel {
             let layer = &self.layers[i];
             let gdn_slot = self.gdn_caches[i].as_mut();
             let attn_slot = self.attn_caches[i].as_mut();
-            xs = layer.forward(&xs, rope, attention_mask, gdn_slot, attn_slot)?;
+            xs = layer.forward_with_flash_mask(
+                &xs,
+                rope,
+                attention_mask,
+                flash_mask.as_ref(),
+                gdn_slot,
+                attn_slot,
+            )?;
             if debug {
                 let last = xs
                     .narrow(1, xs.dim(1)? - 1, 1)?
@@ -1235,6 +1262,12 @@ impl Model {
         self.inner.num_layers()
     }
 
+    /// Enable fused causal attention; see
+    /// [`Qwen3_5TextModel::enable_flash_causal`].
+    pub fn enable_flash_causal(&mut self) {
+        self.inner.enable_flash_causal();
+    }
+
     /// Native maximum context length this checkpoint was trained/configured for.
     pub fn max_position_embeddings(&self) -> usize {
         self.inner.config().max_position_embeddings
@@ -1426,3 +1459,7 @@ mod tests {
 #[cfg(all(test, feature = "cuda"))]
 #[path = "fla_decode_tests.rs"]
 mod fla_decode_tests;
+
+#[cfg(all(test, any(feature = "cuda", feature = "rocm")))]
+#[path = "flash_causal_tests.rs"]
+mod flash_causal_tests;

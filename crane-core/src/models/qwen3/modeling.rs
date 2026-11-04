@@ -47,6 +47,7 @@ use std::io::{Read, Seek};
 use crate::device::{DeviceAssignment, format_budget, greedy_fit_layers, query_gpu_memory};
 use crate::models::modules::embedding::EmbeddingLayer;
 use crate::models::modules::flash_attn::dispatch_flash_attn;
+use crate::models::modules::gpu_flash_attn;
 use crate::models::modules::kv_cache;
 use crate::models::modules::moe::{
     MlpOrMoe, MoeConfig, SparseMoeBlock, offload_reservation_bytes_for,
@@ -198,6 +199,9 @@ struct Attention {
     kv_cache: Option<(Tensor, Tensor)>,
     /// Number of valid (filled) positions in the KV cache buffer.
     cache_seq_len: usize,
+    /// Opt-in vendored flash attention for prefill, see
+    /// [`Qwen3Model::enable_flash_causal`].
+    flash_causal: bool,
 }
 
 impl Attention {
@@ -283,6 +287,7 @@ impl Attention {
             kv_dim,
             kv_cache: None,
             cache_seq_len: 0,
+            flash_causal: false,
         })
     }
 
@@ -326,6 +331,7 @@ impl Attention {
             kv_dim: num_kv_heads * head_dim,
             kv_cache: None,
             cache_seq_len: 0,
+            flash_causal: false,
         })
     }
 
@@ -358,6 +364,7 @@ impl Attention {
         cos: &Tensor,
         sin: &Tensor,
         attention_mask: Option<&Tensor>,
+        flash_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _) = hidden_states.dims3()?;
 
@@ -533,6 +540,17 @@ impl Attention {
                 .reshape((b_sz, self.num_heads, self.head_dim))?
                 .reshape((b_sz, 1, self.num_heads * self.head_dim))?;
             return self.o_proj.forward(&attn_output);
+        }
+
+        // ── Opt-in vendored flash attention for prefill, GPU only ──
+        // The kernel never sees padding, so this is only valid for the
+        // unpadded standard causal mask `enable_flash_causal` requires. It
+        // returns `None` for anything it cannot serve and the SDPA below runs.
+        if self.flash_causal && seq_len > 1 {
+            let mask = flash_mask.or(attention_mask);
+            if let Some(out) = gpu_flash_attn::try_causal_prefill(&q, &k, &v, scale_f32, mask)? {
+                return self.o_proj.forward(&out);
+            }
         }
 
         // ── Standard SDPA for prefill or when n_rep == 1 ──
@@ -790,8 +808,10 @@ impl DecoderLayer {
         cos: &Tensor,
         sin: &Tensor,
         attention_mask: Option<&Tensor>,
+        flash_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
-        let hidden_states = self.forward_attn(hidden_states, cos, sin, attention_mask)?;
+        let hidden_states =
+            self.forward_attn(hidden_states, cos, sin, attention_mask, flash_mask)?;
         self.forward_mlp(&hidden_states)
     }
 
@@ -810,6 +830,7 @@ impl DecoderLayer {
         cos: &Tensor,
         sin: &Tensor,
         attention_mask: Option<&Tensor>,
+        flash_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         let residual = hidden_states;
         let hidden_states = prof::timed(Span::BlockNorm, || {
@@ -817,7 +838,7 @@ impl DecoderLayer {
         })?;
         let hidden_states = prof::timed(Span::Attn, || {
             self.self_attn
-                .forward(&hidden_states, cos, sin, attention_mask)
+                .forward(&hidden_states, cos, sin, attention_mask, flash_mask)
         })?;
         prof::timed(Span::Resid, || residual + hidden_states)
     }
@@ -835,6 +856,10 @@ impl DecoderLayer {
 
     fn clear_kv_cache(&mut self) {
         self.self_attn.clear_kv_cache();
+    }
+
+    fn enable_flash_causal(&mut self) {
+        self.self_attn.flash_causal = true;
     }
 }
 
@@ -1550,20 +1575,27 @@ impl Qwen3Model {
         // MiniCPM-o's TTS conditioning).
         let prune_last = seq_len > 1 && self.last_layer_is_moe;
 
+        // One F16 copy of the causal mask for every opted-in layer, instead
+        // of a cast in each of them.
+        let flash_mask = match attention_mask.as_ref() {
+            Some(mask) if self.layers.iter().any(|l| l.self_attn.flash_causal) => {
+                gpu_flash_attn::prepare_mask(mask)?
+            },
+            _ => None,
+        };
+        let (mask, flash_mask) = (attention_mask.as_ref(), flash_mask.as_ref());
+
         let mut hidden_states = hidden_states;
         if let Some((last, rest)) = self.layers.split_last_mut() {
             for layer in rest {
-                hidden_states =
-                    layer.forward(&hidden_states, &cos, &sin, attention_mask.as_ref())?;
+                hidden_states = layer.forward(&hidden_states, &cos, &sin, mask, flash_mask)?;
             }
             if prune_last {
-                hidden_states =
-                    last.forward_attn(&hidden_states, &cos, &sin, attention_mask.as_ref())?;
+                hidden_states = last.forward_attn(&hidden_states, &cos, &sin, mask, flash_mask)?;
                 hidden_states = hidden_states.narrow(1, seq_len - 1, 1)?;
                 hidden_states = last.forward_mlp(&hidden_states)?;
             } else {
-                hidden_states =
-                    last.forward(&hidden_states, &cos, &sin, attention_mask.as_ref())?;
+                hidden_states = last.forward(&hidden_states, &cos, &sin, mask, flash_mask)?;
             }
         }
 
@@ -1621,6 +1653,23 @@ impl Qwen3Model {
     pub fn clear_kv_cache(&mut self) {
         for layer in &mut self.layers {
             layer.clear_kv_cache();
+        }
+    }
+
+    /// Enable fused causal attention for prefill. The caller guarantees an
+    /// unpadded standard causal mask, which is what prefill builds. Batched
+    /// decode with padding never reaches the fused path, because it is
+    /// single-token.
+    ///
+    /// The vendored kernels compute `KV_max` analytically and skip KV tiles
+    /// past the causal diagonal, so a non-causal mask is cut off silently
+    /// instead of honored. An F32 model runs the kernel in F16, so its
+    /// opted-in attention has F16 precision. Anything the kernels cannot
+    /// serve, such as an unsupported `head_dim` or a CPU device, keeps the
+    /// default path.
+    pub fn enable_flash_causal(&mut self) {
+        for layer in &mut self.layers {
+            layer.enable_flash_causal();
         }
     }
 
@@ -1794,7 +1843,7 @@ impl Qwen3Model {
 
         let mut hidden_states = hidden_states;
         for layer in &mut self.layers {
-            hidden_states = layer.forward(&hidden_states, &cos, &sin, attention_mask)?;
+            hidden_states = layer.forward(&hidden_states, &cos, &sin, attention_mask, None)?;
         }
 
         let hidden_states = self.norm.forward(&hidden_states)?;
@@ -2634,6 +2683,37 @@ mod tests {
             hidden.dims(),
             &[1, 1, 16],
             "MoE pruned path should narrow hidden states to last position",
+        );
+    }
+}
+
+#[cfg(all(test, any(feature = "cuda", feature = "rocm")))]
+mod flash_causal_tests {
+    use super::*;
+    use crate::models::flash_test_support::{assert_flash_tracks_default, hash_weights};
+
+    /// `head_dim` 128 so the vendored kernels have an instantiation.
+    fn tiny_config() -> Config {
+        serde_json::from_str(
+            r#"{"vocab_size":64,"hidden_size":256,"intermediate_size":128,
+            "num_hidden_layers":2,"num_attention_heads":4,"num_key_value_heads":2,
+            "head_dim":128,"max_position_embeddings":256,"rms_norm_eps":1e-6,
+            "use_qk_norm":true,"tie_word_embeddings":true}"#,
+        )
+        .unwrap()
+    }
+
+    // Prefill and continuation prefill through the vendored kernel, then a
+    // decode step through the default path, must track an unflagged model.
+    #[test]
+    fn flash_causal_tracks_default_attention() {
+        assert_flash_tracks_default(
+            "qwen3",
+            64,
+            [(DType::BF16, 0.06), (DType::F16, 0.008)],
+            |dev, dtype| Qwen3Model::new(&tiny_config(), hash_weights(dev, dtype)).unwrap(),
+            |m, ids, start| m.forward(ids, start).unwrap(),
+            Qwen3Model::enable_flash_causal,
         );
     }
 }

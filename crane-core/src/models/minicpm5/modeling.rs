@@ -17,6 +17,7 @@
 //! no KV cache, quantization, or backend plumbing to port, only the
 //! architecture description to confirm against.
 
+use crate::models::modules::gpu_flash_attn;
 use crate::models::modules::rotary::RotaryEmbedding;
 use crate::quantized::gguf_file::Gguf;
 use crate::quantized::gguf_metadata::GgufMetadata;
@@ -107,6 +108,9 @@ struct Attention {
     kv_cache: Option<(Tensor, Tensor)>,
     /// Number of valid (filled) positions in the KV cache buffer.
     cache_seq_len: usize,
+    /// Opt-in vendored flash attention for prefill, see
+    /// [`MiniCpm5Model::enable_flash_causal`].
+    flash_causal: bool,
 }
 
 impl Attention {
@@ -201,6 +205,7 @@ impl Attention {
             kv_dim,
             kv_cache: None,
             cache_seq_len: 0,
+            flash_causal: false,
         })
     }
 
@@ -233,6 +238,7 @@ impl Attention {
             kv_dim: num_kv_heads * head_dim,
             kv_cache: None,
             cache_seq_len: 0,
+            flash_causal: false,
         })
     }
 
@@ -305,6 +311,7 @@ impl Attention {
         cos: &Tensor,
         sin: &Tensor,
         attention_mask: Option<&Tensor>,
+        flash_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _) = hidden_states.dims3()?;
 
@@ -339,7 +346,36 @@ impl Attention {
 
         let (k, v) = self.update_kv_cache(&k, &v)?;
 
+        if let Some(out) = self.try_flash_prefill(&q, &k, &v, attention_mask, flash_mask)? {
+            return Ok(out);
+        }
         self.compute_attention(&q, k, v, attention_mask, b_sz, seq_len)
+    }
+
+    /// Opt-in prefill through the vendored flash-attention kernels, GPU only,
+    /// returning the projected output. `None` leaves the call to
+    /// [`Self::compute_attention`]. The kernel never sees padding, so this is
+    /// only valid for the unpadded standard causal mask that
+    /// `enable_flash_causal` requires.
+    fn try_flash_prefill(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        attention_mask: Option<&Tensor>,
+        flash_mask: Option<&Tensor>,
+    ) -> Result<Option<Tensor>> {
+        if !self.flash_causal || q.dim(2)? == 1 {
+            return Ok(None);
+        }
+        // 1/sqrt(head_dim) is always small and positive, far inside f32.
+        #[allow(clippy::cast_possible_truncation)]
+        let scale = (1.0 / (self.head_dim as f64).sqrt()) as f32;
+        let mask = flash_mask.or(attention_mask);
+        match gpu_flash_attn::try_causal_prefill(q, k, v, scale, mask)? {
+            Some(out) => self.o_proj.forward(&out).map(Some),
+            None => Ok(None),
+        }
     }
 
     fn compute_attention(
@@ -580,12 +616,13 @@ impl DecoderLayer {
         cos: &Tensor,
         sin: &Tensor,
         attention_mask: Option<&Tensor>,
+        flash_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         let residual = hidden_states;
         let hidden_states = self.input_layernorm.forward(hidden_states)?;
-        let hidden_states = self
-            .self_attn
-            .forward(&hidden_states, cos, sin, attention_mask)?;
+        let hidden_states =
+            self.self_attn
+                .forward(&hidden_states, cos, sin, attention_mask, flash_mask)?;
         let hidden_states = (residual + hidden_states)?;
 
         let residual = &hidden_states;
@@ -596,6 +633,10 @@ impl DecoderLayer {
 
     fn clear_kv_cache(&mut self) {
         self.self_attn.clear_kv_cache();
+    }
+
+    fn enable_flash_causal(&mut self) {
+        self.self_attn.flash_causal = true;
     }
 }
 
@@ -807,9 +848,24 @@ impl MiniCpm5Model {
             None
         };
 
+        // One F16 copy of the causal mask for every opted-in layer, instead
+        // of a cast in each of them.
+        let flash_mask = match attention_mask.as_ref() {
+            Some(mask) if self.layers.iter().any(|l| l.self_attn.flash_causal) => {
+                gpu_flash_attn::prepare_mask(mask)?
+            },
+            _ => None,
+        };
+
         let mut hidden_states = hidden_states;
         for layer in self.layers.iter_mut() {
-            hidden_states = layer.forward(&hidden_states, &cos, &sin, attention_mask.as_ref())?;
+            hidden_states = layer.forward(
+                &hidden_states,
+                &cos,
+                &sin,
+                attention_mask.as_ref(),
+                flash_mask.as_ref(),
+            )?;
         }
 
         let hidden_states = self.norm.forward(&hidden_states)?;
@@ -826,10 +882,56 @@ impl MiniCpm5Model {
         // rotary_emb tables are static and reusable — do not clear.
     }
 
+    /// Enable fused causal attention for prefill. The caller guarantees an
+    /// unpadded standard causal mask, which is what prefill builds.
+    ///
+    /// The vendored kernels compute `KV_max` analytically and skip KV tiles
+    /// past the causal diagonal, so a non-causal mask is cut off silently
+    /// instead of honored. An F32 model runs the kernel in F16, so its
+    /// opted-in attention has F16 precision. Anything the kernels cannot
+    /// serve, such as an unsupported `head_dim` or a CPU device, keeps the
+    /// default path.
+    pub fn enable_flash_causal(&mut self) {
+        for layer in &mut self.layers {
+            layer.enable_flash_causal();
+        }
+    }
+
     /// Native maximum context length this checkpoint was trained/configured
     /// for — the precomputed rotary table's row count, since `Config` itself
     /// isn't retained after construction.
     pub fn max_position_embeddings(&self) -> usize {
         self.rotary_emb.max_pos()
+    }
+}
+
+#[cfg(all(test, any(feature = "cuda", feature = "rocm")))]
+mod flash_causal_tests {
+    use super::*;
+    use crate::models::flash_test_support::{assert_flash_tracks_default, hash_weights};
+
+    /// `head_dim` 128 so the vendored kernels have an instantiation.
+    fn tiny_config() -> Config {
+        serde_json::from_str(
+            r#"{"vocab_size":64,"hidden_size":256,"intermediate_size":128,
+            "num_hidden_layers":2,"num_attention_heads":4,"num_key_value_heads":2,
+            "head_dim":128,"hidden_act":"silu","max_position_embeddings":256,
+            "rms_norm_eps":1e-6,"rope_theta":10000.0,"tie_word_embeddings":true}"#,
+        )
+        .unwrap()
+    }
+
+    // Prefill and continuation prefill through the vendored kernel, then a
+    // decode step through the default path, must track an unflagged model.
+    #[test]
+    fn flash_causal_tracks_default_attention() {
+        assert_flash_tracks_default(
+            "minicpm5",
+            64,
+            [(DType::BF16, 0.04), (DType::F16, 0.006)],
+            |dev, dtype| MiniCpm5Model::new(&tiny_config(), &hash_weights(dev, dtype)).unwrap(),
+            |m, ids, start| m.forward(ids, start).unwrap(),
+            MiniCpm5Model::enable_flash_causal,
+        );
     }
 }

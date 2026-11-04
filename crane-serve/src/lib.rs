@@ -98,6 +98,10 @@ pub struct Args {
     /// down others running at the same time.
     #[arg(long, default_value_t = 16, help_heading = "Scheduler")]
     pub decode_tokens_per_seq: usize,
+    /// Use fused flash-attention kernels for causal prefill on the GPU. Off
+    /// by default. Models without support log a warning and ignore it.
+    #[arg(long, help_heading = "Model")]
+    pub flash_attention: bool,
     /// Model file format: `auto`, `safetensors`, or `gguf`. Default `auto`
     /// (detected from files in the model directory).
     #[arg(long, default_value = "auto", help_heading = "Model")]
@@ -215,6 +219,9 @@ pub struct AppState {
     pub port: u16,
     pub max_concurrent: usize,
     pub decode_tokens_per_seq: usize,
+    /// Whether `--flash-attention` was requested. Unsupported models ignore
+    /// it, so this reports the request and not the effect.
+    pub flash_attention: bool,
     pub max_seq_len: usize,
     pub gpu_memory_limit: String,
     /// Valid API keys. Empty means auth is disabled (open access).
@@ -1198,6 +1205,24 @@ pub async fn run(mut args: Args) -> Result<()> {
         );
     }
 
+    // Flash attention needs a model that implements `enable_flash_causal`.
+    // The LLM engine path reports its own unsupported models below.
+    let flash_vlm = matches!(
+        resolved_type,
+        engine::model_factory::ModelType::MinicpmV46
+            | engine::model_factory::ModelType::Qwen3_5VL
+            | engine::model_factory::ModelType::Gemma4VL
+    );
+    if args.flash_attention && args.cpu {
+        tracing::warn!("--flash-attention has no effect with --cpu, ignoring");
+    } else if args.flash_attention && (is_tts || is_asr || is_duplex || (is_vlm && !flash_vlm)) {
+        tracing::warn!(
+            "--flash-attention is not supported for {}, ignoring",
+            resolved_type.display_name()
+        );
+    }
+    let flash_attention = args.flash_attention && !args.cpu;
+
     let (
         engine_handle,
         tokenizer,
@@ -1400,6 +1425,7 @@ pub async fn run(mut args: Args) -> Result<()> {
             let dspark_clone = args.dspark.clone();
             let device_clone = device.clone();
             let dtype_clone = dtype;
+            let flash_clone = flash_attention;
             let (mcpv_tx, mut mcpv_rx) =
                 tokio::sync::mpsc::unbounded_channel::<MinicpmVVlmRequest>();
             let vlm_thread = std::thread::Builder::new()
@@ -1429,6 +1455,9 @@ pub async fn run(mut args: Args) -> Result<()> {
                             return;
                         },
                     };
+                    if flash_clone {
+                        vlm.enable_flash_causal();
+                    }
                     if let Some(draft) = &dspark_clone {
                         match vlm.load_dspark(draft) {
                             Ok(()) => info!("DSpark speculative decoding enabled ({draft})"),
@@ -1495,6 +1524,7 @@ pub async fn run(mut args: Args) -> Result<()> {
             let model_path_clone = args.model_path.clone();
             let device_clone = device.clone();
             let dtype_clone = dtype;
+            let flash_clone = flash_attention;
             let (q35vlm_tx, mut q35vlm_rx) =
                 tokio::sync::mpsc::unbounded_channel::<Qwen3_5VlmRequest>();
             let vlm_thread = std::thread::Builder::new()
@@ -1509,6 +1539,9 @@ pub async fn run(mut args: Args) -> Result<()> {
                                 return;
                             },
                         };
+                    if flash_clone {
+                        vlm.enable_flash_causal();
+                    }
                     info!("Qwen 3.5 VL engine thread started");
                     while let Some(req) = q35vlm_rx.blocking_recv() {
                         let Qwen3_5VlmRequest {
@@ -1550,6 +1583,7 @@ pub async fn run(mut args: Args) -> Result<()> {
             let model_path_clone = args.model_path.clone();
             let device_clone = device.clone();
             let dtype_clone = dtype;
+            let flash_clone = flash_attention;
             let (g4vlm_tx, mut g4vlm_rx) =
                 tokio::sync::mpsc::unbounded_channel::<Gemma4VlmRequest>();
             let vlm_thread = std::thread::Builder::new()
@@ -1567,6 +1601,9 @@ pub async fn run(mut args: Args) -> Result<()> {
                                 return;
                             },
                         };
+                    if flash_clone {
+                        vlm.enable_flash_causal();
+                    }
                     info!("Gemma4 VLM engine thread started");
                     let preprocess_config = ImagePreprocessConfig::default();
                     // Install candle's affinity-pinned rayon pool for this thread's lifetime.
@@ -1831,6 +1868,12 @@ pub async fn run(mut args: Args) -> Result<()> {
             args.quant.as_deref(),
             promotion.as_ref(),
         )?;
+        if flash_attention && !backend.enable_flash_attention() {
+            warn!(
+                "--flash-attention is not supported for {}, ignoring",
+                resolved_type.display_name()
+            );
+        }
         info!(
             "Model loaded successfully (type: {}, format: {:?})",
             resolved_type.display_name(),
@@ -2054,6 +2097,7 @@ pub async fn run(mut args: Args) -> Result<()> {
         port: args.port,
         max_concurrent: args.max_concurrent,
         decode_tokens_per_seq: args.decode_tokens_per_seq,
+        flash_attention: args.flash_attention,
         max_seq_len: args.max_seq_len,
         gpu_memory_limit: gpu_memory_limit_display,
         api_keys: api_keys.clone(),
@@ -2416,6 +2460,7 @@ mod auth_middleware_tests {
             port: 8080,
             max_concurrent: 1,
             decode_tokens_per_seq: 1,
+            flash_attention: false,
             max_seq_len: 0,
             gpu_memory_limit: "unlimited".to_string(),
             api_keys,
@@ -2836,5 +2881,17 @@ mod dtype_tests {
         let clamped = derive_safe_max_seq_len(&cfg_inflated, 10 << 30, 1024).expect("derived");
         let unclamped = derive_safe_max_seq_len(&cfg_matching, 10 << 30, 1024).expect("derived");
         assert_eq!(clamped, unclamped);
+    }
+}
+
+#[cfg(test)]
+mod flash_attention_arg_tests {
+    use super::*;
+
+    // Flash attention stays opt-in: off unless the flag is given.
+    #[test]
+    fn flash_attention_flag_defaults_off() {
+        assert!(!Args::parse_from(["crane-serve", "-m", "x"]).flash_attention);
+        assert!(Args::parse_from(["crane-serve", "-m", "x", "--flash-attention"]).flash_attention);
     }
 }
