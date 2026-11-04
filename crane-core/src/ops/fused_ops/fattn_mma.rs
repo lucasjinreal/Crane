@@ -31,9 +31,9 @@ use candle_core::{DType, Device, Layout, Result, Tensor};
 
 use super::fattn::{
     FATTN_KQ_STRIDE, FattnMmaConfig, MAX_GRID_X_DIM, fixup_scratch_len, gqa_z_tiles,
-    init_fastdiv_values, is_amd_backend, mma_config, mma_config_bf16, mma_shared_mem_bytes,
-    mma_shared_mem_bytes_bf16, q_tiles, select_mma_ncols, select_mma_ncols_bf16, stream_k_grid,
-    stream_k_needs_fixup, unsupported_config,
+    init_fastdiv_values, is_amd_backend, mma_shared_mem_bytes, mma_shared_mem_bytes_bf16, q_tiles,
+    select_mma_ncols, select_mma_ncols_bf16, stream_k_grid, stream_k_needs_fixup,
+    unsupported_config,
 };
 
 /// Bounds-checked scalar arguments for a `crane_fattn_mma_f16_*` launch,
@@ -252,12 +252,12 @@ fn to_u64(n: usize) -> Result<u64> {
 }
 
 /// Shape of one launch, everything [`LaunchGeometry::new`] needs besides the
-/// kernel choice. `seq_kv` is `k`'s length after any GQA padding.
+/// kernel choice. `seq_kv` is `k`'s live sequence length.
 #[derive(Debug, Clone, Copy)]
 struct LaunchShape {
     /// Q's sequence length.
     seq_q: usize,
-    /// K/V's sequence length, after any GQA padding.
+    /// K/V's sequence length (the live buffer length, never padded).
     seq_kv: usize,
     /// Number of KV heads.
     h_kv: usize,
@@ -355,6 +355,11 @@ impl LaunchGeometry {
     /// `ops::rocm::occupancy_max_active_blocks`. Only called for AMD at
     /// `head_dim` 64, the one shape that still computes a split grid.
     ///
+    /// `cfg` is the `mma_config`/`mma_config_bf16` lookup for this variant's
+    /// `(dkq, ncols1*ncols2, is_amd)`, passed in rather than looked up again
+    /// here because callers already need it (for the tail-kernel decision)
+    /// before they can build the `KernelVariant`/`real_occupancy` closure.
+    ///
     /// # Errors
     ///
     /// Returns unsupported-config when the tile count exceeds the grid x
@@ -364,6 +369,7 @@ impl LaunchGeometry {
         variant: &KernelVariant,
         shape: &LaunchShape,
         target: &GridTarget,
+        cfg: FattnMmaConfig,
         real_occupancy: impl FnOnce(usize, usize) -> Option<usize>,
     ) -> Result<Self> {
         let &KernelVariant {
@@ -373,12 +379,6 @@ impl LaunchGeometry {
             is_amd,
             bf16,
         } = variant;
-        let ncols = ncols1 * ncols2;
-        let cfg = if bf16 {
-            mma_config_bf16(dkq, ncols, is_amd)?
-        } else {
-            mma_config(dkq, ncols, is_amd)?
-        };
         let nwarps = cfg.nthreads / 32;
         let (ntiles, iter_k) = tile_counts(&cfg, ncols1, ncols2, shape)?;
         if ntiles > MAX_GRID_X_DIM {
@@ -516,36 +516,52 @@ fn grid_target(device: &Device, forced_grid: Option<usize>) -> Result<GridTarget
 }
 
 /// The kernel and module name for an MMA dispatch, cached as `&'static str`
-/// after the first call for a given `(dkq, ncols1, ncols2, bf16)`. Every
-/// dispatch used to rebuild both strings with `format!`, even though the
-/// domain is small and fixed: the config tables in `fattn.rs` only cover
-/// `dkq` in {64, 128, 256, 512} and a handful of `ncols1`/`ncols2` pairs
-/// per `dkq`, well under 100 combinations total. Leaking each string once
-/// into `&'static str` is a one-time, bounded cost that turns the
-/// per-call allocation into a cache hit; shared by both the CUDA and ROCm
-/// dispatch functions below, since the naming scheme is backend-agnostic.
+/// after the first call for a given `(dkq, ncols1, ncols2, bf16, tail)`.
+/// Every dispatch used to rebuild both strings with `format!`, even though
+/// the domain is small and fixed: the config tables in `fattn.rs` only
+/// cover `dkq` in {64, 128, 256, 512} and a handful of `ncols1`/`ncols2`
+/// pairs per `dkq`, well under 200 combinations total even counting the
+/// `tail` variants. Leaking each string once into `&'static str` is a
+/// one-time, bounded cost that turns the per-call allocation into a cache
+/// hit; shared by both the CUDA and ROCm dispatch functions below, since
+/// the naming scheme is backend-agnostic.
+///
+/// `tail` selects the bounds-checked-tail kernel symbol (see
+/// `fattn_mma_f16.cuh`'s `DECL_FATTN_MMA_F16_TAIL_CASE`), which callers
+/// should only ever request when `ncols2 > 1` and `seq_kv` isn't a
+/// multiple of the selected config's `nbatch_fa` — otherwise the plain
+/// (`tail = false`) symbol already covers the launch and has a smaller
+/// register footprint.
 fn cached_mma_names(
     dkq: usize,
     ncols1: usize,
     ncols2: usize,
     bf16: bool,
+    tail: bool,
 ) -> (&'static str, &'static str) {
     use std::collections::HashMap;
     use std::sync::{OnceLock, RwLock};
 
     static CACHE: OnceLock<
-        RwLock<HashMap<(usize, usize, usize, bool), (&'static str, &'static str)>>,
+        RwLock<HashMap<(usize, usize, usize, bool, bool), (&'static str, &'static str)>>,
     > = OnceLock::new();
     let cache = CACHE.get_or_init(|| RwLock::new(HashMap::new()));
-    let key = (dkq, ncols1, ncols2, bf16);
+    let key = (dkq, ncols1, ncols2, bf16, tail);
     if let Some(&names) = cache.read().unwrap().get(&key) {
         return names;
     }
     *cache.write().unwrap().entry(key).or_insert_with(|| {
-        let kernel_name = if bf16 {
-            crate::ops::fused_ops::fattn::mma_bf16_kernel_name(dkq, ncols1, ncols2)
-        } else {
-            crate::ops::fused_ops::fattn::mma_kernel_name(dkq, ncols1, ncols2)
+        let kernel_name = match (bf16, tail) {
+            (true, true) => {
+                crate::ops::fused_ops::fattn::mma_bf16_kernel_name_tail(dkq, ncols1, ncols2)
+            },
+            (true, false) => {
+                crate::ops::fused_ops::fattn::mma_bf16_kernel_name(dkq, ncols1, ncols2)
+            },
+            (false, true) => {
+                crate::ops::fused_ops::fattn::mma_kernel_name_tail(dkq, ncols1, ncols2)
+            },
+            (false, false) => crate::ops::fused_ops::fattn::mma_kernel_name(dkq, ncols1, ncols2),
         };
         let module_name = if bf16 {
             format!("crane_fattn_mma_bf16_hd{dkq}")
@@ -569,7 +585,7 @@ fn cached_mma_names(
 /// (see [`super::fattn::select_mma_ncols`]) resolves to `1`; this is
 /// enforced below, not just documented.** The kernel accepts a null mask at
 /// any `ncols2`, but this public contract stays as it is for API stability.
-/// Since `ncols2` is selected internally from `gqa_ratio`/`seq_kv` (not
+/// Since `ncols2` is selected internally from `gqa_ratio`/`seq_q` (not
 /// caller-controlled), a caller that always wants "no masking" and might
 /// hit a GQA-batched launch must pass a real all-zero mask tensor instead
 /// of `None`; passing `None` into a `ncols2 > 1` launch returns a
@@ -583,7 +599,7 @@ fn cached_mma_names(
 ///
 /// Returns an error if shapes/dtypes are invalid, `mask = None` while the
 /// selected `ncols2 != 1` (see above), no instantiated kernel covers this
-/// `(head_dim, GQA ratio, seq_q, seq_kv)` combination (callers
+/// `(head_dim, GQA ratio, seq_q)` combination (callers
 /// should fall back to [`super::fattn_tile::fattn_tile_prefill`] in that
 /// case), or the device is CPU (no CPU implementation).
 pub fn fattn_mma_prefill(
@@ -630,6 +646,16 @@ fn prefill_dispatch(
     causal_kv_offset: Option<usize>,
     forced_grid: Option<usize>,
 ) -> Result<Tensor> {
+    let padded_mask;
+    let mask = match mask {
+        Some(m) => {
+            let seq_kv = k.dims4()?.1;
+            check_mask_covers_kv(m, seq_kv, "fattn_mma")?;
+            padded_mask = pad_mask_stride(m, seq_kv)?;
+            Some(&padded_mask)
+        },
+        None => None,
+    };
     #[cfg(feature = "cuda")]
     {
         cuda::fattn_mma_prefill_cuda(q, k, v, mask, kv_max, scale, causal_kv_offset, forced_grid)
@@ -652,7 +678,7 @@ fn prefill_dispatch(
 /// BF16 like `k`/`v`, `mask` is still F16 (the mask is an additive bias
 /// independent of K/V's dtype). Same masking/`kv_max`/error contract as
 /// [`fattn_mma_prefill`]; the one additional failure mode is no instantiated
-/// kernel for this `(head_dim, GQA ratio, seq_q, seq_kv)` shape under
+/// kernel for this `(head_dim, GQA ratio, seq_q)` shape under
 /// [`super::fattn::select_mma_ncols_bf16`] (narrower than the f16 kernel's
 /// coverage — see that function's doc comment), in which case callers fall
 /// back to the F16 cast path, not the tile kernel directly.
@@ -704,6 +730,16 @@ fn prefill_dispatch_bf16(
     causal_kv_offset: Option<usize>,
     forced_grid: Option<usize>,
 ) -> Result<Tensor> {
+    let padded_mask;
+    let mask = match mask {
+        Some(m) => {
+            let seq_kv = k.dims4()?.1;
+            check_mask_covers_kv(m, seq_kv, "fattn_mma_bf16")?;
+            padded_mask = pad_mask_stride(m, seq_kv)?;
+            Some(&padded_mask)
+        },
+        None => None,
+    };
     #[cfg(feature = "cuda")]
     {
         cuda::fattn_mma_bf16_prefill_cuda(
@@ -738,9 +774,9 @@ fn prefill_dispatch_bf16(
 }
 
 /// `(head_dim, gqa_ratio, seq_q, seq_kv, is_amd)` for a `[B, S, H, D]` BSHD
-/// `q`/`k` pair, shared by [`mma_ncols1_for`] and [`pad_for_gqa_batching`] so
-/// the shape derivation and `num_heads_q`/`num_heads_kv` validation live in
-/// one place.
+/// `q`/`k` pair, shared by [`mma_ncols1_for`] and [`causal_in_kernel`] so the
+/// shape derivation and `num_heads_q`/`num_heads_kv` validation live in one
+/// place.
 ///
 /// # Errors
 ///
@@ -766,15 +802,15 @@ fn mma_shape_params(q: &Tensor, k: &Tensor) -> Result<(usize, usize, usize, usiz
 ///
 /// Returns an error if `q`/`k` aren't 4D, `num_heads_kv` is `0`, or
 /// `num_heads_q` isn't a multiple of it, or if no instantiated MMA kernel
-/// covers this `(head_dim, GQA ratio, seq_q, seq_kv)` combination (callers
+/// covers this `(head_dim, GQA ratio, seq_q)` combination (callers
 /// should fall back to [`super::fattn_tile`] in that case).
 fn mma_ncols1_for(q: &Tensor, k: &Tensor) -> Result<usize> {
-    let (d, gqa_ratio, seq_q, seq_kv, is_amd) = mma_shape_params(q, k)?;
-    select_mma_ncols(d, gqa_ratio, seq_q, seq_kv, is_amd)
+    let (d, gqa_ratio, seq_q, _seq_kv, is_amd) = mma_shape_params(q, k)?;
+    select_mma_ncols(d, gqa_ratio, seq_q, is_amd)
         .map(|(ncols1, _)| ncols1)
         .ok_or_else(|| {
             unsupported_config(format!(
-                "fattn_mma: no instantiated kernel for head_dim={d} gqa_ratio={gqa_ratio} seq_q={seq_q} seq_kv={seq_kv}"
+                "fattn_mma: no instantiated kernel for head_dim={d} gqa_ratio={gqa_ratio} seq_q={seq_q}"
             ))
         })
 }
@@ -782,123 +818,19 @@ fn mma_ncols1_for(q: &Tensor, k: &Tensor) -> Result<usize> {
 /// bf16 counterpart of [`mma_ncols1_for`], used by the `fattn_mma_bf16_*`
 /// entry points below.
 fn mma_ncols1_for_bf16(q: &Tensor, k: &Tensor) -> Result<usize> {
-    let (d, gqa_ratio, seq_q, seq_kv, is_amd) = mma_shape_params(q, k)?;
-    select_mma_ncols_bf16(d, gqa_ratio, seq_q, seq_kv, is_amd)
+    let (d, gqa_ratio, seq_q, _seq_kv, is_amd) = mma_shape_params(q, k)?;
+    select_mma_ncols_bf16(d, gqa_ratio, seq_q, is_amd)
         .map(|(ncols1, _)| ncols1)
         .ok_or_else(|| {
             unsupported_config(format!(
-                "fattn_mma_bf16: no instantiated kernel for head_dim={d} gqa_ratio={gqa_ratio} seq_q={seq_q} seq_kv={seq_kv}"
+                "fattn_mma_bf16: no instantiated kernel for head_dim={d} gqa_ratio={gqa_ratio} seq_q={seq_q}"
             ))
         })
 }
 
-/// If treating `seq_kv` as padded up to the next [`FATTN_KQ_STRIDE`]
-/// multiple would unlock a GQA-batched (`ncols2 > 1`) kernel that the live,
-/// unpadded length can't (see [`super::fattn::select_mma_ncols`]'s doc
-/// comment: that path requires an aligned `seq_kv`, which a live prefill
-/// call's real token count almost never has), returns the padded length.
-/// Returns `None` when padding wouldn't change the outcome: `gqa_ratio == 1`
-/// (no sibling queries to batch, regardless of alignment), `seq_kv` is
-/// already aligned, or even the padded length still has no `ncols2 > 1`
-/// kernel (e.g. AMD `head_dim > 256`, which has no MMA path at all). This
-/// mirrors llama.cpp's own precondition for this path: upstream's `K->ne[1]`
-/// is always a KV-cache buffer already allocated padded to this stride, so
-/// its equivalent check is realistically always true; Crane's prefill calls
-/// build exactly the live-length K/V tensor instead, so this function (and
-/// [`pad_for_gqa_batching`]) exist to reproduce that same precondition.
-fn padded_seq_kv_for_gqa_batching(
-    head_dim: usize,
-    gqa_ratio: usize,
-    seq_q: usize,
-    seq_kv: usize,
-    is_amd: bool,
-) -> Option<usize> {
-    if gqa_ratio == 1 {
-        return None;
-    }
-    if let Some((_, ncols2)) = select_mma_ncols(head_dim, gqa_ratio, seq_q, seq_kv, is_amd)
-        && ncols2 > 1
-    {
-        return None;
-    }
-    let padded = seq_kv.next_multiple_of(FATTN_KQ_STRIDE);
-    if padded == seq_kv {
-        return None;
-    }
-    match select_mma_ncols(head_dim, gqa_ratio, seq_q, padded, is_amd) {
-        Some((_, ncols2)) if ncols2 > 1 => Some(padded),
-        _ => None,
-    }
-}
-
-/// bf16 counterpart of [`padded_seq_kv_for_gqa_batching`]: identical logic,
-/// querying [`select_mma_ncols_bf16`] instead of [`select_mma_ncols`] so the
-/// padding decision matches the kernel variant that will actually consume
-/// the padded `seq_kv`.
-fn padded_seq_kv_for_gqa_batching_bf16(
-    head_dim: usize,
-    gqa_ratio: usize,
-    seq_q: usize,
-    seq_kv: usize,
-    is_amd: bool,
-) -> Option<usize> {
-    if gqa_ratio == 1 {
-        return None;
-    }
-    if let Some((_, ncols2)) = select_mma_ncols_bf16(head_dim, gqa_ratio, seq_q, seq_kv, is_amd)
-        && ncols2 > 1
-    {
-        return None;
-    }
-    let padded = seq_kv.next_multiple_of(FATTN_KQ_STRIDE);
-    if padded == seq_kv {
-        return None;
-    }
-    match select_mma_ncols_bf16(head_dim, gqa_ratio, seq_q, padded, is_amd) {
-        Some((_, ncols2)) if ncols2 > 1 => Some(padded),
-        _ => None,
-    }
-}
-
-/// Zero-pads `k`/`v`'s sequence axis (BSHD axis 1) from their live length up
-/// to `padded_seq_kv`. The kernel's GQA-batched (`ncols2 > 1`) tail tile is
-/// read with no bounds check (`oob_check = false` whenever `ncols2 > 1`, see
-/// `fattn_mma_f16.cuh`'s `flash_attn_ext_f16_iter` dispatch), so this
-/// physically extends the buffer rather than merely widening the logical
-/// `KV_max`/mask bound, which alone would leave the tail read past the real
-/// allocation. Padding with zeros (not uninitialized memory) matters: the
-/// padded columns are always masked to `-inf` by [`pad_mask`] before the
-/// softmax, but `-inf + NaN == NaN`, so a garbage bit pattern in the padding
-/// could still corrupt a row's softmax reduction even though its
-/// contribution is meant to be zero. The zero tensor is built in `k`'s own
-/// dtype (not hardcoded to F16), so this is shared by both the F16 and the
-/// native-BF16 kernel family's padding paths.
-fn pad_kv(k: &Tensor, v: &Tensor, padded_seq_kv: usize) -> Result<(Tensor, Tensor)> {
-    let (b, seq_kv, h_kv, d) = k.dims4()?;
-    let pad_len = padded_seq_kv - seq_kv;
-    let zeros = Tensor::zeros((b, pad_len, h_kv, d), k.dtype(), k.device())?;
-    Ok((Tensor::cat(&[k, &zeros], 1)?, Tensor::cat(&[v, &zeros], 1)?))
-}
-
-/// Extends an additive F16 mask's last (kv) axis from its live width up to
-/// `padded_seq_kv` with `-inf`, so the padded K/V rows [`pad_kv`] appends
-/// never contribute to any query's softmax. `seq_kv` must be `<=
-/// padded_seq_kv` (checked by [`pad_for_gqa_batching`] before calling this).
-fn pad_mask(mask: &Tensor, padded_seq_kv: usize) -> Result<Tensor> {
-    let dims = mask.dims().to_vec();
-    let seq_kv = *dims.last().expect("mask must have at least one axis");
-    let mut pad_shape = dims.clone();
-    *pad_shape
-        .last_mut()
-        .expect("mask must have at least one axis") = padded_seq_kv - seq_kv;
-    let neg_inf =
-        Tensor::full(f32::NEG_INFINITY, pad_shape, mask.device())?.to_dtype(DType::F16)?;
-    Tensor::cat(&[mask, &neg_inf], dims.len() - 1)
-}
-
 /// Casts `mask` to F16 if it isn't already (avoiding a no-op cast's clone),
 /// since every `fattn_mma_*_with_mask` entry point (F16 and native-BF16
-/// alike) requires an F16 mask before padding/dispatch.
+/// alike) requires an F16 mask before dispatch.
 fn ensure_f16_mask(mask: &Tensor) -> Result<Tensor> {
     if mask.dtype() == DType::F16 {
         Ok(mask.clone())
@@ -907,81 +839,39 @@ fn ensure_f16_mask(mask: &Tensor) -> Result<Tensor> {
     }
 }
 
-/// Pads `k`/`v`/`mask` for GQA-batched dispatch when beneficial (see
-/// [`padded_seq_kv_for_gqa_batching`]), otherwise returns clones of the
-/// inputs unchanged (a `Tensor` clone is an `Arc` bump, not a data copy).
-/// `mask` must already be F16 and cover `k`'s live (unpadded) `seq_kv`
-/// width — checked explicitly below rather than left as an unenforced
-/// precondition, since a mismatched mask would otherwise make [`pad_mask`]
-/// either underflow (`mask`'s kv axis wider than `k`'s) or silently splice
-/// `-inf` in the wrong place (`mask`'s kv axis narrower than `k`'s,
-/// e.g. a broadcastable width-1 axis). Shared by every F16
-/// `fattn_mma_*`/`fattn_mma_*_with_mask` entry point so the padding decision
-/// and mechanics live in one place; the bf16 entry points use
-/// [`pad_for_gqa_batching_bf16`] instead, so their padding decision matches
-/// the bf16 kernel's own `(ncols1, ncols2)` selection.
-///
-/// # Errors
-///
-/// Returns an error if `q`/`k`'s shapes are invalid (see
-/// [`mma_shape_params`]) or `mask`'s last dimension doesn't equal `k`'s live
-/// `seq_kv`.
-fn pad_for_gqa_batching(
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-    mask: &Tensor,
-) -> Result<(Tensor, Tensor, Tensor)> {
-    let (d, gqa_ratio, seq_q, seq_kv, is_amd) = mma_shape_params(q, k)?;
+/// Validates `mask`'s last (kv) dimension equals `seq_kv`, required by every
+/// `fattn_mma_*_with_mask` entry point so the kernel's per-tile mask
+/// indexing (`k_VKQ_0 + i` up to `seq_kv - 1`) never reads past the mask
+/// buffer.
+fn check_mask_covers_kv(mask: &Tensor, seq_kv: usize, what: &str) -> Result<()> {
     let mask_kv = mask.dims().last().copied().unwrap_or(0);
     if mask_kv != seq_kv {
         candle_core::bail!(
-            "fattn_mma: mask's last dimension ({mask_kv}) must equal k's seq_kv ({seq_kv})"
+            "{what}: mask's last dimension ({mask_kv}) must equal k's seq_kv ({seq_kv})"
         );
     }
-    match padded_seq_kv_for_gqa_batching(d, gqa_ratio, seq_q, seq_kv, is_amd) {
-        Some(padded) => {
-            let (k, v) = pad_kv(k, v, padded)?;
-            let mask = pad_mask(mask, padded)?;
-            Ok((k, v, mask))
-        },
-        None => Ok((k.clone(), v.clone(), mask.clone())),
-    }
+    Ok(())
 }
 
-/// bf16 counterpart of [`pad_for_gqa_batching`]: same mechanics (shared
-/// [`pad_kv`]/[`pad_mask`] helpers — `pad_kv` zero-pads in `k`'s own dtype,
-/// so it produces BF16 padding here), but queries
-/// [`padded_seq_kv_for_gqa_batching_bf16`] so the padding decision matches
-/// the bf16 kernel's own `(ncols1, ncols2)` selection instead of the f16
-/// kernel's.
-///
-/// # Errors
-///
-/// Returns an error if `q`/`k`'s shapes are invalid (see
-/// [`mma_shape_params`]) or `mask`'s last dimension doesn't equal `k`'s live
-/// `seq_kv`.
-fn pad_for_gqa_batching_bf16(
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-    mask: &Tensor,
-) -> Result<(Tensor, Tensor, Tensor)> {
-    let (d, gqa_ratio, seq_q, seq_kv, is_amd) = mma_shape_params(q, k)?;
-    let mask_kv = mask.dims().last().copied().unwrap_or(0);
-    if mask_kv != seq_kv {
-        candle_core::bail!(
-            "fattn_mma_bf16: mask's last dimension ({mask_kv}) must equal k's seq_kv ({seq_kv})"
-        );
+/// Pads `mask`'s kv dimension up to a multiple of 8 `half`s (16 bytes).
+/// `flash_attn_ext_{f16,bf16}_load_mask`'s fast-path loaders read a row at
+/// `mask_h + j_vram*stride_mask + ...` with a vectorized (`cp_async_cg_16`
+/// for F16, `half2` for both dtypes) instruction, which requires that
+/// address aligned regardless of `j_vram`; that only holds for every
+/// `j_vram` if `stride_mask` itself (the mask's real kv-dimension size) is a
+/// multiple of 8. The extra columns are never read by any in-bounds tile
+/// (the bounds-checked tail path is scalar and guarded by `i_sup`), so their
+/// value doesn't matter.
+fn pad_mask_stride(mask: &Tensor, seq_kv: usize) -> Result<Tensor> {
+    let padded_kv = seq_kv.next_multiple_of(8);
+    if padded_kv == seq_kv {
+        return Ok(mask.clone());
     }
-    match padded_seq_kv_for_gqa_batching_bf16(d, gqa_ratio, seq_q, seq_kv, is_amd) {
-        Some(padded) => {
-            let (k, v) = pad_kv(k, v, padded)?;
-            let mask = pad_mask(mask, padded)?;
-            Ok((k, v, mask))
-        },
-        None => Ok((k.clone(), v.clone(), mask.clone())),
-    }
+    let mut dims = mask.dims().to_vec();
+    let last = dims.len() - 1;
+    dims[last] = padded_kv - seq_kv;
+    let pad = Tensor::zeros(dims, mask.dtype(), mask.device())?;
+    Tensor::cat(&[mask, &pad], last)
 }
 
 /// Causal flash-attention: `j <= i + kv_offset`. The common case builds no
@@ -1025,8 +915,7 @@ pub fn fattn_mma_causal(
 ///
 /// Returns a candle error if `q`/`k`/`v`'s shapes are incompatible, if
 /// `mask` isn't broadcastable to `[.., seq_q, seq_kv]`, or if any tensor op
-/// (including the padding this function may perform, see
-/// [`pad_for_gqa_batching`]) fails.
+/// fails.
 pub fn fattn_mma_causal_with_mask(
     q: &Tensor,
     k: &Tensor,
@@ -1037,8 +926,7 @@ pub fn fattn_mma_causal_with_mask(
 ) -> Result<Tensor> {
     let (b, seq_q, _, _) = q.dims4()?;
     let mask = ensure_f16_mask(mask)?;
-    let (k, v, mask) = pad_for_gqa_batching(q, k, v, &mask)?;
-    let ncols1 = mma_ncols1_for(q, &k)?;
+    let ncols1 = mma_ncols1_for(q, k)?;
     let seq_kv = k.dims4()?.1;
     // kv_max_cap rounds seq_kv up to FATTN_KQ_STRIDE rather than capping at
     // the bare seq_kv: the MMA kernel divides KV_max by nbatch_fa
@@ -1057,7 +945,7 @@ pub fn fattn_mma_causal_with_mask(
         kv_max_cap,
         q.device(),
     )?;
-    fattn_mma_prefill(q, &k, &v, Some(&mask), Some(&kv_max), scale)
+    fattn_mma_prefill(q, k, v, Some(&mask), Some(&kv_max), scale)
 }
 
 /// Native-bf16 counterpart of [`fattn_mma_causal`]: masks in the kernel and
@@ -1083,18 +971,23 @@ pub fn fattn_mma_bf16_causal(
     causal_in_kernel(q, k, v, scale, kv_offset)
 }
 
-/// Whether a causal launch must use the host mask. A diagonal that reaches
-/// past the live keys would unmask the zero K/V padding, and only the host
-/// mask hides it.
+/// Whether a causal launch must fall back to the host mask rather than let
+/// the kernel bound its own KV loop from `kv_offset`. Returns `true` when
+/// the causal diagonal extends past the live keys (`seq_q + kv_offset >
+/// seq_kv`). [`causal_in_kernel`]'s bounds-checked tail tile may already
+/// handle this case correctly, but this guard is kept as a deliberate
+/// conservative safety net: the host-mask path is functionally equivalent
+/// and its cost is negligible next to the risk of an out-of-bounds KV read
+/// on an untested edge shape.
 fn causal_needs_host_mask(seq_q: usize, seq_kv: usize, kv_offset: usize) -> bool {
     seq_q + kv_offset > seq_kv
 }
 
-/// Shared body of [`fattn_mma_causal`] and [`fattn_mma_bf16_causal`]: pads
-/// `k`/`v` for GQA batching and launches with no mask and no `KV_max`, so
-/// the kernel masks the diagonal and bounds each tile's KV loop from
-/// `kv_offset`. Picks the native-bf16 kernels when `k`/`v` are `BF16`, the
-/// plain F16 kernels when they are `F16`.
+/// Shared body of [`fattn_mma_causal`] and [`fattn_mma_bf16_causal`]:
+/// launches `k`/`v` directly with no mask and no `KV_max`, so the kernel
+/// masks the diagonal and bounds each tile's KV loop from `kv_offset`.
+/// Picks the native-bf16 kernels when `k`/`v` are `BF16`, the plain F16
+/// kernels when they are `F16`.
 fn causal_in_kernel(
     q: &Tensor,
     k: &Tensor,
@@ -1123,28 +1016,15 @@ fn causal_in_kernel(
         DType::BF16 => true,
         other => candle_core::bail!("fattn_mma causal: k/v must be F16 or BF16, got {other:?}"),
     };
-    let (_, seq_q, _, _) = q.dims4()?;
-    let (head_dim, gqa_ratio, _, seq_kv, is_amd) = mma_shape_params(q, k)?;
-    let padded = if bf16 {
-        padded_seq_kv_for_gqa_batching_bf16(head_dim, gqa_ratio, seq_q, seq_kv, is_amd)
-    } else {
-        padded_seq_kv_for_gqa_batching(head_dim, gqa_ratio, seq_q, seq_kv, is_amd)
-    };
-    // Unpadded, the clones only bump the storage `Arc`s.
-    let (k, v) = match padded {
-        Some(padded) => pad_kv(k, v, padded)?,
-        None => (k.clone(), v.clone()),
-    };
     if bf16 {
-        prefill_dispatch_bf16(q, &k, &v, None, None, scale, Some(kv_offset), None)
+        prefill_dispatch_bf16(q, k, v, None, None, scale, Some(kv_offset), None)
     } else {
-        prefill_dispatch(q, &k, &v, None, None, scale, Some(kv_offset), None)
+        prefill_dispatch(q, k, v, None, None, scale, Some(kv_offset), None)
     }
 }
 
-/// Native-bf16 counterpart of [`fattn_mma_causal_with_mask`]. Like its f16
-/// counterpart, pads `k`/`v`/`mask` for GQA-batched dispatch via
-/// [`pad_for_gqa_batching_bf16`] when beneficial.
+/// Native-bf16 counterpart of [`fattn_mma_causal_with_mask`]: dispatches
+/// through [`fattn_mma_bf16_prefill`]'s kernels instead.
 ///
 /// # Errors
 ///
@@ -1159,8 +1039,7 @@ pub fn fattn_mma_bf16_causal_with_mask(
 ) -> Result<Tensor> {
     let (b, seq_q, _, _) = q.dims4()?;
     let mask = ensure_f16_mask(mask)?;
-    let (k, v, mask) = pad_for_gqa_batching_bf16(q, k, v, &mask)?;
-    let ncols1 = mma_ncols1_for_bf16(q, &k)?;
+    let ncols1 = mma_ncols1_for_bf16(q, k)?;
     let seq_kv = k.dims4()?.1;
     // kv_max_cap: see fattn_mma_causal_with_mask's comment.
     let kv_max_cap = seq_kv.next_multiple_of(FATTN_KQ_STRIDE);
@@ -1174,7 +1053,7 @@ pub fn fattn_mma_bf16_causal_with_mask(
         kv_max_cap,
         q.device(),
     )?;
-    fattn_mma_bf16_prefill(q, &k, &v, Some(&mask), Some(&kv_max), scale)
+    fattn_mma_bf16_prefill(q, k, v, Some(&mask), Some(&kv_max), scale)
 }
 
 /// Sliding-window flash-attention: `i + kv_offset - window_left <= j <= i +
@@ -1229,8 +1108,7 @@ pub fn fattn_mma_windowed_with_mask(
 ) -> Result<Tensor> {
     let (b, seq_q, _, _) = q.dims4()?;
     let mask = ensure_f16_mask(mask)?;
-    let (k, v, mask) = pad_for_gqa_batching(q, k, v, &mask)?;
-    let ncols1 = mma_ncols1_for(q, &k)?;
+    let ncols1 = mma_ncols1_for(q, k)?;
     let seq_kv = k.dims4()?.1;
     // kv_max_cap: see fattn_mma_causal_with_mask's comment.
     let kv_max_cap = seq_kv.next_multiple_of(FATTN_KQ_STRIDE);
@@ -1244,12 +1122,11 @@ pub fn fattn_mma_windowed_with_mask(
         kv_max_cap,
         q.device(),
     )?;
-    fattn_mma_prefill(q, &k, &v, Some(&mask), Some(&kv_max), scale)
+    fattn_mma_prefill(q, k, v, Some(&mask), Some(&kv_max), scale)
 }
 
-/// Native-bf16 counterpart of [`fattn_mma_windowed`]: mirrors the f16
-/// path's GQA-batching padding, see [`fattn_mma_bf16_windowed_with_mask`]'s
-/// doc comment.
+/// Native-bf16 counterpart of [`fattn_mma_windowed`]: see
+/// [`fattn_mma_bf16_windowed_with_mask`]'s doc comment.
 ///
 /// # Errors
 ///
@@ -1276,9 +1153,8 @@ pub fn fattn_mma_bf16_windowed(
     fattn_mma_bf16_windowed_with_mask(q, k, v, scale, kv_offset, window_right, &mask)
 }
 
-/// Native-bf16 counterpart of [`fattn_mma_windowed_with_mask`]. Like its f16
-/// counterpart, pads `k`/`v`/`mask` for GQA-batched dispatch via
-/// [`pad_for_gqa_batching_bf16`] when beneficial.
+/// Native-bf16 counterpart of [`fattn_mma_windowed_with_mask`]: dispatches
+/// through [`fattn_mma_bf16_prefill`]'s kernels instead.
 ///
 /// # Errors
 ///
@@ -1294,8 +1170,7 @@ pub fn fattn_mma_bf16_windowed_with_mask(
 ) -> Result<Tensor> {
     let (b, seq_q, _, _) = q.dims4()?;
     let mask = ensure_f16_mask(mask)?;
-    let (k, v, mask) = pad_for_gqa_batching_bf16(q, k, v, &mask)?;
-    let ncols1 = mma_ncols1_for_bf16(q, &k)?;
+    let ncols1 = mma_ncols1_for_bf16(q, k)?;
     let seq_kv = k.dims4()?.1;
     // kv_max_cap: see fattn_mma_causal_with_mask's comment.
     let kv_max_cap = seq_kv.next_multiple_of(FATTN_KQ_STRIDE);
@@ -1309,7 +1184,7 @@ pub fn fattn_mma_bf16_windowed_with_mask(
         kv_max_cap,
         q.device(),
     )?;
-    fattn_mma_bf16_prefill(q, &k, &v, Some(&mask), Some(&kv_max), scale)
+    fattn_mma_bf16_prefill(q, k, v, Some(&mask), Some(&kv_max), scale)
 }
 
 /// Non-causal (full, bidirectional) flash-attention: every query attends to
@@ -1317,35 +1192,28 @@ pub fn fattn_mma_bf16_windowed_with_mask(
 /// module's doc comment), since `None` is only safe when the
 /// internally-selected `ncols2` resolves to `1`, which this entry point
 /// cannot guarantee for every `(gqa_ratio, seq_kv)` shape. No `KV_max`:
-/// nothing is masked, so there is no tail of the KV loop to skip. Still pads
-/// for GQA-batching (see [`pad_for_gqa_batching`]) when beneficial, even
-/// though no model wires this entry point up yet, for consistency with
-/// [`fattn_mma_causal`]/[`fattn_mma_windowed`].
+/// nothing is masked, so there is no tail of the KV loop to skip.
 ///
 /// # Errors
 ///
-/// See [`fattn_mma_prefill`] and [`pad_for_gqa_batching`].
+/// See [`fattn_mma_prefill`].
 pub fn fattn_mma_full(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32) -> Result<Tensor> {
     let (_, seq_q, _, _) = q.dims4()?;
     let (_, seq_kv, _, _) = k.dims4()?;
     let mask = Tensor::zeros((1, 1, seq_q, seq_kv), DType::F16, q.device())?;
-    let (k, v, mask) = pad_for_gqa_batching(q, k, v, &mask)?;
-    fattn_mma_prefill(q, &k, &v, Some(&mask), None, scale)
+    fattn_mma_prefill(q, k, v, Some(&mask), None, scale)
 }
 
-/// Native-bf16 counterpart of [`fattn_mma_full`]. Still pads for
-/// GQA-batching (see [`pad_for_gqa_batching_bf16`]) when beneficial, for
-/// consistency with [`fattn_mma_bf16_causal`]/[`fattn_mma_bf16_windowed`].
+/// Native-bf16 counterpart of [`fattn_mma_full`].
 ///
 /// # Errors
 ///
-/// See [`fattn_mma_bf16_prefill`] and [`pad_for_gqa_batching_bf16`].
+/// See [`fattn_mma_bf16_prefill`].
 pub fn fattn_mma_bf16_full(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32) -> Result<Tensor> {
     let (_, seq_q, _, _) = q.dims4()?;
     let (_, seq_kv, _, _) = k.dims4()?;
     let mask = Tensor::zeros((1, 1, seq_q, seq_kv), DType::F16, q.device())?;
-    let (k, v, mask) = pad_for_gqa_batching_bf16(q, k, v, &mask)?;
-    fattn_mma_bf16_prefill(q, &k, &v, Some(&mask), None, scale)
+    fattn_mma_bf16_prefill(q, k, v, Some(&mask), None, scale)
 }
 
 #[cfg(feature = "cuda")]
@@ -1357,8 +1225,8 @@ mod cuda {
 
     use super::{FixupPlan, GridTarget, KernelVariant, LaunchGeometry, LaunchScalars, LaunchShape};
     use crate::ops::fused_ops::fattn::{
-        fixup_kernel_name, select_mma_ncols, select_mma_ncols_bf16, unsupported_config,
-        validate_fattn_bshd,
+        fixup_kernel_name, mma_config, mma_config_bf16, select_mma_ncols, select_mma_ncols_bf16,
+        unsupported_config, validate_fattn_bshd,
     };
     use candle_core::{Device, Result, Tensor};
 
@@ -1482,9 +1350,9 @@ mod cuda {
         let dev = q.device().as_cuda_device()?.clone();
         let is_amd = false;
 
-        let Some((ncols1, ncols2)) = select_mma_ncols(d, gqa_ratio, seq_q, seq_kv, is_amd) else {
+        let Some((ncols1, ncols2)) = select_mma_ncols(d, gqa_ratio, seq_q, is_amd) else {
             return Err(unsupported_config(format!(
-                "fattn_mma: no instantiated kernel for head_dim={d} gqa_ratio={gqa_ratio} seq_kv={seq_kv}"
+                "fattn_mma: no instantiated kernel for head_dim={d} gqa_ratio={gqa_ratio} seq_q={seq_q}"
             )));
         };
         // See fattn_mma_prefill's doc comment: a plain mask=None stays
@@ -1504,6 +1372,10 @@ mod cuda {
             gqa_ratio,
         };
         let target = super::grid_target(q.device(), forced_grid)?;
+        let cfg = mma_config(d, ncols1 * ncols2, is_amd)?;
+        let tail = ncols2 > 1 && !seq_kv.is_multiple_of(cfg.nbatch_fa);
+        let (kernel_name, module_name) = super::cached_mma_names(d, ncols1, ncols2, false, tail);
+        let func = dev.get_or_load_custom_func(kernel_name, module_name, ptx_for(d)?)?;
         let variant = KernelVariant {
             dkq: d,
             ncols1,
@@ -1511,14 +1383,12 @@ mod cuda {
             is_amd,
             bf16: false,
         };
-        let geometry = LaunchGeometry::new(&variant, &shape, &target, |_, _| {
+        let geometry = LaunchGeometry::new(&variant, &shape, &target, cfg, |_, _| {
             // CUDA's real occupancy query is unverified here (no CUDA
             // device in this environment); keep the config table's
             // guess until it is checked on real hardware.
             None
         })?;
-        let (kernel_name, module_name) = super::cached_mma_names(d, ncols1, ncols2, false);
-        let func = dev.get_or_load_custom_func(kernel_name, module_name, ptx_for(d)?)?;
 
         let q_sl = f16_slice(&q_s, "q")?.slice(q_l.start_offset()..);
         let k_sl = f16_slice(&k_s, "k")?.slice(k_l.start_offset()..);
@@ -1715,10 +1585,9 @@ mod cuda {
         let dev = q.device().as_cuda_device()?.clone();
         let is_amd = false;
 
-        let Some((ncols1, ncols2)) = select_mma_ncols_bf16(d, gqa_ratio, seq_q, seq_kv, is_amd)
-        else {
+        let Some((ncols1, ncols2)) = select_mma_ncols_bf16(d, gqa_ratio, seq_q, is_amd) else {
             return Err(unsupported_config(format!(
-                "fattn_mma_bf16: no instantiated kernel for head_dim={d} gqa_ratio={gqa_ratio} seq_kv={seq_kv}"
+                "fattn_mma_bf16: no instantiated kernel for head_dim={d} gqa_ratio={gqa_ratio} seq_q={seq_q}"
             )));
         };
         // See fattn_mma_prefill_cuda's identical check. The in-kernel
@@ -1737,6 +1606,10 @@ mod cuda {
             gqa_ratio,
         };
         let target = super::grid_target(q.device(), forced_grid)?;
+        let cfg = mma_config_bf16(d, ncols1 * ncols2, is_amd)?;
+        let tail = ncols2 > 1 && !seq_kv.is_multiple_of(cfg.nbatch_fa);
+        let (kernel_name, module_name) = super::cached_mma_names(d, ncols1, ncols2, true, tail);
+        let func = dev.get_or_load_custom_func(kernel_name, module_name, ptx_for_bf16(d)?)?;
         let variant = KernelVariant {
             dkq: d,
             ncols1,
@@ -1744,14 +1617,12 @@ mod cuda {
             is_amd,
             bf16: true,
         };
-        let geometry = LaunchGeometry::new(&variant, &shape, &target, |_, _| {
+        let geometry = LaunchGeometry::new(&variant, &shape, &target, cfg, |_, _| {
             // CUDA's real occupancy query is unverified here (no CUDA
             // device in this environment); keep the config table's
             // guess until it is checked on real hardware.
             None
         })?;
-        let (kernel_name, module_name) = super::cached_mma_names(d, ncols1, ncols2, true);
-        let func = dev.get_or_load_custom_func(kernel_name, module_name, ptx_for_bf16(d)?)?;
 
         let q_sl = bf16_slice(&q_s, "q")?.slice(q_l.start_offset()..);
         let k_sl = bf16_slice(&k_s, "k")?.slice(k_l.start_offset()..);
@@ -1935,8 +1806,8 @@ mod rocm {
 
     use super::{FixupPlan, GridTarget, KernelVariant, LaunchGeometry, LaunchScalars, LaunchShape};
     use crate::ops::fused_ops::fattn::{
-        fixup_kernel_name, select_mma_ncols, select_mma_ncols_bf16, unsupported_config,
-        validate_fattn_bshd,
+        fixup_kernel_name, mma_config, mma_config_bf16, select_mma_ncols, select_mma_ncols_bf16,
+        unsupported_config, validate_fattn_bshd,
     };
     use crate::ops::rocm;
 
@@ -2077,9 +1948,9 @@ mod rocm {
         let dev = q.device().as_rocm_device()?.clone();
         let is_amd = true;
 
-        let Some((ncols1, ncols2)) = select_mma_ncols(d, gqa_ratio, seq_q, seq_kv, is_amd) else {
+        let Some((ncols1, ncols2)) = select_mma_ncols(d, gqa_ratio, seq_q, is_amd) else {
             return Err(unsupported_config(format!(
-                "fattn_mma: no instantiated kernel for head_dim={d} gqa_ratio={gqa_ratio} seq_kv={seq_kv}"
+                "fattn_mma: no instantiated kernel for head_dim={d} gqa_ratio={gqa_ratio} seq_q={seq_q}"
             )));
         };
         // See fattn_mma_prefill's doc comment: a plain mask=None stays
@@ -2099,7 +1970,9 @@ mod rocm {
             gqa_ratio,
         };
         let target = super::grid_target(q.device(), forced_grid)?;
-        let (kernel_name, module_name) = super::cached_mma_names(d, ncols1, ncols2, false);
+        let cfg = mma_config(d, ncols1 * ncols2, is_amd)?;
+        let tail = ncols2 > 1 && !seq_kv.is_multiple_of(cfg.nbatch_fa);
+        let (kernel_name, module_name) = super::cached_mma_names(d, ncols1, ncols2, false, tail);
         let source = source_for(d)?;
         let variant = KernelVariant {
             dkq: d,
@@ -2108,8 +1981,12 @@ mod rocm {
             is_amd,
             bf16: false,
         };
-        let geometry =
-            LaunchGeometry::new(&variant, &shape, &target, |threads, shared_mem_bytes| {
+        let geometry = LaunchGeometry::new(
+            &variant,
+            &shape,
+            &target,
+            cfg,
+            |threads, shared_mem_bytes| {
                 real_occupancy(
                     &dev,
                     module_name,
@@ -2118,7 +1995,8 @@ mod rocm {
                     threads,
                     shared_mem_bytes,
                 )
-            })?;
+            },
+        )?;
 
         let q_ptr = rocm::strided_device_ptr(&q_s, q_l, DType::F16, "fattn_mma q")?;
         let k_ptr = rocm::strided_device_ptr(&k_s, k_l, DType::F16, "fattn_mma k")?;
@@ -2276,10 +2154,9 @@ mod rocm {
         let dev = q.device().as_rocm_device()?.clone();
         let is_amd = true;
 
-        let Some((ncols1, ncols2)) = select_mma_ncols_bf16(d, gqa_ratio, seq_q, seq_kv, is_amd)
-        else {
+        let Some((ncols1, ncols2)) = select_mma_ncols_bf16(d, gqa_ratio, seq_q, is_amd) else {
             return Err(unsupported_config(format!(
-                "fattn_mma_bf16: no instantiated kernel for head_dim={d} gqa_ratio={gqa_ratio} seq_kv={seq_kv}"
+                "fattn_mma_bf16: no instantiated kernel for head_dim={d} gqa_ratio={gqa_ratio} seq_q={seq_q}"
             )));
         };
         // See fattn_mma_prefill_rocm's identical check. The in-kernel
@@ -2298,7 +2175,9 @@ mod rocm {
             gqa_ratio,
         };
         let target = super::grid_target(q.device(), forced_grid)?;
-        let (kernel_name, module_name) = super::cached_mma_names(d, ncols1, ncols2, true);
+        let cfg = mma_config_bf16(d, ncols1 * ncols2, is_amd)?;
+        let tail = ncols2 > 1 && !seq_kv.is_multiple_of(cfg.nbatch_fa);
+        let (kernel_name, module_name) = super::cached_mma_names(d, ncols1, ncols2, true, tail);
         let source = source_for_bf16(d)?;
         let variant = KernelVariant {
             dkq: d,
@@ -2307,8 +2186,12 @@ mod rocm {
             is_amd,
             bf16: true,
         };
-        let geometry =
-            LaunchGeometry::new(&variant, &shape, &target, |threads, shared_mem_bytes| {
+        let geometry = LaunchGeometry::new(
+            &variant,
+            &shape,
+            &target,
+            cfg,
+            |threads, shared_mem_bytes| {
                 real_occupancy(
                     &dev,
                     module_name,
@@ -2317,7 +2200,8 @@ mod rocm {
                     threads,
                     shared_mem_bytes,
                 )
-            })?;
+            },
+        )?;
 
         let q_ptr = rocm::strided_device_ptr(&q_s, q_l, DType::BF16, "fattn_mma_bf16 q")?;
         let k_ptr = rocm::strided_device_ptr(&k_s, k_l, DType::BF16, "fattn_mma_bf16 k")?;
@@ -2563,6 +2447,7 @@ mod tests {
     use candle_core::{DType, Device, Tensor};
 
     use super::*;
+    use crate::ops::fused_ops::fattn::mma_config;
 
     // No CUDA/ROCm feature compiled in: fattn_mma_prefill must bail rather
     // than silently computing a wrong answer.
@@ -2634,8 +2519,8 @@ mod tests {
     // `ncols1 * ncols2 == 8` on NVIDIA, or they test nothing new.
     #[test]
     fn narrow_bitwise_shapes_select_ncols_8_on_nvidia() {
-        assert_eq!(select_mma_ncols(128, 4, 2, 256, false), Some((2, 4)));
-        assert_eq!(select_mma_ncols(128, 1, 8, 64, false), Some((8, 1)));
+        assert_eq!(select_mma_ncols(128, 4, 2, false), Some((2, 4)));
+        assert_eq!(select_mma_ncols(128, 1, 8, false), Some((8, 1)));
     }
 
     // A driver occupancy query reporting zero active blocks must fall back
@@ -2662,8 +2547,9 @@ mod tests {
             n_sm: 60,
             forced_grid: None,
         };
-        let zero = LaunchGeometry::new(&variant, &shape, &target, |_, _| Some(0)).unwrap();
-        let table = LaunchGeometry::new(&variant, &shape, &target, |_, _| None).unwrap();
+        let cfg = mma_config(variant.dkq, variant.ncols1 * variant.ncols2, variant.is_amd).unwrap();
+        let zero = LaunchGeometry::new(&variant, &shape, &target, cfg, |_, _| Some(0)).unwrap();
+        let table = LaunchGeometry::new(&variant, &shape, &target, cfg, |_, _| None).unwrap();
         assert_eq!(zero.grid, table.grid);
     }
 }
@@ -3080,12 +2966,12 @@ mod gpu_tests {
 
     // End-to-end `fattn_mma_causal` with a non-FATTN_KQ_STRIDE-aligned
     // seq_kv and GQA ratio > 1: unlike `causal_fn_matches_reference_hd128`'s
-    // already-aligned skv=256, this exercises `pad_for_gqa_batching`'s real
-    // `pad_kv`/`pad_mask` code path (skv=200 pads up to 256 to unlock the
-    // ncols2>1 kernel on AMD), which every other GPU test in this module
-    // short-circuits around by only ever using an aligned seq_kv.
+    // already-aligned skv=256, this exercises the kernel's own partial-tile
+    // bounds checks (skv=200 still picks the ncols2>1 kernel on AMD, see
+    // `select_mma_ncols`'s doc comment), which every other GPU test in this
+    // module short-circuits around by only ever using an aligned seq_kv.
     #[test]
-    fn causal_fn_matches_reference_padded_gqa_hd128() {
+    fn causal_fn_matches_reference_unaligned_gqa_hd128() {
         let gpu = test_gpu_device();
         let (b, sq, skv, hq, hkv, d) = (1, 20, 200, 8, 2, 128usize);
         let scale = 1.0f32 / (d as f32).sqrt();
@@ -3110,15 +2996,15 @@ mod gpu_tests {
         let v = v_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
 
         let got = fattn_mma_causal(&q, &k, &v, scale, kv_offset).unwrap();
-        assert_close(&got_vec(got), &want, 3e-2, "causal_fn_padded_gqa");
+        assert_close(&got_vec(got), &want, 3e-2, "causal_fn_unaligned_gqa");
     }
 
-    // bf16 counterpart of `causal_fn_matches_reference_padded_gqa_hd128`:
-    // exercises `pad_for_gqa_batching_bf16`'s real `pad_kv`/`pad_mask` code
-    // path (skv=200 pads up to 256 to unlock the ncols2>1 bf16 kernel on
-    // AMD), proving the bf16 padding path is bit-correct, not just fast.
+    // bf16 counterpart of `causal_fn_matches_reference_unaligned_gqa_hd128`:
+    // exercises the bf16 kernel's own partial-tile bounds checks (skv=200
+    // still picks the ncols2>1 bf16 kernel on AMD), proving that path is
+    // bit-correct, not just fast.
     #[test]
-    fn causal_fn_matches_reference_padded_gqa_bf16_hd128() {
+    fn causal_fn_matches_reference_unaligned_gqa_bf16_hd128() {
         let gpu = test_gpu_device();
         let (b, sq, skv, hq, hkv, d) = (1, 20, 200, 8, 2, 128usize);
         let scale = 1.0f32 / (d as f32).sqrt();
@@ -3155,7 +3041,92 @@ mod gpu_tests {
             .unwrap();
 
         let got = fattn_mma_bf16_causal(&q, &k, &v, scale, kv_offset).unwrap();
-        assert_close(&got_vec(got), &want, 3e-2, "causal_fn_padded_gqa_bf16");
+        assert_close(&got_vec(got), &want, 3e-2, "causal_fn_unaligned_gqa_bf16");
+    }
+
+    // `causal_fn_matches_reference_unaligned_gqa_hd128`'s skv=200 always
+    // spans multiple KV tiles, so it never exercises the single-tile branch
+    // of the kernel's tail dispatch (`skip_initial_preload`, see
+    // `fattn_mma_f16.cuh`'s `oob_tail` handling), which only fires when a
+    // block's entire KV range is one partial tile. hd128 GQA picks
+    // ncols=8, whose smallest `nbatch_fa` across backends is 32 (RDNA);
+    // skv=20 is below that on every backend, forcing the single-tile case.
+    #[test]
+    fn causal_fn_single_tile_tail_gqa_hd128() {
+        let gpu = test_gpu_device();
+        let (b, sq, skv, hq, hkv, d) = (1, 10, 20, 8, 2, 128usize);
+        let scale = 1.0f32 / (d as f32).sqrt();
+        let kv_offset = skv - sq;
+
+        let q_f32 = Tensor::randn(0f32, 1f32, (b, sq, hq, d), &Device::Cpu).unwrap();
+        let k_f32 = Tensor::randn(0f32, 1f32, (b, skv, hkv, d), &Device::Cpu).unwrap();
+        let v_f32 = Tensor::randn(0f32, 1f32, (b, skv, hkv, d), &Device::Cpu).unwrap();
+        let want = naive_attention(
+            &q_f32,
+            &k_f32,
+            &v_f32,
+            scale,
+            MaskMode::Causal,
+            kv_offset,
+            0,
+            0,
+        );
+
+        let q = q_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
+        let k = k_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
+        let v = v_f32.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
+
+        let got = fattn_mma_causal(&q, &k, &v, scale, kv_offset).unwrap();
+        assert_close(&got_vec(got), &want, 3e-2, "causal_fn_single_tile_tail");
+    }
+
+    // bf16 counterpart of `causal_fn_single_tile_tail_gqa_hd128`: proves
+    // the bf16 kernel's single-tile tail branch (no `cp.async` pipeline,
+    // see `fattn_mma_bf16.cuh`'s `oob_check` branch) is bit-correct too.
+    #[test]
+    fn causal_fn_single_tile_tail_gqa_bf16_hd128() {
+        let gpu = test_gpu_device();
+        let (b, sq, skv, hq, hkv, d) = (1, 10, 20, 8, 2, 128usize);
+        let scale = 1.0f32 / (d as f32).sqrt();
+        let kv_offset = skv - sq;
+
+        let q_f32 = Tensor::randn(0f32, 1f32, (b, sq, hq, d), &Device::Cpu).unwrap();
+        let k_f32 = Tensor::randn(0f32, 1f32, (b, skv, hkv, d), &Device::Cpu).unwrap();
+        let v_f32 = Tensor::randn(0f32, 1f32, (b, skv, hkv, d), &Device::Cpu).unwrap();
+        let want = naive_attention(
+            &q_f32,
+            &k_f32,
+            &v_f32,
+            scale,
+            MaskMode::Causal,
+            kv_offset,
+            0,
+            0,
+        );
+
+        let q = q_f32
+            .to_dtype(DType::BF16)
+            .unwrap()
+            .to_device(&gpu)
+            .unwrap();
+        let k = k_f32
+            .to_dtype(DType::BF16)
+            .unwrap()
+            .to_device(&gpu)
+            .unwrap();
+        let v = v_f32
+            .to_dtype(DType::BF16)
+            .unwrap()
+            .to_device(&gpu)
+            .unwrap();
+
+        let got = fattn_mma_bf16_causal(&q, &k, &v, scale, kv_offset).unwrap();
+        assert_close(
+            &got_vec(got),
+            &want,
+            3e-2,
+            "causal_fn_single_tile_tail_bf16",
+        );
     }
 
     // Runs the in-kernel causal entry and the host-mask entry on the same
@@ -3397,11 +3368,10 @@ mod gpu_tests {
     // End-to-end `fattn_mma_windowed`.
     #[test]
     fn windowed_fn_matches_reference_hd128() {
-        // hq != hkv (GQA ratio > 1) and skv a FATTN_KQ_STRIDE (256) multiple:
-        // on AMD, ncols2 only batches GQA heads (resolving to > 1) when both
-        // hold (see `mma_ncols2`'s `gqa_opt_applies` gate); otherwise it
-        // falls back to ncols2 == 1, which the WMMA kernel rejects
-        // unconditionally (see `select_mma_ncols`'s doc comment).
+        // hq != hkv (GQA ratio > 1), so ncols2 resolves to > 1 regardless of
+        // skv's alignment (see `mma_ncols2`'s doc comment); the WMMA kernel
+        // would otherwise reject ncols2 == 1 unconditionally on AMD (see
+        // `select_mma_ncols`'s doc comment).
         let gpu = test_gpu_device();
         let (b, sq, skv, hq, hkv, d) = (1, 20, 256, 8, 2, 128usize);
         let scale = 1.0f32 / (d as f32).sqrt();
