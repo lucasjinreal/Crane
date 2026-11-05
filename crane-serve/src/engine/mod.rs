@@ -743,6 +743,8 @@ impl InferenceEngine {
             if let Some(seq) = self.sequences.get_mut(&victim_id) {
                 seq.kv_caches = vec![None; self.num_layers];
                 seq.status = SequenceStatus::Waiting;
+                seq.prefill_pos = 0;
+                seq.prefill_us = 0;
             }
 
             self.tracked_kv_bytes = self.tracked_kv_bytes.saturating_sub(freed);
@@ -894,6 +896,8 @@ impl InferenceEngine {
 
         let seq = Sequence {
             cached_prefix_len: 0,
+            prefill_pos: 0,
+            prefill_us: 0,
             id: req.id.clone(),
             status: SequenceStatus::Waiting,
             tokens: req.tokens,
@@ -989,6 +993,14 @@ impl InferenceEngine {
             self.send_error(seq_id, &format!("Inference step panicked: {msg}"));
         }
         self.clear_kv_cache_best_effort("panic recovery");
+        // A prompt paused between chunks just lost the KV its progress refers to.
+        if let Some(seq) = self
+            .active_seq_id
+            .as_ref()
+            .and_then(|id| self.sequences.get_mut(id))
+        {
+            seq.prefill_pos = 0;
+        }
     }
 
     fn execute_step_inner(&mut self, output: SchedulerOutput) {
@@ -1129,12 +1141,20 @@ impl InferenceEngine {
             }
         }
 
-        let (input_ids, start_pos) = {
+        let (input_ids, start_pos, done) = {
             let seq = self.sequences.get(&seq_id).unwrap();
-            (seq.next_input_ids().to_vec(), seq.start_pos())
+            (
+                seq.next_input_ids().to_vec(),
+                seq.start_pos(),
+                seq.prefill_pos,
+            )
         };
 
         let prompt_len = input_ids.len();
+        // With per-sequence KV the prompt goes one chunk per step, so running
+        // streams get a decode round between chunks instead of stalling for
+        // the whole prompt.
+        let interleave = self.model.supports_kv_swap();
 
         // Checkpoint one token short of the prompt's end. The prompt ends with
         // the generation prompt (`<|im_start|>assistant\n`); next turn the
@@ -1149,8 +1169,13 @@ impl InferenceEngine {
 
         let mut logits = None;
         let mut processed = 0usize;
-        while processed < checkpoint_at {
-            let chunk_end = (processed + PREFILL_CHUNK_SIZE).min(checkpoint_at);
+        let step_end = if interleave {
+            checkpoint_at.min(PREFILL_CHUNK_SIZE)
+        } else {
+            checkpoint_at
+        };
+        while processed < step_end {
+            let chunk_end = (processed + PREFILL_CHUNK_SIZE).min(step_end);
             let chunk = &input_ids[processed..chunk_end];
             let chunk_start_pos = start_pos + processed;
             logits = match self.model.forward_step(chunk, chunk_start_pos) {
@@ -1187,6 +1212,22 @@ impl InferenceEngine {
                 self.cleanup_sequence(&seq_id);
                 return;
             }
+        }
+
+        if interleave && processed < prompt_len {
+            #[allow(clippy::cast_possible_truncation)]
+            let chunk_us = t0.elapsed().as_micros() as u64;
+            self.stats
+                .total_prefill_time_us
+                .fetch_add(chunk_us, Ordering::Relaxed);
+            if let Some(seq) = self.sequences.get_mut(&seq_id) {
+                seq.prefill_pos += processed;
+                seq.prefill_us += chunk_us;
+            }
+            self.swap_out(&seq_id);
+            self.scheduler.waiting.push_front(seq_id);
+            self.scheduler.decode_next = true;
+            return;
         }
 
         // State now covers everything up to `checkpoint_at`; record it before
@@ -1234,13 +1275,15 @@ impl InferenceEngine {
         self.swap_out(&seq_id);
 
         #[allow(clippy::cast_possible_truncation)]
-        let prefill_us = t0.elapsed().as_micros() as u64;
+        let chunk_us = t0.elapsed().as_micros() as u64;
         self.stats
             .total_prefill_time_us
-            .fetch_add(prefill_us, Ordering::Relaxed);
+            .fetch_add(chunk_us, Ordering::Relaxed);
 
+        let fed = done + prompt_len;
+        let prefill_us = chunk_us + self.sequences.get(&seq_id).unwrap().prefill_us;
         let prefill_tok_s = if prefill_us > 0 {
-            (prompt_len as f64) / (prefill_us as f64 / 1_000_000.0)
+            (fed as f64) / (prefill_us as f64 / 1_000_000.0)
         } else {
             0.0
         };
@@ -1254,8 +1297,8 @@ impl InferenceEngine {
 
         info!(
             id = %seq_id,
-            prompt_len,
-            prefill_chunks = prompt_len.div_ceil(PREFILL_CHUNK_SIZE),
+            prompt_len = fed,
+            prefill_chunks = fed.div_ceil(PREFILL_CHUNK_SIZE),
             prefill_ms = prefill_us / 1000,
             prefill_tok_s = format!("{:.1}", prefill_tok_s),
             "Prefill complete, first token generated",
@@ -2175,5 +2218,160 @@ mod prefix_cache_tests {
     #[test]
     fn empty_cache_reuses_nothing() {
         assert_eq!(cache(&[]).reusable_len(&[1, 2, 3]), 0);
+    }
+}
+
+#[cfg(test)]
+mod interleave_tests {
+    use super::*;
+    use crane_core::{DType, Device};
+    use std::sync::Mutex;
+
+    type Calls = Arc<Mutex<Vec<(usize, usize)>>>;
+
+    /// Per-sequence-KV backend that records `(len, start_pos)` of every forward.
+    struct Stub {
+        calls: Calls,
+        device: Device,
+        tokenizer: tokenizers::Tokenizer,
+    }
+
+    impl ModelBackend for Stub {
+        fn forward_step(&mut self, input_ids: &[u32], start_pos: usize) -> anyhow::Result<Tensor> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((input_ids.len(), start_pos));
+            Ok(Tensor::zeros((1, 1, 8), DType::F32, &self.device)?)
+        }
+        fn clear_kv_cache(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn num_layers(&self) -> usize {
+            1
+        }
+        fn device(&self) -> &Device {
+            &self.device
+        }
+        fn dtype(&self) -> DType {
+            DType::F32
+        }
+        fn tokenizer(&self) -> &tokenizers::Tokenizer {
+            &self.tokenizer
+        }
+        fn eos_token_id(&self) -> Vec<u32> {
+            vec![]
+        }
+        fn warmup(&mut self) {}
+        fn supports_kv_swap(&self) -> bool {
+            true
+        }
+        fn active_kv_cache_bytes(&self) -> u64 {
+            1000
+        }
+    }
+
+    fn engine(gpu_memory_limit_bytes: u64) -> (InferenceEngine, Calls) {
+        let calls = Calls::default();
+        let model = Stub {
+            calls: calls.clone(),
+            device: Device::Cpu,
+            tokenizer: tokenizers::Tokenizer::new(tokenizers::models::bpe::BPE::default()),
+        };
+        let memory = MemoryConfig {
+            max_seq_len: 0,
+            gpu_memory_limit_bytes,
+            baseline_gpu_bytes: 0,
+            moe_offload_reservation_bytes: 0,
+        };
+        (
+            InferenceEngine::new(Box::new(model), 4, 2, memory, false).0,
+            calls,
+        )
+    }
+
+    /// Queues a `prompt_len`-token request; keep the receiver alive or the
+    /// engine sees a disconnected client.
+    fn submit(
+        e: &mut InferenceEngine,
+        id: &str,
+        prompt_len: usize,
+    ) -> mpsc::UnboundedReceiver<EngineResponse> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        e.accept_request(EngineRequest {
+            id: id.into(),
+            tokens: vec![1; prompt_len],
+            max_tokens: 1000,
+            temperature: Some(0.0),
+            top_p: None,
+            top_k: None,
+            repetition_penalty: 1.0,
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
+            eos_token_id: vec![],
+            stop: vec![],
+            tool_names: vec![],
+            arrived_at: Instant::now(),
+            response_tx: tx,
+        });
+        rx
+    }
+
+    /// Runs `n` scheduler steps; returns `P` per prefill step and `D` per decode step.
+    fn run(e: &mut InferenceEngine, n: usize) -> String {
+        let mut steps = String::new();
+        for _ in 0..n {
+            let Some(out) = e.scheduler.schedule() else {
+                break;
+            };
+            steps.push(if out.is_prefill { 'P' } else { 'D' });
+            e.execute_step(out);
+        }
+        steps
+    }
+
+    #[test]
+    fn prompt_within_one_chunk_is_one_step() {
+        let (mut e, calls) = engine(0);
+        let _rx = submit(&mut e, "a", 100);
+        assert_eq!(run(&mut e, 1), "P");
+        assert_eq!(*calls.lock().unwrap(), [(100, 0)]);
+        assert_eq!(e.scheduler.running, ["a"]);
+    }
+
+    #[test]
+    fn long_prompt_is_split_with_decode_rounds_between_chunks() {
+        let (mut e, calls) = engine(0);
+        let _a = submit(&mut e, "a", 10);
+        run(&mut e, 1);
+        calls.lock().unwrap().clear();
+        let _b = submit(&mut e, "b", 5000);
+
+        assert_eq!(run(&mut e, 6), "PDPDPD");
+        let chunks: Vec<_> = calls
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .filter(|c| c.0 > 1)
+            .collect();
+        assert_eq!(chunks, [(2048, 0), (2048, 2048), (904, 4096)]);
+        assert_eq!(e.scheduler.running, ["a", "b"]);
+    }
+
+    #[test]
+    fn evicted_sequence_reprefills_from_the_start() {
+        // Tiny budget: the stub reports 1000 KV bytes for the active sequence.
+        let (mut e, calls) = engine(600);
+        let _a = submit(&mut e, "a", 3000);
+        assert_eq!(run(&mut e, 2), "PP");
+        e.recount_kv_bytes();
+        e.evict_if_needed();
+        assert_eq!(e.scheduler.waiting, ["a"]);
+
+        calls.lock().unwrap().clear();
+        assert_eq!(run(&mut e, 2), "PP");
+        // 3000 prompt tokens plus the one generated before eviction.
+        assert_eq!(*calls.lock().unwrap(), [(2048, 0), (953, 2048)]);
     }
 }
