@@ -289,8 +289,54 @@ struct KernelVariant {
 struct GridTarget {
     /// SMs (NVIDIA) or CUs (AMD).
     n_sm: usize,
-    /// Overrides the policy's grid size. Tests only.
-    forced_grid: Option<usize>,
+    /// Overrides of the launch policy. Tests only.
+    forced: LaunchOverride,
+}
+
+/// Overrides of the launch policy, for tests and benchmarks. Production
+/// entries pass [`LaunchOverride::NONE`].
+#[derive(Debug, Clone, Copy)]
+struct LaunchOverride {
+    /// Replaces the policy's grid size.
+    grid: Option<usize>,
+    /// Replaces the policy's tile order, see [`use_heavy_first`]. Passed
+    /// to the kernel as is, also on a split grid, where the kernel keeps
+    /// the stream-K order. That lets tests reach the kernel's own fallback.
+    heavy_first: Option<bool>,
+}
+
+impl LaunchOverride {
+    /// The policy's own choices.
+    const NONE: Self = Self {
+        grid: None,
+        heavy_first: None,
+    };
+}
+
+/// How a tile's cost varies with its Q tile index `jt`, which decides
+/// whether reordering the tiles can shorten the last wave.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TileCost {
+    /// Every tile walks the same KV range.
+    Uniform,
+    /// A tile's KV range, and so its cost, grows with `jt`.
+    GrowsWithJt,
+}
+
+impl TileCost {
+    /// The cost shape of a launch with in-kernel causal masking at
+    /// `causal_kv_offset`, or with a `kv_max` bound.
+    ///
+    /// A `kv_max` is assumed to grow with `jt`, as every in-tree one does
+    /// (`build_analytic_kv_max`). One that does not only loses the ordering
+    /// benefit, never correctness.
+    fn of(causal_kv_offset: Option<usize>, kv_max: Option<&Tensor>) -> Self {
+        if causal_kv_offset.is_some() || kv_max.is_some() {
+            Self::GrowsWithJt
+        } else {
+            Self::Uniform
+        }
+    }
 }
 
 /// Grid/launch geometry of an MMA launch, with the stream-K fixup pass when
@@ -302,6 +348,9 @@ struct LaunchGeometry {
     /// The fixup launch and its scratch buffer, or `None` when every block
     /// owns whole tiles.
     fixup: Option<FixupPlan>,
+    /// The kernel's `heavy_first` argument, see [`use_heavy_first`]. The
+    /// kernel ignores it unless the grid has one block per tile.
+    heavy_first: bool,
 }
 
 /// The fixup launch of a stream-K grid, see `fattn_fixup.cuh`.
@@ -339,7 +388,7 @@ impl LaunchGeometry {
     /// the kernel reads only `blockIdx.x`, and extra blocks would race on
     /// the same output.
     ///
-    /// The grid is one block per tile, except `target.forced_grid` (tests)
+    /// The grid is one block per tile, except `target.forced.grid` (tests)
     /// or AMD at `head_dim` 64, which always splits via [`stream_k_grid`]
     /// (llama.cpp's own rule for that shape). With one block per tile
     /// `fixup` is `None` and the kernel never reads `dst_meta`. Otherwise
@@ -360,6 +409,8 @@ impl LaunchGeometry {
     /// here because callers already need it (for the tail-kernel decision)
     /// before they can build the `KernelVariant`/`real_occupancy` closure.
     ///
+    /// `cost` feeds the tile order, see [`use_heavy_first`].
+    ///
     /// # Errors
     ///
     /// Returns unsupported-config when the tile count exceeds the grid x
@@ -370,6 +421,7 @@ impl LaunchGeometry {
         shape: &LaunchShape,
         target: &GridTarget,
         cfg: FattnMmaConfig,
+        cost: TileCost,
         real_occupancy: impl FnOnce(usize, usize) -> Option<usize>,
     ) -> Result<Self> {
         let &KernelVariant {
@@ -396,7 +448,7 @@ impl LaunchGeometry {
                 "fattn_mma: ntiles ({ntiles}) * iter_k ({iter_k}) overflows usize"
             ))
         })?;
-        let grid = match target.forced_grid {
+        let grid = match target.forced.grid {
             Some(g) if (1..=total).contains(&g) => g,
             Some(g) => candle_core::bail!("fattn_mma: forced grid {g} outside 1..={total}"),
             None if is_amd && dkq == 64 => {
@@ -415,8 +467,33 @@ impl LaunchGeometry {
             block: (32, to_u32(nwarps, "nwarps")?, 1),
             shared_mem_bytes: to_u32(shared_mem_bytes, "shared_mem_bytes")?,
             fixup,
+            heavy_first: use_heavy_first(cost, grid, ntiles, target.forced.heavy_first),
         })
     }
+}
+
+/// The most tiles a launch can have and still run heaviest-first. Above it,
+/// heavy-first measured slower than the stream-K order. Measured on one
+/// `ROCm` GPU and an NVIDIA L4 only. It is a tile count, not
+/// device-relative, so other GPUs may want another value.
+/// `fattn_bench_tile_order` measures it.
+const HEAVY_FIRST_MAX_TILES: usize = 3072;
+
+/// Whether a launch of `grid` blocks over `ntiles` tiles hands out its
+/// heaviest tiles first, so the light ones fill the last wave.
+///
+/// Only a one-block-per-tile grid can reorder, because a split grid's fixup
+/// slots depend on the stream-K order. Reordering also needs a [`TileCost`]
+/// that grows with the Q tile and at most [`HEAVY_FIRST_MAX_TILES`] tiles.
+/// `forced` (tests) replaces the whole policy.
+///
+/// The gain assumes blocks start in ascending `blockIdx.x`. CUDA and HIP do
+/// that in practice but do not guarantee it. The output never depends on
+/// the order.
+fn use_heavy_first(cost: TileCost, grid: usize, ntiles: usize, forced: Option<bool>) -> bool {
+    forced.unwrap_or(
+        grid == ntiles && cost == TileCost::GrowsWithJt && ntiles <= HEAVY_FIRST_MAX_TILES,
+    )
 }
 
 impl FixupPlan {
@@ -499,18 +576,18 @@ fn tile_counts(
 ///
 /// Returns an error if the attribute query fails or the device is not a
 /// GPU of the enabled backend.
-fn grid_target(device: &Device, forced_grid: Option<usize>) -> Result<GridTarget> {
+fn grid_target(device: &Device, forced: LaunchOverride) -> Result<GridTarget> {
     #[cfg(feature = "cuda")]
     {
-        cuda::grid_target(device, forced_grid)
+        cuda::grid_target(device, forced)
     }
     #[cfg(all(feature = "rocm", not(feature = "cuda")))]
     {
-        rocm::grid_target(device, forced_grid)
+        rocm::grid_target(device, forced)
     }
     #[cfg(not(any(feature = "cuda", feature = "rocm")))]
     {
-        let _ = (device, forced_grid);
+        let _ = (device, forced);
         candle_core::bail!("fattn_mma: requires the cuda or rocm feature")
     }
 }
@@ -628,7 +705,7 @@ pub fn fattn_mma_prefill(
     {
         candle_core::bail!("fattn_mma: kv_max must be I32, got {:?}", kv.dtype());
     }
-    prefill_dispatch(q, k, v, mask, kv_max, scale, None, None)
+    prefill_dispatch(q, k, v, mask, kv_max, scale, None, LaunchOverride::NONE)
 }
 
 /// Backend dispatch shared by [`fattn_mma_prefill`] and the in-kernel causal
@@ -644,7 +721,7 @@ fn prefill_dispatch(
     kv_max: Option<&Tensor>,
     scale: f32,
     causal_kv_offset: Option<usize>,
-    forced_grid: Option<usize>,
+    forced: LaunchOverride,
 ) -> Result<Tensor> {
     let padded_mask;
     let mask = match mask {
@@ -658,15 +735,15 @@ fn prefill_dispatch(
     };
     #[cfg(feature = "cuda")]
     {
-        cuda::fattn_mma_prefill_cuda(q, k, v, mask, kv_max, scale, causal_kv_offset, forced_grid)
+        cuda::fattn_mma_prefill_cuda(q, k, v, mask, kv_max, scale, causal_kv_offset, forced)
     }
     #[cfg(all(feature = "rocm", not(feature = "cuda")))]
     {
-        rocm::fattn_mma_prefill_rocm(q, k, v, mask, kv_max, scale, causal_kv_offset, forced_grid)
+        rocm::fattn_mma_prefill_rocm(q, k, v, mask, kv_max, scale, causal_kv_offset, forced)
     }
     #[cfg(not(any(feature = "cuda", feature = "rocm")))]
     {
-        let _ = (q, k, v, mask, kv_max, scale, causal_kv_offset, forced_grid);
+        let _ = (q, k, v, mask, kv_max, scale, causal_kv_offset, forced);
         candle_core::bail!("fattn_mma_prefill: requires the cuda or rocm feature")
     }
 }
@@ -715,7 +792,7 @@ pub fn fattn_mma_bf16_prefill(
     {
         candle_core::bail!("fattn_mma_bf16: kv_max must be I32, got {:?}", kv.dtype());
     }
-    prefill_dispatch_bf16(q, k, v, mask, kv_max, scale, None, None)
+    prefill_dispatch_bf16(q, k, v, mask, kv_max, scale, None, LaunchOverride::NONE)
 }
 
 /// bf16 counterpart of [`prefill_dispatch`].
@@ -728,7 +805,7 @@ fn prefill_dispatch_bf16(
     kv_max: Option<&Tensor>,
     scale: f32,
     causal_kv_offset: Option<usize>,
-    forced_grid: Option<usize>,
+    forced: LaunchOverride,
 ) -> Result<Tensor> {
     let padded_mask;
     let mask = match mask {
@@ -742,33 +819,15 @@ fn prefill_dispatch_bf16(
     };
     #[cfg(feature = "cuda")]
     {
-        cuda::fattn_mma_bf16_prefill_cuda(
-            q,
-            k,
-            v,
-            mask,
-            kv_max,
-            scale,
-            causal_kv_offset,
-            forced_grid,
-        )
+        cuda::fattn_mma_bf16_prefill_cuda(q, k, v, mask, kv_max, scale, causal_kv_offset, forced)
     }
     #[cfg(all(feature = "rocm", not(feature = "cuda")))]
     {
-        rocm::fattn_mma_bf16_prefill_rocm(
-            q,
-            k,
-            v,
-            mask,
-            kv_max,
-            scale,
-            causal_kv_offset,
-            forced_grid,
-        )
+        rocm::fattn_mma_bf16_prefill_rocm(q, k, v, mask, kv_max, scale, causal_kv_offset, forced)
     }
     #[cfg(not(any(feature = "cuda", feature = "rocm")))]
     {
-        let _ = (q, k, v, mask, kv_max, scale, causal_kv_offset, forced_grid);
+        let _ = (q, k, v, mask, kv_max, scale, causal_kv_offset, forced);
         candle_core::bail!("fattn_mma_bf16_prefill: requires the cuda or rocm feature")
     }
 }
@@ -1017,9 +1076,27 @@ fn causal_in_kernel(
         other => candle_core::bail!("fattn_mma causal: k/v must be F16 or BF16, got {other:?}"),
     };
     if bf16 {
-        prefill_dispatch_bf16(q, k, v, None, None, scale, Some(kv_offset), None)
+        prefill_dispatch_bf16(
+            q,
+            k,
+            v,
+            None,
+            None,
+            scale,
+            Some(kv_offset),
+            LaunchOverride::NONE,
+        )
     } else {
-        prefill_dispatch(q, k, v, None, None, scale, Some(kv_offset), None)
+        prefill_dispatch(
+            q,
+            k,
+            v,
+            None,
+            None,
+            scale,
+            Some(kv_offset),
+            LaunchOverride::NONE,
+        )
     }
 }
 
@@ -1223,7 +1300,10 @@ mod cuda {
     use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
     use candle_core::cuda_backend::{CudaStorage, CudaStorageSlice, WrapErr};
 
-    use super::{FixupPlan, GridTarget, KernelVariant, LaunchGeometry, LaunchScalars, LaunchShape};
+    use super::{
+        FixupPlan, GridTarget, KernelVariant, LaunchGeometry, LaunchOverride, LaunchScalars,
+        LaunchShape, TileCost,
+    };
     use crate::ops::fused_ops::fattn::{
         fixup_kernel_name, mma_config, mma_config_bf16, select_mma_ncols, select_mma_ncols_bf16,
         unsupported_config, validate_fattn_bshd,
@@ -1340,7 +1420,7 @@ mod cuda {
         kv_max: Option<&Tensor>,
         scale: f32,
         causal_kv_offset: Option<usize>,
-        forced_grid: Option<usize>,
+        forced: LaunchOverride,
     ) -> Result<Tensor> {
         let (q_s, q_l) = q.storage_and_layout();
         let (k_s, k_l) = k.storage_and_layout();
@@ -1371,7 +1451,7 @@ mod cuda {
             batch: b,
             gqa_ratio,
         };
-        let target = super::grid_target(q.device(), forced_grid)?;
+        let target = super::grid_target(q.device(), forced)?;
         let cfg = mma_config(d, ncols1 * ncols2, is_amd)?;
         let tail = ncols2 > 1 && !seq_kv.is_multiple_of(cfg.nbatch_fa);
         let (kernel_name, module_name) = super::cached_mma_names(d, ncols1, ncols2, false, tail);
@@ -1383,12 +1463,19 @@ mod cuda {
             is_amd,
             bf16: false,
         };
-        let geometry = LaunchGeometry::new(&variant, &shape, &target, cfg, |_, _| {
-            // CUDA's real occupancy query is unverified here (no CUDA
-            // device in this environment); keep the config table's
-            // guess until it is checked on real hardware.
-            None
-        })?;
+        let geometry = LaunchGeometry::new(
+            &variant,
+            &shape,
+            &target,
+            cfg,
+            TileCost::of(causal_kv_offset, kv_max),
+            |_, _| {
+                // CUDA's real occupancy query is unverified here (no CUDA
+                // device in this environment); keep the config table's
+                // guess until it is checked on real hardware.
+                None
+            },
+        )?;
 
         let q_sl = f16_slice(&q_s, "q")?.slice(q_l.start_offset()..);
         let k_sl = f16_slice(&k_s, "k")?.slice(k_l.start_offset()..);
@@ -1431,6 +1518,7 @@ mod cuda {
         )?;
 
         let causal_kv_offset = super::kernel_causal_offset(causal_kv_offset)?;
+        let heavy_first = i32::from(geometry.heavy_first);
 
         let n_out = b * seq_q * h_q * d;
         let dst = unsafe { dev.alloc::<half::f16>(n_out) }?;
@@ -1507,6 +1595,7 @@ mod cuda {
         builder.arg(&p.nb32);
         builder.arg(&p.nb33);
         builder.arg(&causal_kv_offset);
+        builder.arg(&heavy_first);
         // SAFETY: the argument list above matches
         // `crane_fattn_mma_f16_d{d}_v{d}_c{ncols1}_s{ncols2}`'s `extern "C"`
         // signature exactly (`DECL_FATTN_MMA_F16_CASE` in
@@ -1575,7 +1664,7 @@ mod cuda {
         kv_max: Option<&Tensor>,
         scale: f32,
         causal_kv_offset: Option<usize>,
-        forced_grid: Option<usize>,
+        forced: LaunchOverride,
     ) -> Result<Tensor> {
         let (q_s, q_l) = q.storage_and_layout();
         let (k_s, k_l) = k.storage_and_layout();
@@ -1605,7 +1694,7 @@ mod cuda {
             batch: b,
             gqa_ratio,
         };
-        let target = super::grid_target(q.device(), forced_grid)?;
+        let target = super::grid_target(q.device(), forced)?;
         let cfg = mma_config_bf16(d, ncols1 * ncols2, is_amd)?;
         let tail = ncols2 > 1 && !seq_kv.is_multiple_of(cfg.nbatch_fa);
         let (kernel_name, module_name) = super::cached_mma_names(d, ncols1, ncols2, true, tail);
@@ -1617,12 +1706,19 @@ mod cuda {
             is_amd,
             bf16: true,
         };
-        let geometry = LaunchGeometry::new(&variant, &shape, &target, cfg, |_, _| {
-            // CUDA's real occupancy query is unverified here (no CUDA
-            // device in this environment); keep the config table's
-            // guess until it is checked on real hardware.
-            None
-        })?;
+        let geometry = LaunchGeometry::new(
+            &variant,
+            &shape,
+            &target,
+            cfg,
+            TileCost::of(causal_kv_offset, kv_max),
+            |_, _| {
+                // CUDA's real occupancy query is unverified here (no CUDA
+                // device in this environment); keep the config table's
+                // guess until it is checked on real hardware.
+                None
+            },
+        )?;
 
         let q_sl = bf16_slice(&q_s, "q")?.slice(q_l.start_offset()..);
         let k_sl = bf16_slice(&k_s, "k")?.slice(k_l.start_offset()..);
@@ -1665,6 +1761,7 @@ mod cuda {
         )?;
 
         let causal_kv_offset = super::kernel_causal_offset(causal_kv_offset)?;
+        let heavy_first = i32::from(geometry.heavy_first);
 
         let n_out = b * seq_q * h_q * d;
         let dst = unsafe { dev.alloc::<half::bf16>(n_out) }?;
@@ -1733,6 +1830,7 @@ mod cuda {
         builder.arg(&p.nb32);
         builder.arg(&p.nb33);
         builder.arg(&causal_kv_offset);
+        builder.arg(&heavy_first);
         // SAFETY: the argument list above matches
         // `crane_fattn_mma_bf16_d{d}_v{d}_c{ncols1}_s{ncols2}`'s `extern "C"`
         // signature exactly (`DECL_FATTN_MMA_BF16_CASE` in
@@ -1788,12 +1886,9 @@ mod cuda {
     /// runs on a CUDA build (`KernelVariant::is_amd` is always `false`
     /// here), so this skips the `MULTIPROCESSOR_COUNT` driver query
     /// entirely rather than caching a value nothing reads.
-    pub(super) fn grid_target(device: &Device, forced_grid: Option<usize>) -> Result<GridTarget> {
+    pub(super) fn grid_target(device: &Device, forced: LaunchOverride) -> Result<GridTarget> {
         let _ = device.as_cuda_device()?;
-        Ok(GridTarget {
-            n_sm: 0,
-            forced_grid,
-        })
+        Ok(GridTarget { n_sm: 0, forced })
     }
 }
 
@@ -1804,7 +1899,10 @@ mod rocm {
     use candle_core::rocm_backend::{SendSyncDeviceMemory, rocm_rs};
     use candle_core::{DType, Device, Result, Tensor};
 
-    use super::{FixupPlan, GridTarget, KernelVariant, LaunchGeometry, LaunchScalars, LaunchShape};
+    use super::{
+        FixupPlan, GridTarget, KernelVariant, LaunchGeometry, LaunchOverride, LaunchScalars,
+        LaunchShape, TileCost,
+    };
     use crate::ops::fused_ops::fattn::{
         fixup_kernel_name, mma_config, mma_config_bf16, select_mma_ncols, select_mma_ncols_bf16,
         unsupported_config, validate_fattn_bshd,
@@ -1938,7 +2036,7 @@ mod rocm {
         kv_max: Option<&Tensor>,
         scale: f32,
         causal_kv_offset: Option<usize>,
-        forced_grid: Option<usize>,
+        forced: LaunchOverride,
     ) -> Result<Tensor> {
         let (q_s, q_l) = q.storage_and_layout();
         let (k_s, k_l) = k.storage_and_layout();
@@ -1969,7 +2067,7 @@ mod rocm {
             batch: b,
             gqa_ratio,
         };
-        let target = super::grid_target(q.device(), forced_grid)?;
+        let target = super::grid_target(q.device(), forced)?;
         let cfg = mma_config(d, ncols1 * ncols2, is_amd)?;
         let tail = ncols2 > 1 && !seq_kv.is_multiple_of(cfg.nbatch_fa);
         let (kernel_name, module_name) = super::cached_mma_names(d, ncols1, ncols2, false, tail);
@@ -1986,6 +2084,7 @@ mod rocm {
             &shape,
             &target,
             cfg,
+            TileCost::of(causal_kv_offset, kv_max),
             |threads, shared_mem_bytes| {
                 real_occupancy(
                     &dev,
@@ -2030,6 +2129,7 @@ mod rocm {
         )?;
 
         let causal_kv_offset = super::kernel_causal_offset(causal_kv_offset)?;
+        let heavy_first = i32::from(geometry.heavy_first);
 
         let n_out = b * seq_q * h_q * d;
         let dst = dev.alloc::<half::f16>(n_out)?;
@@ -2088,6 +2188,7 @@ mod rocm {
             rocm::arg(&p.nb32),
             rocm::arg(&p.nb33),
             rocm::arg(&causal_kv_offset),
+            rocm::arg(&heavy_first),
         ];
 
         // SAFETY: the argument list above matches
@@ -2144,7 +2245,7 @@ mod rocm {
         kv_max: Option<&Tensor>,
         scale: f32,
         causal_kv_offset: Option<usize>,
-        forced_grid: Option<usize>,
+        forced: LaunchOverride,
     ) -> Result<Tensor> {
         let (q_s, q_l) = q.storage_and_layout();
         let (k_s, k_l) = k.storage_and_layout();
@@ -2174,7 +2275,7 @@ mod rocm {
             batch: b,
             gqa_ratio,
         };
-        let target = super::grid_target(q.device(), forced_grid)?;
+        let target = super::grid_target(q.device(), forced)?;
         let cfg = mma_config_bf16(d, ncols1 * ncols2, is_amd)?;
         let tail = ncols2 > 1 && !seq_kv.is_multiple_of(cfg.nbatch_fa);
         let (kernel_name, module_name) = super::cached_mma_names(d, ncols1, ncols2, true, tail);
@@ -2191,6 +2292,7 @@ mod rocm {
             &shape,
             &target,
             cfg,
+            TileCost::of(causal_kv_offset, kv_max),
             |threads, shared_mem_bytes| {
                 real_occupancy(
                     &dev,
@@ -2235,6 +2337,7 @@ mod rocm {
         )?;
 
         let causal_kv_offset = super::kernel_causal_offset(causal_kv_offset)?;
+        let heavy_first = i32::from(geometry.heavy_first);
 
         let n_out = b * seq_q * h_q * d;
         let dst = dev.alloc::<half::bf16>(n_out)?;
@@ -2293,6 +2396,7 @@ mod rocm {
             rocm::arg(&p.nb32),
             rocm::arg(&p.nb33),
             rocm::arg(&causal_kv_offset),
+            rocm::arg(&heavy_first),
         ];
 
         // SAFETY: see fattn_mma_prefill_rocm's identical SAFETY comment;
@@ -2333,7 +2437,7 @@ mod rocm {
     /// dispatch; cached per device ordinal. CUDA has no equivalent cache:
     /// `n_sm` only feeds the AMD `head_dim == 64` split, so CUDA's
     /// `grid_target` skips the query entirely.
-    pub(super) fn grid_target(device: &Device, forced_grid: Option<usize>) -> Result<GridTarget> {
+    pub(super) fn grid_target(device: &Device, forced: LaunchOverride) -> Result<GridTarget> {
         use std::collections::HashMap;
         use std::sync::{OnceLock, RwLock};
 
@@ -2344,11 +2448,11 @@ mod rocm {
             candle_core::bail!("grid_target: not a rocm device");
         };
         if let Some(&n_sm) = cache.read().unwrap().get(&gpu_id) {
-            return Ok(GridTarget { n_sm, forced_grid });
+            return Ok(GridTarget { n_sm, forced });
         }
         let n_sm = rocm::multiprocessor_count(device)?;
         cache.write().unwrap().insert(gpu_id, n_sm);
-        Ok(GridTarget { n_sm, forced_grid })
+        Ok(GridTarget { n_sm, forced })
     }
 
     /// The driver's real occupancy for this kernel, or `None` if the query
@@ -2545,12 +2649,126 @@ mod tests {
         };
         let target = GridTarget {
             n_sm: 60,
-            forced_grid: None,
+            forced: LaunchOverride::NONE,
         };
         let cfg = mma_config(variant.dkq, variant.ncols1 * variant.ncols2, variant.is_amd).unwrap();
-        let zero = LaunchGeometry::new(&variant, &shape, &target, cfg, |_, _| Some(0)).unwrap();
-        let table = LaunchGeometry::new(&variant, &shape, &target, cfg, |_, _| None).unwrap();
+        let uniform = TileCost::Uniform;
+        let zero =
+            LaunchGeometry::new(&variant, &shape, &target, cfg, uniform, |_, _| Some(0)).unwrap();
+        let table =
+            LaunchGeometry::new(&variant, &shape, &target, cfg, uniform, |_, _| None).unwrap();
         assert_eq!(zero.grid, table.grid);
+    }
+
+    // Heavy-first needs one block per tile, a cost that grows with the Q
+    // tile and a launch that is not too large. A forced order replaces the
+    // policy on any grid, so tests can reach the kernel's fallback.
+    #[test]
+    fn heavy_first_policy() {
+        use TileCost::{GrowsWithJt, Uniform};
+        let ntiles = 64;
+        // (cost, grid, forced, want)
+        let rows = [
+            (GrowsWithJt, ntiles, None, true),
+            (Uniform, ntiles, None, false),
+            (GrowsWithJt, ntiles + 1, None, false),
+            (GrowsWithJt, ntiles / 2, Some(true), true),
+            (Uniform, ntiles, Some(true), true),
+            (GrowsWithJt, ntiles, Some(false), false),
+        ];
+        for (cost, grid, forced, want) in rows {
+            assert_eq!(
+                use_heavy_first(cost, grid, ntiles, forced),
+                want,
+                "{cost:?} grid={grid} forced={forced:?}"
+            );
+        }
+        let max = HEAVY_FIRST_MAX_TILES;
+        assert!(use_heavy_first(GrowsWithJt, max, max, None));
+        assert!(!use_heavy_first(GrowsWithJt, max + 1, max + 1, None));
+    }
+
+    // In-kernel causal masking or a `KV_max` make the cost grow with the Q
+    // tile. Neither leaves it uniform.
+    #[test]
+    fn tile_cost_of_launch() {
+        let kv_max = Tensor::zeros(4, DType::I32, &Device::Cpu).unwrap();
+        assert_eq!(TileCost::of(Some(0), None), TileCost::GrowsWithJt);
+        assert_eq!(TileCost::of(None, Some(&kv_max)), TileCost::GrowsWithJt);
+        assert_eq!(TileCost::of(None, None), TileCost::Uniform);
+    }
+
+    // `LaunchGeometry::new` turns heavy-first on for a growing cost, and off
+    // for a uniform cost or too many tiles.
+    #[test]
+    fn launch_geometry_picks_tile_order() {
+        let (h_kv, gqa_ratio) = (2, 4);
+        let geometry = |seq: usize, cost| {
+            let (ncols1, ncols2) = select_mma_ncols(128, gqa_ratio, seq, false).unwrap();
+            let variant = KernelVariant {
+                dkq: 128,
+                ncols1,
+                ncols2,
+                is_amd: false,
+                bf16: false,
+            };
+            let shape = LaunchShape {
+                seq_q: seq,
+                seq_kv: seq,
+                h_kv,
+                batch: 1,
+                gqa_ratio,
+            };
+            let target = GridTarget {
+                n_sm: 0,
+                forced: LaunchOverride::NONE,
+            };
+            let cfg = mma_config(128, ncols1 * ncols2, false).unwrap();
+            let (ntiles, _) = tile_counts(&cfg, ncols1, ncols2, &shape).unwrap();
+            let got = LaunchGeometry::new(&variant, &shape, &target, cfg, cost, |_, _| None)
+                .unwrap()
+                .heavy_first;
+            (got, ntiles)
+        };
+        let (got, ntiles) = geometry(512, TileCost::GrowsWithJt);
+        assert!(ntiles <= HEAVY_FIRST_MAX_TILES);
+        assert!(got);
+        assert!(!geometry(512, TileCost::Uniform).0);
+        let (got, ntiles) = geometry(64 * 1024, TileCost::GrowsWithJt);
+        assert!(ntiles > HEAVY_FIRST_MAX_TILES);
+        assert!(!got);
+    }
+
+    // The heavy-first mapping gives every tile to exactly one block and
+    // hands them out with `jt` never rising. The GPU tests can show the
+    // first, not the second.
+    #[test]
+    fn heavy_first_mapping_is_a_falling_permutation() {
+        for iter_j in [1, 3, 8] {
+            for nheads in [1, 2, 5, 8] {
+                let ntiles = iter_j * nheads;
+                let what = format!("iter_j={iter_j} nheads={nheads}");
+                let tiles: Vec<usize> = (0..ntiles)
+                    .map(|b| heavy_first_tile(b, iter_j, nheads))
+                    .collect();
+                let mut sorted = tiles.clone();
+                sorted.sort_unstable();
+                assert!(
+                    sorted.into_iter().eq(0..ntiles),
+                    "{what}: not a permutation"
+                );
+                for pair in tiles.windows(2) {
+                    assert!(pair[1] % iter_j <= pair[0] % iter_j, "{what}: jt rises");
+                }
+            }
+        }
+    }
+
+    /// Mirror of the heavy-first branch of `crane_fattn_block_kbc_range`
+    /// (`fattn_fixup.cuh`): the tile block `b` takes, for `nheads` tiles per
+    /// Q tile index.
+    fn heavy_first_tile(b: usize, iter_j: usize, nheads: usize) -> usize {
+        (b % nheads) * iter_j + (iter_j - 1 - b / nheads)
     }
 }
 

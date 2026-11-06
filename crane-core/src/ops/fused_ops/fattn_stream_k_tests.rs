@@ -4,7 +4,9 @@
 //! tile, give blocks segments that lie wholly past the causal bound, and
 //! make blocks finish one tile and start the next. Every run must match
 //! the one-block-per-tile launch and an F32 reference within the
-//! long-sequence tolerance, and give the same bits twice.
+//! long-sequence tolerance, and give the same bits twice. The heavy-first
+//! tile order of a one-block-per-tile launch must match the stream-K order
+//! bit for bit, also with batch 2 and with 16 Q and 4 KV heads.
 
 use candle_core::{DType, Device, Tensor};
 
@@ -19,7 +21,8 @@ use super::super::fattn::{
 use super::super::fattn_long_seq_host::compare;
 use super::long_seq_tests::{bitwise_eq, round_to, scaled_q, to_host, tolerance};
 use super::{
-    LaunchShape, fattn_mma_bf16_causal, prefill_dispatch, prefill_dispatch_bf16, tile_counts,
+    LaunchOverride, LaunchShape, fattn_mma_bf16_causal, prefill_dispatch, prefill_dispatch_bf16,
+    tile_counts,
 };
 
 /// `head_dim` 512 has no MMA kernel on AMD.
@@ -31,6 +34,20 @@ const HEAD_DIMS: [usize; 3] = [64, 128, 256];
 /// one aligned one.
 const SEQS: [usize; 2] = [231, 256];
 const DTYPES: [DType; 2] = [DType::BF16, DType::F16];
+/// The default layout, a second batch element, and twice the heads.
+const LAYOUTS: [Layout; 3] = [
+    Layout::DEFAULT,
+    Layout {
+        batch: 2,
+        hq: HQ,
+        hkv: HKV,
+    },
+    Layout {
+        batch: 1,
+        hq: 2 * HQ,
+        hkv: 2 * HKV,
+    },
+];
 
 ///// Tests ///////////////////////////////////////////////////////////////
 
@@ -52,6 +69,41 @@ fn forced_grids_match_plain_launch_causal_with_mask() {
 #[test]
 fn forced_grids_match_plain_launch_full() {
     run_forced_grids(Mode::Full);
+}
+
+// Every tile is computed exactly once whatever order the blocks take
+// them in. One block per tile, forced heavy-first and forced stream-K
+// order, give the same bits for every mode, layout, dtype, head_dim and
+// length. The bits cannot show which order ran, only that neither skips
+// or repeats a tile.
+#[test]
+fn heavy_first_order_matches_stream_k_order_bitwise() {
+    let gpu = test_gpu_device();
+    let modes = [
+        Mode::Causal,
+        Mode::CausalWithMask,
+        Mode::Full,
+        Mode::FullWithKvMax,
+    ];
+    for (mode, layout) in modes.into_iter().flat_map(|m| LAYOUTS.map(|l| (m, l))) {
+        for dtype in DTYPES {
+            for d in HEAD_DIMS {
+                for seq in SEQS {
+                    let case = Case::with_layout(dtype, d, seq, mode, layout, &gpu);
+                    let ordered = |heavy_first| {
+                        case.run_with(LaunchOverride {
+                            grid: Some(case.ntiles),
+                            heavy_first: Some(heavy_first),
+                        })
+                    };
+                    assert!(
+                        bitwise_eq(&ordered(true), &ordered(false)),
+                        "{case:?}: heavy-first order differs from stream-K order"
+                    );
+                }
+            }
+        }
+    }
 }
 
 // At seq 231 the policy's own grid choice gives a correct, deterministic
@@ -126,6 +178,28 @@ enum Mode {
     CausalWithMask,
     /// An all-zero mask, no `KV_max`.
     Full,
+    /// An all-zero mask plus a `KV_max` that is the same for every tile.
+    FullWithKvMax,
+}
+
+/// The batch size and head counts of a case.
+#[derive(Debug, Clone, Copy)]
+struct Layout {
+    /// Batch size.
+    batch: usize,
+    /// Number of Q heads.
+    hq: usize,
+    /// Number of KV heads.
+    hkv: usize,
+}
+
+impl Layout {
+    /// Batch 1 with the long-sequence head counts.
+    const DEFAULT: Self = Self {
+        batch: 1,
+        hq: HQ,
+        hkv: HKV,
+    };
 }
 
 /// Runs every forced grid of [`forced_grids`] for every dtype, `head_dim`
@@ -156,7 +230,17 @@ fn run_forced_grids(mode: Mode) {
                         bitwise_eq(&got, &case.run(Some(grid))),
                         "{case:?} {what}: not deterministic"
                     );
-                    let cmp = compare(&got, &plain, HQ, d, tolerance(dtype));
+                    // The kernel must keep the stream-K order on a split
+                    // grid, whatever order the host asks for.
+                    let heavy_first = case.run_with(LaunchOverride {
+                        grid: Some(grid),
+                        heavy_first: Some(true),
+                    });
+                    assert!(
+                        bitwise_eq(&got, &heavy_first),
+                        "{case:?} {what}: heavy-first changed a split grid"
+                    );
+                    let cmp = compare(&got, &plain, case.layout.hq, d, tolerance(dtype));
                     assert!(
                         cmp.failures.is_empty(),
                         "{case:?} {what}: {} rows off the plain launch, max err {:.2e}",
@@ -201,13 +285,14 @@ fn max_seams_in_a_tile(total: usize, grid: usize, iter_k: usize) -> usize {
     per_tile.into_iter().max().unwrap_or(0)
 }
 
-/// One dtype, `head_dim`, length and [`Mode`], with the launch inputs
-/// prepared the way the public entries prepare them.
+/// One dtype, `head_dim`, length, [`Mode`] and [`Layout`], with the launch
+/// inputs prepared the way the public entries prepare them.
 struct Case {
     dtype: DType,
     d: usize,
     seq: usize,
     mode: Mode,
+    layout: Layout,
     q: Tensor,
     /// Padded for GQA batching where the entries pad.
     k: Tensor,
@@ -227,11 +312,14 @@ impl std::fmt::Debug for Case {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{:?} hd{} seq={} {:?} ncols=({}, {}) ntiles={} iter_k={}",
+            "{:?} hd{} seq={} {:?} b{} {}Q/{}KV ncols=({}, {}) ntiles={} iter_k={}",
             self.dtype,
             self.d,
             self.seq,
             self.mode,
+            self.layout.batch,
+            self.layout.hq,
+            self.layout.hkv,
             self.ncols1,
             self.ncols2,
             self.ntiles,
@@ -241,35 +329,58 @@ impl std::fmt::Debug for Case {
 }
 
 impl Case {
+    /// [`Case::with_layout`] with [`Layout::DEFAULT`].
+    fn new(dtype: DType, d: usize, seq: usize, mode: Mode, gpu: &Device) -> Self {
+        Self::with_layout(dtype, d, seq, mode, Layout::DEFAULT, gpu)
+    }
+
     /// Builds Spike-distribution inputs (a running max that moves deep into
     /// the KV loop) and the reference.
     ///
     /// # Panics
     ///
-    /// If no MMA kernel covers the shape.
+    /// If no MMA kernel covers the shape, or `layout` does not keep the
+    /// long-sequence GQA ratio.
     #[allow(clippy::too_many_lines)] // one case's worth of setup, not separable
-    fn new(dtype: DType, d: usize, seq: usize, mode: Mode, gpu: &Device) -> Self {
+    fn with_layout(
+        dtype: DType,
+        d: usize,
+        seq: usize,
+        mode: Mode,
+        layout: Layout,
+        gpu: &Device,
+    ) -> Self {
+        let Layout { batch, hq, hkv } = layout;
+        // long_seq_inputs is fixed at HQ Q and HKV KV heads. With the same
+        // ratio, seq * batch * hq / HQ of its rows hold exactly batch
+        // elements of seq rows of hq and hkv heads.
+        assert!(
+            (batch * hq).is_multiple_of(HQ) && hq * HKV == hkv * HQ,
+            "{layout:?}: not a multiple of {HQ}Q/{HKV}KV"
+        );
         let bf16 = dtype == DType::BF16;
         let is_amd = is_amd_backend();
-        let gqa_ratio = HQ / HKV;
+        let gqa_ratio = hq / hkv;
         // head_dim is at most 512, exact in an f32.
         #[allow(clippy::cast_precision_loss)]
         let scale = (d as f32).sqrt().recip();
         let [q_host, k_host, v_host] =
-            long_seq_inputs(seq, d, LongSeqDist::Spike, 0).map(|h| round_to(h, dtype));
-        let bshd = |h: &[f32], heads| Tensor::from_slice(h, (1, seq, heads, d), gpu).unwrap();
-        let q = bshd(&q_host, HQ).to_dtype(dtype).unwrap();
-        let k = bshd(&k_host, HKV).to_dtype(dtype).unwrap();
-        let v = bshd(&v_host, HKV).to_dtype(dtype).unwrap();
-        let mask_mode = if mode == Mode::Full {
+            long_seq_inputs(seq * batch * hq / HQ, d, LongSeqDist::Spike, 0)
+                .map(|h| round_to(h, dtype));
+        let bshd = |h: &[f32], heads| Tensor::from_slice(h, (batch, seq, heads, d), gpu).unwrap();
+        let q = bshd(&q_host, hq).to_dtype(dtype).unwrap();
+        let k = bshd(&k_host, hkv).to_dtype(dtype).unwrap();
+        let v = bshd(&v_host, hkv).to_dtype(dtype).unwrap();
+        let full = matches!(mode, Mode::Full | Mode::FullWithKvMax);
+        let mask_mode = if full {
             MaskMode::Full
         } else {
             MaskMode::Causal
         };
         let want = naive_attention(
-            &bshd(&scaled_q(&q_host, scale, dtype), HQ),
-            &bshd(&k_host, HKV),
-            &bshd(&v_host, HKV),
+            &bshd(&scaled_q(&q_host, scale, dtype), hq),
+            &bshd(&k_host, hkv),
+            &bshd(&v_host, hkv),
             1.0,
             mask_mode,
             0,
@@ -279,8 +390,8 @@ impl Case {
 
         let (k, v, mask) = match mode {
             Mode::Causal => (k, v, None),
-            Mode::CausalWithMask | Mode::Full => {
-                let mask = if mode == Mode::Full {
+            Mode::CausalWithMask | Mode::Full | Mode::FullWithKvMax => {
+                let mask = if full {
                     Tensor::zeros((1, 1, seq, seq), DType::F16, gpu).unwrap()
                 } else {
                     build_additive_mask_f16(seq, seq, 0, None, 0, gpu).unwrap()
@@ -305,19 +416,25 @@ impl Case {
         let shape = LaunchShape {
             seq_q: seq,
             seq_kv,
-            h_kv: HKV,
-            batch: 1,
+            h_kv: hkv,
+            batch,
             gqa_ratio,
         };
         let (ntiles, iter_k) = tile_counts(&cfg, ncols1, ncols2, &shape).unwrap();
-        let kv_max = (mode == Mode::CausalWithMask).then(|| {
+        let window_right = match mode {
+            Mode::CausalWithMask => Some(0),
+            // Reaching past seq_kv clamps every tile's bound to the cap.
+            Mode::FullWithKvMax => Some(seq_kv),
+            Mode::Causal | Mode::Full => None,
+        };
+        let kv_max = window_right.map(|window_right| {
             build_analytic_kv_max(
-                1,
+                batch,
                 seq,
                 ncols1,
                 0,
                 seq_kv,
-                0,
+                window_right,
                 seq_kv.next_multiple_of(FATTN_KQ_STRIDE),
                 gpu,
             )
@@ -328,6 +445,7 @@ impl Case {
             d,
             seq,
             mode,
+            layout,
             q,
             k,
             v,
@@ -345,12 +463,21 @@ impl Case {
     /// Launches with `grid` blocks, or the policy's grid for `None`, and
     /// returns the output on the host.
     fn run(&self, grid: Option<usize>) -> Vec<f32> {
+        self.run_with(LaunchOverride {
+            grid,
+            heavy_first: None,
+        })
+    }
+
+    /// Launches with the launch policy overridden by `forced`, and returns
+    /// the output on the host.
+    fn run_with(&self, forced: LaunchOverride) -> Vec<f32> {
         // The allocator hands the next launch the block freed last. Fill a
         // block of the output's size with NaN and free it, so a launch that
         // leaves part of its output unwritten cannot pass on the stale
         // result of an earlier run.
         drop(
-            Tensor::full(f32::NAN, (1, self.seq, HQ, self.d), self.q.device())
+            Tensor::full(f32::NAN, self.q.shape(), self.q.device())
                 .and_then(|t| t.to_dtype(self.dtype))
                 .unwrap(),
         );
@@ -368,15 +495,21 @@ impl Case {
             self.kv_max.as_ref(),
             self.scale,
             offset,
-            grid,
+            forced,
         )
-        .unwrap_or_else(|e| panic!("{self:?} grid {grid:?}: {e}"));
+        .unwrap_or_else(|e| panic!("{self:?} {forced:?}: {e}"));
         to_host(&out)
     }
 
     /// Asserts `got` is within the long-sequence tolerance of the reference.
     fn check(&self, got: &[f32], what: &str) {
-        let cmp = compare(got, &self.want, HQ, self.d, tolerance(self.dtype));
+        let cmp = compare(
+            got,
+            &self.want,
+            self.layout.hq,
+            self.d,
+            tolerance(self.dtype),
+        );
         assert!(
             cmp.failures.is_empty(),
             "{self:?} {what}: {} rows off the reference, max err {:.2e}",

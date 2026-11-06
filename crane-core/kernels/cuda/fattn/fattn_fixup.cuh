@@ -26,6 +26,26 @@
 
 #include "fattn_common.cuh"
 
+// The [kbc, kbc_stop) range of (tile, KV block) units this block walks, for
+// `nheads` tiles per Q tile index `jt`. With `heavy_first` and one block
+// per tile, it hands out the heaviest tiles first, with `jt` falling and
+// heads changing fastest, the order CK uses. The light tiles then fill the
+// last wave. That gain assumes blocks start in ascending `blockIdx.x`, which
+// neither CUDA nor HIP guarantees. The output does not depend on it. The
+// host decides `heavy_first` (`fattn_mma.rs`). Split grids keep the stream-K
+// order whatever it says, because the fixup's block slots depend on it.
+static __device__ __forceinline__ int2 crane_fattn_block_kbc_range(
+        const int iter_k, const int iter_j, const int nheads, const bool heavy_first) {
+    const int ntiles = iter_j*nheads;
+    if (heavy_first && gridDim.x == unsigned(ntiles)) {
+        const int b    = blockIdx.x;
+        const int tile = (b % nheads)*iter_j + (iter_j - 1 - b / nheads);
+        return make_int2(tile*iter_k, (tile + 1)*iter_k);
+    }
+    return make_int2(int(int64_t(blockIdx.x + 0)*(iter_k*ntiles) / gridDim.x),
+                     int(int64_t(blockIdx.x + 1)*(iter_k*ntiles) / gridDim.x));
+}
+
 // Writes a partial that drops out of the merge: the kernels' initial KQ max,
 // a zero row sum and a zero accumulator. For a segment whose KV range lies
 // wholly past the causal bound, which never runs the tile loop.
