@@ -1215,6 +1215,10 @@ impl InferenceEngine {
         }
 
         if interleave && processed < prompt_len {
+            // The chunk is only queued; wait for the GPU so its time is counted here.
+            if let Err(e) = self.model.device().synchronize() {
+                warn!("device sync after prefill chunk failed: {e}");
+            }
             #[allow(clippy::cast_possible_truncation)]
             let chunk_us = t0.elapsed().as_micros() as u64;
             self.stats
