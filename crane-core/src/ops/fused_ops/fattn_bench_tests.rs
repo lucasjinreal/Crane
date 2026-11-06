@@ -38,7 +38,7 @@ use super::super::fattn::test_support::{
 };
 use super::long_seq_tests::{SEQS, round_to};
 use super::{
-    fattn_mma_bf16_causal, fattn_mma_bf16_causal_with_mask, fattn_mma_causal,
+    LaunchOverride, fattn_mma_bf16_causal, fattn_mma_bf16_causal_with_mask, fattn_mma_causal,
     fattn_mma_causal_with_mask, prefill_dispatch, prefill_dispatch_bf16,
 };
 use crate::models::qwen3_5::grouped_sdpa;
@@ -57,6 +57,11 @@ const COLUMNS: [&str; 5] = ["mma", "mma_mask", "sdpa", "ck", "fa2_split"];
 const GQA_SHAPES: [(usize, usize, usize); 2] = [(8, 2, 256), (32, 8, 128)];
 /// From under one wave of tiles up to long-context prefill.
 const GQA_SEQS: [usize; 6] = [512, 1024, 4096, 8192, 16384, 32768];
+/// Lengths of [`fattn_bench_tile_order`]. For both GQA shapes and batch
+/// sizes they reach past [`super::HEAVY_FIRST_MAX_TILES`].
+const TILE_ORDER_SEQS: [usize; 5] = [1024, 2048, 4096, 8192, 16384];
+/// Timed batches per cell of [`fattn_bench_tile_order`].
+const TILE_ORDER_BATCHES: usize = 9;
 
 ///// Tests ///////////////////////////////////////////////////////////////
 
@@ -84,6 +89,24 @@ fn fattn_bench_gqa_shapes() {
     let mut failures = 0;
     for (hq, hkv, d) in GQA_SHAPES {
         failures += bench_gqa_shape(&gpu, hq, hkv, d);
+    }
+    assert_eq!(failures, 0, "{failures} cell(s) failed, see stderr");
+}
+
+// Prints, for every shape in `GQA_SHAPES` at batch 1 and 2, the µs per
+// call of a one-block-per-tile in-kernel causal launch in each tile order:
+// stream-K and heavy-first. Rows show the tile count, so the
+// `HEAVY_FIRST_MAX_TILES` cutoff can be checked on any GPU.
+#[test]
+#[ignore = "needs a CUDA/ROCm GPU, long-running"]
+fn fattn_bench_tile_order() {
+    let gpu = test_gpu_device();
+    warm_up(&gpu).unwrap();
+    let mut failures = 0;
+    for (hq, hkv, d) in GQA_SHAPES {
+        for batch in [1, 2] {
+            failures += bench_tile_order(&gpu, hq, hkv, d, batch);
+        }
     }
     assert_eq!(failures, 0, "{failures} cell(s) failed, see stderr");
 }
@@ -127,11 +150,15 @@ fn forced_grid_split_vs_no_split_hd256() {
                 eprintln!(
                     "[fattn_grid_trace] seq={seq} bf16={bf16} mode={mode} ntiles={ntiles} ---"
                 );
+                let forced = LaunchOverride {
+                    grid: forced_grid,
+                    heavy_first: None,
+                };
                 let dispatch_once = || {
                     if bf16 {
-                        prefill_dispatch_bf16(&q, &k, &v, None, None, scale, Some(0), forced_grid)
+                        prefill_dispatch_bf16(&q, &k, &v, None, None, scale, Some(0), forced)
                     } else {
-                        prefill_dispatch(&q, &k, &v, None, None, scale, Some(0), forced_grid)
+                        prefill_dispatch(&q, &k, &v, None, None, scale, Some(0), forced)
                     }
                     .unwrap()
                 };
@@ -335,6 +362,77 @@ fn bench_gqa_shape(gpu: &Device, hq: usize, hkv: usize, d: usize) -> usize {
     failures
 }
 
+/// Prints one table of µs per call for `hq` Q heads, `hkv` KV heads, head
+/// dim `d` and `batch`, one row per dtype and length in
+/// [`TILE_ORDER_SEQS`]. Columns are the stream-K order and heavy-first.
+///
+/// Returns the number of failed cells, each reported on stderr.
+fn bench_tile_order(gpu: &Device, hq: usize, hkv: usize, d: usize, batch: usize) -> usize {
+    assert!(
+        hq.is_multiple_of(HQ) && hq * HKV == hkv * HQ,
+        "{hq}Q/{hkv}KV: not a multiple of {HQ}Q/{HKV}KV"
+    );
+    let gqa_ratio = hq / hkv;
+    let is_amd = is_amd_backend();
+    // head_dim is at most 512, exact in an f32.
+    #[allow(clippy::cast_precision_loss)]
+    let scale = (d as f32).sqrt().recip();
+    println!("{hq}Q/{hkv}KV hd{d} batch {batch}, us per call");
+    println!(
+        "{:>6}{:>7}{:>7}{:>11}{:>12}",
+        "dtype", "seq", "tiles", "stream_k", "heavy_first"
+    );
+    let mut failures = 0;
+    for seq in TILE_ORDER_SEQS {
+        let rows = seq * batch * hq / HQ;
+        let [q_host, k_host, v_host] = long_seq_inputs(rows, d, LongSeqDist::Normal, 0);
+        let bshd =
+            |host: &[f32], heads| Tensor::from_slice(host, (batch, seq, heads, d), gpu).unwrap();
+        let (q32, k32, v32) = (bshd(&q_host, hq), bshd(&k_host, hkv), bshd(&v_host, hkv));
+        // Fewer calls at long lengths, where one call already takes long.
+        let calls = u32::try_from(2048 * 50 / (seq * batch))
+            .unwrap()
+            .clamp(3, CALLS);
+        for dtype in [DType::F16, DType::BF16] {
+            let bf16 = dtype == DType::BF16;
+            let select = if bf16 {
+                select_mma_ncols_bf16
+            } else {
+                select_mma_ncols
+            };
+            let Some((ncols1, ncols2)) = select(d, gqa_ratio, seq, is_amd) else {
+                continue;
+            };
+            let ntiles = q_tiles(seq, ncols1) * gqa_z_tiles(gqa_ratio, ncols2) * hkv * batch;
+            let [q, k, v] = [&q32, &k32, &v32].map(|src| src.to_dtype(dtype).unwrap());
+            print!("{:>6}{seq:>7}{ntiles:>7}", format!("{dtype:?}"));
+            for heavy_first in [false, true] {
+                let forced = LaunchOverride {
+                    grid: Some(ntiles),
+                    heavy_first: Some(heavy_first),
+                };
+                let timed = time_us_with(gpu, TILE_ORDER_BATCHES, calls, || {
+                    if bf16 {
+                        prefill_dispatch_bf16(&q, &k, &v, None, None, scale, Some(0), forced)
+                    } else {
+                        prefill_dispatch(&q, &k, &v, None, None, scale, Some(0), forced)
+                    }
+                });
+                match timed {
+                    Ok(us) => print!("{us:>12.1}"),
+                    Err(err) => {
+                        failures += 1;
+                        eprintln!("{dtype:?} seq={seq} heavy_first={heavy_first}: {err}");
+                        print!("{:>12}", "err");
+                    },
+                }
+            }
+            println!();
+        }
+    }
+    failures
+}
+
 /// Keeps the GPU busy with large matmuls for [`WARM_UP`]. A GPU coming out
 /// of idle runs at low clocks for a while, and without this the first timed
 /// row is inflated in every column.
@@ -354,7 +452,16 @@ fn warm_up(gpu: &Device) -> Result<()> {
     Ok(())
 }
 
-/// Median µs per call of `f`, over [`BATCHES`] batches of [`CALLS`]
+/// [`time_us_with`] over [`BATCHES`] batches of [`CALLS`] calls.
+///
+/// # Errors
+///
+/// As [`time_us_with`].
+fn time_us(gpu: &Device, f: impl FnMut() -> Result<Tensor>) -> Result<f64> {
+    time_us_with(gpu, BATCHES, CALLS, f)
+}
+
+/// Median µs per call of `f`, over `batches` batches of `calls`
 /// back-to-back calls with one device sync per batch. One untimed batch
 /// first absorbs JIT compilation and allocator growth.
 ///
@@ -362,23 +469,28 @@ fn warm_up(gpu: &Device) -> Result<()> {
 ///
 /// Returns the first error of `f` or of a device sync. Also returns an
 /// error if the first output, checked once before timing, is not finite.
-fn time_us(gpu: &Device, mut f: impl FnMut() -> Result<Tensor>) -> Result<f64> {
+fn time_us_with(
+    gpu: &Device,
+    batches: usize,
+    calls: u32,
+    mut f: impl FnMut() -> Result<Tensor>,
+) -> Result<f64> {
     let sum = f()?.to_dtype(DType::F32)?.sum_all()?.to_scalar::<f32>()?;
     if !sum.is_finite() {
         candle_core::bail!("non-finite output, sum {sum}");
     }
     let mut batch = || -> Result<()> {
-        for _ in 0..CALLS {
+        for _ in 0..calls {
             std::hint::black_box(f()?);
         }
         gpu.synchronize()
     };
     batch()?;
-    let mut per_call = [0f64; BATCHES];
+    let mut per_call = vec![0f64; batches];
     for t in &mut per_call {
         let start = Instant::now();
         batch()?;
-        *t = start.elapsed().as_secs_f64() * 1e6 / f64::from(CALLS);
+        *t = start.elapsed().as_secs_f64() * 1e6 / f64::from(calls);
     }
     Ok(median(&mut per_call))
 }

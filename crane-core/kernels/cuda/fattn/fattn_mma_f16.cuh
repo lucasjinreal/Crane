@@ -1907,7 +1907,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16(
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
                             const int32_t nb31, const int32_t nb32, const int64_t nb33,
-                            const int32_t causal_kv_offset) {
+                            const int32_t causal_kv_offset,
+                            const int32_t heavy_first) {
     ggml_cuda_pdl_sync(); // TODO optimize placement
 #if defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE))
     const char * GGML_CUDA_RESTRICT Q              = Q_ptr;
@@ -1982,8 +1983,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16(
     const int iter_z_gqa = (gqa_ratio + (ncols2    - 1)) / ncols2;
 
     // kbc == k block continuous, current index in continuous ijk space.
-    int       kbc      = int64_t(blockIdx.x + 0)*(iter_k*iter_j*iter_z_gqa*ne12*ne03) / gridDim.x;
-    const int kbc_stop = int64_t(blockIdx.x + 1)*(iter_k*iter_j*iter_z_gqa*ne12*ne03) / gridDim.x;
+    const int2 kbc_range = crane_fattn_block_kbc_range(
+        iter_k, iter_j, iter_z_gqa*ne12*ne03, heavy_first != 0);
+    int       kbc      = kbc_range.x;
+    const int kbc_stop = kbc_range.y;
 
     // If the seams of 2 CUDA blocks fall within an output tile their results need to be combined.
     // For this we need to track both the block that starts the tile (needs_fixup) and the block that finishes the tile (is_fixup).
@@ -2097,7 +2100,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16(
               nb11, nb12, nb13,
               nb21, nb22, nb23,
               ne31, ne32, ne33,
-              nb31, nb32, nb33, causal_kv_offset);
+              nb31, nb32, nb33, causal_kv_offset, heavy_first);
     NO_DEVICE_CODE;
 #endif // defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE))
 }
@@ -2120,7 +2123,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16(
         int32_t nb21, int32_t nb22, int64_t nb23,                                                       \
         int32_t ne31, int32_t ne32, int32_t ne33,                                                       \
         int32_t nb31, int32_t nb32, int64_t nb33,                                                       \
-        int32_t causal_kv_offset)                                                                       \
+        int32_t causal_kv_offset, int32_t heavy_first)                                                  \
     {                                                                                                    \
         flash_attn_ext_f16<DKQ_, DV_, ncols1_, ncols2_, false, false, false, false>(                    \
             Q, K, V, mask, sinks, KV_max, dst, dst_meta,                                                \
@@ -2128,7 +2131,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16(
             ne00, ne01, ne02, ne03, nb01, nb02, nb03,                                                    \
             ne10, ne11, ne12, ne13, nb11, nb12, nb13,                                                    \
             nb21, nb22, nb23, ne31, ne32, ne33, nb31, nb32, nb33,                                        \
-            causal_kv_offset);                                                                          \
+            causal_kv_offset, heavy_first);                                                             \
     }                                                                                                    \
     DECL_CRANE_FATTN_FIXUP(f16, half, DV_, ncols1_, ncols2_)
 
@@ -2163,7 +2166,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16(
         int32_t nb21, int32_t nb22, int64_t nb23,                                                       \
         int32_t ne31, int32_t ne32, int32_t ne33,                                                       \
         int32_t nb31, int32_t nb32, int64_t nb33,                                                       \
-        int32_t causal_kv_offset)                                                                       \
+        int32_t causal_kv_offset, int32_t heavy_first)                                                  \
     {                                                                                                    \
         flash_attn_ext_f16<DKQ_, DV_, ncols1_, ncols2_, false, false, false, true>(                    \
             Q, K, V, mask, sinks, KV_max, dst, dst_meta,                                                \
@@ -2171,5 +2174,5 @@ static __device__ __forceinline__ void flash_attn_ext_f16(
             ne00, ne01, ne02, ne03, nb01, nb02, nb03,                                                    \
             ne10, ne11, ne12, ne13, nb11, nb12, nb13,                                                    \
             nb21, nb22, nb23, ne31, ne32, ne33, nb31, nb32, nb33,                                        \
-            causal_kv_offset);                                                                          \
+            causal_kv_offset, heavy_first);                                                             \
     }
