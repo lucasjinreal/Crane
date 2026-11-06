@@ -5,6 +5,8 @@
 //! heads, `head_dim` 256, at the long-sequence lengths. Timings are not
 //! asserted. A column that errors or returns a non-finite output prints
 //! `err` and fails the test once the table is complete.
+//! `fattn_bench_gqa_shapes` times only the in-kernel causal entries, at the
+//! GQA shapes of Qwen3.5-0.8B and Qwen3-4B up to 32k.
 //!
 //! Inputs are prepared once per length. Each table starts after a short
 //! warm-up, so the first row isn't measured while the GPU is still leaving
@@ -40,7 +42,9 @@ use super::{
     fattn_mma_causal_with_mask, prefill_dispatch, prefill_dispatch_bf16,
 };
 use crate::models::qwen3_5::grouped_sdpa;
-use crate::ops::fused_ops::fattn::{gqa_z_tiles, q_tiles, select_mma_ncols, select_mma_ncols_bf16};
+use crate::ops::fused_ops::fattn::{
+    gqa_z_tiles, is_amd_backend, q_tiles, select_mma_ncols, select_mma_ncols_bf16,
+};
 
 const HEAD_DIM: usize = 256;
 const BATCHES: usize = 20;
@@ -49,6 +53,10 @@ const CALLS: u32 = 50;
 const WARM_UP: Duration = Duration::from_secs(1);
 /// Table columns, in the order [`bench_table`] fills each row.
 const COLUMNS: [&str; 5] = ["mma", "mma_mask", "sdpa", "ck", "fa2_split"];
+/// `(Q heads, KV heads, head_dim)` of Qwen3.5-0.8B and Qwen3-4B.
+const GQA_SHAPES: [(usize, usize, usize); 2] = [(8, 2, 256), (32, 8, 128)];
+/// From under one wave of tiles up to long-context prefill.
+const GQA_SEQS: [usize; 6] = [512, 1024, 4096, 8192, 16384, 32768];
 
 ///// Tests ///////////////////////////////////////////////////////////////
 
@@ -64,6 +72,20 @@ fn fattn_bench_bf16_hd256() {
 #[ignore = "needs a CUDA/ROCm GPU, long-running"]
 fn fattn_bench_f16_hd256() {
     bench_table(DType::F16);
+}
+
+// Prints the in-kernel causal timing table of every shape in
+// `GQA_SHAPES`, with each launch's tile count.
+#[test]
+#[ignore = "needs a CUDA/ROCm GPU, long-running"]
+fn fattn_bench_gqa_shapes() {
+    let gpu = test_gpu_device();
+    warm_up(&gpu).unwrap();
+    let mut failures = 0;
+    for (hq, hkv, d) in GQA_SHAPES {
+        failures += bench_gqa_shape(&gpu, hq, hkv, d);
+    }
+    assert_eq!(failures, 0, "{failures} cell(s) failed, see stderr");
 }
 
 // Compares today's auto-selected stream-K grid against a forced
@@ -248,6 +270,69 @@ fn bench_table(dtype: DType) {
         println!();
     }
     assert_eq!(failures, 0, "{failures} column(s) failed, see stderr");
+}
+
+/// Prints one table of µs per call of the in-kernel causal entries for
+/// `hq` Q heads, `hkv` KV heads and head dim `d`, one row per length in
+/// [`GQA_SEQS`]. A dtype with no kernel variant prints `-`.
+///
+/// Returns the number of failed cells, each reported on stderr.
+fn bench_gqa_shape(gpu: &Device, hq: usize, hkv: usize, d: usize) -> usize {
+    // long_seq_inputs is fixed at HQ Q and HKV KV heads. With the same
+    // ratio, seq * hq / HQ of its rows hold exactly seq rows of hq and hkv
+    // heads.
+    assert!(
+        hq.is_multiple_of(HQ) && hq * HKV == hkv * HQ,
+        "{hq}Q/{hkv}KV: not a multiple of {HQ}Q/{HKV}KV"
+    );
+    let gqa_ratio = hq / hkv;
+    let is_amd = is_amd_backend();
+    // head_dim is at most 512, exact in an f32.
+    #[allow(clippy::cast_precision_loss)]
+    let scale = (d as f32).sqrt().recip();
+    println!("{hq}Q/{hkv}KV hd{d}, us per call");
+    println!(
+        "{:>6}{:>10}{:>11}{:>10}{:>11}",
+        "seq", "f16 tiles", "f16", "bf16 tiles", "bf16"
+    );
+    let mut failures = 0;
+    for seq in GQA_SEQS {
+        let [q_host, k_host, v_host] = long_seq_inputs(seq * hq / HQ, d, LongSeqDist::Normal, 0);
+        let bshd = |host: &[f32], heads| Tensor::from_slice(host, (1, seq, heads, d), gpu).unwrap();
+        let (q32, k32, v32) = (bshd(&q_host, hq), bshd(&k_host, hkv), bshd(&v_host, hkv));
+        print!("{seq:>6}");
+        for dtype in [DType::F16, DType::BF16] {
+            let bf16 = dtype == DType::BF16;
+            let select = if bf16 {
+                select_mma_ncols_bf16
+            } else {
+                select_mma_ncols
+            };
+            let Some((ncols1, ncols2)) = select(d, gqa_ratio, seq, is_amd) else {
+                print!("{:>10}{:>11}", "-", "-");
+                continue;
+            };
+            let ntiles = q_tiles(seq, ncols1) * gqa_z_tiles(gqa_ratio, ncols2) * hkv;
+            let [q, k, v] = [&q32, &k32, &v32].map(|src| src.to_dtype(dtype).unwrap());
+            let timed = time_us(gpu, || {
+                if bf16 {
+                    fattn_mma_bf16_causal(&q, &k, &v, scale, 0)
+                } else {
+                    fattn_mma_causal(&q, &k, &v, scale, 0)
+                }
+            });
+            match timed {
+                Ok(us) => print!("{ntiles:>10}{us:>11.1}"),
+                Err(err) => {
+                    failures += 1;
+                    eprintln!("{hq}Q/{hkv}KV hd{d} {dtype:?} seq={seq}: {err}");
+                    print!("{ntiles:>10}{:>11}", "err");
+                },
+            }
+        }
+        println!();
+    }
+    failures
 }
 
 /// Keeps the GPU busy with large matmuls for [`WARM_UP`]. A GPU coming out
