@@ -13,8 +13,8 @@ use candle_core::{DType, Device, Tensor};
 
 use super::long_seq_tests::{DISTS, SEEDS_PER_DIST, SEQS, round_to, to_host};
 use super::{
-    fattn_mma_bf16_causal, fattn_mma_bf16_full, fattn_mma_bf16_windowed, fattn_mma_causal,
-    fattn_mma_full, fattn_mma_windowed,
+    LaunchOverride, fattn_mma_bf16_causal, fattn_mma_bf16_full, fattn_mma_bf16_windowed,
+    fattn_mma_causal, fattn_mma_full, fattn_mma_windowed, prefill_dispatch, prefill_dispatch_bf16,
 };
 use crate::ops::fused_ops::fattn::is_amd_backend;
 use crate::ops::fused_ops::fattn::test_support::{
@@ -177,6 +177,9 @@ enum Variant {
     /// Causal with each KV head repeated twice, a GQA ratio of 2. Ratio 1
     /// has no kernel on AMD.
     Gqa2,
+    /// Plain causal on the long-KV kernel set of the RDNA hd256 64-column
+    /// tile, forced at every length. Only exists for `head_dim` 256 on `ROCm`.
+    LongKv,
 }
 
 impl Variant {
@@ -191,6 +194,7 @@ impl Variant {
             Self::Windowed => " windowed",
             Self::Full => " full",
             Self::Gqa2 => " gqa2",
+            Self::LongKv => " longkv",
         }
     }
 }
@@ -199,9 +203,14 @@ impl Variant {
 fn compute_all(gpu: &Device) -> BTreeMap<String, u64> {
     let mut out = BTreeMap::new();
     for head_dim in HEAD_DIMS {
+        let sweep: &[Variant] = if head_dim == 256 && is_amd_backend() {
+            &[Variant::Causal, Variant::LongKv]
+        } else {
+            &[Variant::Causal]
+        };
         for seq in SEQS {
             for (seed, dist) in seeds(SEEDS_PER_DIST) {
-                hash_cases(gpu, &mut out, &[Variant::Causal], head_dim, seq, dist, seed);
+                hash_cases(gpu, &mut out, sweep, head_dim, seq, dist, seed);
             }
         }
         for seq in VARIANT_SEQS {
@@ -288,6 +297,18 @@ fn run_variant(
         Variant::Windowed => fattn_mma_windowed(&q, &k, &v, scale, 0, WINDOW_LEFT, 0),
         Variant::Full if bf16 => fattn_mma_bf16_full(&q, &k, &v, scale),
         Variant::Full => fattn_mma_full(&q, &k, &v, scale),
+        Variant::LongKv => {
+            let forced = LaunchOverride {
+                long_kv: Some(true),
+                ..LaunchOverride::NONE
+            };
+            let dispatch = if bf16 {
+                prefill_dispatch_bf16
+            } else {
+                prefill_dispatch
+            };
+            dispatch(&q, &k, &v, None, None, scale, Some(0), forced)
+        },
     };
     out.unwrap()
 }

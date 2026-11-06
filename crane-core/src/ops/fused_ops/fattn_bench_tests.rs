@@ -45,6 +45,8 @@ use super::{
     use_heavy_first,
 };
 use crate::models::qwen3_5::grouped_sdpa;
+#[cfg(all(feature = "rocm", not(feature = "cuda")))]
+use crate::ops::fused_ops::fattn::{MmaConfigSet, mma_config_set};
 use crate::ops::fused_ops::fattn::{
     gqa_z_tiles, is_amd_backend, q_tiles, select_mma_ncols, select_mma_ncols_bf16,
 };
@@ -68,6 +70,21 @@ const GQA_SEQS: [usize; 10] = [
 const TILE_ORDER_SEQS: [usize; 5] = [1024, 2048, 4096, 8192, 16384];
 /// Timed batches per cell of [`fattn_bench_tile_order`].
 const TILE_ORDER_BATCHES: usize = 9;
+/// `(Q heads, KV heads)` at `head_dim` 256 of Qwen3.5-0.8B,
+/// Ornith-1.5-35B-A3B and Qwen3.5-4B. Each resolves to a different
+/// 64-column tile.
+const LONG_KV_SHAPES: [(usize, usize); 3] = [(8, 2), (16, 2), (16, 4)];
+/// KV lengths around the long-KV crossover.
+const LONG_KV_SEQS: [usize; 11] = [
+    2048, 3072, 4096, 5120, 6144, 7168, 8192, 12288, 16384, 24576, 32768,
+];
+/// Query rows of the chunked-prefill table of
+/// `fattn_bench_long_kv_crossover`.
+const CHUNK_ROWS: usize = 2048;
+/// Other chunk sizes, timed at [`LONG_KV_BIG_SEQS`] only.
+const OTHER_CHUNK_ROWS: [usize; 5] = [512, 1024, 4096, 8192, 16384];
+/// KV lengths of the other chunk sizes, where K and V outgrow the cache.
+const LONG_KV_BIG_SEQS: [usize; 7] = [8192, 12288, 16384, 24576, 32768, 49152, 65536];
 /// Rounds of [`time_pair_us`], each timing one batch of every launch.
 const PAIR_ROUNDS: usize = 9;
 /// How long [`time_pair_us`] aims to make one batch, in µs.
@@ -121,6 +138,49 @@ fn fattn_bench_tile_order() {
     assert_eq!(failures, 0, "{failures} cell(s) failed, see stderr");
 }
 
+// Prints, for the hd256 shapes of `LONG_KV_SHAPES`, the in-kernel causal
+// timing of the default kernel set against the long-KV set, once with every
+// row a query row and once as the last `CHUNK_ROWS` rows of a longer
+// prefill. The second table shows whether the crossover follows `seq_kv`.
+#[cfg(all(feature = "rocm", not(feature = "cuda")))]
+#[test]
+#[ignore = "needs a ROCm GPU, long-running"]
+fn fattn_bench_long_kv_crossover() {
+    let gpu = test_gpu_device();
+    warm_up(&gpu).unwrap();
+    let mut failures = 0;
+    for chunk in [None, Some(CHUNK_ROWS)] {
+        for (hq, hkv) in LONG_KV_SHAPES {
+            failures += bench_long_kv_shape(&gpu, (hq, hkv), chunk, &LONG_KV_SEQS);
+        }
+    }
+    assert_eq!(failures, 0, "{failures} cell(s) failed, see stderr");
+}
+
+// As `fattn_bench_long_kv_crossover`, for the chunk sizes of
+// `OTHER_CHUNK_ROWS` at the KV lengths where K and V outgrow the cache.
+// `CRANE_LONG_KV_CHUNKS` (comma-separated rows) narrows the sizes.
+#[cfg(all(feature = "rocm", not(feature = "cuda")))]
+#[test]
+#[ignore = "needs a ROCm GPU, long-running"]
+fn fattn_bench_long_kv_chunks() {
+    let gpu = test_gpu_device();
+    warm_up(&gpu).unwrap();
+    let only: Option<Vec<usize>> = std::env::var("CRANE_LONG_KV_CHUNKS")
+        .ok()
+        .map(|v| v.split(',').map(|n| n.trim().parse().unwrap()).collect());
+    let mut failures = 0;
+    for rows in OTHER_CHUNK_ROWS {
+        if only.as_ref().is_some_and(|o| !o.contains(&rows)) {
+            continue;
+        }
+        for (hq, hkv) in LONG_KV_SHAPES {
+            failures += bench_long_kv_shape(&gpu, (hq, hkv), Some(rows), &LONG_KV_BIG_SEQS);
+        }
+    }
+    assert_eq!(failures, 0, "{failures} cell(s) failed, see stderr");
+}
+
 // Compares today's auto-selected stream-K grid against a forced
 // single-wave (one block per tile, no fixup) grid at the shapes stream-K
 // targets, printing a bitwise-match check between the two.
@@ -162,7 +222,7 @@ fn forced_grid_split_vs_no_split_hd256() {
                 );
                 let forced = LaunchOverride {
                     grid: forced_grid,
-                    heavy_first: None,
+                    ..LaunchOverride::NONE
                 };
                 let dispatch_once = || {
                     if bf16 {
@@ -351,8 +411,8 @@ fn bench_gqa_shape(gpu: &Device, hq: usize, hkv: usize, d: usize) -> usize {
             let (q, k, v) = (randn(hq), randn(hkv), randn(hkv));
             let launch = |heavy| {
                 let forced = LaunchOverride {
-                    grid: None,
                     heavy_first: Some(heavy),
+                    ..LaunchOverride::NONE
                 };
                 if bf16 {
                     prefill_dispatch_bf16(&q, &k, &v, None, None, scale, Some(0), forced)
@@ -429,6 +489,7 @@ fn bench_tile_order(gpu: &Device, hq: usize, hkv: usize, d: usize, batch: usize)
                 let forced = LaunchOverride {
                     grid: Some(ntiles),
                     heavy_first: Some(heavy_first),
+                    ..LaunchOverride::NONE
                 };
                 let timed = time_us_with(gpu, TILE_ORDER_BATCHES, calls, || {
                     if bf16 {
@@ -447,6 +508,86 @@ fn bench_tile_order(gpu: &Device, hq: usize, hkv: usize, d: usize, batch: usize)
                 }
             }
             println!();
+        }
+    }
+    failures
+}
+
+/// One `LONG_KV_SHAPES` table for both dtypes: default and long-KV set in
+/// alternating batches over `LONG_KV_SEQS`, and the set the policy picks.
+/// With `chunk`, only the last `chunk` rows of each length are queries.
+/// Returns the number of failed cells.
+#[cfg(all(feature = "rocm", not(feature = "cuda")))]
+fn bench_long_kv_shape(
+    gpu: &Device,
+    (hq, hkv): (usize, usize),
+    chunk: Option<usize>,
+    seqs: &[usize],
+) -> usize {
+    const D: usize = HEAD_DIM;
+    let gqa_ratio = hq / hkv;
+    // head_dim is exact in an f32.
+    #[allow(clippy::cast_precision_loss)]
+    let scale = (D as f32).sqrt().recip();
+    let mut failures = 0;
+    for dtype in [DType::F16, DType::BF16] {
+        let bf16 = dtype == DType::BF16;
+        let select = if bf16 {
+            select_mma_ncols_bf16
+        } else {
+            select_mma_ncols
+        };
+        let rows = chunk.map_or_else(|| "all rows".to_string(), |c| format!("{c} rows"));
+        println!("{hq}Q/{hkv}KV hd{D} {dtype:?}, {rows} as queries, us per call");
+        println!(
+            "{:>6}{:>8}{:>7}{:>8}{:>11}{:>11}{:>8}{:>9}",
+            "seq_kv", "ncols", "tiles", "kv_MiB", "default", "long_kv", "delta%", "policy"
+        );
+        for &seq_kv in seqs {
+            let seq_q = chunk.map_or(seq_kv, |c| c.min(seq_kv));
+            let Some((ncols1, ncols2)) = select(D, gqa_ratio, seq_q, true) else {
+                println!("{seq_kv:>6}{:>8}", "-");
+                continue;
+            };
+            let ncols = ncols1 * ncols2;
+            let ntiles = q_tiles(seq_q, ncols1) * gqa_z_tiles(gqa_ratio, ncols2) * hkv;
+            // K and V together, in MiB.
+            let kv_mib = (2 * seq_kv * hkv * D * dtype.size_in_bytes()) >> 20;
+            let randn = |rows, heads| {
+                Tensor::randn(0f32, 1f32, (1, rows, heads, D), gpu)
+                    .and_then(|t| t.to_dtype(dtype))
+                    .unwrap()
+            };
+            let (q, k, v) = (randn(seq_q, hq), randn(seq_kv, hkv), randn(seq_kv, hkv));
+            let offset = seq_kv - seq_q;
+            let launch = |long_kv| {
+                let forced = LaunchOverride {
+                    long_kv: Some(long_kv),
+                    ..LaunchOverride::NONE
+                };
+                if bf16 {
+                    prefill_dispatch_bf16(&q, &k, &v, None, None, scale, Some(offset), forced)
+                } else {
+                    prefill_dispatch(&q, &k, &v, None, None, scale, Some(offset), forced)
+                }
+            };
+            match time_pair_us(gpu, || launch(false), || launch(true)) {
+                Ok((default, long_kv)) => {
+                    let policy = match mma_config_set(D, ncols, (seq_kv, offset), hkv, true) {
+                        MmaConfigSet::Default => "default",
+                        MmaConfigSet::LongKv => "long_kv",
+                    };
+                    println!(
+                        "{seq_kv:>6}{ncols:>8}{ntiles:>7}{kv_mib:>8}{default:>11.1}{long_kv:>11.1}{:>+8.1}{policy:>9}",
+                        (long_kv / default - 1.0) * 100.0
+                    );
+                },
+                Err(err) => {
+                    failures += 1;
+                    eprintln!("{hq}Q/{hkv}KV {dtype:?} seq_kv={seq_kv}: {err}");
+                    println!("{seq_kv:>6}{ncols:>8}{:>25}", "err");
+                },
+            }
         }
     }
     failures

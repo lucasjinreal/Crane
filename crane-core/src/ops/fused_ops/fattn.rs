@@ -155,7 +155,11 @@ fn mma_config_rdna(dkq: usize, ncols: usize) -> Option<FattnMmaConfig> {
         (128, 8 | 16) => C { nthreads: 64, occupancy: 2, nbatch_fa: 32, nbatch_k2: 64, nbatch_v2: 64, nbatch_combine: 64, nstages_target: 1, q_in_reg: true },
         (128, 32 | 64) => C { nthreads: 128, occupancy: 2, nbatch_fa: 64, nbatch_k2: 64, nbatch_v2: 64, nbatch_combine: 64, nstages_target: 1, q_in_reg: true },
         (256, 8 | 16) => C { nthreads: 64, occupancy: 2, nbatch_fa: 32, nbatch_k2: 128, nbatch_v2: 128, nbatch_combine: 128, nstages_target: 1, q_in_reg: true },
-        (256, 32 | 64) => C { nthreads: 256, occupancy: 2, nbatch_fa: 64, nbatch_k2: 128, nbatch_v2: 128, nbatch_combine: 64, nstages_target: 1, q_in_reg: true },
+        (256, 32) => C { nthreads: 256, occupancy: 2, nbatch_fa: 64, nbatch_k2: 128, nbatch_v2: 128, nbatch_combine: 64, nstages_target: 1, q_in_reg: true },
+        // Q in LDS to cut register spill, with nbatch_fa halved to fit the
+        // 64 KB LDS limit (see the matching `.cuh` entry). Long KV uses
+        // `mma_config_rdna_long_kv` instead.
+        (256, 64) => C { nthreads: 256, occupancy: 2, nbatch_fa: 32, nbatch_k2: 128, nbatch_v2: 128, nbatch_combine: 64, nstages_target: 1, q_in_reg: false },
         (512, 8 | 16) => C { nthreads: 128, occupancy: 3, nbatch_fa: 64, nbatch_k2: 96, nbatch_v2: 64, nbatch_combine: 128, nstages_target: 1, q_in_reg: true },
         (512, 32 | 64) => C { nthreads: 128, occupancy: 2, nbatch_fa: 32, nbatch_k2: 128, nbatch_v2: 128, nbatch_combine: 128, nstages_target: 1, q_in_reg: true },
         _ => return None,
@@ -203,7 +207,8 @@ fn mma_config_bf16_rdna(dkq: usize, ncols: usize) -> Option<FattnMmaConfig> {
         (128, 8 | 16) => C { nthreads: 64, occupancy: 2, nbatch_fa: 32, nbatch_k2: 64, nbatch_v2: 64, nbatch_combine: 64, nstages_target: 1, q_in_reg: true },
         (128, 32 | 64) => C { nthreads: 128, occupancy: 2, nbatch_fa: 32, nbatch_k2: 64, nbatch_v2: 64, nbatch_combine: 64, nstages_target: 1, q_in_reg: true },
         (256, 8 | 16) => C { nthreads: 64, occupancy: 2, nbatch_fa: 32, nbatch_k2: 128, nbatch_v2: 128, nbatch_combine: 128, nstages_target: 1, q_in_reg: true },
-        (256, 32 | 64) => C { nthreads: 256, occupancy: 2, nbatch_fa: 64, nbatch_k2: 128, nbatch_v2: 128, nbatch_combine: 64, nstages_target: 1, q_in_reg: true },
+        (256, 32) => C { nthreads: 256, occupancy: 2, nbatch_fa: 64, nbatch_k2: 128, nbatch_v2: 128, nbatch_combine: 64, nstages_target: 1, q_in_reg: true },
+        (256, 64) => C { nthreads: 256, occupancy: 2, nbatch_fa: 32, nbatch_k2: 128, nbatch_v2: 128, nbatch_combine: 64, nstages_target: 1, q_in_reg: false },
         (512, 8 | 16) => C { nthreads: 128, occupancy: 3, nbatch_fa: 64, nbatch_k2: 96, nbatch_v2: 64, nbatch_combine: 128, nstages_target: 1, q_in_reg: true },
         (512, 32 | 64) => C { nthreads: 128, occupancy: 2, nbatch_fa: 32, nbatch_k2: 128, nbatch_v2: 128, nbatch_combine: 128, nstages_target: 1, q_in_reg: true },
         _ => return None,
@@ -238,6 +243,98 @@ pub(crate) fn mma_config_bf16(dkq: usize, ncols: usize, is_amd: bool) -> Result<
             if is_amd { "RDNA" } else { "Ampere" }
         ))
     })
+}
+
+/// Which compiled kernel set an MMA launch uses.
+///
+/// The RDNA hd256 64-column tile has two configs, and neither wins at every
+/// KV length. See [`mma_config_set`] for the policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum MmaConfigSet {
+    /// The tuning tables' own entry, in the module built from the
+    /// head-dim's regular instance file.
+    Default,
+    /// The long-KV config of [`mma_config_rdna_long_kv`], in a separate
+    /// module built from the `*_long_kv` instance file. Same kernel names.
+    LongKv,
+}
+
+/// `seq_kv` from which the RDNA hd256 64-column tile may switch to the
+/// long-KV set. Below it the default set wins, because the long set's
+/// register spill costs more than the loop iterations it saves.
+///
+/// Measured on gfx1201 only.
+pub(crate) const RDNA_HD256_LONG_KV_MIN_SEQ_KV: usize = 4096;
+
+/// Bytes of K and V that every query tile reads, from which the default set
+/// wins again. Past it the long set's 64-row KV tiles stream K and V through
+/// the last-level cache less well than the default's 32-row tiles, and a
+/// chunked prefill (small `seq_q`, large `seq_kv`) runs 4 to 26% slower on
+/// it.
+///
+/// Measured on gfx1201 only, where the Infinity Cache is 64 MiB. The cliff
+/// sits between 44 and 56 MiB, so the limit is 48 MiB. A GPU with a smaller
+/// cache probably hits it earlier. This policy then keeps the long set where
+/// the default set would win, which is the pre-tuning behavior. A GPU with a
+/// larger cache probably hits it later. This policy then takes the default
+/// set where the long set would win by about 5%.
+pub(crate) const RDNA_HD256_LONG_KV_MAX_FLOOR_BYTES: usize = 48 << 20;
+
+/// Whether a long-KV kernel set exists for this launch: only the RDNA hd256
+/// 64-column tile has one.
+pub(crate) fn has_long_kv_set(dkq: usize, ncols: usize, is_amd: bool) -> bool {
+    is_amd && dkq == 256 && ncols == 64
+}
+
+/// Picks the kernel set for a launch of `ncols = ncols1 * ncols2` columns
+/// over `seq_kv` keys and `h_kv` KV heads.
+///
+/// `min_kv` is the number of leading K/V rows every query tile reads: the
+/// causal offset for in-kernel causal masking, and `0` for any launch that
+/// does not know it. An all-rows prefill has `min_kv = 0`, since the first
+/// query tiles read only a short prefix. A chunked prefill reads at least
+/// `seq_kv - seq_q` rows in every tile.
+///
+/// The default set keeps Q in LDS with 32-row KV tiles, which avoids the
+/// register spill and wins on short KV. The long-KV set wins from
+/// [`RDNA_HD256_LONG_KV_MIN_SEQ_KV`] on, unless the `min_kv` rows of K and V
+/// already reach [`RDNA_HD256_LONG_KV_MAX_FLOOR_BYTES`]. Every other launch
+/// uses [`MmaConfigSet::Default`].
+pub(crate) fn mma_config_set(
+    dkq: usize,
+    ncols: usize,
+    (seq_kv, min_kv): (usize, usize),
+    h_kv: usize,
+    is_amd: bool,
+) -> MmaConfigSet {
+    // K and V: 4 bytes per (row, head, column).
+    let floor_bytes = min_kv
+        .saturating_mul(h_kv)
+        .saturating_mul(dkq)
+        .saturating_mul(4);
+    if has_long_kv_set(dkq, ncols, is_amd)
+        && seq_kv >= RDNA_HD256_LONG_KV_MIN_SEQ_KV
+        && floor_bytes < RDNA_HD256_LONG_KV_MAX_FLOOR_BYTES
+    {
+        MmaConfigSet::LongKv
+    } else {
+        MmaConfigSet::Default
+    }
+}
+
+/// The long-KV config for both dtypes: Q in registers with 64-row KV tiles.
+/// It must match the `CRANE_FATTN_LONG_KV` branch of the RDNA tables in
+/// `fattn_mma_f16.cuh` and `fattn_mma_bf16.cuh`, because a mismatched
+/// `nbatch_fa` picks the wrong tail kernel and reads out of bounds.
+///
+/// Returns `None` unless a long-KV set exists for `(dkq, ncols)`, see
+/// [`has_long_kv_set`].
+#[rustfmt::skip]
+pub(crate) fn mma_config_rdna_long_kv(dkq: usize, ncols: usize) -> Option<FattnMmaConfig> {
+    use FattnMmaConfig as C;
+    has_long_kv_set(dkq, ncols, true).then_some(
+        C { nthreads: 256, occupancy: 2, nbatch_fa: 64, nbatch_k2: 128, nbatch_v2: 128, nbatch_combine: 64, nstages_target: 1, q_in_reg: true },
+    )
 }
 
 /// Picks `ncols2` (how many GQA-sibling Q heads share one block's K/V load):
@@ -1078,6 +1175,108 @@ mod tests {
                 }
             }
         }
+    }
+
+    // Every RDNA config AMD can launch, long-KV set included, needs at most
+    // 64 KiB of LDS, the per-workgroup limit on RDNA. AMD rejects ncols2 == 1
+    // and head_dim 512, so those pairs are skipped.
+    #[test]
+    fn rdna_mma_configs_fit_in_amd_lds() {
+        const AMD_LDS_PER_WORKGROUP: usize = 64 * 1024;
+        for head_dim in [64usize, 128, 256] {
+            for &(ncols1, ncols2) in instantiated_pairs(head_dim) {
+                if ncols2 == 1 {
+                    continue;
+                }
+                let cfg = mma_config(head_dim, ncols1 * ncols2, true).unwrap();
+                let bytes = mma_shared_mem_bytes(head_dim, ncols1, ncols2, &cfg, true);
+                assert!(
+                    bytes <= AMD_LDS_PER_WORKGROUP,
+                    "f16 head_dim={head_dim} c{ncols1}_s{ncols2}: {bytes} B of LDS"
+                );
+            }
+            for &(ncols1, ncols2) in instantiated_pairs_bf16(head_dim) {
+                if ncols2 == 1 {
+                    continue;
+                }
+                let cfg = mma_config_bf16(head_dim, ncols1 * ncols2, true).unwrap();
+                let bytes = mma_shared_mem_bytes_bf16(head_dim, ncols1, ncols2, &cfg);
+                assert!(
+                    bytes <= AMD_LDS_PER_WORKGROUP,
+                    "bf16 head_dim={head_dim} c{ncols1}_s{ncols2}: {bytes} B of LDS"
+                );
+            }
+        }
+        // The long-KV config, for every 64-column pair AMD can pick.
+        let long = mma_config_rdna_long_kv(256, 64).unwrap();
+        for (ncols1, ncols2) in [(32, 2), (16, 4), (8, 8)] {
+            let bytes = mma_shared_mem_bytes(256, ncols1, ncols2, &long, true);
+            assert!(
+                bytes <= AMD_LDS_PER_WORKGROUP,
+                "long-KV c{ncols1}_s{ncols2}: {bytes} B of LDS"
+            );
+        }
+    }
+
+    // Only the RDNA hd256 64-column tile has a long-KV set, and the switch
+    // happens exactly at the `seq_kv` threshold.
+    #[test]
+    fn mma_config_set_switches_at_the_threshold() {
+        let min = RDNA_HD256_LONG_KV_MIN_SEQ_KV;
+        let set = |ncols, seq_kv, dkq, is_amd| mma_config_set(dkq, ncols, (seq_kv, 0), 2, is_amd);
+        assert_eq!(set(64, min - 1, 256, true), MmaConfigSet::Default);
+        assert_eq!(set(64, min, 256, true), MmaConfigSet::LongKv);
+        assert_eq!(set(64, 1 << 20, 256, true), MmaConfigSet::LongKv);
+        // Neither another column count, another head_dim, nor NVIDIA.
+        assert_eq!(set(32, min, 256, true), MmaConfigSet::Default);
+        assert_eq!(set(64, min, 128, true), MmaConfigSet::Default);
+        assert_eq!(set(64, min, 256, false), MmaConfigSet::Default);
+    }
+
+    // A long KV that every query tile reads in full goes back to the default
+    // set, at exactly the byte limit.
+    #[test]
+    fn mma_config_set_returns_to_default_past_the_cache_floor() {
+        // 2 KV heads, head_dim 256: 2 KiB of K and V per row and head, so
+        // 4 KiB per row.
+        let rows = RDNA_HD256_LONG_KV_MAX_FLOOR_BYTES / (2 * 256 * 2 * 2);
+        let seq_kv = 4 * rows;
+        let set = |min_kv| mma_config_set(256, 64, (seq_kv, min_kv), 2, true);
+        assert_eq!(set(0), MmaConfigSet::LongKv);
+        assert_eq!(set(rows - 1), MmaConfigSet::LongKv);
+        assert_eq!(set(rows), MmaConfigSet::Default);
+        assert_eq!(set(seq_kv), MmaConfigSet::Default);
+        // More KV heads reach the limit with fewer rows.
+        assert_eq!(
+            mma_config_set(256, 64, (seq_kv, rows / 2), 4, true),
+            MmaConfigSet::Default
+        );
+        // Huge inputs saturate instead of wrapping.
+        assert_eq!(
+            mma_config_set(256, 64, (usize::MAX, usize::MAX), usize::MAX, true),
+            MmaConfigSet::Default
+        );
+    }
+
+    // The long-KV config differs from the default one only in the tile
+    // shape, and its kernel set exists exactly where `has_long_kv_set` says.
+    #[test]
+    fn long_kv_config_matches_has_long_kv_set() {
+        for dkq in [64usize, 128, 256, 512] {
+            for ncols in [8usize, 16, 32, 64] {
+                assert_eq!(
+                    mma_config_rdna_long_kv(dkq, ncols).is_some(),
+                    has_long_kv_set(dkq, ncols, true),
+                    "dkq={dkq} ncols={ncols}"
+                );
+            }
+        }
+        let long = mma_config_rdna_long_kv(256, 64).unwrap();
+        let default = mma_config(256, 64, true).unwrap();
+        assert_eq!((long.nbatch_fa, long.q_in_reg), (64, true));
+        assert_eq!((default.nbatch_fa, default.q_in_reg), (32, false));
+        assert_eq!(long.nthreads, default.nthreads);
+        assert_eq!(long.nbatch_k2, default.nbatch_k2);
     }
 
     #[test]

@@ -30,9 +30,10 @@
 use candle_core::{DType, Device, Layout, Result, Tensor};
 
 use super::fattn::{
-    FATTN_KQ_STRIDE, FattnMmaConfig, MAX_GRID_X_DIM, fixup_scratch_len, gqa_z_tiles,
-    init_fastdiv_values, is_amd_backend, mma_shared_mem_bytes, mma_shared_mem_bytes_bf16, q_tiles,
-    select_mma_ncols, select_mma_ncols_bf16, stream_k_grid, stream_k_needs_fixup,
+    FATTN_KQ_STRIDE, FattnMmaConfig, MAX_GRID_X_DIM, MmaConfigSet, fixup_scratch_len, gqa_z_tiles,
+    has_long_kv_set, init_fastdiv_values, is_amd_backend, mma_config, mma_config_bf16,
+    mma_config_rdna_long_kv, mma_config_set, mma_shared_mem_bytes, mma_shared_mem_bytes_bf16,
+    q_tiles, select_mma_ncols, select_mma_ncols_bf16, stream_k_grid, stream_k_needs_fixup,
     unsupported_config,
 };
 
@@ -303,6 +304,11 @@ struct LaunchOverride {
     /// to the kernel as is, also on a split grid, where the kernel keeps
     /// the stream-K order. That lets tests reach the kernel's own fallback.
     heavy_first: Option<bool>,
+    /// Replaces the policy's kernel set (see [`mma_config_set`]): `Some(true)`
+    /// forces [`MmaConfigSet::LongKv`], `Some(false)` forces
+    /// [`MmaConfigSet::Default`]. Forcing the long set on a launch that has
+    /// none is an error.
+    long_kv: Option<bool>,
 }
 
 impl LaunchOverride {
@@ -310,6 +316,7 @@ impl LaunchOverride {
     const NONE: Self = Self {
         grid: None,
         heavy_first: None,
+        long_kv: None,
     };
 }
 
@@ -337,6 +344,69 @@ impl TileCost {
             Self::Uniform
         }
     }
+}
+
+/// What a launch reads of K and V, for the kernel-set policy.
+#[derive(Debug, Clone, Copy)]
+struct KvExtent {
+    /// K/V rows.
+    rows: usize,
+    /// Leading K/V rows every query tile reads, see [`mma_config_set`].
+    shared_rows: usize,
+    /// K/V heads.
+    heads: usize,
+}
+
+impl KvExtent {
+    /// The extent of a launch over `seq_kv` rows of `h_kv` heads. Only the
+    /// in-kernel causal entries know their offset. Every other launch counts
+    /// as reading nothing for sure, which is correct for an all-rows causal
+    /// prefill. It is conservative for a non-causal (full) launch that reads
+    /// all of K/V per row. That case should pass `Some(seq_kv)` once a
+    /// production caller exists.
+    fn new(seq_kv: usize, h_kv: usize, causal_kv_offset: Option<usize>) -> Self {
+        Self {
+            rows: seq_kv,
+            // Off-by-one: row 0 reads o+1 keys; using o is a deliberate
+            // conservative approximation, well within the cache-floor slack.
+            shared_rows: causal_kv_offset.unwrap_or(0),
+            heads: h_kv,
+        }
+    }
+}
+
+/// The tuning config and kernel set of an MMA launch.
+///
+/// # Errors
+///
+/// Returns an error if no config exists for `(dkq, ncols)`, or if `forced`
+/// asks for the long-KV set where none exists.
+fn launch_config(
+    (dkq, ncols): (usize, usize),
+    kv: KvExtent,
+    (is_amd, bf16): (bool, bool),
+    forced: LaunchOverride,
+) -> Result<(FattnMmaConfig, MmaConfigSet)> {
+    let set = match forced.long_kv {
+        Some(true) if !has_long_kv_set(dkq, ncols, is_amd) => {
+            candle_core::bail!(
+                "fattn_mma: no long-KV kernel set for head_dim={dkq} ncols={ncols} (is_amd={is_amd})"
+            )
+        },
+        Some(true) => MmaConfigSet::LongKv,
+        Some(false) => MmaConfigSet::Default,
+        None => mma_config_set(dkq, ncols, (kv.rows, kv.shared_rows), kv.heads, is_amd),
+    };
+    let cfg = match set {
+        MmaConfigSet::LongKv => mma_config_rdna_long_kv(dkq, ncols).ok_or_else(|| {
+            candle_core::Error::Msg(format!(
+                "fattn_mma: no long-KV config for head_dim={dkq} ncols={ncols}"
+            ))
+        })?,
+        MmaConfigSet::Default if bf16 => mma_config_bf16(dkq, ncols, is_amd)?,
+        MmaConfigSet::Default => mma_config(dkq, ncols, is_amd)?,
+    };
+    Ok((cfg, set))
 }
 
 /// Grid/launch geometry of an MMA launch, with the stream-K fixup pass when
@@ -609,21 +679,23 @@ fn grid_target(device: &Device, forced: LaunchOverride) -> Result<GridTarget> {
 /// multiple of the selected config's `nbatch_fa` — otherwise the plain
 /// (`tail = false`) symbol already covers the launch and has a smaller
 /// register footprint.
+///
+/// `set` selects the module: [`MmaConfigSet::LongKv`] has the same kernel
+/// names as the default set, in a module of its own.
 fn cached_mma_names(
     dkq: usize,
     ncols1: usize,
     ncols2: usize,
-    bf16: bool,
-    tail: bool,
+    (bf16, tail): (bool, bool),
+    set: MmaConfigSet,
 ) -> (&'static str, &'static str) {
     use std::collections::HashMap;
     use std::sync::{OnceLock, RwLock};
 
-    static CACHE: OnceLock<
-        RwLock<HashMap<(usize, usize, usize, bool, bool), (&'static str, &'static str)>>,
-    > = OnceLock::new();
+    type Key = (usize, usize, usize, bool, bool, MmaConfigSet);
+    static CACHE: OnceLock<RwLock<HashMap<Key, (&'static str, &'static str)>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| RwLock::new(HashMap::new()));
-    let key = (dkq, ncols1, ncols2, bf16, tail);
+    let key = (dkq, ncols1, ncols2, bf16, tail, set);
     if let Some(&names) = cache.read().unwrap().get(&key) {
         return names;
     }
@@ -640,10 +712,16 @@ fn cached_mma_names(
             },
             (false, false) => crate::ops::fused_ops::fattn::mma_kernel_name(dkq, ncols1, ncols2),
         };
-        let module_name = if bf16 {
-            format!("crane_fattn_mma_bf16_hd{dkq}")
+        // The long-KV set reuses the kernel names, so only its module differs.
+        let long_kv = if set == MmaConfigSet::LongKv {
+            "_long_kv"
         } else {
-            format!("crane_fattn_mma_hd{dkq}")
+            ""
+        };
+        let module_name = if bf16 {
+            format!("crane_fattn_mma_bf16_hd{dkq}{long_kv}")
+        } else {
+            format!("crane_fattn_mma_hd{dkq}{long_kv}")
         };
         (&*String::leak(kernel_name), &*String::leak(module_name))
     })
@@ -1305,8 +1383,8 @@ mod cuda {
         LaunchShape, TileCost,
     };
     use crate::ops::fused_ops::fattn::{
-        fixup_kernel_name, mma_config, mma_config_bf16, select_mma_ncols, select_mma_ncols_bf16,
-        unsupported_config, validate_fattn_bshd,
+        fixup_kernel_name, select_mma_ncols, select_mma_ncols_bf16, unsupported_config,
+        validate_fattn_bshd,
     };
     use candle_core::{Device, Result, Tensor};
 
@@ -1452,9 +1530,11 @@ mod cuda {
             gqa_ratio,
         };
         let target = super::grid_target(q.device(), forced)?;
-        let cfg = mma_config(d, ncols1 * ncols2, is_amd)?;
+        let kv = super::KvExtent::new(seq_kv, h_kv, causal_kv_offset);
+        let (cfg, set) = super::launch_config((d, ncols1 * ncols2), kv, (is_amd, false), forced)?;
         let tail = ncols2 > 1 && !seq_kv.is_multiple_of(cfg.nbatch_fa);
-        let (kernel_name, module_name) = super::cached_mma_names(d, ncols1, ncols2, false, tail);
+        let (kernel_name, module_name) =
+            super::cached_mma_names(d, ncols1, ncols2, (false, tail), set);
         let func = dev.get_or_load_custom_func(kernel_name, module_name, ptx_for(d)?)?;
         let variant = KernelVariant {
             dkq: d,
@@ -1695,9 +1775,11 @@ mod cuda {
             gqa_ratio,
         };
         let target = super::grid_target(q.device(), forced)?;
-        let cfg = mma_config_bf16(d, ncols1 * ncols2, is_amd)?;
+        let kv = super::KvExtent::new(seq_kv, h_kv, causal_kv_offset);
+        let (cfg, set) = super::launch_config((d, ncols1 * ncols2), kv, (is_amd, true), forced)?;
         let tail = ncols2 > 1 && !seq_kv.is_multiple_of(cfg.nbatch_fa);
-        let (kernel_name, module_name) = super::cached_mma_names(d, ncols1, ncols2, true, tail);
+        let (kernel_name, module_name) =
+            super::cached_mma_names(d, ncols1, ncols2, (true, tail), set);
         let func = dev.get_or_load_custom_func(kernel_name, module_name, ptx_for_bf16(d)?)?;
         let variant = KernelVariant {
             dkq: d,
@@ -1901,11 +1983,11 @@ mod rocm {
 
     use super::{
         FixupPlan, GridTarget, KernelVariant, LaunchGeometry, LaunchOverride, LaunchScalars,
-        LaunchShape, TileCost,
+        LaunchShape, MmaConfigSet, TileCost,
     };
     use crate::ops::fused_ops::fattn::{
-        fixup_kernel_name, mma_config, mma_config_bf16, select_mma_ncols, select_mma_ncols_bf16,
-        unsupported_config, validate_fattn_bshd,
+        fixup_kernel_name, select_mma_ncols, select_mma_ncols_bf16, unsupported_config,
+        validate_fattn_bshd,
     };
     use crate::ops::rocm;
 
@@ -1959,13 +2041,19 @@ mod rocm {
         splice_once(instance_source, "#include \"fattn_mma_f16.cuh\"", &mma_f16)
     }
 
-    fn source_for(dkq: usize) -> Result<&'static str> {
+    fn source_for(dkq: usize, set: MmaConfigSet) -> Result<&'static str> {
         use std::sync::OnceLock;
         macro_rules! source_once {
             ($file:literal) => {{
                 static SOURCE: OnceLock<String> = OnceLock::new();
                 SOURCE.get_or_init(|| rocm_mma_source(include_str!($file)))
             }};
+        }
+        if set == MmaConfigSet::LongKv {
+            return Ok(match dkq {
+                256 => source_once!("../../../kernels/cuda/fattn/fattn_mma_hd256_long_kv.hip"),
+                _ => candle_core::bail!("fattn_mma: no long-KV kernel set for head_dim {dkq}"),
+            });
         }
         Ok(match dkq {
             64 => source_once!("../../../kernels/cuda/fattn/fattn_mma_hd64.cu"),
@@ -2006,13 +2094,23 @@ mod rocm {
         )
     }
 
-    fn source_for_bf16(dkq: usize) -> Result<&'static str> {
+    fn source_for_bf16(dkq: usize, set: MmaConfigSet) -> Result<&'static str> {
         use std::sync::OnceLock;
         macro_rules! source_once_bf16 {
             ($file:literal) => {{
                 static SOURCE: OnceLock<String> = OnceLock::new();
                 SOURCE.get_or_init(|| rocm_mma_bf16_source(include_str!($file)))
             }};
+        }
+        if set == MmaConfigSet::LongKv {
+            return Ok(match dkq {
+                256 => {
+                    source_once_bf16!(
+                        "../../../kernels/cuda/fattn/fattn_mma_hd256_long_kv_bf16.hip"
+                    )
+                },
+                _ => candle_core::bail!("fattn_mma_bf16: no long-KV kernel set for head_dim {dkq}"),
+            });
         }
         Ok(match dkq {
             64 => source_once_bf16!("../../../kernels/cuda/fattn/fattn_mma_hd64_bf16.cu"),
@@ -2068,10 +2166,12 @@ mod rocm {
             gqa_ratio,
         };
         let target = super::grid_target(q.device(), forced)?;
-        let cfg = mma_config(d, ncols1 * ncols2, is_amd)?;
+        let kv = super::KvExtent::new(seq_kv, h_kv, causal_kv_offset);
+        let (cfg, set) = super::launch_config((d, ncols1 * ncols2), kv, (is_amd, false), forced)?;
         let tail = ncols2 > 1 && !seq_kv.is_multiple_of(cfg.nbatch_fa);
-        let (kernel_name, module_name) = super::cached_mma_names(d, ncols1, ncols2, false, tail);
-        let source = source_for(d)?;
+        let (kernel_name, module_name) =
+            super::cached_mma_names(d, ncols1, ncols2, (false, tail), set);
+        let source = source_for(d, set)?;
         let variant = KernelVariant {
             dkq: d,
             ncols1,
@@ -2276,10 +2376,12 @@ mod rocm {
             gqa_ratio,
         };
         let target = super::grid_target(q.device(), forced)?;
-        let cfg = mma_config_bf16(d, ncols1 * ncols2, is_amd)?;
+        let kv = super::KvExtent::new(seq_kv, h_kv, causal_kv_offset);
+        let (cfg, set) = super::launch_config((d, ncols1 * ncols2), kv, (is_amd, true), forced)?;
         let tail = ncols2 > 1 && !seq_kv.is_multiple_of(cfg.nbatch_fa);
-        let (kernel_name, module_name) = super::cached_mma_names(d, ncols1, ncols2, true, tail);
-        let source = source_for_bf16(d)?;
+        let (kernel_name, module_name) =
+            super::cached_mma_names(d, ncols1, ncols2, (true, tail), set);
+        let source = source_for_bf16(d, set)?;
         let variant = KernelVariant {
             dkq: d,
             ncols1,
@@ -2551,7 +2653,7 @@ mod tests {
     use candle_core::{DType, Device, Tensor};
 
     use super::*;
-    use crate::ops::fused_ops::fattn::mma_config;
+    use crate::ops::fused_ops::fattn::{RDNA_HD256_LONG_KV_MIN_SEQ_KV, mma_config};
 
     // No CUDA/ROCm feature compiled in: fattn_mma_prefill must bail rather
     // than silently computing a wrong answer.
@@ -2568,6 +2670,93 @@ mod tests {
             err.to_string()
                 .contains("requires the cuda or rocm feature")
         );
+    }
+
+    // The policy picks the long-KV set from the threshold on, and a forced
+    // override wins over it in both directions.
+    #[test]
+    fn launch_config_picks_and_forces_the_kernel_set() {
+        let min = RDNA_HD256_LONG_KV_MIN_SEQ_KV;
+        let pick = |seq_kv, forced| {
+            let kv = KvExtent::new(seq_kv, 2, None);
+            launch_config((256, 64), kv, (true, false), forced)
+                .unwrap()
+                .1
+        };
+        assert_eq!(pick(min - 1, LaunchOverride::NONE), MmaConfigSet::Default);
+        assert_eq!(pick(min, LaunchOverride::NONE), MmaConfigSet::LongKv);
+        let force = |long_kv| LaunchOverride {
+            long_kv: Some(long_kv),
+            ..LaunchOverride::NONE
+        };
+        assert_eq!(pick(min, force(false)), MmaConfigSet::Default);
+        assert_eq!(pick(1, force(true)), MmaConfigSet::LongKv);
+    }
+
+    // Only a launch that knows its causal offset can return to the default
+    // set for a long KV every tile reads: an unknown offset keeps the
+    // long-KV set.
+    #[test]
+    fn kv_extent_uses_the_causal_offset_only() {
+        let seq_kv = 65536;
+        let set = |offset| {
+            let kv = KvExtent::new(seq_kv, 2, offset);
+            launch_config((256, 64), kv, (true, false), LaunchOverride::NONE)
+                .unwrap()
+                .1
+        };
+        assert_eq!(set(None), MmaConfigSet::LongKv);
+        assert_eq!(set(Some(0)), MmaConfigSet::LongKv);
+        assert_eq!(set(Some(seq_kv - 2048)), MmaConfigSet::Default);
+    }
+
+    // Each set gets its own tuning config, for both dtypes.
+    #[test]
+    fn launch_config_returns_the_config_of_the_chosen_set() {
+        for bf16 in [false, true] {
+            let nbatch_fa = |long_kv| {
+                let forced = LaunchOverride {
+                    long_kv: Some(long_kv),
+                    ..LaunchOverride::NONE
+                };
+                launch_config((256, 64), KvExtent::new(1, 2, None), (true, bf16), forced)
+                    .unwrap()
+                    .0
+                    .nbatch_fa
+            };
+            assert_eq!(nbatch_fa(false), 32);
+            assert_eq!(nbatch_fa(true), 64);
+        }
+    }
+
+    // Forcing the long set where no kernels exist is an error, not a silent
+    // fallback to the default set.
+    #[test]
+    fn launch_config_rejects_forced_long_kv_without_a_set() {
+        let forced = LaunchOverride {
+            long_kv: Some(true),
+            ..LaunchOverride::NONE
+        };
+        for (shape, is_amd) in [((256, 32), true), ((128, 64), true), ((256, 64), false)] {
+            let err = launch_config(shape, KvExtent::new(1, 2, None), (is_amd, false), forced)
+                .expect_err("no long-KV set exists for this launch");
+            assert!(err.to_string().contains("no long-KV kernel set"), "{err}");
+        }
+    }
+
+    // The long-KV set reuses the kernel names and differs by module only.
+    #[test]
+    fn cached_mma_names_separates_the_sets_by_module() {
+        for bf16 in [false, true] {
+            for tail in [false, true] {
+                let (kernel, module) =
+                    cached_mma_names(256, 16, 4, (bf16, tail), MmaConfigSet::Default);
+                let (long_kernel, long_module) =
+                    cached_mma_names(256, 16, 4, (bf16, tail), MmaConfigSet::LongKv);
+                assert_eq!(kernel, long_kernel);
+                assert_eq!(long_module, format!("{module}_long_kv"));
+            }
+        }
     }
 
     // q must be in the k/v dtype for both kernel families. F32 q, which
@@ -2788,9 +2977,9 @@ mod gpu_tests {
         MaskMode, naive_attention, narrowed_bhsd, test_gpu_device,
     };
     use super::{
-        fattn_mma_bf16_causal, fattn_mma_bf16_causal_with_mask, fattn_mma_bf16_prefill,
-        fattn_mma_causal, fattn_mma_causal_with_mask, fattn_mma_full, fattn_mma_prefill,
-        fattn_mma_windowed,
+        LaunchOverride, fattn_mma_bf16_causal, fattn_mma_bf16_causal_with_mask,
+        fattn_mma_bf16_prefill, fattn_mma_causal, fattn_mma_causal_with_mask, fattn_mma_full,
+        fattn_mma_prefill, fattn_mma_windowed, prefill_dispatch, prefill_dispatch_bf16,
     };
 
     /// `[1, seq_q, seq_kv]` F16 additive causal mask: `0` where `j <=
@@ -3122,6 +3311,52 @@ mod gpu_tests {
     #[test]
     fn causal_hd256() {
         run_causal(1, 32, 256, 4, 2, 256);
+    }
+
+    // Both kernel sets of the RDNA hd256 64-column tile match the reference
+    // at GQA ratios 4 and 8 (`c16_s4`, `c8_s8`), over an aligned length and
+    // two unaligned ones (the `_tail` kernels).
+    #[cfg(all(feature = "rocm", not(feature = "cuda")))]
+    #[test]
+    fn both_kernel_sets_match_reference_hd256() {
+        let gpu = test_gpu_device();
+        let d = 256;
+        // 1 / sqrt(256).
+        let scale = 0.0625f32;
+        for dtype in [DType::F16, DType::BF16] {
+            for (hq, hkv) in [(8, 2), (16, 2)] {
+                for seq in [231, 256, 300] {
+                    let rand = |heads| {
+                        Tensor::randn(0f32, 1f32, (1, seq, heads, d), &Device::Cpu).unwrap()
+                    };
+                    let (q, k, v) = (rand(hq), rand(hkv), rand(hkv));
+                    let want = naive_attention(&q, &k, &v, scale, MaskMode::Causal, 0, 0, 0);
+                    let to_gpu = |t: &Tensor| t.to_dtype(dtype).unwrap().to_device(&gpu).unwrap();
+                    let (qg, kg, vg) = (to_gpu(&q), to_gpu(&k), to_gpu(&v));
+                    for long_kv in [false, true] {
+                        let forced = LaunchOverride {
+                            long_kv: Some(long_kv),
+                            ..LaunchOverride::NONE
+                        };
+                        let dispatch = if dtype == DType::BF16 {
+                            prefill_dispatch_bf16
+                        } else {
+                            prefill_dispatch
+                        };
+                        let got = got_vec(
+                            dispatch(&qg, &kg, &vg, None, None, scale, Some(0), forced).unwrap(),
+                        );
+                        assert_eq!(got.len(), want.len());
+                        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                            assert!(
+                                (g - w).abs() <= 3e-2 * w.abs().max(1.0),
+                                "[{i}] got {g}, want {w} ({dtype:?} {hq}Q/{hkv}KV seq={seq} long_kv={long_kv})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // GQA: query heads share KV heads, exercising ncols2 > 1 selection.

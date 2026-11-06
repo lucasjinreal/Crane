@@ -32,6 +32,8 @@ bf16 hd128 seq2048 seed0 offset 540893bd0cbed8ce
   - `windowed`: sliding window
   - `full`: no mask
   - `gqa2`: causal at GQA ratio 2 instead of 4
+  - `longkv`: plain causal on the long-KV kernel set of the RDNA hd256
+    64-column tile (head_dim 256, ROCm only), over the full sweep
 
 Each backend has one file, valid for one architecture. The committed
 `fattn_goldens_rocm.txt` comes from an RDNA4 GPU (`cc 12.0`), and
