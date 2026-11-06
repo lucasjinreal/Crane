@@ -816,6 +816,24 @@ namespace ggml_cuda_mma {
     // get_transposed(nv_bfloat162) counterpart: fattn_mma_bf16.cuh never
     // instantiates the narrow (cols_per_warp == 8) tile shape that is the
     // only caller of get_transposed on the f16 side, so it is never needed.
+#if defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
+    // Packs two floats into a bfloat162 with round-to-nearest-even, without
+    // the NaN check of __float22bfloat162_rn. gfx11/gfx12 have no hardware
+    // f32 -> bf16 convert, and the NaN check makes the stock one ~13 VALU
+    // ops per pair. Bit-identical for every non-NaN input (Inf included).
+    // Only valid for the softmax P tile, which is exp2 of finite or -inf.
+    static __device__ __forceinline__ nv_bfloat162 pack_bf16_rne_nonan(const float a, const float b) {
+        uint32_t ua = __float_as_uint(a);
+        uint32_t ub = __float_as_uint(b);
+        ua += 0x7fffu + ((ua >> 16) & 1u);
+        ub += 0x7fffu + ((ub >> 16) & 1u);
+        const uint32_t packed = (ua >> 16) | (ub & 0xffff0000u);
+        nv_bfloat162 ret;
+        __builtin_memcpy(&ret, &packed, sizeof(ret));
+        return ret;
+    }
+#endif // defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
+
 #if defined(AMPERE_MMA_AVAILABLE)
     template <int I, int J>
     static __device__ __forceinline__ tile<I, J/2, nv_bfloat162> get_bf16(const tile<I, J, float> & tile_float) {
@@ -837,10 +855,7 @@ namespace ggml_cuda_mma {
             tmp[i] = tile_float.x[l];
             i ^= 1;
             tmp[i] = __shfl_xor_sync(0xFFFFFFFF, tile_float.x[l], 16, WARP_SIZE);
-            // __floats2bfloat162_rn(float, float) is CUDA-only; HIP only has
-            // the float2-argument __float22bfloat162_rn, which both targets
-            // provide.
-            ret.x[l] = __float22bfloat162_rn(make_float2(tmp[0], tmp[1]));
+            ret.x[l] = pack_bf16_rne_nonan(tmp[0], tmp[1]);
         }
         return ret;
     }
@@ -850,10 +865,7 @@ namespace ggml_cuda_mma {
         tile<I, J/2, nv_bfloat162> ret;
 #pragma unroll
         for (int l0 = 0; l0 < tile_float.ne; l0 += 2) {
-            // __floats2bfloat162_rn(float, float) is CUDA-only; HIP only has
-            // the float2-argument __float22bfloat162_rn, which both targets
-            // provide.
-            ret.x[l0/2] = __float22bfloat162_rn(make_float2(tile_float.x[l0 + 0], tile_float.x[l0 + 1]));
+            ret.x[l0/2] = pack_bf16_rne_nonan(tile_float.x[l0 + 0], tile_float.x[l0 + 1]);
         }
         return ret;
     }
