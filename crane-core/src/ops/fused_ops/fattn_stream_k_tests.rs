@@ -16,7 +16,8 @@ use super::super::fattn::test_support::{
 };
 use super::super::fattn::{
     FATTN_KQ_STRIDE, build_additive_mask_f16, build_analytic_kv_max, is_amd_backend, mma_config,
-    mma_config_bf16, select_mma_ncols, select_mma_ncols_bf16, stream_k_needs_fixup,
+    mma_config_bf16, mma_config_rdna_long_kv, select_mma_ncols, select_mma_ncols_bf16,
+    stream_k_needs_fixup,
 };
 use super::super::fattn_long_seq_host::compare;
 use super::long_seq_tests::{bitwise_eq, round_to, scaled_q, to_host, tolerance};
@@ -71,6 +72,20 @@ fn forced_grids_match_plain_launch_full() {
     run_forced_grids(Mode::Full);
 }
 
+// The long-KV kernel set of the RDNA hd256 64-column tile, in its own
+// module with its own fixup kernels, merges split tiles like the default
+// set does, at an unaligned and an aligned length.
+#[cfg(all(feature = "rocm", not(feature = "cuda")))]
+#[test]
+fn forced_grids_match_plain_launch_long_kv_set() {
+    let gpu = test_gpu_device();
+    for dtype in DTYPES {
+        for seq in SEQS {
+            check_forced_grids(&Case::long_kv(dtype, 256, seq, Mode::Causal, &gpu));
+        }
+    }
+}
+
 // Every tile is computed exactly once whatever order the blocks take
 // them in. One block per tile, forced heavy-first and forced stream-K
 // order, give the same bits for every mode, layout, dtype, head_dim and
@@ -94,6 +109,7 @@ fn heavy_first_order_matches_stream_k_order_bitwise() {
                         case.run_with(LaunchOverride {
                             grid: Some(case.ntiles),
                             heavy_first: Some(heavy_first),
+                            ..LaunchOverride::NONE
                         })
                     };
                     assert!(
@@ -210,47 +226,53 @@ fn run_forced_grids(mode: Mode) {
     for dtype in DTYPES {
         for d in HEAD_DIMS {
             for seq in SEQS {
-                let case = Case::new(dtype, d, seq, mode, &gpu);
-                let plain = case.run(Some(case.ntiles));
-                case.check(&plain, "plain grid");
-                for (grid, seams) in forced_grids(case.ntiles, case.iter_k) {
-                    let what = format!("grid {grid} ({seams} seams)");
-                    let total = case.ntiles * case.iter_k;
-                    assert!(
-                        stream_k_needs_fixup(total, grid, case.iter_k).unwrap(),
-                        "{case:?} {what}: no seam inside a tile"
-                    );
-                    assert_eq!(
-                        max_seams_in_a_tile(total, grid, case.iter_k),
-                        seams,
-                        "{case:?} {what}: wrong seam count"
-                    );
-                    let got = case.run(Some(grid));
-                    assert!(
-                        bitwise_eq(&got, &case.run(Some(grid))),
-                        "{case:?} {what}: not deterministic"
-                    );
-                    // The kernel must keep the stream-K order on a split
-                    // grid, whatever order the host asks for.
-                    let heavy_first = case.run_with(LaunchOverride {
-                        grid: Some(grid),
-                        heavy_first: Some(true),
-                    });
-                    assert!(
-                        bitwise_eq(&got, &heavy_first),
-                        "{case:?} {what}: heavy-first changed a split grid"
-                    );
-                    let cmp = compare(&got, &plain, case.layout.hq, d, tolerance(dtype));
-                    assert!(
-                        cmp.failures.is_empty(),
-                        "{case:?} {what}: {} rows off the plain launch, max err {:.2e}",
-                        cmp.failures.len(),
-                        cmp.max_err
-                    );
-                    case.check(&got, &what);
-                }
+                check_forced_grids(&Case::new(dtype, d, seq, mode, &gpu));
             }
         }
+    }
+}
+
+/// Every forced grid of `case` matches its one-block-per-tile launch and
+/// the reference, and gives the same bits twice.
+fn check_forced_grids(case: &Case) {
+    let plain = case.run(Some(case.ntiles));
+    case.check(&plain, "plain grid");
+    for (grid, seams) in forced_grids(case.ntiles, case.iter_k) {
+        let what = format!("grid {grid} ({seams} seams)");
+        let total = case.ntiles * case.iter_k;
+        assert!(
+            stream_k_needs_fixup(total, grid, case.iter_k).unwrap(),
+            "{case:?} {what}: no seam inside a tile"
+        );
+        assert_eq!(
+            max_seams_in_a_tile(total, grid, case.iter_k),
+            seams,
+            "{case:?} {what}: wrong seam count"
+        );
+        let got = case.run(Some(grid));
+        assert!(
+            bitwise_eq(&got, &case.run(Some(grid))),
+            "{case:?} {what}: not deterministic"
+        );
+        // The kernel must keep the stream-K order on a split grid, whatever
+        // order the host asks for.
+        let heavy_first = case.run_with(LaunchOverride {
+            grid: Some(grid),
+            heavy_first: Some(true),
+            ..LaunchOverride::NONE
+        });
+        assert!(
+            bitwise_eq(&got, &heavy_first),
+            "{case:?} {what}: heavy-first changed a split grid"
+        );
+        let cmp = compare(&got, &plain, case.layout.hq, case.d, tolerance(case.dtype));
+        assert!(
+            cmp.failures.is_empty(),
+            "{case:?} {what}: {} rows off the plain launch, max err {:.2e}",
+            cmp.failures.len(),
+            cmp.max_err
+        );
+        case.check(&got, &what);
     }
 }
 
@@ -293,6 +315,8 @@ struct Case {
     seq: usize,
     mode: Mode,
     layout: Layout,
+    /// Whether every launch forces the long-KV kernel set.
+    long_kv: bool,
     q: Tensor,
     /// Padded for GQA batching where the entries pad.
     k: Tensor,
@@ -312,7 +336,7 @@ impl std::fmt::Debug for Case {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{:?} hd{} seq={} {:?} b{} {}Q/{}KV ncols=({}, {}) ntiles={} iter_k={}",
+            "{:?} hd{} seq={} {:?} b{} {}Q/{}KV ncols=({}, {}) ntiles={} iter_k={} long_kv={}",
             self.dtype,
             self.d,
             self.seq,
@@ -323,7 +347,8 @@ impl std::fmt::Debug for Case {
             self.ncols1,
             self.ncols2,
             self.ntiles,
-            self.iter_k
+            self.iter_k,
+            self.long_kv
         )
     }
 }
@@ -334,6 +359,24 @@ impl Case {
         Self::with_layout(dtype, d, seq, mode, Layout::DEFAULT, gpu)
     }
 
+    /// [`Case::new`] on the long-KV kernel set, whatever `seq` the policy
+    /// would pick it at.
+    fn long_kv(dtype: DType, d: usize, seq: usize, mode: Mode, gpu: &Device) -> Self {
+        Self::with_set(dtype, d, seq, mode, (Layout::DEFAULT, true), gpu)
+    }
+
+    /// [`Case::with_set`] on the default kernel set.
+    fn with_layout(
+        dtype: DType,
+        d: usize,
+        seq: usize,
+        mode: Mode,
+        layout: Layout,
+        gpu: &Device,
+    ) -> Self {
+        Self::with_set(dtype, d, seq, mode, (layout, false), gpu)
+    }
+
     /// Builds Spike-distribution inputs (a running max that moves deep into
     /// the KV loop) and the reference.
     ///
@@ -342,12 +385,12 @@ impl Case {
     /// If no MMA kernel covers the shape, or `layout` does not keep the
     /// long-sequence GQA ratio.
     #[allow(clippy::too_many_lines)] // one case's worth of setup, not separable
-    fn with_layout(
+    fn with_set(
         dtype: DType,
         d: usize,
         seq: usize,
         mode: Mode,
-        layout: Layout,
+        (layout, long_kv): (Layout, bool),
         gpu: &Device,
     ) -> Self {
         let Layout { batch, hq, hkv } = layout;
@@ -407,12 +450,14 @@ impl Case {
         };
         let (ncols1, ncols2) = select(d, gqa_ratio, seq, is_amd)
             .unwrap_or_else(|| panic!("{dtype:?} hd{d} seq={seq}: no MMA kernel"));
-        let cfg = if bf16 {
-            mma_config_bf16(d, ncols1 * ncols2, is_amd)
+        let cfg = if long_kv {
+            mma_config_rdna_long_kv(d, ncols1 * ncols2)
+                .unwrap_or_else(|| panic!("hd{d} {ncols1}x{ncols2}: no long-KV set"))
+        } else if bf16 {
+            mma_config_bf16(d, ncols1 * ncols2, is_amd).unwrap()
         } else {
-            mma_config(d, ncols1 * ncols2, is_amd)
-        }
-        .unwrap();
+            mma_config(d, ncols1 * ncols2, is_amd).unwrap()
+        };
         let shape = LaunchShape {
             seq_q: seq,
             seq_kv,
@@ -446,6 +491,7 @@ impl Case {
             seq,
             mode,
             layout,
+            long_kv,
             q,
             k,
             v,
@@ -465,13 +511,16 @@ impl Case {
     fn run(&self, grid: Option<usize>) -> Vec<f32> {
         self.run_with(LaunchOverride {
             grid,
-            heavy_first: None,
+            ..LaunchOverride::NONE
         })
     }
 
     /// Launches with the launch policy overridden by `forced`, and returns
     /// the output on the host.
-    fn run_with(&self, forced: LaunchOverride) -> Vec<f32> {
+    fn run_with(&self, mut forced: LaunchOverride) -> Vec<f32> {
+        if self.long_kv {
+            forced.long_kv = Some(true);
+        }
         // The allocator hands the next launch the block freed last. Fill a
         // block of the output's size with NaN and free it, so a launch that
         // leaves part of its output unwritten cannot pass on the stale

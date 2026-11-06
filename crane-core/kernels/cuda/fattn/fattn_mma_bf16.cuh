@@ -157,7 +157,17 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 16,  64, 2,  32, 128, 128, 128, 1, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 32, 256, 2,  64, 128, 128,  64, 1, true);
+#if defined(CRANE_FATTN_LONG_KV)
+    // Long KV: Q in registers and 64-row KV tiles. Fewer loop iterations
+    // win once the KV length is large, despite the register spill.
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 256, 2,  64, 128, 128,  64, 1, true);
+#else
+    // Short KV: Q stays in LDS because Q in registers spills heavily at this
+    // shape. nbatch_fa is halved so that Q, K/V and the mask fit in the
+    // 64 KB of LDS a workgroup may use. The host's `mma_config_rdna_long_kv`
+    // mirrors the branch above.
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 256, 2,  32, 128, 128,  64, 1, false);
+#endif // defined(CRANE_FATTN_LONG_KV)
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 16, 128, 3,  64,  96,  64, 128, 1, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 32, 128, 2,  32, 128, 128, 128, 1, true);
