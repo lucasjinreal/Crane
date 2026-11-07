@@ -22,8 +22,8 @@ use super::super::fattn::{
 use super::super::fattn_long_seq_host::compare;
 use super::long_seq_tests::{bitwise_eq, round_to, scaled_q, to_host, tolerance};
 use super::{
-    LaunchOverride, LaunchShape, fattn_mma_bf16_causal, prefill_dispatch, prefill_dispatch_bf16,
-    tile_counts,
+    LaunchOverride, LaunchShape, fattn_mma_bf16_causal, narrowed_ncols1, prefill_dispatch,
+    prefill_dispatch_bf16, tile_counts,
 };
 
 /// `head_dim` 512 has no MMA kernel on AMD.
@@ -450,6 +450,12 @@ impl Case {
         };
         let (ncols1, ncols2) = select(d, gqa_ratio, seq, is_amd)
             .unwrap_or_else(|| panic!("{dtype:?} hd{d} seq={seq}: no MMA kernel"));
+        // Match fattn_mma_prefill_cuda/_bf16_prefill_cuda's own narrowing, so
+        // this test's kv_max/ntiles/iter_k never diverge from what the
+        // dispatch actually launches with (see narrowed_ncols1's doc
+        // comment).
+        let ncols1 =
+            narrowed_ncols1(&q, ncols1, ncols2, seq, gqa_ratio, hkv, batch, is_amd, bf16).unwrap();
         let cfg = if long_kv {
             mma_config_rdna_long_kv(d, ncols1 * ncols2)
                 .unwrap_or_else(|| panic!("hd{d} {ncols1}x{ncols2}: no long-KV set"))

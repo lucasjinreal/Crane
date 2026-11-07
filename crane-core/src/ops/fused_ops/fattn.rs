@@ -492,6 +492,63 @@ pub(crate) fn select_mma_ncols_bf16(
     Some((ncols1, ncols2))
 }
 
+/// Halves `ncols1` when the resulting grid would underfill the GPU: more
+/// SMs than tiles leaves some idle for the whole launch. Halving `ncols1`
+/// doubles the Q-tile count (see [`q_tiles`]) at the cost of half the MMA
+/// work per block, trading per-block latency for occupancy. This is a
+/// selection-only change: the `(ncols1/2, ncols2)` kernel is already
+/// instantiated everywhere [`select_mma_ncols`]/[`select_mma_ncols_bf16`]
+/// can return `(ncols1, ncols2)` with `ncols1` even, since every even
+/// `ncols1` tier in [`mma_ncols1`]/[`mma_ncols1_bf16`]'s ladder has a
+/// corresponding half-sized tier one step down.
+///
+/// NVIDIA-only: this compares the raw tile count against the raw SM count,
+/// which only approximates occupancy where the config's `occupancy` field
+/// (blocks resident per SM) is `1`, as it is for Ampere's hd256 64-column
+/// tile. RDNA's hd256 tables report `occupancy: 2` at both the 64- and
+/// 32-column tiles (see `mma_config_rdna`), so a GPU already runs two
+/// blocks per CU regardless, and this threshold never reflects real
+/// occupancy there. Measured on a 64-CU RDNA4 card: halving Qwen3.5's
+/// hd256/GQA4 shape at seq 231/238 made it slower (about 45us to 52us), not
+/// faster, confirming the block-count proxy does not hold on AMD. AMD stays
+/// untouched until an occupancy-aware threshold is modeled and validated
+/// there; a naive port would also need the RDNA hd256 64-column tile's
+/// separate long-KV kernel set back in mind, since that set only exists at
+/// `ncols == 64` and halving away from it would make it unreachable (see
+/// [`mma_config_set`]).
+///
+/// Returns `ncols1` unchanged if `is_amd`, `n_sm` is `0` (unknown, e.g. the
+/// CUDA build before a successful SM-count query), the grid is not
+/// underfilled, or halving would drop the product below NVIDIA's minimum
+/// (`ncols1*ncols2 >= 16` for bf16, `>= 8` for f16, see
+/// [`select_mma_ncols`]/[`select_mma_ncols_bf16`]'s asserts).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn narrow_for_underfill(
+    ncols1: usize,
+    ncols2: usize,
+    seq_q: usize,
+    gqa_ratio: usize,
+    h_kv: usize,
+    batch: usize,
+    n_sm: usize,
+    is_amd: bool,
+    bf16: bool,
+) -> usize {
+    if is_amd || n_sm == 0 {
+        return ncols1;
+    }
+    let ntiles = q_tiles(seq_q, ncols1) * gqa_z_tiles(gqa_ratio, ncols2) * h_kv * batch;
+    if ntiles >= n_sm {
+        return ncols1;
+    }
+    let half = ncols1 / 2;
+    let min_product = if bf16 { 16 } else { 8 };
+    if half < 1 || half * ncols2 < min_product {
+        return ncols1;
+    }
+    half
+}
+
 /// Which kernel family [`select_mma_ncols`] would pick for, i.e. whether a
 /// call with these shapes has an instantiated MMA kernel at all. `seq_kv`
 /// is unused (see [`select_mma_ncols`]'s doc comment) but kept in the
@@ -1030,6 +1087,78 @@ mod tests {
                 FattnKernelType::MmaF16
             );
         }
+    }
+
+    #[test]
+    fn narrow_for_underfill_keeps_ncols1_when_grid_is_full() {
+        // 30 tiles on 16 SMs: not underfilled.
+        assert_eq!(
+            narrow_for_underfill(16, 4, 238, 4, 2, 1, 16, false, false),
+            16
+        );
+    }
+
+    #[test]
+    fn narrow_for_underfill_halves_ncols1_on_qwen35_hd256_shape() {
+        // hd256 gqa4 seq238 h_kv2 batch1 on an L4 (58 SMs): q_tiles(238, 16)
+        // = 15, gqa_z_tiles(4, 4) = 1, so ntiles = 15*1*2*1 = 30 < 58.
+        // Halving to ncols1=8 doubles ntiles to 58, filling the grid.
+        assert_eq!(
+            narrow_for_underfill(16, 4, 238, 4, 2, 1, 58, false, false),
+            8
+        );
+        assert_eq!(
+            narrow_for_underfill(16, 4, 238, 4, 2, 1, 58, false, true),
+            8
+        );
+    }
+
+    #[test]
+    fn narrow_for_underfill_never_narrows_on_amd() {
+        // Same shape and occupancy as the NVIDIA test above (would halve to
+        // 8 there), but is_amd=true must keep it at 16 regardless. Measured
+        // on a 64-CU RDNA4 card: narrowing this exact shape at seq 231/238
+        // made it slower, not faster, because RDNA's hd256 tables already
+        // report occupancy=2 at both tile widths, so raw tile count vs SM
+        // count is not a valid occupancy signal there (see this function's
+        // doc comment).
+        assert_eq!(
+            narrow_for_underfill(16, 4, 238, 4, 2, 1, 58, true, false),
+            16
+        );
+    }
+
+    #[test]
+    fn narrow_for_underfill_ignores_unknown_sm_count() {
+        assert_eq!(
+            narrow_for_underfill(16, 4, 238, 4, 2, 1, 0, false, false),
+            16
+        );
+    }
+
+    #[test]
+    fn narrow_for_underfill_stops_below_the_minimum_product() {
+        // Halving ncols1=8 with ncols2=4 would give product 16, below
+        // NVIDIA f16's minimum of 8... but 8*4=32 is still >= 8, so this
+        // halves. Pick ncols1=8,ncols2=2 (product 16) halving to
+        // ncols1=4,ncols2=2 (product 8): still valid on NVIDIA f16 (min 8)
+        // but invalid on NVIDIA bf16 (min 16), which must stay unchanged.
+        assert_eq!(
+            narrow_for_underfill(8, 2, 238, 2, 2, 1, 1000, false, false),
+            4
+        );
+        assert_eq!(
+            narrow_for_underfill(8, 2, 238, 2, 2, 1, 1000, false, true),
+            8
+        );
+    }
+
+    #[test]
+    fn narrow_for_underfill_stops_at_ncols1_one() {
+        assert_eq!(
+            narrow_for_underfill(1, 16, 238, 16, 2, 1, 1000, false, false),
+            1
+        );
     }
 
     // select_mma_ncols must only ever return (ncols1, ncols2) pairs that
