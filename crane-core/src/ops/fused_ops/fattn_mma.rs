@@ -33,8 +33,8 @@ use super::fattn::{
     FATTN_KQ_STRIDE, FattnMmaConfig, MAX_GRID_X_DIM, MmaConfigSet, fixup_scratch_len, gqa_z_tiles,
     has_long_kv_set, init_fastdiv_values, is_amd_backend, mma_config, mma_config_bf16,
     mma_config_rdna_long_kv, mma_config_set, mma_shared_mem_bytes, mma_shared_mem_bytes_bf16,
-    q_tiles, select_mma_ncols, select_mma_ncols_bf16, stream_k_grid, stream_k_needs_fixup,
-    unsupported_config,
+    narrow_for_underfill, q_tiles, select_mma_ncols, select_mma_ncols_bf16, stream_k_grid,
+    stream_k_needs_fixup, unsupported_config,
 };
 
 /// Bounds-checked scalar arguments for a `crane_fattn_mma_f16_*` launch,
@@ -930,10 +930,44 @@ fn mma_shape_params(q: &Tensor, k: &Tensor) -> Result<(usize, usize, usize, usiz
     Ok((d, h_q / h_kv, seq_q, seq_kv, is_amd_backend()))
 }
 
+/// Applies the same grid-underfill narrowing [`fattn_mma_prefill_cuda`]/
+/// [`fattn_mma_bf16_prefill_cuda`] apply internally, so a caller that needs
+/// `ncols1` to size its own tensor (namely [`mma_ncols1_for`]/
+/// [`mma_ncols1_for_bf16`], for `KV_max`) never diverges from the `ncols1`
+/// the kernel actually launches with. `grid_target`'s `n_sm` query is cached
+/// per device, so calling it again here is cheap.
+#[allow(clippy::too_many_arguments)] // one narrow_for_underfill call's worth of inputs
+fn narrowed_ncols1(
+    q: &Tensor,
+    ncols1: usize,
+    ncols2: usize,
+    seq_q: usize,
+    gqa_ratio: usize,
+    h_kv: usize,
+    batch: usize,
+    is_amd: bool,
+    bf16: bool,
+) -> Result<usize> {
+    let target = grid_target(q.device(), LaunchOverride::NONE)?;
+    Ok(narrow_for_underfill(
+        ncols1,
+        ncols2,
+        seq_q,
+        gqa_ratio,
+        h_kv,
+        batch,
+        target.n_sm,
+        is_amd,
+        bf16,
+    ))
+}
+
 /// `(ncols1, gqa_ratio)` for a `[B, S, H, D]` BSHD `q`/`k` pair, shared by
 /// [`fattn_mma_causal`]/[`fattn_mma_full`]/[`fattn_mma_windowed`] to size
 /// their `KV_max` tensor before dispatching to [`fattn_mma_prefill`] (which
-/// re-derives the same `ncols1` internally from the same inputs).
+/// re-derives the same `ncols1` internally from the same inputs, including
+/// the [`narrow_for_underfill`] grid-underfill narrowing via
+/// [`narrowed_ncols1`] above).
 ///
 /// # Errors
 ///
@@ -943,26 +977,30 @@ fn mma_shape_params(q: &Tensor, k: &Tensor) -> Result<(usize, usize, usize, usiz
 /// should fall back to [`super::fattn_tile`] in that case).
 fn mma_ncols1_for(q: &Tensor, k: &Tensor) -> Result<usize> {
     let (d, gqa_ratio, seq_q, _seq_kv, is_amd) = mma_shape_params(q, k)?;
-    select_mma_ncols(d, gqa_ratio, seq_q, is_amd)
-        .map(|(ncols1, _)| ncols1)
-        .ok_or_else(|| {
-            unsupported_config(format!(
-                "fattn_mma: no instantiated kernel for head_dim={d} gqa_ratio={gqa_ratio} seq_q={seq_q}"
-            ))
-        })
+    let (ncols1, ncols2) = select_mma_ncols(d, gqa_ratio, seq_q, is_amd).ok_or_else(|| {
+        unsupported_config(format!(
+            "fattn_mma: no instantiated kernel for head_dim={d} gqa_ratio={gqa_ratio} seq_q={seq_q}"
+        ))
+    })?;
+    let (batch, _, h_kv, _) = k.dims4()?;
+    narrowed_ncols1(
+        q, ncols1, ncols2, seq_q, gqa_ratio, h_kv, batch, is_amd, false,
+    )
 }
 
 /// bf16 counterpart of [`mma_ncols1_for`], used by the `fattn_mma_bf16_*`
 /// entry points below.
 fn mma_ncols1_for_bf16(q: &Tensor, k: &Tensor) -> Result<usize> {
     let (d, gqa_ratio, seq_q, _seq_kv, is_amd) = mma_shape_params(q, k)?;
-    select_mma_ncols_bf16(d, gqa_ratio, seq_q, is_amd)
-        .map(|(ncols1, _)| ncols1)
-        .ok_or_else(|| {
-            unsupported_config(format!(
-                "fattn_mma_bf16: no instantiated kernel for head_dim={d} gqa_ratio={gqa_ratio} seq_q={seq_q}"
-            ))
-        })
+    let (ncols1, ncols2) = select_mma_ncols_bf16(d, gqa_ratio, seq_q, is_amd).ok_or_else(|| {
+        unsupported_config(format!(
+            "fattn_mma_bf16: no instantiated kernel for head_dim={d} gqa_ratio={gqa_ratio} seq_q={seq_q}"
+        ))
+    })?;
+    let (batch, _, h_kv, _) = k.dims4()?;
+    narrowed_ncols1(
+        q, ncols1, ncols2, seq_q, gqa_ratio, h_kv, batch, is_amd, true,
+    )
 }
 
 /// Casts `mask` to F16 if it isn't already (avoiding a no-op cast's clone),
@@ -1383,8 +1421,8 @@ mod cuda {
         LaunchShape, TileCost,
     };
     use crate::ops::fused_ops::fattn::{
-        fixup_kernel_name, select_mma_ncols, select_mma_ncols_bf16, unsupported_config,
-        validate_fattn_bshd,
+        fixup_kernel_name, narrow_for_underfill, select_mma_ncols, select_mma_ncols_bf16,
+        unsupported_config, validate_fattn_bshd,
     };
     use candle_core::{Device, Result, Tensor};
 
@@ -1508,7 +1546,7 @@ mod cuda {
         let dev = q.device().as_cuda_device()?.clone();
         let is_amd = false;
 
-        let Some((ncols1, ncols2)) = select_mma_ncols(d, gqa_ratio, seq_q, is_amd) else {
+        let Some((mut ncols1, ncols2)) = select_mma_ncols(d, gqa_ratio, seq_q, is_amd) else {
             return Err(unsupported_config(format!(
                 "fattn_mma: no instantiated kernel for head_dim={d} gqa_ratio={gqa_ratio} seq_q={seq_q}"
             )));
@@ -1530,6 +1568,17 @@ mod cuda {
             gqa_ratio,
         };
         let target = super::grid_target(q.device(), forced)?;
+        ncols1 = narrow_for_underfill(
+            ncols1,
+            ncols2,
+            seq_q,
+            gqa_ratio,
+            h_kv,
+            b,
+            target.n_sm,
+            is_amd,
+            false,
+        );
         let kv = super::KvExtent::new(seq_kv, h_kv, causal_kv_offset);
         let (cfg, set) = super::launch_config((d, ncols1 * ncols2), kv, (is_amd, false), forced)?;
         let tail = ncols2 > 1 && !seq_kv.is_multiple_of(cfg.nbatch_fa);
@@ -1754,7 +1803,7 @@ mod cuda {
         let dev = q.device().as_cuda_device()?.clone();
         let is_amd = false;
 
-        let Some((ncols1, ncols2)) = select_mma_ncols_bf16(d, gqa_ratio, seq_q, is_amd) else {
+        let Some((mut ncols1, ncols2)) = select_mma_ncols_bf16(d, gqa_ratio, seq_q, is_amd) else {
             return Err(unsupported_config(format!(
                 "fattn_mma_bf16: no instantiated kernel for head_dim={d} gqa_ratio={gqa_ratio} seq_q={seq_q}"
             )));
@@ -1775,6 +1824,17 @@ mod cuda {
             gqa_ratio,
         };
         let target = super::grid_target(q.device(), forced)?;
+        ncols1 = narrow_for_underfill(
+            ncols1,
+            ncols2,
+            seq_q,
+            gqa_ratio,
+            h_kv,
+            b,
+            target.n_sm,
+            is_amd,
+            true,
+        );
         let kv = super::KvExtent::new(seq_kv, h_kv, causal_kv_offset);
         let (cfg, set) = super::launch_config((d, ncols1 * ncols2), kv, (is_amd, true), forced)?;
         let tail = ncols2 > 1 && !seq_kv.is_multiple_of(cfg.nbatch_fa);
@@ -1963,14 +2023,35 @@ mod cuda {
         ))
     }
 
-    /// The device facts for the stream-K grid choice. `n_sm` only feeds
-    /// [`LaunchGeometry::new`]'s AMD `head_dim == 64` split, which never
-    /// runs on a CUDA build (`KernelVariant::is_amd` is always `false`
-    /// here), so this skips the `MULTIPROCESSOR_COUNT` driver query
-    /// entirely rather than caching a value nothing reads.
+    /// The device facts for the stream-K grid choice: the SM count of
+    /// `device`, used by [`narrow_for_underfill`] to detect a grid that
+    /// leaves SMs idle. `n_sm` is a static fact about a device for the
+    /// process's lifetime, so it is cached per gpu_id rather than queried
+    /// on every dispatch, mirroring the ROCm `grid_target`.
     pub(super) fn grid_target(device: &Device, forced: LaunchOverride) -> Result<GridTarget> {
-        let _ = device.as_cuda_device()?;
-        Ok(GridTarget { n_sm: 0, forced })
+        use std::collections::HashMap;
+        use std::sync::{OnceLock, RwLock};
+
+        use candle_core::cuda_backend::cudarc::driver::sys::CUdevice_attribute;
+
+        static CACHE: OnceLock<RwLock<HashMap<usize, usize>>> = OnceLock::new();
+        let cache = CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+
+        let candle_core::DeviceLocation::Cuda { gpu_id } = device.location() else {
+            candle_core::bail!("grid_target: not a cuda device");
+        };
+        if let Some(&n_sm) = cache.read().unwrap().get(&gpu_id) {
+            return Ok(GridTarget { n_sm, forced });
+        }
+        let stream = device.as_cuda_device()?.cuda_stream();
+        let n_sm = stream
+            .context()
+            .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+            .w()?
+            .try_into()
+            .unwrap_or(0);
+        cache.write().unwrap().insert(gpu_id, n_sm);
+        Ok(GridTarget { n_sm, forced })
     }
 }
 
@@ -1986,8 +2067,8 @@ mod rocm {
         LaunchShape, MmaConfigSet, TileCost,
     };
     use crate::ops::fused_ops::fattn::{
-        fixup_kernel_name, select_mma_ncols, select_mma_ncols_bf16, unsupported_config,
-        validate_fattn_bshd,
+        fixup_kernel_name, narrow_for_underfill, select_mma_ncols, select_mma_ncols_bf16,
+        unsupported_config, validate_fattn_bshd,
     };
     use crate::ops::rocm;
 
@@ -2151,7 +2232,7 @@ mod rocm {
         let dev = q.device().as_rocm_device()?.clone();
         let is_amd = true;
 
-        let Some((ncols1, ncols2)) = select_mma_ncols(d, gqa_ratio, seq_q, is_amd) else {
+        let Some((mut ncols1, ncols2)) = select_mma_ncols(d, gqa_ratio, seq_q, is_amd) else {
             return Err(unsupported_config(format!(
                 "fattn_mma: no instantiated kernel for head_dim={d} gqa_ratio={gqa_ratio} seq_q={seq_q}"
             )));
@@ -2173,6 +2254,17 @@ mod rocm {
             gqa_ratio,
         };
         let target = super::grid_target(q.device(), forced)?;
+        ncols1 = narrow_for_underfill(
+            ncols1,
+            ncols2,
+            seq_q,
+            gqa_ratio,
+            h_kv,
+            b,
+            target.n_sm,
+            is_amd,
+            false,
+        );
         let kv = super::KvExtent::new(seq_kv, h_kv, causal_kv_offset);
         let (cfg, set) = super::launch_config((d, ncols1 * ncols2), kv, (is_amd, false), forced)?;
         let tail = ncols2 > 1 && !seq_kv.is_multiple_of(cfg.nbatch_fa);
@@ -2362,7 +2454,7 @@ mod rocm {
         let dev = q.device().as_rocm_device()?.clone();
         let is_amd = true;
 
-        let Some((ncols1, ncols2)) = select_mma_ncols_bf16(d, gqa_ratio, seq_q, is_amd) else {
+        let Some((mut ncols1, ncols2)) = select_mma_ncols_bf16(d, gqa_ratio, seq_q, is_amd) else {
             return Err(unsupported_config(format!(
                 "fattn_mma_bf16: no instantiated kernel for head_dim={d} gqa_ratio={gqa_ratio} seq_q={seq_q}"
             )));
@@ -2383,6 +2475,17 @@ mod rocm {
             gqa_ratio,
         };
         let target = super::grid_target(q.device(), forced)?;
+        ncols1 = narrow_for_underfill(
+            ncols1,
+            ncols2,
+            seq_q,
+            gqa_ratio,
+            h_kv,
+            b,
+            target.n_sm,
+            is_amd,
+            true,
+        );
         let kv = super::KvExtent::new(seq_kv, h_kv, causal_kv_offset);
         let (cfg, set) = super::launch_config((d, ncols1 * ncols2), kv, (is_amd, true), forced)?;
         let tail = ncols2 > 1 && !seq_kv.is_multiple_of(cfg.nbatch_fa);
