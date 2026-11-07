@@ -509,7 +509,7 @@ impl LaunchGeometry {
             )));
         }
         let shared_mem_bytes = if bf16 {
-            mma_shared_mem_bytes_bf16(dkq, ncols1, ncols2, &cfg)
+            mma_shared_mem_bytes_bf16(dkq, ncols1, ncols2, &cfg, is_amd)
         } else {
             mma_shared_mem_bytes(dkq, ncols1, ncols2, &cfg, is_amd)
         };
@@ -2064,29 +2064,36 @@ mod rocm {
         })
     }
 
-    /// bf16 counterpart of [`rocm_mma_source`]: `fattn_mma_bf16.cuh` only
-    /// includes `crane_fattn_shim.cuh`, `mma.cuh`, and `fattn_common.cuh`
-    /// (no `cp_async.cuh`/`swizzle.cuh` — this kernel never pipelines or
-    /// swizzles, see that file's module doc), so this splice is simpler
-    /// than [`rocm_mma_source`]'s. Same splice-once/strip-elsewhere rule:
-    /// `crane_fattn_shim.cuh` is included from three places (`mma.cuh`,
-    /// `fattn_common.cuh`, and `fattn_mma_bf16.cuh` itself), so `mma_h`/
-    /// `common` have their own copy of that `#include` line stripped before
-    /// being spliced in, leaving exactly one copy of the shim's contents in
-    /// the final source.
+    /// bf16 counterpart of [`rocm_mma_source`]: `fattn_mma_bf16.cuh` now
+    /// shares `fattn_mma_f16.cuh`'s `cp_async.cuh`/`swizzle.cuh` pipeline
+    /// (both NVIDIA-only; stub out under HIP, see those headers' module
+    /// docs), so the splice order matches [`rocm_mma_source`]'s. Same
+    /// splice-once/strip-elsewhere rule: `crane_fattn_shim.cuh` is included
+    /// from five places (`mma.cuh`, `cp_async.cuh`, `swizzle.cuh`,
+    /// `fattn_common.cuh`, and `fattn_mma_bf16.cuh` itself), so each leaf's
+    /// own copy of that `#include` (and, for `swizzle.cuh`, its `mma.cuh`
+    /// include) is stripped before splicing, leaving exactly one copy of
+    /// each header's contents in the final source.
     fn rocm_mma_bf16_source(instance_source: &'static str) -> String {
         let shim = include_str!("../../../kernels/cuda/fattn/crane_fattn_shim.cuh");
         let mma_h = include_str!("../../../kernels/cuda/fattn/mma.cuh")
+            .replace("#include \"crane_fattn_shim.cuh\"", "");
+        let cp_async = include_str!("../../../kernels/cuda/fattn/cp_async.cuh")
             .replace("#include \"crane_fattn_shim.cuh\"", "");
         let common = include_str!("../../../kernels/cuda/fattn/fattn_common.cuh")
             .replace("#include \"crane_fattn_shim.cuh\"", "");
         let fixup = include_str!("../../../kernels/cuda/fattn/fattn_fixup.cuh")
             .replace("#include \"fattn_common.cuh\"", "");
+        let swizzle = include_str!("../../../kernels/cuda/fattn/swizzle.cuh")
+            .replace("#include \"crane_fattn_shim.cuh\"", "")
+            .replace("#include \"mma.cuh\"", "");
         let mma_bf16 = include_str!("../../../kernels/cuda/fattn/fattn_mma_bf16.cuh");
         let mma_bf16 = splice_once(mma_bf16, "#include \"crane_fattn_shim.cuh\"", shim);
+        let mma_bf16 = splice_once(&mma_bf16, "#include \"cp_async.cuh\"", &cp_async);
         let mma_bf16 = splice_once(&mma_bf16, "#include \"mma.cuh\"", &mma_h);
         let mma_bf16 = splice_once(&mma_bf16, "#include \"fattn_common.cuh\"", &common);
         let mma_bf16 = splice_once(&mma_bf16, "#include \"fattn_fixup.cuh\"", &fixup);
+        let mma_bf16 = splice_once(&mma_bf16, "#include \"swizzle.cuh\"", &swizzle);
         splice_once(
             instance_source,
             "#include \"fattn_mma_bf16.cuh\"",

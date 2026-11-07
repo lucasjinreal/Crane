@@ -607,19 +607,19 @@ pub(crate) fn mma_shared_mem_bytes(
     nbytes_shared_combine.max(rest)
 }
 
-/// bf16 counterpart of [`mma_shared_mem_bytes`]: same formula, but always
-/// passes `is_amd = true` to it regardless of actual architecture.
-/// `fattn_mma_bf16.cuh` never enables shared-memory swizzle or multi-stage
-/// `cp.async` pipelining even on NVIDIA (see that file's module doc), which
-/// is exactly the stride/stage behavior `is_amd = true` already selects in
-/// [`mma_shared_mem_bytes`] and [`tile_stride`].
+/// bf16 counterpart of [`mma_shared_mem_bytes`]: same formula, forwarding
+/// `is_amd` unchanged. `fattn_mma_bf16.cuh` now shares `fattn_mma_f16.cuh`'s
+/// shared-memory swizzle and multi-stage `cp.async` pipelining on NVIDIA
+/// (see that file's module doc), so BF16's smem sizing must track the real
+/// architecture the same way F16's does.
 pub(crate) fn mma_shared_mem_bytes_bf16(
     dkq: usize,
     ncols1: usize,
     ncols2: usize,
     cfg: &FattnMmaConfig,
+    is_amd: bool,
 ) -> usize {
-    mma_shared_mem_bytes(dkq, ncols1, ncols2, cfg, true)
+    mma_shared_mem_bytes(dkq, ncols1, ncols2, cfg, is_amd)
 }
 
 /// `ggml_cuda_fattn_smem_swizzle::tile_stride(nbatch_2, cc)`'s host
@@ -1200,7 +1200,7 @@ mod tests {
                     continue;
                 }
                 let cfg = mma_config_bf16(head_dim, ncols1 * ncols2, true).unwrap();
-                let bytes = mma_shared_mem_bytes_bf16(head_dim, ncols1, ncols2, &cfg);
+                let bytes = mma_shared_mem_bytes_bf16(head_dim, ncols1, ncols2, &cfg, true);
                 assert!(
                     bytes <= AMD_LDS_PER_WORKGROUP,
                     "bf16 head_dim={head_dim} c{ncols1}_s{ncols2}: {bytes} B of LDS"

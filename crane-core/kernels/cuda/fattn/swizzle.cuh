@@ -27,7 +27,8 @@
  * tiles (Turing+ NVIDIA only, see `TURING_MMA_AVAILABLE` in
  * `crane_fattn_shim.cuh`; always disabled on AMD). Upstream's source file
  * is named `fattn-swizzle.cuh`; renamed here to `swizzle.cuh` to match
- * this directory's naming convention. Used by `fattn_mma_f16.cuh`.
+ * this directory's naming convention. Used by `fattn_mma_f16.cuh` and
+ * `fattn_mma_bf16.cuh`.
  *
  * Drops the host-callable `enabled(nbatch_2, cc)`/`tile_stride(nbatch_2,
  * cc)` overloads: both were only reachable from llama.cpp's host dispatch
@@ -102,20 +103,28 @@ static __device__ __forceinline__ const half2 * lane_addr(
     return (const half2 *) ((const char *) tile_base + byte_off);
 }
 
-template<int stride_h2, bool swz, typename TileT>
+// `T2` is the tile's packed element type (half2 or nv_bfloat162, both 4
+// bytes): the non-swizzled fallback forwards straight to
+// ggml_cuda_mma::load_ldmatrix, whose overload set is selected by `T2`
+// matching `TileT`'s own element type, so it can't be fixed to `half2`
+// here. The swizzled path only ever needs a raw byte address (the PTX
+// `ldmatrix` instructions below don't interpret the pointee type), so it
+// casts through `half2 *` once, into `lane_addr`.
+template<int stride_h2, bool swz, typename TileT, typename T2>
 static __device__ __forceinline__ void load_ldmatrix(
-        TileT & t, const half2 * tile_base, const int base_row, const int base_col_h2) {
+        TileT & t, const T2 * tile_base, const int base_row, const int base_col_h2) {
     if constexpr (swz) {
-        static_assert(std::is_same_v<TileT, ggml_cuda_mma::tile<16, 8, half2>>,
-            "the swizzled layout is only supported for tile<16, 8, half2>");
-        ldmatrix_x4((int *) t.x, lane_addr<stride_h2>(tile_base, base_row, base_col_h2, TileT::I, TileT::J));
+        static_assert(std::is_same_v<TileT, ggml_cuda_mma::tile<16, 8, half2>>
+                   || std::is_same_v<TileT, ggml_cuda_mma::tile<16, 8, nv_bfloat162>>,
+            "the swizzled layout is only supported for tile<16, 8, half2 or nv_bfloat162>");
+        ldmatrix_x4((int *) t.x, lane_addr<stride_h2>((const half2 *) tile_base, base_row, base_col_h2, TileT::I, TileT::J));
     } else {
         ggml_cuda_mma::load_ldmatrix(t, tile_base + base_row*stride_h2 + base_col_h2, stride_h2);
     }
 }
 
-template<int stride_h2, bool swz, typename TileT>
-static __device__ __forceinline__ void load_ldmatrix(TileT & t, const half2 * tile_base, const int off_h2) {
+template<int stride_h2, bool swz, typename TileT, typename T2>
+static __device__ __forceinline__ void load_ldmatrix(TileT & t, const T2 * tile_base, const int off_h2) {
     if constexpr (swz) {
         load_ldmatrix<stride_h2, swz>(t, tile_base, off_h2 / stride_h2, off_h2 % stride_h2);
     } else {
@@ -123,20 +132,21 @@ static __device__ __forceinline__ void load_ldmatrix(TileT & t, const half2 * ti
     }
 }
 
-template<int stride_h2, bool swz, typename TileT>
+template<int stride_h2, bool swz, typename TileT, typename T2>
 static __device__ __forceinline__ void load_ldmatrix_trans(
-        TileT & t, const half2 * tile_base, const int base_row, const int base_col_h2) {
+        TileT & t, const T2 * tile_base, const int base_row, const int base_col_h2) {
     if constexpr (swz) {
-        static_assert(std::is_same_v<TileT, ggml_cuda_mma::tile<16, 8, half2>>,
-            "the swizzled layout is only supported for tile<16, 8, half2>");
-        ldmatrix_x4_trans((int *) t.x, lane_addr<stride_h2>(tile_base, base_row, base_col_h2, TileT::I, TileT::J));
+        static_assert(std::is_same_v<TileT, ggml_cuda_mma::tile<16, 8, half2>>
+                   || std::is_same_v<TileT, ggml_cuda_mma::tile<16, 8, nv_bfloat162>>,
+            "the swizzled layout is only supported for tile<16, 8, half2 or nv_bfloat162>");
+        ldmatrix_x4_trans((int *) t.x, lane_addr<stride_h2>((const half2 *) tile_base, base_row, base_col_h2, TileT::I, TileT::J));
     } else {
         ggml_cuda_mma::load_ldmatrix_trans(t, tile_base + base_row*stride_h2 + base_col_h2, stride_h2);
     }
 }
 
-template<int stride_h2, bool swz, typename TileT>
-static __device__ __forceinline__ void load_ldmatrix_trans(TileT & t, const half2 * tile_base, const int off_h2) {
+template<int stride_h2, bool swz, typename TileT, typename T2>
+static __device__ __forceinline__ void load_ldmatrix_trans(TileT & t, const T2 * tile_base, const int off_h2) {
     if constexpr (swz) {
         load_ldmatrix_trans<stride_h2, swz>(t, tile_base, off_h2 / stride_h2, off_h2 % stride_h2);
     } else {
