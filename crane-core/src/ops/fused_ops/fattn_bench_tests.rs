@@ -573,7 +573,7 @@ fn bench_long_kv_shape(
             };
             match time_pair_us(gpu, || launch(false), || launch(true)) {
                 Ok((default, long_kv)) => {
-                    let policy = match mma_config_set(D, ncols, (seq_kv, offset), hkv, true) {
+                    let policy = match mma_config_set(D, ncols, (seq_kv, offset), hkv, true, bf16) {
                         MmaConfigSet::Default => "default",
                         MmaConfigSet::LongKv => "long_kv",
                     };

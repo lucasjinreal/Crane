@@ -129,8 +129,20 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 64, 128, 2,  64,  64,  64,  64, 2, true);
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 16,  64, 4,  32, 128, 128, 128, 2, true);
+#if defined(CRANE_FATTN_LONG_KV)
+    // Long KV: Q in registers, matching the pre-N3 config. Fewer loop
+    // iterations win once the KV length is large, despite the spill.
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 32, 128, 2,  32, 128, 128, 128, 2, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 128, 2,  32, 128, 128, 128, 2, true);
+#else
+    // Short KV: Q in smem, not registers. BF16's F32 VKQ accumulator plus Q
+    // in registers spills heavily at this shape. Occupancy drops to 1 since
+    // two blocks' worth of smem (Q now additive, not overlapped with K/V)
+    // exceeds the 100 KB limit. The host's `mma_config_bf16_ampere` mirrors
+    // this branch; `mma_config_ampere_bf16_long_kv` mirrors the branch above.
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 32, 128, 1,  32, 128, 128, 128, 2, false);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 128, 1,  32, 128, 128, 128, 2, false);
+#endif // defined(CRANE_FATTN_LONG_KV)
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 16,  64, 4,  32, 256, 256, 128, 1, false);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 32, 128, 2,  32, 128, 128, 128, 1, false);

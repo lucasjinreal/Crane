@@ -31,10 +31,11 @@ use candle_core::{DType, Device, Layout, Result, Tensor};
 
 use super::fattn::{
     FATTN_KQ_STRIDE, FattnMmaConfig, MAX_GRID_X_DIM, MmaConfigSet, fixup_scratch_len, gqa_z_tiles,
-    has_long_kv_set, init_fastdiv_values, is_amd_backend, mma_config, mma_config_bf16,
-    mma_config_rdna_long_kv, mma_config_set, mma_shared_mem_bytes, mma_shared_mem_bytes_bf16,
-    narrow_for_underfill, q_tiles, select_mma_ncols, select_mma_ncols_bf16, stream_k_grid,
-    stream_k_needs_fixup, unsupported_config,
+    has_long_kv_set, init_fastdiv_values, is_amd_backend, mma_config,
+    mma_config_ampere_bf16_long_kv, mma_config_bf16, mma_config_rdna_long_kv, mma_config_set,
+    mma_shared_mem_bytes, mma_shared_mem_bytes_bf16, narrow_for_underfill, q_tiles,
+    select_mma_ncols, select_mma_ncols_bf16, stream_k_grid, stream_k_needs_fixup,
+    unsupported_config,
 };
 
 /// Bounds-checked scalar arguments for a `crane_fattn_mma_f16_*` launch,
@@ -388,17 +389,29 @@ fn launch_config(
     forced: LaunchOverride,
 ) -> Result<(FattnMmaConfig, MmaConfigSet)> {
     let set = match forced.long_kv {
-        Some(true) if !has_long_kv_set(dkq, ncols, is_amd) => {
+        Some(true) if !has_long_kv_set(dkq, ncols, is_amd, bf16) => {
             candle_core::bail!(
-                "fattn_mma: no long-KV kernel set for head_dim={dkq} ncols={ncols} (is_amd={is_amd})"
+                "fattn_mma: no long-KV kernel set for head_dim={dkq} ncols={ncols} (is_amd={is_amd} bf16={bf16})"
             )
         },
         Some(true) => MmaConfigSet::LongKv,
         Some(false) => MmaConfigSet::Default,
-        None => mma_config_set(dkq, ncols, (kv.rows, kv.shared_rows), kv.heads, is_amd),
+        None => mma_config_set(
+            dkq,
+            ncols,
+            (kv.rows, kv.shared_rows),
+            kv.heads,
+            is_amd,
+            bf16,
+        ),
     };
     let cfg = match set {
-        MmaConfigSet::LongKv => mma_config_rdna_long_kv(dkq, ncols).ok_or_else(|| {
+        MmaConfigSet::LongKv if is_amd => mma_config_rdna_long_kv(dkq, ncols).ok_or_else(|| {
+            candle_core::Error::Msg(format!(
+                "fattn_mma: no long-KV config for head_dim={dkq} ncols={ncols}"
+            ))
+        })?,
+        MmaConfigSet::LongKv => mma_config_ampere_bf16_long_kv(dkq, ncols).ok_or_else(|| {
             candle_core::Error::Msg(format!(
                 "fattn_mma: no long-KV config for head_dim={dkq} ncols={ncols}"
             ))
@@ -1418,7 +1431,7 @@ mod cuda {
 
     use super::{
         FixupPlan, GridTarget, KernelVariant, LaunchGeometry, LaunchOverride, LaunchScalars,
-        LaunchShape, TileCost,
+        LaunchShape, MmaConfigSet, TileCost,
     };
     use crate::ops::fused_ops::fattn::{
         fixup_kernel_name, narrow_for_underfill, select_mma_ncols, select_mma_ncols_bf16,
@@ -1440,7 +1453,15 @@ mod cuda {
         })
     }
 
-    fn ptx_for_bf16(dkq: usize) -> Result<&'static str> {
+    /// The long-KV set only exists at `head_dim=256`, see
+    /// [`crate::ops::fused_ops::fattn::has_long_kv_set`].
+    fn ptx_for_bf16(dkq: usize, set: MmaConfigSet) -> Result<&'static str> {
+        if set == MmaConfigSet::LongKv {
+            return match dkq {
+                256 => Ok(ptx::FATTN_MMA_HD256_LONG_KV_BF16),
+                _ => candle_core::bail!("fattn_mma_bf16: no long-KV PTX for head_dim {dkq}"),
+            };
+        }
         Ok(match dkq {
             64 => ptx::FATTN_MMA_HD64_BF16,
             128 => ptx::FATTN_MMA_HD128_BF16,
@@ -1840,7 +1861,7 @@ mod cuda {
         let tail = ncols2 > 1 && !seq_kv.is_multiple_of(cfg.nbatch_fa);
         let (kernel_name, module_name) =
             super::cached_mma_names(d, ncols1, ncols2, (true, tail), set);
-        let func = dev.get_or_load_custom_func(kernel_name, module_name, ptx_for_bf16(d)?)?;
+        let func = dev.get_or_load_custom_func(kernel_name, module_name, ptx_for_bf16(d, set)?)?;
         let variant = KernelVariant {
             dkq: d,
             ncols1,
@@ -1985,7 +2006,7 @@ mod cuda {
         if let (Some(f), Some(scratch)) = (&geometry.fixup, &scratch) {
             let fixup_name = fixup_kernel_name(d, ncols1, ncols2, true);
             let fixup_func =
-                dev.get_or_load_custom_func(&fixup_name, module_name, ptx_for_bf16(d)?)?;
+                dev.get_or_load_custom_func(&fixup_name, module_name, ptx_for_bf16(d, set)?)?;
             let mut fixup_builder = fixup_func.builder();
             fixup_builder.arg(&dst);
             fixup_builder.arg(scratch);
@@ -2763,7 +2784,9 @@ mod tests {
     use candle_core::{DType, Device, Tensor};
 
     use super::*;
-    use crate::ops::fused_ops::fattn::{RDNA_HD256_LONG_KV_MIN_SEQ_KV, mma_config};
+    use crate::ops::fused_ops::fattn::{
+        AMPERE_BF16_HD256_LONG_KV_MIN_SEQ_KV, RDNA_HD256_LONG_KV_MIN_SEQ_KV, mma_config,
+    };
 
     // No CUDA/ROCm feature compiled in: fattn_mma_prefill must bail rather
     // than silently computing a wrong answer.
@@ -2790,6 +2813,27 @@ mod tests {
         let pick = |seq_kv, forced| {
             let kv = KvExtent::new(seq_kv, 2, None);
             launch_config((256, 64), kv, (true, false), forced)
+                .unwrap()
+                .1
+        };
+        assert_eq!(pick(min - 1, LaunchOverride::NONE), MmaConfigSet::Default);
+        assert_eq!(pick(min, LaunchOverride::NONE), MmaConfigSet::LongKv);
+        let force = |long_kv| LaunchOverride {
+            long_kv: Some(long_kv),
+            ..LaunchOverride::NONE
+        };
+        assert_eq!(pick(min, force(false)), MmaConfigSet::Default);
+        assert_eq!(pick(1, force(true)), MmaConfigSet::LongKv);
+    }
+
+    // NVIDIA's BF16 hd256 32-column tile mirrors the RDNA policy above, at
+    // its own threshold.
+    #[test]
+    fn launch_config_picks_the_ampere_bf16_long_kv_set() {
+        let min = AMPERE_BF16_HD256_LONG_KV_MIN_SEQ_KV;
+        let pick = |seq_kv, forced| {
+            let kv = KvExtent::new(seq_kv, 2, None);
+            launch_config((256, 32), kv, (false, true), forced)
                 .unwrap()
                 .1
         };
