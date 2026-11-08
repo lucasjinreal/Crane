@@ -215,13 +215,34 @@ fn mma_config_bf16_rdna(dkq: usize, ncols: usize) -> Option<FattnMmaConfig> {
     })
 }
 
-/// bf16 counterpart of [`mma_config_ampere`]: currently an exact copy (the
-/// RDNA table is where [`mma_config_bf16_rdna`] differs); kept separate so
-/// an NVIDIA-specific bf16 tuning change doesn't require touching the F16
-/// table either.
+/// bf16 counterpart of [`mma_config_ampere`]: identical at every
+/// `(dkq, ncols)` pair except `(256, 32 | 64)`, where Q is moved from
+/// registers to shared memory (`q_in_reg: false`). BF16's F32 VKQ
+/// accumulator plus Q in registers spills heavily at this shape (see
+/// `fattn_mma_bf16.cuh`'s module doc); moving Q to smem trades that spill
+/// for smem the 100 KB NVIDIA limit can absorb at `nbatch_fa`'s existing
+/// value of 32. Occupancy drops to 1, since two blocks' worth of smem at
+/// this shape exceeds the limit. `nbatch_fa` is unchanged. Past
+/// [`AMPERE_BF16_HD256_LONG_KV_MIN_SEQ_KV`], [`mma_config_ampere_bf16_long_kv`]
+/// reverts this entry to Q in registers instead, mirroring RDNA's R3
+/// (`mma_config_rdna`): past that KV length the saved loop iterations
+/// outweigh the spill this entry otherwise avoids.
 #[rustfmt::skip]
 fn mma_config_bf16_ampere(dkq: usize, ncols: usize) -> Option<FattnMmaConfig> {
-    mma_config_ampere(dkq, ncols)
+    use FattnMmaConfig as C;
+    Some(match (dkq, ncols) {
+        (64, 8) => C { nthreads: 128, occupancy: 2, nbatch_fa: 128, nbatch_k2: 32, nbatch_v2: 32, nbatch_combine: 32, nstages_target: 2, q_in_reg: true },
+        (64, 16 | 32 | 64) => C { nthreads: 128, occupancy: 2, nbatch_fa: 64, nbatch_k2: 32, nbatch_v2: 32, nbatch_combine: 32, nstages_target: 2, q_in_reg: true },
+        (128, 8) => C { nthreads: 128, occupancy: 2, nbatch_fa: 128, nbatch_k2: 64, nbatch_v2: 64, nbatch_combine: 64, nstages_target: 2, q_in_reg: true },
+        (128, 16 | 32 | 64) => C { nthreads: 128, occupancy: 2, nbatch_fa: 64, nbatch_k2: 64, nbatch_v2: 64, nbatch_combine: 64, nstages_target: 2, q_in_reg: true },
+        (256, 8) => C { nthreads: 128, occupancy: 2, nbatch_fa: 64, nbatch_k2: 128, nbatch_v2: 128, nbatch_combine: 128, nstages_target: 2, q_in_reg: true },
+        (256, 16) => C { nthreads: 64, occupancy: 4, nbatch_fa: 32, nbatch_k2: 128, nbatch_v2: 128, nbatch_combine: 128, nstages_target: 2, q_in_reg: true },
+        (256, 32 | 64) => C { nthreads: 128, occupancy: 1, nbatch_fa: 32, nbatch_k2: 128, nbatch_v2: 128, nbatch_combine: 128, nstages_target: 2, q_in_reg: false },
+        (512, 8 | 16) => C { nthreads: 64, occupancy: 4, nbatch_fa: 32, nbatch_k2: 256, nbatch_v2: 256, nbatch_combine: 128, nstages_target: 1, q_in_reg: false },
+        (512, 32) => C { nthreads: 128, occupancy: 2, nbatch_fa: 32, nbatch_k2: 128, nbatch_v2: 128, nbatch_combine: 128, nstages_target: 1, q_in_reg: false },
+        (512, 64) => C { nthreads: 256, occupancy: 1, nbatch_fa: 32, nbatch_k2: 128, nbatch_v2: 128, nbatch_combine: 128, nstages_target: 1, q_in_reg: false },
+        _ => return None,
+    })
 }
 
 /// bf16 counterpart of [`mma_config`]: looks up [`mma_config_bf16_rdna`]/
@@ -247,15 +268,17 @@ pub(crate) fn mma_config_bf16(dkq: usize, ncols: usize, is_amd: bool) -> Result<
 
 /// Which compiled kernel set an MMA launch uses.
 ///
-/// The RDNA hd256 64-column tile has two configs, and neither wins at every
-/// KV length. See [`mma_config_set`] for the policy.
+/// The RDNA hd256 64-column tile and NVIDIA's BF16 hd256 32/64-column tiles
+/// each have two configs, and neither wins at every KV length. See
+/// [`mma_config_set`] for the policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum MmaConfigSet {
     /// The tuning tables' own entry, in the module built from the
     /// head-dim's regular instance file.
     Default,
-    /// The long-KV config of [`mma_config_rdna_long_kv`], in a separate
-    /// module built from the `*_long_kv` instance file. Same kernel names.
+    /// The long-KV config of [`mma_config_rdna_long_kv`] or
+    /// [`mma_config_ampere_bf16_long_kv`], in a separate module built from
+    /// the `*_long_kv` instance file. Same kernel names.
     LongKv,
 }
 
@@ -280,10 +303,21 @@ pub(crate) const RDNA_HD256_LONG_KV_MIN_SEQ_KV: usize = 4096;
 /// set where the long set would win by about 5%.
 pub(crate) const RDNA_HD256_LONG_KV_MAX_FLOOR_BYTES: usize = 48 << 20;
 
-/// Whether a long-KV kernel set exists for this launch: only the RDNA hd256
-/// 64-column tile has one.
-pub(crate) fn has_long_kv_set(dkq: usize, ncols: usize, is_amd: bool) -> bool {
-    is_amd && dkq == 256 && ncols == 64
+/// `seq_kv` from which NVIDIA's BF16 hd256 32/64-column tiles switch to
+/// the long-KV set (`q_in_reg: true`, matching the pre-N3 config). Below it
+/// the default N3 set (`q_in_reg: false`) wins. Provisional: picked from
+/// existing bench data (wins at 1024, regresses at 2048/4096) without its
+/// own measurement at this exact length; narrow this once a verification
+/// run sweeps intermediate lengths.
+///
+/// Measured on an L4 only, like RDNA's own threshold is gfx1201-only.
+pub(crate) const AMPERE_BF16_HD256_LONG_KV_MIN_SEQ_KV: usize = 2048;
+
+/// Whether a long-KV kernel set exists for this launch: the RDNA hd256
+/// 64-column tile (any dtype), and NVIDIA's BF16 hd256 32/64-column tiles.
+pub(crate) fn has_long_kv_set(dkq: usize, ncols: usize, is_amd: bool, bf16: bool) -> bool {
+    (is_amd && dkq == 256 && ncols == 64)
+        || (!is_amd && bf16 && dkq == 256 && matches!(ncols, 32 | 64))
 }
 
 /// Picks the kernel set for a launch of `ncols = ncols1 * ncols2` columns
@@ -295,45 +329,74 @@ pub(crate) fn has_long_kv_set(dkq: usize, ncols: usize, is_amd: bool) -> bool {
 /// query tiles read only a short prefix. A chunked prefill reads at least
 /// `seq_kv - seq_q` rows in every tile.
 ///
-/// The default set keeps Q in LDS with 32-row KV tiles, which avoids the
-/// register spill and wins on short KV. The long-KV set wins from
-/// [`RDNA_HD256_LONG_KV_MIN_SEQ_KV`] on, unless the `min_kv` rows of K and V
-/// already reach [`RDNA_HD256_LONG_KV_MAX_FLOOR_BYTES`]. Every other launch
-/// uses [`MmaConfigSet::Default`].
+/// On RDNA, the default set keeps Q in LDS with 32-row KV tiles, which
+/// avoids the register spill and wins on short KV. Its long-KV set wins
+/// from [`RDNA_HD256_LONG_KV_MIN_SEQ_KV`] on, unless the `min_kv` rows of K
+/// and V already reach [`RDNA_HD256_LONG_KV_MAX_FLOOR_BYTES`] (an
+/// Infinity-Cache-specific floor with no NVIDIA analog). On NVIDIA BF16
+/// hd256, the default set keeps Q in smem; its long-KV set wins from
+/// [`AMPERE_BF16_HD256_LONG_KV_MIN_SEQ_KV`] on, with no cache-floor check.
+/// Every other launch uses [`MmaConfigSet::Default`].
 pub(crate) fn mma_config_set(
     dkq: usize,
     ncols: usize,
     (seq_kv, min_kv): (usize, usize),
     h_kv: usize,
     is_amd: bool,
+    bf16: bool,
 ) -> MmaConfigSet {
-    // K and V: 4 bytes per (row, head, column).
-    let floor_bytes = min_kv
-        .saturating_mul(h_kv)
-        .saturating_mul(dkq)
-        .saturating_mul(4);
-    if has_long_kv_set(dkq, ncols, is_amd)
-        && seq_kv >= RDNA_HD256_LONG_KV_MIN_SEQ_KV
-        && floor_bytes < RDNA_HD256_LONG_KV_MAX_FLOOR_BYTES
-    {
+    if !has_long_kv_set(dkq, ncols, is_amd, bf16) {
+        return MmaConfigSet::Default;
+    }
+    let long_kv = if is_amd {
+        // K and V: 4 bytes per (row, head, column).
+        let floor_bytes = min_kv
+            .saturating_mul(h_kv)
+            .saturating_mul(dkq)
+            .saturating_mul(4);
+        seq_kv >= RDNA_HD256_LONG_KV_MIN_SEQ_KV && floor_bytes < RDNA_HD256_LONG_KV_MAX_FLOOR_BYTES
+    } else {
+        seq_kv >= AMPERE_BF16_HD256_LONG_KV_MIN_SEQ_KV
+    };
+    if long_kv {
         MmaConfigSet::LongKv
     } else {
         MmaConfigSet::Default
     }
 }
 
-/// The long-KV config for both dtypes: Q in registers with 64-row KV tiles.
-/// It must match the `CRANE_FATTN_LONG_KV` branch of the RDNA tables in
-/// `fattn_mma_f16.cuh` and `fattn_mma_bf16.cuh`, because a mismatched
+/// The RDNA long-KV config for both dtypes: Q in registers with 64-row KV
+/// tiles. It must match the `CRANE_FATTN_LONG_KV` branch of the RDNA tables
+/// in `fattn_mma_f16.cuh` and `fattn_mma_bf16.cuh`, because a mismatched
 /// `nbatch_fa` picks the wrong tail kernel and reads out of bounds.
 ///
-/// Returns `None` unless a long-KV set exists for `(dkq, ncols)`, see
-/// [`has_long_kv_set`].
+/// Returns `None` unless a long-KV set exists for `(dkq, ncols)` on RDNA,
+/// see [`has_long_kv_set`].
 #[rustfmt::skip]
 pub(crate) fn mma_config_rdna_long_kv(dkq: usize, ncols: usize) -> Option<FattnMmaConfig> {
     use FattnMmaConfig as C;
-    has_long_kv_set(dkq, ncols, true).then_some(
+    // `bf16` is irrelevant here: `has_long_kv_set`'s AMD clause doesn't
+    // consult it, since RDNA's long-KV set is dtype-independent. If that
+    // clause is ever split by dtype, this `true` must be replaced with the
+    // caller's real `bf16`.
+    has_long_kv_set(dkq, ncols, true, true).then_some(
         C { nthreads: 256, occupancy: 2, nbatch_fa: 64, nbatch_k2: 128, nbatch_v2: 128, nbatch_combine: 64, nstages_target: 1, q_in_reg: true },
+    )
+}
+
+/// NVIDIA's BF16 hd256 32/64-column long-KV config: `q_in_reg: true`,
+/// identical to [`mma_config_bf16_ampere`]'s own pre-N3 `(256, 32 | 64)`
+/// entry. Unlike RDNA's long-KV set, `nbatch_fa` is unchanged (32 in both
+/// sets) — only `occupancy`/`q_in_reg` differ. Must match the
+/// `CRANE_FATTN_LONG_KV` branch of the Ampere table in `fattn_mma_bf16.cuh`.
+///
+/// Returns `None` unless a long-KV set exists for `(dkq, ncols)` on NVIDIA
+/// BF16, see [`has_long_kv_set`].
+#[rustfmt::skip]
+pub(crate) fn mma_config_ampere_bf16_long_kv(dkq: usize, ncols: usize) -> Option<FattnMmaConfig> {
+    use FattnMmaConfig as C;
+    has_long_kv_set(dkq, ncols, false, true).then_some(
+        C { nthreads: 128, occupancy: 2, nbatch_fa: 32, nbatch_k2: 128, nbatch_v2: 128, nbatch_combine: 128, nstages_target: 2, q_in_reg: true },
     )
 }
 
@@ -1347,57 +1410,120 @@ mod tests {
         }
     }
 
-    // Only the RDNA hd256 64-column tile has a long-KV set, and the switch
-    // happens exactly at the `seq_kv` threshold.
+    // Checks the doc-comment claim on `mma_config_bf16_ampere`'s `(256, 32 |
+    // 64)` entry: one block's smem fits the L4's 100 KB per-SM budget, but
+    // two don't, which is why that entry sets `occupancy: 1`. Not
+    // L4-specific: this is a test-only invariant, not a dispatch decision
+    // tuned to the verification GPU.
+    #[test]
+    fn ampere_bf16_hd256_q_in_reg_false_needs_two_blocks_of_smem() {
+        // Max opt-in shared memory per block on compute capability 8.9 (Ada
+        // Lovelace: L4, L40, L40S, RTX 4090, ...): 99 KiB, the documented
+        // `cudaDevAttrMaxSharedMemoryPerBlockOptin` for that compute
+        // capability (1 KiB less than the 100 KB total per SM, which the
+        // driver reserves).
+        const CUDA_CC89_SMEM_PER_BLOCK_OPTIN_BYTES: usize = 99 << 10;
+        for (ncols1, ncols2, ncols) in [(16, 2, 32), (32, 2, 64)] {
+            let cfg = mma_config_bf16_ampere(256, ncols).unwrap();
+            assert!(!cfg.q_in_reg);
+            let bytes = mma_shared_mem_bytes_bf16(256, ncols1, ncols2, &cfg, false);
+            assert!(
+                bytes <= CUDA_CC89_SMEM_PER_BLOCK_OPTIN_BYTES,
+                "ncols={ncols}: one block alone already needs {bytes} B"
+            );
+            assert!(
+                2 * bytes > CUDA_CC89_SMEM_PER_BLOCK_OPTIN_BYTES,
+                "ncols={ncols}: two blocks fit in {} B, occupancy could be 2",
+                2 * bytes
+            );
+        }
+    }
+
+    // Only the RDNA hd256 64-column tile (any dtype) and NVIDIA's BF16 hd256
+    // 32/64-column tiles have a long-KV set, and each switches exactly at
+    // its own `seq_kv` threshold.
     #[test]
     fn mma_config_set_switches_at_the_threshold() {
         let min = RDNA_HD256_LONG_KV_MIN_SEQ_KV;
-        let set = |ncols, seq_kv, dkq, is_amd| mma_config_set(dkq, ncols, (seq_kv, 0), 2, is_amd);
-        assert_eq!(set(64, min - 1, 256, true), MmaConfigSet::Default);
-        assert_eq!(set(64, min, 256, true), MmaConfigSet::LongKv);
-        assert_eq!(set(64, 1 << 20, 256, true), MmaConfigSet::LongKv);
+        let set = |ncols, seq_kv, dkq, is_amd, bf16| {
+            mma_config_set(dkq, ncols, (seq_kv, 0), 2, is_amd, bf16)
+        };
+        assert_eq!(set(64, min - 1, 256, true, false), MmaConfigSet::Default);
+        assert_eq!(set(64, min, 256, true, false), MmaConfigSet::LongKv);
+        assert_eq!(set(64, 1 << 20, 256, true, false), MmaConfigSet::LongKv);
+        // RDNA's set is dtype-independent.
+        assert_eq!(set(64, min, 256, true, true), MmaConfigSet::LongKv);
         // Neither another column count, another head_dim, nor NVIDIA.
-        assert_eq!(set(32, min, 256, true), MmaConfigSet::Default);
-        assert_eq!(set(64, min, 128, true), MmaConfigSet::Default);
-        assert_eq!(set(64, min, 256, false), MmaConfigSet::Default);
+        assert_eq!(set(32, min, 256, true, false), MmaConfigSet::Default);
+        assert_eq!(set(64, min, 128, true, false), MmaConfigSet::Default);
+        assert_eq!(set(64, min, 256, false, false), MmaConfigSet::Default);
+
+        let ampere_min = AMPERE_BF16_HD256_LONG_KV_MIN_SEQ_KV;
+        let nv_set = |ncols, seq_kv| mma_config_set(256, ncols, (seq_kv, 0), 2, false, true);
+        assert_eq!(nv_set(32, ampere_min - 1), MmaConfigSet::Default);
+        assert_eq!(nv_set(32, ampere_min), MmaConfigSet::LongKv);
+        assert_eq!(nv_set(64, ampere_min), MmaConfigSet::LongKv);
+        assert_eq!(nv_set(64, 1 << 20), MmaConfigSet::LongKv);
+        // Neither another column count, nor F16.
+        assert_eq!(nv_set(16, ampere_min), MmaConfigSet::Default);
+        assert_eq!(
+            mma_config_set(256, 32, (ampere_min, 0), 2, false, false),
+            MmaConfigSet::Default
+        );
     }
 
     // A long KV that every query tile reads in full goes back to the default
-    // set, at exactly the byte limit.
+    // set, at exactly the byte limit. AMD-only (RDNA's cache-floor heuristic
+    // has no NVIDIA analog), so `bf16` is fixed and doesn't change the
+    // result.
     #[test]
     fn mma_config_set_returns_to_default_past_the_cache_floor() {
         // 2 KV heads, head_dim 256: 2 KiB of K and V per row and head, so
         // 4 KiB per row.
         let rows = RDNA_HD256_LONG_KV_MAX_FLOOR_BYTES / (2 * 256 * 2 * 2);
         let seq_kv = 4 * rows;
-        let set = |min_kv| mma_config_set(256, 64, (seq_kv, min_kv), 2, true);
+        let set = |min_kv| mma_config_set(256, 64, (seq_kv, min_kv), 2, true, false);
         assert_eq!(set(0), MmaConfigSet::LongKv);
         assert_eq!(set(rows - 1), MmaConfigSet::LongKv);
         assert_eq!(set(rows), MmaConfigSet::Default);
         assert_eq!(set(seq_kv), MmaConfigSet::Default);
         // More KV heads reach the limit with fewer rows.
         assert_eq!(
-            mma_config_set(256, 64, (seq_kv, rows / 2), 4, true),
+            mma_config_set(256, 64, (seq_kv, rows / 2), 4, true, false),
             MmaConfigSet::Default
         );
         // Huge inputs saturate instead of wrapping.
         assert_eq!(
-            mma_config_set(256, 64, (usize::MAX, usize::MAX), usize::MAX, true),
+            mma_config_set(256, 64, (usize::MAX, usize::MAX), usize::MAX, true, false),
             MmaConfigSet::Default
         );
     }
 
     // The long-KV config differs from the default one only in the tile
-    // shape, and its kernel set exists exactly where `has_long_kv_set` says.
+    // shape, and its kernel set exists exactly where `has_long_kv_set` says,
+    // on both backends.
     #[test]
     fn long_kv_config_matches_has_long_kv_set() {
-        for dkq in [64usize, 128, 256, 512] {
-            for ncols in [8usize, 16, 32, 64] {
-                assert_eq!(
-                    mma_config_rdna_long_kv(dkq, ncols).is_some(),
-                    has_long_kv_set(dkq, ncols, true),
-                    "dkq={dkq} ncols={ncols}"
-                );
+        for is_amd in [false, true] {
+            for bf16 in [false, true] {
+                for dkq in [64usize, 128, 256, 512] {
+                    for ncols in [8usize, 16, 32, 64] {
+                        let has_set = if is_amd {
+                            mma_config_rdna_long_kv(dkq, ncols).is_some()
+                        } else if bf16 {
+                            mma_config_ampere_bf16_long_kv(dkq, ncols).is_some()
+                        } else {
+                            // No F16 long-KV config function exists on
+                            // NVIDIA: N3 never touched F16.
+                            false
+                        };
+                        assert_eq!(
+                            has_set,
+                            has_long_kv_set(dkq, ncols, is_amd, bf16),
+                            "is_amd={is_amd} bf16={bf16} dkq={dkq} ncols={ncols}"
+                        );
+                    }
+                }
             }
         }
         let long = mma_config_rdna_long_kv(256, 64).unwrap();
@@ -1406,6 +1532,15 @@ mod tests {
         assert_eq!((default.nbatch_fa, default.q_in_reg), (32, false));
         assert_eq!(long.nthreads, default.nthreads);
         assert_eq!(long.nbatch_k2, default.nbatch_k2);
+
+        // NVIDIA's long-KV set is literally the pre-N3 config: only
+        // occupancy/q_in_reg revert, nbatch_fa stays 32 in both sets.
+        let nv_long = mma_config_ampere_bf16_long_kv(256, 32).unwrap();
+        let nv_default = mma_config_bf16(256, 32, false).unwrap();
+        assert_eq!((nv_long.occupancy, nv_long.q_in_reg), (2, true));
+        assert_eq!((nv_default.occupancy, nv_default.q_in_reg), (1, false));
+        assert_eq!(nv_long.nbatch_fa, nv_default.nbatch_fa);
+        assert_eq!(nv_long.nthreads, nv_default.nthreads);
     }
 
     #[test]

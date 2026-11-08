@@ -16,8 +16,8 @@ use super::super::fattn::test_support::{
 };
 use super::super::fattn::{
     FATTN_KQ_STRIDE, build_additive_mask_f16, build_analytic_kv_max, is_amd_backend, mma_config,
-    mma_config_bf16, mma_config_rdna_long_kv, select_mma_ncols, select_mma_ncols_bf16,
-    stream_k_needs_fixup,
+    mma_config_ampere_bf16_long_kv, mma_config_bf16, mma_config_rdna_long_kv, select_mma_ncols,
+    select_mma_ncols_bf16, stream_k_needs_fixup,
 };
 use super::super::fattn_long_seq_host::compare;
 use super::long_seq_tests::{bitwise_eq, round_to, scaled_q, to_host, tolerance};
@@ -83,6 +83,18 @@ fn forced_grids_match_plain_launch_long_kv_set() {
         for seq in SEQS {
             check_forced_grids(&Case::long_kv(dtype, 256, seq, Mode::Causal, &gpu));
         }
+    }
+}
+
+// As `forced_grids_match_plain_launch_long_kv_set`, for NVIDIA's BF16 hd256
+// long-KV set (see `mma_config_ampere_bf16_long_kv`). BF16-only: N3 never
+// touched F16, so Ampere F16 has no long-KV set at all.
+#[cfg(all(feature = "cuda", not(feature = "rocm")))]
+#[test]
+fn forced_grids_match_plain_launch_long_kv_set_bf16() {
+    let gpu = test_gpu_device();
+    for seq in SEQS {
+        check_forced_grids(&Case::long_kv(DType::BF16, 256, seq, Mode::Causal, &gpu));
     }
 }
 
@@ -457,8 +469,12 @@ impl Case {
         let ncols1 =
             narrowed_ncols1(&q, ncols1, ncols2, seq, gqa_ratio, hkv, batch, is_amd, bf16).unwrap();
         let cfg = if long_kv {
-            mma_config_rdna_long_kv(d, ncols1 * ncols2)
-                .unwrap_or_else(|| panic!("hd{d} {ncols1}x{ncols2}: no long-KV set"))
+            let long = if is_amd {
+                mma_config_rdna_long_kv(d, ncols1 * ncols2)
+            } else {
+                mma_config_ampere_bf16_long_kv(d, ncols1 * ncols2)
+            };
+            long.unwrap_or_else(|| panic!("hd{d} {ncols1}x{ncols2}: no long-KV set"))
         } else if bf16 {
             mma_config_bf16(d, ncols1 * ncols2, is_amd).unwrap()
         } else {
