@@ -779,11 +779,13 @@ impl InferenceEngine {
         // This prevents the scheduler from admitting new sequences that
         // would immediately exceed the budget again (eviction thrashing).
         // The cap is lifted when a sequence finishes naturally.
-        let post_eviction_running = self.scheduler.running.len();
-        self.scheduler.effective_max_running = Some(post_eviction_running);
+        // A paused prompt already holds KV, so it counts under the cap.
+        let cap = self.scheduler.running.len()
+            + usize::from(self.sequences.keys().any(|id| self.is_paused(id)));
+        self.scheduler.effective_max_running = Some(cap);
         info!(
             "Eviction complete: capping concurrent sequences at {} (was {})",
-            post_eviction_running, self.scheduler.max_running,
+            cap, self.scheduler.max_running,
         );
 
         // Grant a cooldown period so the cuMemGetInfo hard-safety check
@@ -2411,5 +2413,18 @@ mod interleave_tests {
         assert_eq!(run(&mut e, 2), "PP");
         // 3000 prompt tokens plus the one generated before eviction.
         assert_eq!(*calls.lock().unwrap(), [(2048, 0), (953, 2048)]);
+    }
+
+    #[test]
+    fn paused_prompt_continues_past_the_eviction_cap() {
+        let (mut e, _) = engine(600_000);
+        let _a = submit(&mut e, "a", 10);
+        run(&mut e, 1);
+        let _b = submit(&mut e, "b", 5000);
+        assert_eq!(run(&mut e, 1), "P");
+        e.evict_if_needed();
+
+        assert_eq!(run(&mut e, 4), "DPDP");
+        assert_eq!(e.scheduler.running, ["a", "b"]);
     }
 }
