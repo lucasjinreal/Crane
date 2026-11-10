@@ -30,7 +30,7 @@ required-features = ["onnx"]
 ahash = "0.8"
 anyhow = "1.0.97"
 
-candle-flash-attn = { version = "=0.11.0", optional = true }
+candle-flash-attn = { version = "=0.11.1", optional = true }
 # Candle backend variants — see `src/candle_backend.rs`. Every variant,
 # including the plain/stock one, is a *renamed* dependency on the underlying
 # `candle-core`/`candle-nn`/`candle-transformers` package (`candle-core-default`,
@@ -105,12 +105,12 @@ candle-nn-default = { workspace = true, optional = true, features = ["metal"] }
 # Direct deps so `ops/quant_iq/metal.rs` can use `candle_metal_kernels::metal::{Library, ComputePipeline, ...}`
 # (candle-core's `metal_backend` doesn't re-export them) and `objc2_metal::MTLSize`
 # (used to construct dispatch dimensions for `dispatch_threads`).
-candle-metal-kernels = { version = "0.11", optional = true }
+candle-metal-kernels = { version = "0.11.1", optional = true }
 objc2-metal = { version = "0.3", optional = true }
 
 [target.'cfg(all(target_os = "macos", target_arch = "x86_64"))'.dependencies]
 candle-core-default = { workspace = true, optional = true, features = ["accelerate"] }
-candle-metal-kernels = { version = "0.11", optional = true }
+candle-metal-kernels = { version = "0.11.1", optional = true }
 objc2-metal = { version = "0.3", optional = true }
 
 # Mach VM statistics for `device::available_host_memory` on macOS.

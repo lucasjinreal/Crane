@@ -15,16 +15,16 @@ authors = ["Nicholas Jela<nicholasjela@gmail.com>"]
 # that add a backend candle doesn't have yet carry a suffix. Each fork (and
 # the `sycl`/`rocm` special-casing in candle_backend.rs) is meant to go away
 # once that backend merges into candle proper.
-candle-core = { version = "0.11" }
-candle-nn = { version = "0.11" }
-candle-transformers = { version = "0.11" }
+candle-core = { version = "0.11.1" }
+candle-nn = { version = "0.11.1" }
+candle-transformers = { version = "0.11.1" }
 
 # Renamed copies of the plain/stock candle packages above, used by
 # `crane-core` instead of the bare names — see the comment on
 # `candle-core-default` in `crane-core/Cargo.toml` for why.
-candle-core-default = { package = "candle-core", version = "0.11" }
-candle-nn-default = { package = "candle-nn", version = "0.11" }
-candle-transformers-default = { package = "candle-transformers", version = "0.11" }
+candle-core-default = { package = "candle-core", version = "0.11.1" }
+candle-nn-default = { package = "candle-nn", version = "0.11.1" }
+candle-transformers-default = { package = "candle-transformers", version = "0.11.1" }
 
 # Direct dep on candle's Metal helper crate. Candle's `metal_backend` module
 # only re-exports `MetalDevice`/`MetalStorage`/`MetalError`; reaching the
@@ -33,7 +33,7 @@ candle-transformers-default = { package = "candle-transformers", version = "0.11
 # modules in `crane-core/src/ops/fused_ops/`) requires naming the crate
 # explicitly. Same `0.11` pin as candle-core itself, which pulls it in
 # transitively on its own `metal` feature.
-candle-metal-kernels = { version = "0.11.0" }
+candle-metal-kernels = { version = "0.11.1" }
 
 # Same exact pin candle-core uses on its own `metal` feature. Needed to
 # construct `MTLSize` for `dispatch_threads`/`dispatch_thread_groups` —
