@@ -34,15 +34,15 @@ use std::time::{Duration, Instant};
 
 use candle_core::{DType, Device, Result, Tensor};
 
-use super::super::fattn::build_additive_mask_f16;
 use super::super::fattn::test_support::{
     LONG_SEQ_HKV as HKV, LONG_SEQ_HQ as HQ, LongSeqDist, long_seq_inputs, test_gpu_device,
 };
+use super::super::fattn::{FATTN_KQ_STRIDE, build_additive_mask_f16, build_analytic_kv_max};
 use super::long_seq_tests::{SEQS, round_to};
 use super::{
     LaunchOverride, TileCost, fattn_mma_bf16_causal, fattn_mma_bf16_causal_with_mask,
-    fattn_mma_causal, fattn_mma_causal_with_mask, prefill_dispatch, prefill_dispatch_bf16,
-    use_heavy_first,
+    fattn_mma_bf16_prefill, fattn_mma_causal, fattn_mma_causal_with_mask, fattn_mma_prefill,
+    mma_ncols1_for, mma_ncols1_for_bf16, prefill_dispatch, prefill_dispatch_bf16, use_heavy_first,
 };
 use crate::models::qwen3_5::grouped_sdpa;
 #[cfg(all(feature = "rocm", not(feature = "cuda")))]
@@ -104,6 +104,75 @@ fn fattn_bench_bf16_hd256() {
 #[ignore = "needs a CUDA/ROCm GPU, long-running"]
 fn fattn_bench_f16_hd256() {
     bench_table(DType::F16);
+}
+
+// Diagnostic for PERF.md's N5/R6 item: isolates the per-call `kv_max`
+// rebuild (`build_analytic_kv_max`) that `fattn_mma_causal_with_mask`/
+// `fattn_mma_bf16_causal_with_mask` pay on every call, by calling
+// `fattn_mma_prefill`/`fattn_mma_bf16_prefill` directly with a `kv_max`
+// built once per `seq`, the same lifetime as the already-hoisted `mask`.
+// `delta%` is how much of `mma_mask`'s time the hoist recovers.
+#[test]
+#[ignore = "needs a CUDA/ROCm GPU, long-running"]
+fn fattn_bench_mask_overhead_hd256() {
+    let gpu = test_gpu_device();
+    #[allow(clippy::cast_precision_loss)]
+    let scale = (HEAD_DIM as f32).sqrt().recip();
+    warm_up(&gpu).unwrap();
+    let mut failures = 0;
+    for (dtype, bf16) in [(DType::F16, false), (DType::BF16, true)] {
+        println!("{dtype:?} hd{HEAD_DIM} mask overhead, us per call");
+        println!(
+            "{:>6}{:>11}{:>11}{:>10}",
+            "seq", "mma_mask", "hoisted", "delta%"
+        );
+        for seq in SEQS {
+            let [q_host, k_host, v_host] =
+                long_seq_inputs(seq, HEAD_DIM, LongSeqDist::Normal, 0).map(|h| round_to(h, dtype));
+            let bshd = |h: &[f32], heads| Tensor::from_slice(h, (1, seq, heads, HEAD_DIM), &gpu);
+            let q = bshd(&q_host, HQ).unwrap().to_dtype(dtype).unwrap();
+            let k = bshd(&k_host, HKV).unwrap().to_dtype(dtype).unwrap();
+            let v = bshd(&v_host, HKV).unwrap().to_dtype(dtype).unwrap();
+            let mask = build_additive_mask_f16(seq, seq, 0, None, 0, &gpu).unwrap();
+
+            let mma_mask = time_us(&gpu, || {
+                if bf16 {
+                    fattn_mma_bf16_causal_with_mask(&q, &k, &v, scale, 0, &mask)
+                } else {
+                    fattn_mma_causal_with_mask(&q, &k, &v, scale, 0, &mask)
+                }
+            });
+
+            let (batch, seq_q, _, _) = q.dims4().unwrap();
+            let kv_max_cap = seq.next_multiple_of(FATTN_KQ_STRIDE);
+            let ncols1 = if bf16 {
+                mma_ncols1_for_bf16(&q, &k).unwrap()
+            } else {
+                mma_ncols1_for(&q, &k).unwrap()
+            };
+            let kv_max =
+                build_analytic_kv_max(batch, seq_q, ncols1, 0, seq, 0, kv_max_cap, &gpu).unwrap();
+            let hoisted = time_us(&gpu, || {
+                if bf16 {
+                    fattn_mma_bf16_prefill(&q, &k, &v, Some(&mask), Some(&kv_max), scale)
+                } else {
+                    fattn_mma_prefill(&q, &k, &v, Some(&mask), Some(&kv_max), scale)
+                }
+            });
+
+            match (mma_mask, hoisted) {
+                (Ok(masked_us), Ok(hoisted_us)) => {
+                    let delta = (masked_us - hoisted_us) / masked_us * 100.0;
+                    println!("{seq:>6}{masked_us:>11.1}{hoisted_us:>11.1}{delta:>9.1}");
+                },
+                (masked_us, hoisted_us) => {
+                    failures += 1;
+                    eprintln!("seq={seq} {dtype:?}: mma_mask={masked_us:?} hoisted={hoisted_us:?}");
+                },
+            }
+        }
+    }
+    assert_eq!(failures, 0, "{failures} row(s) failed, see stderr");
 }
 
 // Prints, for every shape in `GQA_SHAPES`, the in-kernel causal timing of
