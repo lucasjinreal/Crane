@@ -1022,6 +1022,7 @@ impl InferenceEngine {
             .and_then(|id| self.sequences.get_mut(id))
         {
             seq.prefill_pos = 0;
+            seq.prefill_us = 0;
         }
     }
 
