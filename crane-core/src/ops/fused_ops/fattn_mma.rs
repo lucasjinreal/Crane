@@ -796,12 +796,44 @@ pub fn fattn_mma_prefill(
     {
         candle_core::bail!("fattn_mma: kv_max must be I32, got {:?}", kv.dtype());
     }
-    prefill_dispatch(q, k, v, mask, kv_max, scale, None, LaunchOverride::NONE)
+    prefill_dispatch(
+        q,
+        k,
+        v,
+        mask,
+        kv_max,
+        scale,
+        None,
+        WindowBounds::NONE,
+        LaunchOverride::NONE,
+    )
 }
 
-/// Backend dispatch shared by [`fattn_mma_prefill`] and the in-kernel causal
-/// entries. `causal_kv_offset = Some(o)` makes the kernel mask keys `j > i +
-/// o` itself, in addition to any `mask`. Callers validate dtypes before
+/// Sliding-window bounds passed to the kernel on top of any causal/mask
+/// bound. `window.left = -1` disables the left bound entirely; `window.right
+/// = -1` means the causal diagonal itself is the right bound, with no
+/// extension past it. A plain named struct instead of two positional `i32`s
+/// so `left`/`right` can't be silently transposed across the ~10 call sites
+/// that thread them through to the kernel launch.
+#[derive(Debug, Clone, Copy)]
+struct WindowBounds {
+    left: i32,
+    right: i32,
+}
+
+impl WindowBounds {
+    /// No windowing: both bounds disabled.
+    const NONE: Self = Self {
+        left: -1,
+        right: -1,
+    };
+}
+
+/// Backend dispatch shared by [`fattn_mma_prefill`] and the in-kernel causal/
+/// windowed entries. `causal_kv_offset = Some(o)` makes the kernel mask keys
+/// `j > i + o` itself, in addition to any `mask`. `window` additionally
+/// bounds keys `j < i + o - window.left` and `j > i + o + window.right`; see
+/// [`WindowBounds`] for its `-1` sentinel. Callers validate dtypes before
 /// calling this.
 #[allow(clippy::too_many_arguments)] // one launch's worth of inputs, not separable
 fn prefill_dispatch(
@@ -812,6 +844,7 @@ fn prefill_dispatch(
     kv_max: Option<&Tensor>,
     scale: f32,
     causal_kv_offset: Option<usize>,
+    window: WindowBounds,
     forced: LaunchOverride,
 ) -> Result<Tensor> {
     let padded_mask;
@@ -826,15 +859,47 @@ fn prefill_dispatch(
     };
     #[cfg(feature = "cuda")]
     {
-        cuda::fattn_mma_prefill_cuda(q, k, v, mask, kv_max, scale, causal_kv_offset, forced)
+        cuda::fattn_mma_prefill_cuda(
+            q,
+            k,
+            v,
+            mask,
+            kv_max,
+            scale,
+            causal_kv_offset,
+            window.left,
+            window.right,
+            forced,
+        )
     }
     #[cfg(all(feature = "rocm", not(feature = "cuda")))]
     {
-        rocm::fattn_mma_prefill_rocm(q, k, v, mask, kv_max, scale, causal_kv_offset, forced)
+        rocm::fattn_mma_prefill_rocm(
+            q,
+            k,
+            v,
+            mask,
+            kv_max,
+            scale,
+            causal_kv_offset,
+            window.left,
+            window.right,
+            forced,
+        )
     }
     #[cfg(not(any(feature = "cuda", feature = "rocm")))]
     {
-        let _ = (q, k, v, mask, kv_max, scale, causal_kv_offset, forced);
+        let _ = (
+            q,
+            k,
+            v,
+            mask,
+            kv_max,
+            scale,
+            causal_kv_offset,
+            window,
+            forced,
+        );
         candle_core::bail!("fattn_mma_prefill: requires the cuda or rocm feature")
     }
 }
@@ -883,7 +948,17 @@ pub fn fattn_mma_bf16_prefill(
     {
         candle_core::bail!("fattn_mma_bf16: kv_max must be I32, got {:?}", kv.dtype());
     }
-    prefill_dispatch_bf16(q, k, v, mask, kv_max, scale, None, LaunchOverride::NONE)
+    prefill_dispatch_bf16(
+        q,
+        k,
+        v,
+        mask,
+        kv_max,
+        scale,
+        None,
+        WindowBounds::NONE,
+        LaunchOverride::NONE,
+    )
 }
 
 /// bf16 counterpart of [`prefill_dispatch`].
@@ -896,6 +971,7 @@ fn prefill_dispatch_bf16(
     kv_max: Option<&Tensor>,
     scale: f32,
     causal_kv_offset: Option<usize>,
+    window: WindowBounds,
     forced: LaunchOverride,
 ) -> Result<Tensor> {
     let padded_mask;
@@ -910,15 +986,47 @@ fn prefill_dispatch_bf16(
     };
     #[cfg(feature = "cuda")]
     {
-        cuda::fattn_mma_bf16_prefill_cuda(q, k, v, mask, kv_max, scale, causal_kv_offset, forced)
+        cuda::fattn_mma_bf16_prefill_cuda(
+            q,
+            k,
+            v,
+            mask,
+            kv_max,
+            scale,
+            causal_kv_offset,
+            window.left,
+            window.right,
+            forced,
+        )
     }
     #[cfg(all(feature = "rocm", not(feature = "cuda")))]
     {
-        rocm::fattn_mma_bf16_prefill_rocm(q, k, v, mask, kv_max, scale, causal_kv_offset, forced)
+        rocm::fattn_mma_bf16_prefill_rocm(
+            q,
+            k,
+            v,
+            mask,
+            kv_max,
+            scale,
+            causal_kv_offset,
+            window.left,
+            window.right,
+            forced,
+        )
     }
     #[cfg(not(any(feature = "cuda", feature = "rocm")))]
     {
-        let _ = (q, k, v, mask, kv_max, scale, causal_kv_offset, forced);
+        let _ = (
+            q,
+            k,
+            v,
+            mask,
+            kv_max,
+            scale,
+            causal_kv_offset,
+            window,
+            forced,
+        );
         candle_core::bail!("fattn_mma_bf16_prefill: requires the cuda or rocm feature")
     }
 }
@@ -1213,6 +1321,7 @@ fn causal_in_kernel(
             None,
             scale,
             Some(kv_offset),
+            WindowBounds::NONE,
             LaunchOverride::NONE,
         )
     } else {
@@ -1224,6 +1333,88 @@ fn causal_in_kernel(
             None,
             scale,
             Some(kv_offset),
+            WindowBounds::NONE,
+            LaunchOverride::NONE,
+        )
+    }
+}
+
+/// Whether a windowed launch must fall back to the host mask rather than
+/// let the kernel bound its own KV loop from `kv_offset`/`window_right`.
+/// Returns `true` when the window's right edge extends past the live keys
+/// (`seq_q + kv_offset + window_right > seq_kv`), the same conservative
+/// safety net as [`causal_needs_host_mask`] (which this reduces to when
+/// `window_right == 0`).
+fn windowed_needs_host_mask(
+    seq_q: usize,
+    seq_kv: usize,
+    kv_offset: usize,
+    window_right: usize,
+) -> bool {
+    seq_q + kv_offset + window_right > seq_kv
+}
+
+/// Shared body of [`fattn_mma_windowed`] and [`fattn_mma_bf16_windowed`]:
+/// launches `k`/`v` directly with no mask and no `KV_max`, so the kernel
+/// masks both edges of the sliding window and bounds each tile's KV loop
+/// itself, the windowed counterpart of [`causal_in_kernel`]. Picks the
+/// native-bf16 kernels when `k`/`v` are `BF16`, the plain F16 kernels when
+/// they are `F16`.
+fn windowed_in_kernel(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    kv_offset: usize,
+    window_left: usize,
+    window_right: usize,
+) -> Result<Tensor> {
+    // Same dtype contract as causal_in_kernel.
+    if q.dtype() != k.dtype() {
+        candle_core::bail!(
+            "fattn_mma windowed: q must match k/v dtype, got q={:?} k={:?}",
+            q.dtype(),
+            k.dtype()
+        );
+    }
+    if v.dtype() != k.dtype() {
+        candle_core::bail!(
+            "fattn_mma windowed: k/v dtypes must match, got k={:?} v={:?}",
+            k.dtype(),
+            v.dtype()
+        );
+    }
+    let bf16 = match k.dtype() {
+        DType::F16 => false,
+        DType::BF16 => true,
+        other => candle_core::bail!("fattn_mma windowed: k/v must be F16 or BF16, got {other:?}"),
+    };
+    let window = WindowBounds {
+        left: to_i32(window_left, "window_left")?,
+        right: to_i32(window_right, "window_right")?,
+    };
+    if bf16 {
+        prefill_dispatch_bf16(
+            q,
+            k,
+            v,
+            None,
+            None,
+            scale,
+            Some(kv_offset),
+            window,
+            LaunchOverride::NONE,
+        )
+    } else {
+        prefill_dispatch(
+            q,
+            k,
+            v,
+            None,
+            None,
+            scale,
+            Some(kv_offset),
+            window,
             LaunchOverride::NONE,
         )
     }
@@ -1263,9 +1454,13 @@ pub fn fattn_mma_bf16_causal_with_mask(
 }
 
 /// Sliding-window flash-attention: `i + kv_offset - window_left <= j <= i +
-/// kv_offset + window_right`. See [`fattn_mma_causal`] for the mask/`KV_max`
-/// rationale; `window_left` only narrows the mask (there is no lower bound
-/// to the kernel's KV loop), while `window_right` also tightens `KV_max`.
+/// kv_offset + window_right`. The common case builds no mask or `KV_max`
+/// tensor: the kernel masks both window edges and bounds the KV loop
+/// itself from `kv_offset`/`window_left`/`window_right`, the windowed
+/// counterpart of [`fattn_mma_causal`]. See [`windowed_needs_host_mask`]
+/// for when a host mask (and `KV_max`) is still required instead. Output is
+/// bitwise equal to [`fattn_mma_windowed_with_mask`] given a mask encoding
+/// the same window.
 ///
 /// # Errors
 ///
@@ -1281,6 +1476,9 @@ pub fn fattn_mma_windowed(
 ) -> Result<Tensor> {
     let (_, seq_q, _, _) = q.dims4()?;
     let (_, seq_kv, _, _) = k.dims4()?;
+    if !windowed_needs_host_mask(seq_q, seq_kv, kv_offset, window_right) {
+        return windowed_in_kernel(q, k, v, scale, kv_offset, window_left, window_right);
+    }
     let mask = super::fattn::build_additive_mask_f16(
         seq_q,
         seq_kv,
@@ -1331,8 +1529,10 @@ pub fn fattn_mma_windowed_with_mask(
     fattn_mma_prefill(q, k, v, Some(&mask), Some(&kv_max), scale)
 }
 
-/// Native-bf16 counterpart of [`fattn_mma_windowed`]: see
-/// [`fattn_mma_bf16_windowed_with_mask`]'s doc comment.
+/// Native-bf16 counterpart of [`fattn_mma_windowed`]: dispatches through
+/// [`fattn_mma_bf16_prefill`]'s kernels instead. See
+/// [`fattn_mma_bf16_windowed_with_mask`]'s doc comment for the mask-based
+/// fallback.
 ///
 /// # Errors
 ///
@@ -1348,6 +1548,9 @@ pub fn fattn_mma_bf16_windowed(
 ) -> Result<Tensor> {
     let (_, seq_q, _, _) = q.dims4()?;
     let (_, seq_kv, _, _) = k.dims4()?;
+    if !windowed_needs_host_mask(seq_q, seq_kv, kv_offset, window_right) {
+        return windowed_in_kernel(q, k, v, scale, kv_offset, window_left, window_right);
+    }
     let mask = super::fattn::build_additive_mask_f16(
         seq_q,
         seq_kv,
@@ -1557,6 +1760,8 @@ mod cuda {
         kv_max: Option<&Tensor>,
         scale: f32,
         causal_kv_offset: Option<usize>,
+        window_left: i32,
+        window_right: i32,
         forced: LaunchOverride,
     ) -> Result<Tensor> {
         let (q_s, q_l) = q.storage_and_layout();
@@ -1746,6 +1951,8 @@ mod cuda {
         builder.arg(&p.nb33);
         builder.arg(&causal_kv_offset);
         builder.arg(&heavy_first);
+        builder.arg(&window_left);
+        builder.arg(&window_right);
         // SAFETY: the argument list above matches
         // `crane_fattn_mma_f16_d{d}_v{d}_c{ncols1}_s{ncols2}`'s `extern "C"`
         // signature exactly (`DECL_FATTN_MMA_F16_CASE` in
@@ -1814,6 +2021,8 @@ mod cuda {
         kv_max: Option<&Tensor>,
         scale: f32,
         causal_kv_offset: Option<usize>,
+        window_left: i32,
+        window_right: i32,
         forced: LaunchOverride,
     ) -> Result<Tensor> {
         let (q_s, q_l) = q.storage_and_layout();
@@ -1994,6 +2203,8 @@ mod cuda {
         builder.arg(&p.nb33);
         builder.arg(&causal_kv_offset);
         builder.arg(&heavy_first);
+        builder.arg(&window_left);
+        builder.arg(&window_right);
         // SAFETY: the argument list above matches
         // `crane_fattn_mma_bf16_d{d}_v{d}_c{ncols1}_s{ncols2}`'s `extern "C"`
         // signature exactly (`DECL_FATTN_MMA_BF16_CASE` in
@@ -2243,6 +2454,8 @@ mod rocm {
         kv_max: Option<&Tensor>,
         scale: f32,
         causal_kv_offset: Option<usize>,
+        window_left: i32,
+        window_right: i32,
         forced: LaunchOverride,
     ) -> Result<Tensor> {
         let (q_s, q_l) = q.storage_and_layout();
@@ -2409,6 +2622,8 @@ mod rocm {
             rocm::arg(&p.nb33),
             rocm::arg(&causal_kv_offset),
             rocm::arg(&heavy_first),
+            rocm::arg(&window_left),
+            rocm::arg(&window_right),
         ];
 
         // SAFETY: the argument list above matches
@@ -2465,6 +2680,8 @@ mod rocm {
         kv_max: Option<&Tensor>,
         scale: f32,
         causal_kv_offset: Option<usize>,
+        window_left: i32,
+        window_right: i32,
         forced: LaunchOverride,
     ) -> Result<Tensor> {
         let (q_s, q_l) = q.storage_and_layout();
@@ -2630,6 +2847,8 @@ mod rocm {
             rocm::arg(&p.nb33),
             rocm::arg(&causal_kv_offset),
             rocm::arg(&heavy_first),
+            rocm::arg(&window_left),
+            rocm::arg(&window_right),
         ];
 
         // SAFETY: see fattn_mma_prefill_rocm's identical SAFETY comment;
@@ -2953,6 +3172,21 @@ mod tests {
         assert!(!causal_needs_host_mask(64, 64, 0));
     }
 
+    // Same rule as `causal_needs_host_mask`, extended by `window_right`:
+    // the windowed entries use the host mask exactly when the window's
+    // right edge of the last query row reaches past the last live key.
+    // Reduces to `causal_needs_host_mask` at `window_right == 0`.
+    #[test]
+    fn windowed_needs_host_mask_only_past_live_keys() {
+        assert!(!windowed_needs_host_mask(20, 200, 179, 0));
+        assert!(!windowed_needs_host_mask(20, 200, 180, 0));
+        assert!(windowed_needs_host_mask(20, 200, 181, 0));
+        assert!(!windowed_needs_host_mask(64, 64, 0, 0));
+        assert!(!windowed_needs_host_mask(20, 200, 170, 9));
+        assert!(!windowed_needs_host_mask(20, 200, 170, 10));
+        assert!(windowed_needs_host_mask(20, 200, 170, 11));
+    }
+
     // `None` maps to the kernel's "not causal" sentinel, `Some` passes the
     // offset through, and an offset beyond `i32::MAX` is rejected.
     #[test]
@@ -3131,9 +3365,11 @@ mod gpu_tests {
         MaskMode, naive_attention, narrowed_bhsd, test_gpu_device,
     };
     use super::{
-        LaunchOverride, fattn_mma_bf16_causal, fattn_mma_bf16_causal_with_mask,
-        fattn_mma_bf16_prefill, fattn_mma_causal, fattn_mma_causal_with_mask, fattn_mma_full,
-        fattn_mma_prefill, fattn_mma_windowed, prefill_dispatch, prefill_dispatch_bf16,
+        LaunchOverride, WindowBounds, fattn_mma_bf16_causal, fattn_mma_bf16_causal_with_mask,
+        fattn_mma_bf16_prefill, fattn_mma_bf16_windowed_with_mask, fattn_mma_causal,
+        fattn_mma_causal_with_mask, fattn_mma_full, fattn_mma_prefill, fattn_mma_windowed,
+        fattn_mma_windowed_with_mask, prefill_dispatch, prefill_dispatch_bf16, windowed_in_kernel,
+        windowed_needs_host_mask,
     };
 
     /// `[1, seq_q, seq_kv]` F16 additive causal mask: `0` where `j <=
@@ -3498,7 +3734,18 @@ mod gpu_tests {
                             prefill_dispatch
                         };
                         let got = got_vec(
-                            dispatch(&qg, &kg, &vg, None, None, scale, Some(0), forced).unwrap(),
+                            dispatch(
+                                &qg,
+                                &kg,
+                                &vg,
+                                None,
+                                None,
+                                scale,
+                                Some(0),
+                                WindowBounds::NONE,
+                                forced,
+                            )
+                            .unwrap(),
                         );
                         assert_eq!(got.len(), want.len());
                         for (i, (g, w)) in got.iter().zip(&want).enumerate() {
@@ -3832,6 +4079,138 @@ mod gpu_tests {
         }
         if !is_amd_backend() {
             assert_causal_bitwise_equals_with_mask(true, (1, 64, 64, 4, 4, 128));
+        }
+    }
+
+    // Runs the in-kernel windowed entry (`windowed_in_kernel`, M1 option 3)
+    // and the host-mask entry on the same inputs and requires identical
+    // output bits. `kv_offset` must leave enough slack
+    // (`sq + kv_offset + window_right <= skv`) that `windowed_needs_host_mask`
+    // never triggers the fallback, which would otherwise make both sides
+    // call the same mask-based kernel.
+    #[allow(clippy::many_single_char_names)]
+    fn assert_windowed_bitwise_equals_with_mask(
+        bf16: bool,
+        (b, sq, skv, hq, hkv, d): (usize, usize, usize, usize, usize, usize),
+        (window_left, window_right): (usize, usize),
+        kv_offset: usize,
+    ) {
+        let gpu = test_gpu_device();
+        // `d` is at most 256, exact in an f32.
+        #[allow(clippy::cast_precision_loss)]
+        let scale = 1.0f32 / (d as f32).sqrt();
+        let kv_dtype = if bf16 { DType::BF16 } else { DType::F16 };
+        assert!(!windowed_needs_host_mask(sq, skv, kv_offset, window_right));
+
+        let q = Tensor::randn(0f32, 1f32, (b, sq, hq, d), &gpu)
+            .unwrap()
+            .to_dtype(kv_dtype)
+            .unwrap();
+        let k = Tensor::randn(0f32, 1f32, (b, skv, hkv, d), &gpu)
+            .unwrap()
+            .to_dtype(kv_dtype)
+            .unwrap();
+        let v = Tensor::randn(0f32, 1f32, (b, skv, hkv, d), &gpu)
+            .unwrap()
+            .to_dtype(kv_dtype)
+            .unwrap();
+        let mask = super::super::fattn::build_additive_mask_f16(
+            sq,
+            skv,
+            kv_offset,
+            Some(window_left),
+            window_right,
+            &gpu,
+        )
+        .unwrap();
+
+        // windowed_in_kernel auto-detects F16/BF16 from k/v's dtype.
+        let got = windowed_in_kernel(&q, &k, &v, scale, kv_offset, window_left, window_right);
+        let want = if bf16 {
+            fattn_mma_bf16_windowed_with_mask(&q, &k, &v, scale, kv_offset, window_right, &mask)
+        } else {
+            fattn_mma_windowed_with_mask(&q, &k, &v, scale, kv_offset, window_right, &mask)
+        };
+        let (got, want) = (got_vec(got.unwrap()), got_vec(want.unwrap()));
+        assert_eq!(got.len(), want.len());
+        let mismatches = got
+            .iter()
+            .zip(&want)
+            .filter(|(g, w)| g.to_bits() != w.to_bits())
+            .count();
+        assert_eq!(
+            mismatches,
+            0,
+            "bf16={bf16} b={b} sq={sq} skv={skv} hq={hq} hkv={hkv} d={d} \
+             window=({window_left},{window_right}): {mismatches} of {} elements differ",
+            got.len()
+        );
+    }
+
+    // Shapes cover an unaligned seq_kv with GQA padding, a window narrower
+    // than one tile, a window spanning several tiles, and batch 2. Reuses
+    // `CAUSAL_BITWISE_SHAPES`' shapes with a window on each. `window_right`
+    // stays 0 here (left-edge-only masking); `kv_offset = skv - sq` is the
+    // tightest offset that still satisfies `windowed_needs_host_mask`.
+    const WINDOWED_BITWISE_CASES: [((usize, usize, usize, usize, usize, usize), (usize, usize));
+        5] = [
+        ((1, 231, 231, 8, 2, 256), (32, 0)),
+        ((1, 16, 256, 8, 2, 128), (8, 0)),
+        ((1, 100, 300, 8, 2, 64), (40, 0)),
+        ((2, 64, 64, 8, 2, 128), (16, 0)),
+        ((1, 300, 1100, 8, 2, 256), (128, 0)),
+    ];
+
+    // `windowed_in_kernel` (kernel masks both window edges) equals
+    // `fattn_mma_windowed_with_mask` (host mask) bit for bit.
+    #[test]
+    fn windowed_matches_windowed_with_mask_bitwise() {
+        for (shape, window) in WINDOWED_BITWISE_CASES {
+            let kv_offset = shape.2 - shape.1;
+            assert_windowed_bitwise_equals_with_mask(false, shape, window, kv_offset);
+        }
+    }
+
+    // Same check for the native-bf16 kernels.
+    #[test]
+    fn windowed_matches_windowed_with_mask_bitwise_bf16() {
+        for (shape, window) in WINDOWED_BITWISE_CASES {
+            let kv_offset = shape.2 - shape.1;
+            assert_windowed_bitwise_equals_with_mask(true, shape, window, kv_offset);
+        }
+    }
+
+    // Same shapes, but with `window_right > 0` and `kv_offset` lowered so
+    // `sq + kv_offset + window_right <= skv`: `WINDOWED_BITWISE_CASES` can't
+    // cover this, since its `kv_offset = skv - sq` leaves no room for a
+    // positive `window_right` without tripping `windowed_needs_host_mask`
+    // and silently falling back to the host-mask kernel on both sides. This
+    // exercises the in-kernel right-edge trim (`right_ext`/`kv_end`) that
+    // would otherwise go untested.
+    const WINDOWED_RIGHT_BITWISE_CASES: [(
+        (usize, usize, usize, usize, usize, usize),
+        (usize, usize),
+        usize,
+    ); 3] = [
+        ((1, 100, 300, 8, 2, 64), (40, 20), 170),
+        ((1, 64, 256, 8, 2, 128), (16, 8), 180),
+        ((1, 231, 500, 8, 2, 256), (32, 10), 250),
+    ];
+
+    // `windowed_in_kernel` matches the host-mask entry bit for bit when
+    // `window_right > 0` actually reaches the in-kernel path.
+    #[test]
+    fn windowed_right_matches_windowed_with_mask_bitwise() {
+        for (shape, window, kv_offset) in WINDOWED_RIGHT_BITWISE_CASES {
+            assert_windowed_bitwise_equals_with_mask(false, shape, window, kv_offset);
+        }
+    }
+
+    // Same check for the native-bf16 kernels.
+    #[test]
+    fn windowed_right_matches_windowed_with_mask_bitwise_bf16() {
+        for (shape, window, kv_offset) in WINDOWED_RIGHT_BITWISE_CASES {
+            assert_windowed_bitwise_equals_with_mask(true, shape, window, kv_offset);
         }
     }
 

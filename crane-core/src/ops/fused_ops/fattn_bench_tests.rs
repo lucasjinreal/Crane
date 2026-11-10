@@ -40,9 +40,11 @@ use super::super::fattn::test_support::{
 use super::super::fattn::{FATTN_KQ_STRIDE, build_additive_mask_f16, build_analytic_kv_max};
 use super::long_seq_tests::{SEQS, round_to};
 use super::{
-    LaunchOverride, TileCost, fattn_mma_bf16_causal, fattn_mma_bf16_causal_with_mask,
-    fattn_mma_bf16_prefill, fattn_mma_causal, fattn_mma_causal_with_mask, fattn_mma_prefill,
-    mma_ncols1_for, mma_ncols1_for_bf16, prefill_dispatch, prefill_dispatch_bf16, use_heavy_first,
+    LaunchOverride, TileCost, WindowBounds, fattn_mma_bf16_causal, fattn_mma_bf16_causal_with_mask,
+    fattn_mma_bf16_prefill, fattn_mma_bf16_windowed, fattn_mma_bf16_windowed_with_mask,
+    fattn_mma_causal, fattn_mma_causal_with_mask, fattn_mma_prefill, fattn_mma_windowed,
+    fattn_mma_windowed_with_mask, mma_ncols1_for, mma_ncols1_for_bf16, prefill_dispatch,
+    prefill_dispatch_bf16, use_heavy_first,
 };
 use crate::models::qwen3_5::grouped_sdpa;
 #[cfg(all(feature = "rocm", not(feature = "cuda")))]
@@ -175,6 +177,76 @@ fn fattn_bench_mask_overhead_hd256() {
     assert_eq!(failures, 0, "{failures} row(s) failed, see stderr");
 }
 
+// Diagnostic for PERF.md's M1 option 3: compares the old windowed path
+// (`fattn_mma_windowed`'s pre-M1 body — a host-built mask plus `KV_max`,
+// rebuilt on every call) against the new in-kernel scalar-bound path
+// (`windowed_in_kernel`, no mask or `KV_max` tensor at all). `WINDOW_LEFT`
+// is narrower than every `seq` in `SEQS` from 1024 up, so the in-kernel
+// tile-skip (not just the avoided mask build) should show at the longer
+// rows, beyond what `fattn_bench_mask_overhead_hd256`'s plain-causal
+// (window-free) comparison can demonstrate.
+#[test]
+#[ignore = "needs a CUDA/ROCm GPU, long-running"]
+fn fattn_bench_windowed_overhead_hd256() {
+    let gpu = test_gpu_device();
+    #[allow(clippy::cast_precision_loss)]
+    let scale = (HEAD_DIM as f32).sqrt().recip();
+    warm_up(&gpu).unwrap();
+    let mut failures = 0;
+    const WINDOW_LEFT: usize = 256;
+    for (dtype, bf16) in [(DType::F16, false), (DType::BF16, true)] {
+        println!(
+            "{dtype:?} hd{HEAD_DIM} windowed overhead (window_left={WINDOW_LEFT}), us per call"
+        );
+        println!(
+            "{:>6}{:>11}{:>11}{:>10}",
+            "seq", "mask", "in_kernel", "delta%"
+        );
+        for seq in SEQS {
+            let [q_host, k_host, v_host] =
+                long_seq_inputs(seq, HEAD_DIM, LongSeqDist::Normal, 0).map(|h| round_to(h, dtype));
+            let bshd = |h: &[f32], heads| Tensor::from_slice(h, (1, seq, heads, HEAD_DIM), &gpu);
+            let q = bshd(&q_host, HQ).unwrap().to_dtype(dtype).unwrap();
+            let k = bshd(&k_host, HKV).unwrap().to_dtype(dtype).unwrap();
+            let v = bshd(&v_host, HKV).unwrap().to_dtype(dtype).unwrap();
+
+            // Old path: build the mask fresh every call, then dispatch
+            // through the host-mask kernel entry, same as
+            // `fattn_mma_windowed` did before M1 option 3.
+            let masked = time_us(&gpu, || {
+                let mask = build_additive_mask_f16(seq, seq, 0, Some(WINDOW_LEFT), 0, &gpu)?;
+                if bf16 {
+                    fattn_mma_bf16_windowed_with_mask(&q, &k, &v, scale, 0, 0, &mask)
+                } else {
+                    fattn_mma_windowed_with_mask(&q, &k, &v, scale, 0, 0, &mask)
+                }
+            });
+
+            // New path: fattn_mma_windowed now dispatches through
+            // windowed_in_kernel (no mask, no KV_max tensor).
+            let in_kernel = time_us(&gpu, || {
+                if bf16 {
+                    fattn_mma_bf16_windowed(&q, &k, &v, scale, 0, WINDOW_LEFT, 0)
+                } else {
+                    fattn_mma_windowed(&q, &k, &v, scale, 0, WINDOW_LEFT, 0)
+                }
+            });
+
+            match (masked, in_kernel) {
+                (Ok(masked_us), Ok(in_kernel_us)) => {
+                    let delta = (masked_us - in_kernel_us) / masked_us * 100.0;
+                    println!("{seq:>6}{masked_us:>11.1}{in_kernel_us:>11.1}{delta:>9.1}");
+                },
+                (masked_us, in_kernel_us) => {
+                    failures += 1;
+                    eprintln!("seq={seq} {dtype:?}: mask={masked_us:?} in_kernel={in_kernel_us:?}");
+                },
+            }
+        }
+    }
+    assert_eq!(failures, 0, "{failures} row(s) failed, see stderr");
+}
+
 // Prints, for every shape in `GQA_SHAPES`, the in-kernel causal timing of
 // both tile orders with each launch's tile count.
 #[test]
@@ -295,9 +367,29 @@ fn forced_grid_split_vs_no_split_hd256() {
                 };
                 let dispatch_once = || {
                     if bf16 {
-                        prefill_dispatch_bf16(&q, &k, &v, None, None, scale, Some(0), forced)
+                        prefill_dispatch_bf16(
+                            &q,
+                            &k,
+                            &v,
+                            None,
+                            None,
+                            scale,
+                            Some(0),
+                            WindowBounds::NONE,
+                            forced,
+                        )
                     } else {
-                        prefill_dispatch(&q, &k, &v, None, None, scale, Some(0), forced)
+                        prefill_dispatch(
+                            &q,
+                            &k,
+                            &v,
+                            None,
+                            None,
+                            scale,
+                            Some(0),
+                            WindowBounds::NONE,
+                            forced,
+                        )
                     }
                     .unwrap()
                 };
@@ -484,9 +576,29 @@ fn bench_gqa_shape(gpu: &Device, hq: usize, hkv: usize, d: usize) -> usize {
                     ..LaunchOverride::NONE
                 };
                 if bf16 {
-                    prefill_dispatch_bf16(&q, &k, &v, None, None, scale, Some(0), forced)
+                    prefill_dispatch_bf16(
+                        &q,
+                        &k,
+                        &v,
+                        None,
+                        None,
+                        scale,
+                        Some(0),
+                        WindowBounds::NONE,
+                        forced,
+                    )
                 } else {
-                    prefill_dispatch(&q, &k, &v, None, None, scale, Some(0), forced)
+                    prefill_dispatch(
+                        &q,
+                        &k,
+                        &v,
+                        None,
+                        None,
+                        scale,
+                        Some(0),
+                        WindowBounds::NONE,
+                        forced,
+                    )
                 }
             };
             match time_pair_us(gpu, || launch(false), || launch(true)) {
@@ -562,9 +674,29 @@ fn bench_tile_order(gpu: &Device, hq: usize, hkv: usize, d: usize, batch: usize)
                 };
                 let timed = time_us_with(gpu, TILE_ORDER_BATCHES, calls, || {
                     if bf16 {
-                        prefill_dispatch_bf16(&q, &k, &v, None, None, scale, Some(0), forced)
+                        prefill_dispatch_bf16(
+                            &q,
+                            &k,
+                            &v,
+                            None,
+                            None,
+                            scale,
+                            Some(0),
+                            WindowBounds::NONE,
+                            forced,
+                        )
                     } else {
-                        prefill_dispatch(&q, &k, &v, None, None, scale, Some(0), forced)
+                        prefill_dispatch(
+                            &q,
+                            &k,
+                            &v,
+                            None,
+                            None,
+                            scale,
+                            Some(0),
+                            WindowBounds::NONE,
+                            forced,
+                        )
                     }
                 });
                 match timed {
@@ -635,9 +767,29 @@ fn bench_long_kv_shape(
                     ..LaunchOverride::NONE
                 };
                 if bf16 {
-                    prefill_dispatch_bf16(&q, &k, &v, None, None, scale, Some(offset), forced)
+                    prefill_dispatch_bf16(
+                        &q,
+                        &k,
+                        &v,
+                        None,
+                        None,
+                        scale,
+                        Some(offset),
+                        WindowBounds::NONE,
+                        forced,
+                    )
                 } else {
-                    prefill_dispatch(&q, &k, &v, None, None, scale, Some(offset), forced)
+                    prefill_dispatch(
+                        &q,
+                        &k,
+                        &v,
+                        None,
+                        None,
+                        scale,
+                        Some(offset),
+                        WindowBounds::NONE,
+                        forced,
+                    )
                 }
             };
             match time_pair_us(gpu, || launch(false), || launch(true)) {

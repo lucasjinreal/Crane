@@ -22,8 +22,8 @@ use super::super::fattn::{
 use super::super::fattn_long_seq_host::compare;
 use super::long_seq_tests::{bitwise_eq, round_to, scaled_q, to_host, tolerance};
 use super::{
-    LaunchOverride, LaunchShape, fattn_mma_bf16_causal, narrowed_ncols1, prefill_dispatch,
-    prefill_dispatch_bf16, tile_counts,
+    LaunchOverride, LaunchShape, WindowBounds, fattn_mma_bf16_causal, narrowed_ncols1,
+    prefill_dispatch, prefill_dispatch_bf16, tile_counts,
 };
 
 /// `head_dim` 512 has no MMA kernel on AMD.
@@ -566,6 +566,7 @@ impl Case {
             self.kv_max.as_ref(),
             self.scale,
             offset,
+            WindowBounds::NONE,
             forced,
         )
         .unwrap_or_else(|e| panic!("{self:?} {forced:?}: {e}"));
