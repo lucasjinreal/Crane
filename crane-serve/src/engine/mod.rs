@@ -387,6 +387,15 @@ impl InferenceEngine {
 
                 match output {
                     Some(output) => {
+                        // Real decode-token count for the expert-cache clock,
+                        // captured from whichever execute_step call below
+                        // actually runs (0 for prefill/no-op branches).
+                        // output.batch.len() would undercount: a single
+                        // execute_step call can generate up to
+                        // decode_tokens_per_seq tokens per sequence via the
+                        // multi-round loop inside step_decode_batch/
+                        // step_decode_sequential, not just one.
+                        let mut tokens_generated: u64 = 0;
                         // KV cache budget gate: if a prefill is scheduled but we're
                         // over the KV budget, first try to evict (preempt) the
                         // largest running sequence to make room. If still over,
@@ -406,7 +415,7 @@ impl InferenceEngine {
                                     batch: decode_batch,
                                     is_prefill: false,
                                 };
-                                self.execute_step(decode_output);
+                                tokens_generated = self.execute_step(decode_output);
                             } else {
                                 // Budget OK after eviction (or nothing running) — proceed.
                                 self.execute_step(output);
@@ -443,15 +452,44 @@ impl InferenceEngine {
                                 .filter(|id| self.scheduler.running.contains(id))
                                 .collect();
                             if !surviving.is_empty() {
-                                self.execute_step(SchedulerOutput {
+                                tokens_generated = self.execute_step(SchedulerOutput {
                                     batch: surviving,
                                     is_prefill: false,
                                 });
                             }
                         } else {
-                            self.execute_step(output);
+                            tokens_generated = self.execute_step(output);
                         }
                         self.step_counter += 1;
+
+                        // Expert cache: advance the adaptive placement's token
+                        // clock whenever a real decode round ran. Gating on
+                        // `tokens_generated > 0` (rather than the scheduler's
+                        // original is_prefill decision) also covers the
+                        // deferred-prefill branch above, which executes a real
+                        // decode round instead of the scheduled prefill.
+                        // Prefill itself always returns 0 here: it goes
+                        // through `gpu_offload_forward`, not `cached_forward`,
+                        // so no routing hits are recorded there — advancing
+                        // the clock for unobserved tokens would dilute the
+                        // hit-count signal `decay_and_swap` relies on.
+                        if tokens_generated > 0 {
+                            // Isolated like `execute_step`: `on_step`/
+                            // `decay_and_swap` do real GPU work and panic on
+                            // a poisoned mutex, which must not take down the
+                            // engine's main loop.
+                            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                self.model.expert_cache_on_step(tokens_generated)
+                            })) {
+                                Ok(Ok(0)) => {},
+                                Ok(Ok(swaps)) => debug!("expert cache: {swaps} swaps this window"),
+                                Ok(Err(e)) => warn!("expert cache on_step failed (non-fatal): {e}"),
+                                Err(panic) => {
+                                    let msg = panic_message(&panic);
+                                    warn!("expert cache on_step panicked (non-fatal): {msg}");
+                                },
+                            }
+                        }
 
                         if self.step_counter.is_multiple_of(50) {
                             self.log_stats();
@@ -972,39 +1010,46 @@ impl InferenceEngine {
     /// "Engine thread has shut down". Instead, fail the step's sequences and
     /// reset the model's caches — a panic mid-forward says nothing about what
     /// state they are in.
-    fn execute_step(&mut self, output: SchedulerOutput) {
+    /// Returns the number of decode tokens actually generated this call (0
+    /// for prefill, or if the step panicked) — see the call site in the main
+    /// loop, which feeds this to the expert-cache token clock.
+    fn execute_step(&mut self, output: SchedulerOutput) -> u64 {
         let batch = output.batch.clone();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.execute_step_inner(output);
+            self.execute_step_inner(output)
         }));
-        let Err(panic) = result else {
-            return;
-        };
-        let msg = panic_message(&panic);
-        error!(
-            "Inference step panicked, failing {} sequence(s): {msg}",
-            batch.len()
-        );
-        for seq_id in &batch {
-            self.send_error(seq_id, &format!("Inference step panicked: {msg}"));
+        match result {
+            Ok(tokens) => tokens,
+            Err(panic) => {
+                let msg = panic_message(&panic);
+                error!(
+                    "Inference step panicked, failing {} sequence(s): {msg}",
+                    batch.len()
+                );
+                for seq_id in &batch {
+                    self.send_error(seq_id, &format!("Inference step panicked: {msg}"));
+                }
+                self.clear_kv_cache_best_effort("panic recovery");
+                0
+            },
         }
-        self.clear_kv_cache_best_effort("panic recovery");
     }
 
-    fn execute_step_inner(&mut self, output: SchedulerOutput) {
+    fn execute_step_inner(&mut self, output: SchedulerOutput) -> u64 {
         if output.is_prefill {
             debug_assert_eq!(output.batch.len(), 1);
             let seq_id = &output.batch[0];
             self.step_prefill(seq_id.clone());
+            0
         } else if self.model.supports_batch_decode() && output.batch.len() > 1 {
             // True batched decode only when there are multiple sequences.
             // For a single sequence the sequential path is far cheaper: it
             // keeps the KV cache resident in the model and avoids the
             // extract→pad→stack→extract GPU-copy cycle that batch decode
             // performs every scheduling round.
-            self.step_decode_batch(output.batch);
+            self.step_decode_batch(output.batch)
         } else {
-            self.step_decode_sequential(&output.batch);
+            self.step_decode_sequential(&output.batch)
         }
     }
 
@@ -1375,16 +1420,22 @@ impl InferenceEngine {
     /// Uses **lazy eviction**: when a sequence completes or is cancelled
     /// mid-loop, it stays in the batch tensor (wasting trivial compute)
     /// rather than triggering an expensive extract→re-setup cycle.
+    ///
+    /// Returns the number of decode tokens actually generated this call
+    /// (across every sequence in `batch`), for the expert-cache token clock
+    /// — see the call site in the main loop. Not simply `batch.len()`: this
+    /// runs up to `self.decode_tokens_per_seq` rounds per call, so the real
+    /// count can be far larger.
     // The setup, multi-round decode loop, and finalization below are one
     // cohesive decode step; splitting them further would scatter shared
     // local state (batch, kv_lens, alive, positions) across functions.
     #[allow(clippy::too_many_lines)]
-    fn step_decode_batch(&mut self, batch: Vec<String>) {
+    fn step_decode_batch(&mut self, batch: Vec<String>) -> u64 {
         let t0 = Instant::now();
 
         let batch = self.filter_cancelled_batch(batch);
         if batch.is_empty() {
-            return;
+            return 0;
         }
 
         let batch_size = batch.len();
@@ -1407,7 +1458,7 @@ impl InferenceEngine {
                 for seq_id in &batch {
                     self.send_error(seq_id, &format!("Batch decode setup failed: {e}"));
                 }
-                return;
+                return 0;
             },
         };
         drop(kv_caches);
@@ -1438,7 +1489,7 @@ impl InferenceEngine {
                         self.send_error(seq_id, &format!("Mask build failed: {e}"));
                     }
                     self.clear_kv_cache_best_effort("mask build");
-                    return;
+                    return 0;
                 },
             };
 
@@ -1495,7 +1546,7 @@ impl InferenceEngine {
                     }
                     self.clear_kv_cache_best_effort("decode input upload");
                     self.drain_pending_completions(&pending_finish, &pending_cancel);
-                    return;
+                    return total_tokens_this_step;
                 },
             };
 
@@ -1521,7 +1572,7 @@ impl InferenceEngine {
                     }
                     self.clear_kv_cache_best_effort("batched decode");
                     self.drain_pending_completions(&pending_finish, &pending_cancel);
-                    return;
+                    return total_tokens_this_step;
                 },
             };
 
@@ -1621,14 +1672,17 @@ impl InferenceEngine {
 
         self.drain_requests();
         self.check_cancelled();
+        total_tokens_this_step
     }
 
     // ─────────────────────────────────────────────────────────
     //  Sequential decode
     // ─────────────────────────────────────────────────────────
 
-    /// Sequential decode for backends without batch decode support.
-    fn step_decode_sequential(&mut self, batch: &[String]) {
+    /// Sequential decode for backends without batch decode support. Returns
+    /// the number of decode tokens actually generated this call — see
+    /// `step_decode_batch`'s doc comment on why this isn't `batch.len()`.
+    fn step_decode_sequential(&mut self, batch: &[String]) -> u64 {
         let t0 = Instant::now();
         let mut total_tokens: u64 = 0;
 
@@ -1738,6 +1792,7 @@ impl InferenceEngine {
 
         self.drain_requests();
         self.check_cancelled();
+        total_tokens
     }
 
     // ─────────────────────────────────────────────────────────

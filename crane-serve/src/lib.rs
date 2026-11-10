@@ -29,7 +29,7 @@ use tracing::{info, warn};
 
 use chat_template::ChatTemplateProcessor;
 use crane_core::device::{DeviceAssignment, format_budget, query_gpu_memory};
-use engine::backend::ExpertPromotionPolicy;
+use engine::backend::ExpertCachePolicy;
 use engine::model_factory::{ModelFormat, ModelType};
 use engine::{EngineHandle, InferenceEngine, KV_GPU_OVERHEAD_FACTOR, MemoryConfig};
 use handlers::asr::AsrTranscribeRequest;
@@ -811,23 +811,24 @@ fn resolve_dtype(
 
 /// Resolve `--gpu-memory-limit` / `--offload-experts` into an initial `MoE`
 /// expert `Device` (`devices.expert`) and, when the real GPU/CPU split must
-/// be decided after the model exists, an [`ExpertPromotionPolicy`] for the
-/// caller to hand to [`crate::engine::backend::Qwen3Backend::new`].
+/// be decided after the model exists, an [`ExpertCachePolicy`] for the
+/// caller to hand to [`crate::engine::backend::Qwen3Backend::new`] /
+/// [`crate::engine::backend::Qwen3_5Backend::new_with_options`].
 ///
 /// - No GPU / `--cpu`, or `--offload-experts`: experts start (and stay) on
-///   CPU, no promotion.
+///   CPU, no cache.
 /// - `--gpu-memory-limit` set: experts start on CPU; the returned policy
-///   tells the caller to attempt promoting them to GPU once the model
+///   tells the caller to attempt seeding a GPU expert cache once the model
 ///   exists and real VRAM headroom is known.
 /// - No limit, GPU present: experts load directly to the main GPU device,
-///   no promotion needed.
+///   no cache needed.
 fn resolve_expert_placement(
     gpu_memory_limit: Option<&str>,
     offload_experts: bool,
     device: &crane_core::models::Device,
     max_concurrent: usize,
     max_seq_len: usize,
-) -> (DeviceAssignment, Option<ExpertPromotionPolicy>) {
+) -> (DeviceAssignment, Option<ExpertCachePolicy>) {
     if !is_gpu_device(device) || offload_experts {
         return (
             DeviceAssignment {
@@ -846,7 +847,7 @@ fn resolve_expert_placement(
             main: device.clone(),
             expert: crane_core::models::Device::Cpu,
         },
-        Some(ExpertPromotionPolicy {
+        Some(ExpertCachePolicy {
             vram_ceiling_bytes: raw_limit,
             max_concurrent: Some(max_concurrent),
             max_seq_len: Some(max_seq_len),
@@ -1815,7 +1816,7 @@ pub async fn run(mut args: Args) -> Result<()> {
     } else {
         // Only one of the TTS/ASR/VLM/LLM branches runs per process, so each is
         // the sole long-lived consumer of candle's process-wide rayon pool.
-        let (devices, promotion) = resolve_expert_placement(
+        let (devices, cache_policy) = resolve_expert_placement(
             args.gpu_memory_limit.as_deref(),
             args.offload_experts,
             &device,
@@ -1829,7 +1830,7 @@ pub async fn run(mut args: Args) -> Result<()> {
             &dtype,
             format,
             args.quant.as_deref(),
-            promotion.as_ref(),
+            cache_policy.as_ref(),
         )?;
         info!(
             "Model loaded successfully (type: {}, format: {:?})",
@@ -1853,24 +1854,24 @@ pub async fn run(mut args: Args) -> Result<()> {
                     args.max_seq_len,
                 );
                 args.max_seq_len = clamped;
-                // The initial expert-promotion pass (in create_backend) used
+                // The initial expert-cache seed pass (in create_backend) used
                 // the pre-clamp max_seq_len, over-reserving VRAM for a KV
-                // cache larger than the model can ever actually use. Re-run
-                // promotion with the clamped cap so the model can reclaim
-                // that headroom and promote additional MoE layers.
-                if let Some(ref promo) = promotion {
+                // cache larger than the model can ever actually use. Reseed
+                // with the clamped cap so the model can reclaim that
+                // headroom and cache more experts.
+                if let Some(ref policy) = cache_policy {
                     let effective_concurrent = if backend.supports_kv_swap() {
                         args.max_concurrent
                     } else {
                         1
                     };
-                    let updated = ExpertPromotionPolicy {
-                        vram_ceiling_bytes: promo.vram_ceiling_bytes,
+                    let updated = ExpertCachePolicy {
+                        vram_ceiling_bytes: policy.vram_ceiling_bytes,
                         max_concurrent: Some(effective_concurrent),
                         max_seq_len: Some(clamped),
-                        chunk_tokens: promo.chunk_tokens,
+                        chunk_tokens: policy.chunk_tokens,
                     };
-                    backend.re_promote_experts(&updated)?;
+                    backend.reseed_expert_cache(&updated)?;
                 }
             }
         }
@@ -1886,7 +1887,7 @@ pub async fn run(mut args: Args) -> Result<()> {
             let physical_total = query_gpu_memory(&device).map_or(0, |(_, total)| total);
             // The engine caps max_concurrent to 1 when the backend doesn't
             // support KV-cache swapping (see InferenceEngine::new). Use the
-            // same effective value for expert re-promotion below, rather
+            // same effective value for the expert-cache reseed below, rather
             // than the (potentially higher) CLI value.
             let effective_concurrent = if backend.supports_kv_swap() {
                 args.max_concurrent
@@ -1912,27 +1913,27 @@ pub async fn run(mut args: Args) -> Result<()> {
                     );
                     memory_config.max_seq_len = derived;
                     args.max_seq_len = derived;
-                    // The first expert-promotion pass (in create_backend) used
-                    // max_seq_len=0, which fell back to max_position_embeddings
-                    // for KV reservation — over-reserving VRAM and
-                    // under-promoting experts. Re-run promotion with the
-                    // tighter derived cap so the model can reclaim that
-                    // headroom and promote additional MoE layers.
-                    if let Some(ref promo) = promotion {
-                        let updated = ExpertPromotionPolicy {
-                            vram_ceiling_bytes: promo.vram_ceiling_bytes,
+                    // The first expert-cache seed pass (in create_backend)
+                    // used max_seq_len=0, which fell back to
+                    // max_position_embeddings for KV reservation —
+                    // over-reserving VRAM and under-sizing the cache. Reseed
+                    // with the tighter derived cap so the model can reclaim
+                    // that headroom and cache more experts.
+                    if let Some(ref policy) = cache_policy {
+                        let updated = ExpertCachePolicy {
+                            vram_ceiling_bytes: policy.vram_ceiling_bytes,
                             max_concurrent: Some(effective_concurrent),
                             max_seq_len: Some(derived),
-                            chunk_tokens: promo.chunk_tokens,
+                            chunk_tokens: policy.chunk_tokens,
                         };
-                        backend.re_promote_experts(&updated)?;
-                        // Baseline must be re-recorded: promoting more experts
-                        // to GPU increases VRAM usage, and the engine's
+                        backend.reseed_expert_cache(&updated)?;
+                        // Baseline must be re-recorded: caching more experts
+                        // on GPU increases VRAM usage, and the engine's
                         // kv_budget_bytes() subtracts baseline from the
                         // limit. A stale (lower) baseline would over-estimate
                         // the KV budget, risking OOM.
                         memory_config.record_baseline(&device);
-                        // Re-promotion also changes which layers are
+                        // Reseeding also changes which layers are
                         // CPU-resident, so the offload reservation (which
                         // depends on that residency) must be recomputed too.
                         memory_config.moe_offload_reservation_bytes =
@@ -2572,31 +2573,31 @@ mod dtype_tests {
     // ── resolve_expert_placement ──
 
     #[test]
-    fn resolve_expert_placement_cpu_device_stays_cpu_no_promotion() {
+    fn resolve_expert_placement_cpu_device_stays_cpu_no_cache_policy() {
         let d = Device::Cpu;
-        let (devices, promotion) = resolve_expert_placement(Some("8G"), false, &d, 16, 4096);
+        let (devices, cache_policy) = resolve_expert_placement(Some("8G"), false, &d, 16, 4096);
         assert!(devices.expert.is_cpu());
-        assert!(promotion.is_none());
+        assert!(cache_policy.is_none());
     }
 
     #[test]
-    fn resolve_expert_placement_offload_experts_forces_cpu_no_promotion() {
+    fn resolve_expert_placement_offload_experts_forces_cpu_no_cache_policy() {
         let d = Device::Cpu;
         // A CPU device already forces CPU on its own; this asserts
         // --offload-experts is also checked independently of device kind
         // (relevant once a real GPU device reaches this branch).
-        let (devices, promotion) = resolve_expert_placement(None, true, &d, 16, 4096);
+        let (devices, cache_policy) = resolve_expert_placement(None, true, &d, 16, 4096);
         assert!(devices.expert.is_cpu());
-        assert!(promotion.is_none());
+        assert!(cache_policy.is_none());
     }
 
     #[test]
     fn resolve_expert_placement_no_limit_on_cpu_is_uniform_cpu() {
         let d = Device::Cpu;
-        let (devices, promotion) = resolve_expert_placement(None, false, &d, 16, 4096);
+        let (devices, cache_policy) = resolve_expert_placement(None, false, &d, 16, 4096);
         assert!(devices.main.is_cpu());
         assert!(devices.expert.is_cpu());
-        assert!(promotion.is_none());
+        assert!(cache_policy.is_none());
     }
 
     // ── --text-only override ──

@@ -112,7 +112,7 @@ impl LinearLayer {
     /// `Standard` layer on `device` — this loses the quantized memory
     /// footprint for the moved weight, a deliberate tradeoff for promoting
     /// an expert from CPU to GPU once real headroom is known (see
-    /// `Qwen3Model::promote_experts_to_gpu`). `dtype` must match the
+    /// `Qwen3Model::seed_expert_cache`). `dtype` must match the
     /// model's compute dtype: candle's matmul requires both operands to
     /// share a dtype, so a promoted weight left in the wrong dtype fails
     /// on its very next forward pass.
