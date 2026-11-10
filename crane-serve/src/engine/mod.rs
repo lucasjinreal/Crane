@@ -393,10 +393,17 @@ impl InferenceEngine {
                         // defer the prefill and drain existing sequences.
                         if output.is_prefill && self.is_over_kv_budget() {
                             // Attempt eviction before deferring.
+                            let resuming = output.batch.iter().any(|id| self.is_paused(id));
                             self.evict_if_needed();
+                            // Evicting the prompt this step would continue throws its chunks away.
+                            let dropped =
+                                resuming && !output.batch.iter().any(|id| self.is_paused(id));
 
-                            if self.is_over_kv_budget() && !self.scheduler.running.is_empty() {
-                                // Still over budget and have running sequences to drain.
+                            if (dropped || self.is_over_kv_budget())
+                                && !self.scheduler.running.is_empty()
+                            {
+                                // Still over budget (or the prompt was dropped) with
+                                // running sequences to drain.
                                 for seq_id in &output.batch {
                                     self.scheduler.waiting.push_front(seq_id.clone());
                                 }
@@ -683,9 +690,18 @@ impl InferenceEngine {
             .map(|(id, _)| id)
     }
 
-    /// Preempt (evict) running sequences until KV usage is within budget.
+    /// A prompt paused between prefill chunks: it holds KV but has produced
+    /// no tokens yet.
+    fn is_paused(&self, id: &str) -> bool {
+        self.sequences
+            .get(id)
+            .is_some_and(|s| s.status == SequenceStatus::Waiting && s.prefill_pos > 0)
+    }
+
+    /// Preempt (evict) sequences until KV usage is within budget.
     ///
-    /// Eviction policy: **longest-output-first** — the sequence that has
+    /// A paused prompt goes first (while something is running): it has
+    /// produced no tokens. Then, **longest-output-first** — the sequence that has
     /// generated the most tokens (and therefore holds the largest KV cache)
     /// is evicted first. Its KV cache is dropped and it is moved back to
     /// the waiting queue for later re-prefill.
@@ -707,7 +723,8 @@ impl InferenceEngine {
         let had_running = !self.scheduler.running.is_empty();
 
         while self.tracked_kv_bytes > budget && !self.scheduler.running.is_empty() {
-            let Some(victim_id) = self.largest_running_victim() else {
+            let paused = self.sequences.keys().find(|id| self.is_paused(id)).cloned();
+            let Some(victim_id) = paused.or_else(|| self.largest_running_victim()) else {
                 break;
             };
 
@@ -750,9 +767,12 @@ impl InferenceEngine {
             self.tracked_kv_bytes = self.tracked_kv_bytes.saturating_sub(freed);
 
             // Move from running back to waiting (back, not front — avoid
-            // immediate re-prefill which would cause thrashing).
-            self.scheduler.running.retain(|id| id != &victim_id);
-            self.scheduler.waiting.push_back(victim_id);
+            // immediate re-prefill which would cause thrashing). A paused
+            // prompt is already queued.
+            if self.scheduler.running.contains(&victim_id) {
+                self.scheduler.running.retain(|id| id != &victim_id);
+                self.scheduler.waiting.push_back(victim_id);
+            }
         }
 
         // Cap effective max_running to the post-eviction running count.
@@ -2361,6 +2381,20 @@ mod interleave_tests {
             .collect();
         assert_eq!(chunks, [(2048, 0), (2048, 2048), (904, 4096)]);
         assert_eq!(e.scheduler.running, ["a", "b"]);
+    }
+
+    #[test]
+    fn evicting_over_budget_drops_paused_prompt_not_running_request() {
+        let (mut e, _) = engine(600);
+        let _a = submit(&mut e, "a", 10);
+        run(&mut e, 1);
+        let _b = submit(&mut e, "b", 5000);
+        assert_eq!(run(&mut e, 1), "P");
+
+        assert!(!e.evict_if_needed());
+        assert_eq!(e.scheduler.running, ["a"]);
+        assert_eq!(e.scheduler.waiting, ["b"]);
+        assert_eq!(e.sequences["b"].prefill_pos, 0);
     }
 
     #[test]
