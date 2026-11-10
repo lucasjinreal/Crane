@@ -593,7 +593,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         const int jt,
         const int kb0,
         const int k_VKQ_sup,
-        const int causal_kv_offset) {
+        const int causal_kv_offset,
+        const int window_left,
+        const int window_right) {
 #if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
     constexpr int  warp_size       = ggml_cuda_get_physical_warp_size();
     constexpr int  ncols           = ncols1 * ncols2;
@@ -755,7 +757,29 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         // Keys past the diagonal get -inf, the value the host mask adds.
         // The tile test is block-uniform, so only tiles crossing the
         // diagonal pay for the per-element loop.
-        if (causal_kv_offset >= 0 && k_VKQ_0 + nbatch_fa - 1 > jt*ncols1 + causal_kv_offset) {
+        {
+            const int right_ext = window_right >= 0 ? window_right : 0;
+            if (causal_kv_offset >= 0 && k_VKQ_0 + nbatch_fa - 1 > jt*ncols1 + causal_kv_offset + right_ext) {
+#pragma unroll
+                for (int i00 = 0; i00 < nbatch_fa; i00 += np*T_C_KQ::I) {
+                    const int i0 = i00 + (threadIdx.y % np)*T_C_KQ::I;
+#pragma unroll
+                    for (int l = 0; l < T_C_KQ::ne; ++l) {
+                        const int i = i0 + T_C_KQ::get_i(l);
+                        const int j = ((threadIdx.y / np)*T_C_KQ::J + T_C_KQ::get_j(l)) / ncols2;
+
+                        if (k_VKQ_0 + i > jt*ncols1 + j + causal_kv_offset + right_ext) {
+                            KQ_C[i00/(np*T_C_KQ::I)].x[l] = -INFINITY;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Keys before the sliding window's left edge get -inf. Same
+        // block-uniform tile test as the right edge above.
+        if (window_left >= 0 && causal_kv_offset >= 0
+                && k_VKQ_0 < jt*ncols1 + (ncols1 - 1) + causal_kv_offset - window_left) {
 #pragma unroll
             for (int i00 = 0; i00 < nbatch_fa; i00 += np*T_C_KQ::I) {
                 const int i0 = i00 + (threadIdx.y % np)*T_C_KQ::I;
@@ -764,7 +788,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     const int i = i0 + T_C_KQ::get_i(l);
                     const int j = ((threadIdx.y / np)*T_C_KQ::J + T_C_KQ::get_j(l)) / ncols2;
 
-                    if (k_VKQ_0 + i > jt*ncols1 + j + causal_kv_offset) {
+                    if (k_VKQ_0 + i < jt*ncols1 + j + causal_kv_offset - window_left) {
                         KQ_C[i00/(np*T_C_KQ::I)].x[l] = -INFINITY;
                     }
                 }
@@ -851,7 +875,29 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         // Keys past the diagonal get -inf, the value the host mask adds.
         // The tile test is block-uniform, so only tiles crossing the
         // diagonal pay for the per-element loop.
-        if (causal_kv_offset >= 0 && k_VKQ_0 + nbatch_fa - 1 > jt*ncols1 + causal_kv_offset) {
+        {
+            const int right_ext = window_right >= 0 ? window_right : 0;
+            if (causal_kv_offset >= 0 && k_VKQ_0 + nbatch_fa - 1 > jt*ncols1 + causal_kv_offset + right_ext) {
+#pragma unroll
+                for (int i00 = 0; i00 < nbatch_fa; i00 += np*T_C_KQ::J) {
+                    const int i0 = i00 + (threadIdx.y % np)*T_C_KQ::J;
+#pragma unroll
+                    for (int l = 0; l < T_C_KQ::ne; ++l) {
+                        const int i = i0 + T_C_KQ::get_j(l);
+                        const int j = ((threadIdx.y / np)*cols_per_warp + T_C_KQ::get_i(l)) / ncols2;
+
+                        if (k_VKQ_0 + i > jt*ncols1 + j + causal_kv_offset + right_ext) {
+                            KQ_C[i00/(np*T_C_KQ::J)].x[l] = -INFINITY;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Keys before the sliding window's left edge get -inf. Same
+        // block-uniform tile test as the right edge above.
+        if (window_left >= 0 && causal_kv_offset >= 0
+                && k_VKQ_0 < jt*ncols1 + (ncols1 - 1) + causal_kv_offset - window_left) {
 #pragma unroll
             for (int i00 = 0; i00 < nbatch_fa; i00 += np*T_C_KQ::J) {
                 const int i0 = i00 + (threadIdx.y % np)*T_C_KQ::J;
@@ -860,7 +906,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     const int i = i0 + T_C_KQ::get_j(l);
                     const int j = ((threadIdx.y / np)*cols_per_warp + T_C_KQ::get_i(l)) / ncols2;
 
-                    if (k_VKQ_0 + i > jt*ncols1 + j + causal_kv_offset) {
+                    if (k_VKQ_0 + i < jt*ncols1 + j + causal_kv_offset - window_left) {
                         KQ_C[i00/(np*T_C_KQ::J)].x[l] = -INFINITY;
                     }
                 }
@@ -1104,7 +1150,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         scale, slope, logit_softcap, ne01, ne02,
         stride_K, stride_V, stride_mask,
         tile_Q, tile_K, tile_V, tile_mask,
-        Q_B, VKQ_C, KQ_max, KQ_rowsum, kb0, causal_kv_offset);
+        Q_B, VKQ_C, KQ_max, KQ_rowsum, kb0, causal_kv_offset,
+        window_left, window_right);
     NO_DEVICE_CODE;
 #endif // defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
 }
@@ -1192,7 +1239,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         const int zt_gqa,
         const int kb0_start,
         const int kb0_stop,
-        const int causal_kv_offset) {
+        const int causal_kv_offset,
+        const int window_left,
+        const int window_right) {
 #if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
     //In this kernel Q, K, V are matrices while i, j, k are matrix indices.
 
@@ -1363,7 +1412,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                      T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
                     (Q_h2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
                      ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-                     KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, causal_kv_offset);
+                     KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, causal_kv_offset, window_left, window_right);
             }
             constexpr bool last_iter = true;
             constexpr int  k_VKQ_sup = nbatch_fa;
@@ -1372,7 +1421,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
                 (Q_h2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, causal_kv_offset);
+                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, causal_kv_offset, window_left, window_right);
         } else {
             // The true last KV tile is narrower than nbatch_fa. Stop the
             // cp.async-pipelined loop one tile early so no preload ever
@@ -1389,7 +1438,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                      T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
                     (Q_h2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
                      ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-                     KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, causal_kv_offset);
+                     KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, causal_kv_offset, window_left, window_right);
             }
             if (kb0 < kb0_stop - 1) {
                 // Second-to-last tile is still full-sized: process it, but
@@ -1402,7 +1451,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                      T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
                     (Q_h2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
                      ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-                     KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, causal_kv_offset);
+                     KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, causal_kv_offset, window_left, window_right);
                 ++kb0;
             }
             constexpr bool last_iter_final = true;
@@ -1413,7 +1462,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
                 (Q_h2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, causal_kv_offset);
+                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, causal_kv_offset, window_left, window_right);
         }
     } else {
         // Preload mask and K data for first iteration when using cp_async with multiple stages:
@@ -1442,7 +1491,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                      T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
                     (Q_h2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
                      ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-                     KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, causal_kv_offset);
+                     KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, causal_kv_offset, window_left, window_right);
             }
             constexpr bool last_iter = true;
             const     int  k_VKQ_sup = ne11 - kb0*nbatch_fa;
@@ -1451,7 +1500,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                   T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
                 (Q_h2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, causal_kv_offset);
+                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, causal_kv_offset, window_left, window_right);
         } else {
             constexpr bool oob_check = false;
             for (; kb0 < kb0_stop-1; ++kb0) {
@@ -1462,7 +1511,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                      T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
                     (Q_h2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
                      ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-                     KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, causal_kv_offset);
+                     KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, causal_kv_offset, window_left, window_right);
             }
             constexpr bool last_iter = true;
             constexpr int  k_VKQ_sup = nbatch_fa;
@@ -1471,7 +1520,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
                 (Q_h2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, causal_kv_offset);
+                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, causal_kv_offset, window_left, window_right);
         }
     }
 
@@ -1878,7 +1927,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     GGML_UNUSED_VARS(Q_h2, K_h2, V_h2, mask_h, indices, sinks_f, dstk, dstk_fixup,
         scale, slope, logit_softcap, ne01, ne02, gqa_ratio,
         stride_Q1, stride_Q2, stride_K, stride_V, stride_mask,
-        jt, kb0_start, kb0_stop, causal_kv_offset);
+        jt, kb0_start, kb0_stop, causal_kv_offset, window_left, window_right);
     NO_DEVICE_CODE;
 #endif // defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
 }
@@ -1918,7 +1967,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16(
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
                             const int32_t nb31, const int32_t nb32, const int64_t nb33,
                             const int32_t causal_kv_offset,
-                            const int32_t heavy_first) {
+                            const int32_t heavy_first,
+                            const int32_t window_left,
+                            const int32_t window_right) {
     ggml_cuda_pdl_sync(); // TODO optimize placement
 #if defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE))
     const char * GGML_CUDA_RESTRICT Q              = Q_ptr;
@@ -2032,15 +2083,38 @@ static __device__ __forceinline__ void flash_attn_ext_f16(
         }
         // KV tiles past the diagonal of the tile's last row are fully masked.
         if (causal_kv_offset >= 0) {
-            const int kv_end = min((jt + 1)*ncols1, (int) ne01.z) + causal_kv_offset;
+            const int right_ext = window_right >= 0 ? window_right : 0;
+            const int kv_end = min((jt + 1)*ncols1, (int) ne01.z) + causal_kv_offset + right_ext;
             kb0_stop = min(kb0_stop, (kv_end + nbatch_fa - 1) / nbatch_fa);
         }
+        // The sliding window's left edge narrows where this tile's KV loop
+        // may start. This must NOT change kb0_start itself: the
+        // needs_fixup/is_fixup selection below is a stream-K grid-partition
+        // fact (whether THIS block's assigned range begins at the tile's
+        // true start), independent of windowing. kb0_fa_start is always <=
+        // kb0_stop here: kb0_stop is computed from the tile's full causal
+        // bound (the while loop only runs while this block's grid range
+        // covers a whole tile), and a tile's last row's bound is always >=
+        // its first row's window start. The clamp below is defensive: it
+        // only matters if a future stream-K split assigns a block a
+        // sub-range of the tile narrower than the window itself, which
+        // can't happen today (windowed_in_kernel always passes
+        // LaunchOverride::NONE, so kb0_start is 0 whenever window_left is
+        // set), but keeps kb0_fa_start from exceeding kb0_stop if that
+        // ever changes.
+        int kb0_fa_start = kb0_start;
+        if (window_left >= 0 && causal_kv_offset >= 0) {
+            const int first_row = jt * ncols1;
+            const int kv_start = max(0, first_row + causal_kv_offset - window_left);
+            kb0_fa_start = max(kb0_fa_start, kv_start / nbatch_fa);
+        }
+        kb0_fa_start = min(kb0_fa_start, kb0_stop);
         constexpr bool is_fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
         if (kb0_start == 0) {
             constexpr bool needs_fixup = false; // CUDA block is working on an entire tile.
             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, oob_tail>
                 (Q_h2, K_h2, V_h2, mask_h, indices, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
-                 ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop, causal_kv_offset);
+                 ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_fa_start, kb0_stop, causal_kv_offset, window_left, window_right);
         } else if (kb0_start >= kb0_stop) {
             // The causal bound ends the tile before this segment starts.
             crane_fattn_write_empty_partial<DV, ncols>(dst_meta, blockIdx.x, gridDim.x + blockIdx.x);
@@ -2048,7 +2122,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16(
             constexpr bool needs_fixup = true; // CUDA block is missing the beginning of a tile.
             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, oob_tail>
                 (Q_h2, K_h2, V_h2, mask_h, indices, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
-                 ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop, causal_kv_offset);
+                 ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_fa_start, kb0_stop, causal_kv_offset, window_left, window_right);
         }
 
         kbc += iter_k;
@@ -2086,12 +2160,21 @@ static __device__ __forceinline__ void flash_attn_ext_f16(
         kb0_stop = min(kb0_stop, KV_max[sequence*iter_j + jt] / nbatch_fa);
     }
     if (causal_kv_offset >= 0) {
-        const int kv_end = min((jt + 1)*ncols1, (int) ne01.z) + causal_kv_offset;
+        const int right_ext = window_right >= 0 ? window_right : 0;
+        const int kv_end = min((jt + 1)*ncols1, (int) ne01.z) + causal_kv_offset + right_ext;
         kb0_stop = min(kb0_stop, (kv_end + nbatch_fa - 1) / nbatch_fa);
+    }
+    // is_fixup/needs_fixup are constants below (not branched on kb0_start),
+    // so clamping kb0_start in place is safe here, unlike the while loop
+    // above.
+    if (window_left >= 0 && causal_kv_offset >= 0) {
+        const int first_row = jt * ncols1;
+        const int kv_start = max(0, first_row + causal_kv_offset - window_left);
+        kb0_start = max(kb0_start, kv_start / nbatch_fa);
     }
 
     if (kb0_start >= kb0_stop) {
-        // The causal bound ends the tile before this segment starts.
+        // The causal or window bound ends the tile before this segment starts.
         crane_fattn_write_empty_partial<DV, ncols>(dst_meta, gridDim.x + blockIdx.x, blockIdx.x);
         return;
     }
@@ -2100,7 +2183,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16(
     constexpr bool needs_fixup = false;
     flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, oob_tail>
         (Q_h2, K_h2, V_h2, mask_h, indices, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
-         ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop, causal_kv_offset);
+         ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop, causal_kv_offset, window_left, window_right);
 #else
     GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,
@@ -2110,7 +2193,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16(
               nb11, nb12, nb13,
               nb21, nb22, nb23,
               ne31, ne32, ne33,
-              nb31, nb32, nb33, causal_kv_offset, heavy_first);
+              nb31, nb32, nb33, causal_kv_offset, heavy_first, window_left, window_right);
     NO_DEVICE_CODE;
 #endif // defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE))
 }
@@ -2133,7 +2216,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16(
         int32_t nb21, int32_t nb22, int64_t nb23,                                                       \
         int32_t ne31, int32_t ne32, int32_t ne33,                                                       \
         int32_t nb31, int32_t nb32, int64_t nb33,                                                       \
-        int32_t causal_kv_offset, int32_t heavy_first)                                                  \
+        int32_t causal_kv_offset, int32_t heavy_first,                                                   \
+        int32_t window_left, int32_t window_right)                                                       \
     {                                                                                                    \
         flash_attn_ext_f16<DKQ_, DV_, ncols1_, ncols2_, false, false, false, false>(                    \
             Q, K, V, mask, sinks, KV_max, dst, dst_meta,                                                \
@@ -2141,7 +2225,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16(
             ne00, ne01, ne02, ne03, nb01, nb02, nb03,                                                    \
             ne10, ne11, ne12, ne13, nb11, nb12, nb13,                                                    \
             nb21, nb22, nb23, ne31, ne32, ne33, nb31, nb32, nb33,                                        \
-            causal_kv_offset, heavy_first);                                                             \
+            causal_kv_offset, heavy_first, window_left, window_right);                                  \
     }                                                                                                    \
     DECL_CRANE_FATTN_FIXUP(f16, half, DV_, ncols1_, ncols2_)
 
@@ -2176,7 +2260,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16(
         int32_t nb21, int32_t nb22, int64_t nb23,                                                       \
         int32_t ne31, int32_t ne32, int32_t ne33,                                                       \
         int32_t nb31, int32_t nb32, int64_t nb33,                                                       \
-        int32_t causal_kv_offset, int32_t heavy_first)                                                  \
+        int32_t causal_kv_offset, int32_t heavy_first,                                                   \
+        int32_t window_left, int32_t window_right)                                                       \
     {                                                                                                    \
         flash_attn_ext_f16<DKQ_, DV_, ncols1_, ncols2_, false, false, false, true>(                    \
             Q, K, V, mask, sinks, KV_max, dst, dst_meta,                                                \
@@ -2184,5 +2269,5 @@ static __device__ __forceinline__ void flash_attn_ext_f16(
             ne00, ne01, ne02, ne03, nb01, nb02, nb03,                                                    \
             ne10, ne11, ne12, ne13, nb11, nb12, nb13,                                                    \
             nb21, nb22, nb23, ne31, ne32, ne33, nb31, nb32, nb33,                                        \
-            causal_kv_offset, heavy_first);                                                             \
+            causal_kv_offset, heavy_first, window_left, window_right);                                  \
     }

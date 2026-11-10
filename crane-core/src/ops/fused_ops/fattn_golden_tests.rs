@@ -13,8 +13,9 @@ use candle_core::{DType, Device, Tensor};
 
 use super::long_seq_tests::{DISTS, SEEDS_PER_DIST, SEQS, round_to, to_host};
 use super::{
-    LaunchOverride, fattn_mma_bf16_causal, fattn_mma_bf16_full, fattn_mma_bf16_windowed,
-    fattn_mma_causal, fattn_mma_full, fattn_mma_windowed, prefill_dispatch, prefill_dispatch_bf16,
+    LaunchOverride, WindowBounds, fattn_mma_bf16_causal, fattn_mma_bf16_full,
+    fattn_mma_bf16_windowed, fattn_mma_causal, fattn_mma_full, fattn_mma_windowed,
+    prefill_dispatch, prefill_dispatch_bf16,
 };
 use crate::ops::fused_ops::fattn::is_amd_backend;
 use crate::ops::fused_ops::fattn::test_support::{
@@ -307,7 +308,17 @@ fn run_variant(
             } else {
                 prefill_dispatch
             };
-            dispatch(&q, &k, &v, None, None, scale, Some(0), forced)
+            dispatch(
+                &q,
+                &k,
+                &v,
+                None,
+                None,
+                scale,
+                Some(0),
+                WindowBounds::NONE,
+                forced,
+            )
         },
     };
     out.unwrap()
