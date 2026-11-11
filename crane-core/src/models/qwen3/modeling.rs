@@ -202,6 +202,12 @@ struct Attention {
     /// Opt-in vendored flash attention for prefill, see
     /// [`Qwen3Model::enable_flash_causal`].
     flash_causal: bool,
+    /// `KV_max` shared across every layer in one forward pass, built once by
+    /// [`Qwen3Model::decode`] via `gpu_flash_attn::prepare_causal_kv_max`
+    /// instead of rebuilt per layer. `None` when flash attention is off,
+    /// there is nothing to share for this shape, or during decode
+    /// (`seq_len == 1`, which never takes the flash path).
+    flash_kv_max: Option<Tensor>,
 }
 
 impl Attention {
@@ -288,6 +294,7 @@ impl Attention {
             kv_cache: None,
             cache_seq_len: 0,
             flash_causal: false,
+            flash_kv_max: None,
         })
     }
 
@@ -332,6 +339,7 @@ impl Attention {
             kv_cache: None,
             cache_seq_len: 0,
             flash_causal: false,
+            flash_kv_max: None,
         })
     }
 
@@ -548,7 +556,10 @@ impl Attention {
         // returns `None` for anything it cannot serve and the SDPA below runs.
         if self.flash_causal && seq_len > 1 {
             let mask = flash_mask.or(attention_mask);
-            if let Some(out) = gpu_flash_attn::try_causal_prefill(&q, &k, &v, scale_f32, mask)? {
+            let kv_max = self.flash_kv_max.as_ref();
+            if let Some(out) =
+                gpu_flash_attn::try_causal_prefill_with_kv_max(&q, &k, &v, scale_f32, mask, kv_max)?
+            {
                 return self.o_proj.forward(&out);
             }
         }
@@ -1576,14 +1587,33 @@ impl Qwen3Model {
         // MiniCPM-o's TTS conditioning).
         let prune_last = seq_len > 1 && self.last_layer_is_moe;
 
+        let any_flash = self.layers.iter().any(|l| l.self_attn.flash_causal);
+
         // One F16 copy of the causal mask for every opted-in layer, instead
         // of a cast in each of them.
         let flash_mask = match attention_mask.as_ref() {
-            Some(mask) if self.layers.iter().any(|l| l.self_attn.flash_causal) => {
-                gpu_flash_attn::prepare_mask(mask)?
-            },
+            Some(mask) if any_flash => gpu_flash_attn::prepare_mask(mask)?,
             _ => None,
         };
+        // One shared KV_max for every opted-in layer, instead of a rebuild
+        // (CPU fill + device alloc + H2D copy) in each of them.
+        let flash_kv_max = if any_flash && seq_len > 1 {
+            gpu_flash_attn::prepare_causal_kv_max(
+                b_sz,
+                seq_len,
+                total_len,
+                self.config.head_dim(),
+                self.config.num_attention_heads,
+                self.config.num_key_value_heads,
+                self.dtype,
+                device,
+            )?
+        } else {
+            None
+        };
+        for layer in &mut self.layers {
+            layer.self_attn.flash_kv_max.clone_from(&flash_kv_max);
+        }
         let (mask, flash_mask) = (attention_mask.as_ref(), flash_mask.as_ref());
 
         let mut hidden_states = hidden_states;

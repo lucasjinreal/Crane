@@ -1124,6 +1124,53 @@ fn mma_ncols1_for_bf16(q: &Tensor, k: &Tensor) -> Result<usize> {
     )
 }
 
+/// Scalar counterpart of [`mma_ncols1_for`]/[`mma_ncols1_for_bf16`]: computes
+/// the same `ncols1` from a model's own config and input dimensions, without
+/// needing `q`/`k` tensors. Lets a caller size a shared `KV_max` (see
+/// [`crate::models::modules::gpu_flash_attn::prepare_causal_kv_max`]) before
+/// `q`/`k` even exist for every layer, from one set of shapes computed once
+/// per forward pass.
+///
+/// Returns `None` when no instantiated MMA kernel covers this
+/// `(head_dim, gqa_ratio, seq_q)` combination, the same case
+/// [`mma_ncols1_for`]/[`mma_ncols1_for_bf16`] turn into an `Err`; the caller
+/// here has no tensor to retry with a different kernel family, so it should
+/// fall back to not pre-building a shared `KV_max` for this call instead.
+///
+/// # Errors
+///
+/// Returns an error if `n_heads_kv` is `0` or `n_heads_q` isn't a positive
+/// multiple of it.
+pub(crate) fn compute_mma_ncols1(
+    head_dim: usize,
+    n_heads_q: usize,
+    n_heads_kv: usize,
+    batch: usize,
+    seq_q: usize,
+    bf16: bool,
+    device: &Device,
+) -> Result<Option<usize>> {
+    if n_heads_kv == 0 || !n_heads_q.is_multiple_of(n_heads_kv) {
+        candle_core::bail!(
+            "fattn_mma: num_heads_q ({n_heads_q}) must be a positive multiple of num_heads_kv ({n_heads_kv})"
+        );
+    }
+    let gqa_ratio = n_heads_q / n_heads_kv;
+    let is_amd = is_amd_backend();
+    let selected = if bf16 {
+        select_mma_ncols_bf16(head_dim, gqa_ratio, seq_q, is_amd)
+    } else {
+        select_mma_ncols(head_dim, gqa_ratio, seq_q, is_amd)
+    };
+    let Some((ncols1, ncols2)) = selected else {
+        return Ok(None);
+    };
+    let n_sm = grid_target(device, LaunchOverride::NONE)?.n_sm;
+    Ok(Some(narrow_for_underfill(
+        ncols1, ncols2, seq_q, gqa_ratio, n_heads_kv, batch, n_sm, is_amd, bf16,
+    )))
+}
+
 /// Casts `mask` to F16 if it isn't already (avoiding a no-op cast's clone),
 /// since every `fattn_mma_*_with_mask` entry point (F16 and native-BF16
 /// alike) requires an F16 mask before dispatch.
@@ -1205,7 +1252,10 @@ pub fn fattn_mma_causal(
 /// `j <= i + kv_offset`, covering `k`'s live `seq_kv` (any dtype, cast to
 /// F16 here if needed). `KV_max` is still rebuilt per call. It is
 /// `O(batch * n_tiles)`, not `O(seq^2)`, so there is no analogous cost to
-/// share.
+/// share, though a caller that already has one anyway (e.g. from
+/// [`crate::models::modules::gpu_flash_attn::prepare_causal_kv_max`]) can
+/// pass it to [`fattn_mma_causal_with_mask_kv_max`] instead and skip the
+/// rebuild too.
 ///
 /// # Errors
 ///
@@ -1242,6 +1292,34 @@ pub fn fattn_mma_causal_with_mask(
         q.device(),
     )?;
     fattn_mma_prefill(q, k, v, Some(&mask), Some(&kv_max), scale)
+}
+
+/// Same as [`fattn_mma_causal_with_mask`], but for a caller that also
+/// already has `KV_max` (built once per forward pass, shared across every
+/// layer, e.g. via
+/// [`crate::models::modules::gpu_flash_attn::prepare_causal_kv_max`]). This
+/// skips the per-call `KV_max` rebuild [`fattn_mma_causal_with_mask`] still
+/// pays. `kv_max` must be the same analytic bound
+/// [`super::fattn::build_analytic_kv_max`] would build for this call's
+/// `(batch, seq_q, seq_kv, kv_offset)` and the kernel's own `ncols1` for this
+/// shape; a mismatched `kv_max` silently truncates or extends which keys a
+/// tile reads.
+///
+/// # Errors
+///
+/// Returns a candle error if `q`/`k`/`v`'s shapes are incompatible, if
+/// `mask`/`kv_max` aren't shaped as [`fattn_mma_prefill`] expects, or if any
+/// tensor op fails.
+pub fn fattn_mma_causal_with_mask_kv_max(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    mask: &Tensor,
+    kv_max: &Tensor,
+) -> Result<Tensor> {
+    let mask = ensure_f16_mask(mask)?;
+    fattn_mma_prefill(q, k, v, Some(&mask), Some(kv_max), scale)
 }
 
 /// Native-bf16 counterpart of [`fattn_mma_causal`]: masks in the kernel and
@@ -1421,7 +1499,9 @@ fn windowed_in_kernel(
 }
 
 /// Native-bf16 counterpart of [`fattn_mma_causal_with_mask`]: dispatches
-/// through [`fattn_mma_bf16_prefill`]'s kernels instead.
+/// through [`fattn_mma_bf16_prefill`]'s kernels instead. `KV_max` is still
+/// rebuilt per call; see [`fattn_mma_bf16_causal_with_mask_kv_max`] for a
+/// caller that already has one.
 ///
 /// # Errors
 ///
@@ -1451,6 +1531,24 @@ pub fn fattn_mma_bf16_causal_with_mask(
         q.device(),
     )?;
     fattn_mma_bf16_prefill(q, k, v, Some(&mask), Some(&kv_max), scale)
+}
+
+/// Native-bf16 counterpart of [`fattn_mma_causal_with_mask_kv_max`]:
+/// dispatches through [`fattn_mma_bf16_prefill`]'s kernels instead.
+///
+/// # Errors
+///
+/// See [`fattn_mma_causal_with_mask_kv_max`].
+pub fn fattn_mma_bf16_causal_with_mask_kv_max(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    mask: &Tensor,
+    kv_max: &Tensor,
+) -> Result<Tensor> {
+    let mask = ensure_f16_mask(mask)?;
+    fattn_mma_bf16_prefill(q, k, v, Some(&mask), Some(kv_max), scale)
 }
 
 /// Sliding-window flash-attention: `i + kv_offset - window_left <= j <= i +
@@ -4458,6 +4556,55 @@ mod gpu_tests {
             max_diff > 1e-3,
             "garbage mask produced the same output as the correct mask (max diff {max_diff})"
         );
+    }
+
+    // compute_mma_ncols1 computes ncols1 from scalars alone, since
+    // gpu_flash_attn::prepare_causal_kv_max calls it before any layer's
+    // q/k tensors exist. It must agree with mma_ncols1_for/
+    // mma_ncols1_for_bf16's tensor-derived result for the same shape, or a
+    // caller-supplied KV_max would size tiles the kernel does not expect.
+    #[test]
+    fn compute_mma_ncols1_matches_mma_ncols1_for() {
+        let gpu = test_gpu_device();
+        // (head_dim, n_heads_q, n_heads_kv, batch, seq_q)
+        let cases = [
+            (64usize, 8usize, 2usize, 1usize, 1usize),
+            (64, 8, 2, 1, 231),
+            (64, 8, 2, 1, 1024),
+            (128, 8, 2, 1, 1),
+            (128, 8, 2, 1, 231),
+            (128, 8, 2, 1, 1024),
+            (256, 8, 2, 1, 1),
+            (256, 8, 2, 1, 231),
+            (256, 8, 2, 1, 1024),
+            (512, 8, 2, 1, 1),
+            (512, 8, 2, 1, 231),
+            (512, 8, 2, 1, 1024),
+        ];
+        for (head_dim, n_heads_q, n_heads_kv, batch, seq_q) in cases {
+            let q = Tensor::zeros((batch, seq_q, n_heads_q, head_dim), DType::F16, &gpu).unwrap();
+            let k = Tensor::zeros((batch, seq_q, n_heads_kv, head_dim), DType::F16, &gpu).unwrap();
+
+            let want = super::mma_ncols1_for(&q, &k).ok();
+            let got = super::compute_mma_ncols1(
+                head_dim, n_heads_q, n_heads_kv, batch, seq_q, false, &gpu,
+            )
+            .unwrap();
+            assert_eq!(
+                got, want,
+                "f16 mismatch at head_dim={head_dim} seq_q={seq_q}"
+            );
+
+            let want_bf16 = super::mma_ncols1_for_bf16(&q, &k).ok();
+            let got_bf16 = super::compute_mma_ncols1(
+                head_dim, n_heads_q, n_heads_kv, batch, seq_q, true, &gpu,
+            )
+            .unwrap();
+            assert_eq!(
+                got_bf16, want_bf16,
+                "bf16 mismatch at head_dim={head_dim} seq_q={seq_q}"
+            );
+        }
     }
 }
 
