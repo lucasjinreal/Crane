@@ -34,11 +34,13 @@ use candle_core::{Result, Tensor};
 
 #[cfg(crane_fattn)]
 use crate::ops::fused_ops::fattn_mma::{
-    fattn_mma_bf16_causal, fattn_mma_bf16_causal_with_mask, fattn_mma_causal,
-    fattn_mma_causal_with_mask,
+    fattn_mma_bf16_causal, fattn_mma_bf16_causal_with_mask, fattn_mma_bf16_windowed,
+    fattn_mma_causal, fattn_mma_causal_with_mask, fattn_mma_windowed,
 };
 #[cfg(crane_fattn)]
-use crate::ops::fused_ops::fattn_tile::{fattn_tile_causal, fattn_tile_causal_with_mask};
+use crate::ops::fused_ops::fattn_tile::{
+    fattn_tile_causal, fattn_tile_causal_with_mask, fattn_tile_windowed,
+};
 // Only builds without ROCm need the trait. The ROCm fork's own `Device` has
 // an inherent `is_rocm()`.
 #[cfg(all(crane_fattn, feature = "cuda", not(feature = "rocm")))]
@@ -119,6 +121,45 @@ pub(crate) fn try_causal_prefill(
         None => try_causal(q, k, v, scale),
     };
     out.transpose()?
+        .map(|o| {
+            let (batch, heads, seq, dim) = o.dims4()?;
+            o.transpose(1, 2)?.reshape((batch, seq, heads * dim))
+        })
+        .transpose()
+}
+
+/// Tries sliding-window flash attention for prefill: key `j` is visible
+/// from query `i` when `i + kv_offset - window_left <= j <= i + kv_offset +
+/// window_right`, where `kv_offset` is `k`'s sequence length minus `q`'s.
+/// This is the windowed counterpart of [`try_causal_prefill`]: the kernel
+/// bounds both window edges itself, with no host-built mask, so it is
+/// cheaper than passing an equivalent mask through [`try_causal_prefill`].
+///
+/// For a causal sliding window of `window` keys including the query
+/// itself, pass `window_left = window - 1` and `window_right = 0`.
+///
+/// `q` is `[B, H_q, S, D]` and `k`/`v` are `[B, H_kv, kv_len, D]`, same as
+/// [`try_causal_prefill`]. The result is `[B, S, H*D]` for a decoder's
+/// `o_proj`.
+///
+/// Returns `None` unless the build has the kernels (`rocm`, or `cuda` with
+/// `flash-attn-intree`) and `q` is on that device, or for an unsupported
+/// `head_dim` or a shape without a usable kernel.
+///
+/// # Errors
+///
+/// The inner `Result` errors on a kernel launch failure or on tensor shapes
+/// the kernel rejects.
+pub(crate) fn try_windowed_prefill(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    window_left: usize,
+    window_right: usize,
+) -> Result<Option<Tensor>> {
+    dispatch_windowed(q, k, v, scale, window_left, window_right)
+        .transpose()?
         .map(|o| {
             let (batch, heads, seq, dim) = o.dims4()?;
             o.transpose(1, 2)?.reshape((batch, seq, heads * dim))
@@ -222,6 +263,48 @@ fn dispatch_causal(
     mask: Option<&Tensor>,
 ) -> Option<Result<Tensor>> {
     let _ = (q, k, v, scale, mask);
+    None
+}
+
+/// Shared body of [`try_windowed_prefill`].
+#[cfg(crane_fattn)]
+fn dispatch_windowed(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    window_left: usize,
+    window_right: usize,
+) -> Option<Result<Tensor>> {
+    if intree_env() == Some(false) || !on_kernel_device(q) || !head_dim_supported(q) {
+        return None;
+    }
+    let offset = match kv_offset(q, k) {
+        Ok(offset) => offset,
+        Err(e) => return Some(Err(e)),
+    };
+    run(
+        q,
+        k,
+        v,
+        |qf, kf, vf| fattn_mma_bf16_windowed(qf, kf, vf, scale, offset, window_left, window_right),
+        |qf, kf, vf| fattn_mma_windowed(qf, kf, vf, scale, offset, window_left, window_right),
+        |qf, kf, vf| fattn_tile_windowed(qf, kf, vf, scale, offset, window_left, window_right),
+    )
+    .transpose()
+}
+
+/// Builds without a GPU kernel backend never serve a call.
+#[cfg(not(crane_fattn))]
+fn dispatch_windowed(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    window_left: usize,
+    window_right: usize,
+) -> Option<Result<Tensor>> {
+    let _ = (q, k, v, scale, window_left, window_right);
     None
 }
 
@@ -507,7 +590,7 @@ mod gpu_tests {
 
     use crate::ops::fused_ops::fattn::test_support::{narrowed_bhsd, test_gpu_device};
 
-    use super::{try_causal, try_causal_prefill, try_causal_with_mask};
+    use super::{try_causal, try_causal_prefill, try_causal_with_mask, try_windowed_prefill};
 
     /// Random F32 reference tensors on the CPU plus their `dtype` copies on
     /// the GPU.
@@ -817,6 +900,90 @@ mod gpu_tests {
             assert_eq!(got.dims(), &[1, 20, 4 * 128]);
             assert_close(&to_vec(&got), &want, 3e-2);
         }
+    }
+
+    // The windowed kernel must match the naive sliding-window reference
+    // with no caller-built mask. This is what Gemma4's sliding layers use.
+    #[test]
+    fn try_windowed_prefill_matches_reference() {
+        let inp = inputs((1, 4, 2, 40, 120, 128), DType::F16);
+        let [q, k, v] = &inp.gpu;
+        let window = 8;
+        let got = try_windowed_prefill(q, k, v, inp.scale, window - 1, 0)
+            .unwrap()
+            .expect("GPU device must serve a supported shape");
+        assert_eq!(got.dims(), &[1, 40, 4 * 128]);
+        let got_bhsd = got
+            .reshape((1, 40, 4, 128))
+            .unwrap()
+            .transpose(1, 2)
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        let got_vec = to_vec(&got_bhsd);
+        let want = naive_windowed(&inp, Some(window));
+        assert_close(&got_vec, &want, 3e-2);
+
+        // The window must matter here, or the check above proves nothing.
+        let diff = |other: &[f32]| {
+            other
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max)
+        };
+        assert!(
+            diff(&naive_causal(&inp)) > 1e-2,
+            "window did not change the reference"
+        );
+
+        // The kernel's edge must be exact: shifting the reference window by
+        // one key either direction must diverge from `want` more than it
+        // does, pinning the boundary instead of just "some window applies".
+        assert!(
+            diff(&naive_windowed(&inp, Some(window - 1))) > 1e-2,
+            "kernel window is wider than requested"
+        );
+        assert!(
+            diff(&naive_windowed(&inp, Some(window + 1))) > 1e-2,
+            "kernel window is narrower than requested"
+        );
+    }
+
+    // Native BF16 path through the windowed kernel.
+    #[test]
+    fn try_windowed_prefill_bf16_matches_reference() {
+        let inp = inputs((1, 4, 2, 40, 120, 128), DType::BF16);
+        let [q, k, v] = &inp.gpu;
+        let window = 8;
+        let got = try_windowed_prefill(q, k, v, inp.scale, window - 1, 0)
+            .unwrap()
+            .expect("GPU device must serve a supported shape");
+        assert_eq!(got.dims(), &[1, 40, 4 * 128]);
+        let got_bhsd = got
+            .reshape((1, 40, 4, 128))
+            .unwrap()
+            .transpose(1, 2)
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        assert_close(
+            &to_vec(&got_bhsd),
+            &naive_windowed(&inp, Some(window)),
+            3e-2,
+        );
+    }
+
+    // An unsupported head_dim returns `None`, same as the causal path.
+    #[test]
+    fn try_windowed_prefill_unsupported_head_dim_returns_none() {
+        let inp = inputs((1, 4, 2, 5, 11, 100), DType::F16);
+        let [q, k, v] = &inp.gpu;
+        assert!(
+            try_windowed_prefill(q, k, v, inp.scale, 7, 0)
+                .unwrap()
+                .is_none()
+        );
     }
 
     // An unaligned seq_kv at GQA ratio 8 exercises the K/V padding the

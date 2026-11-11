@@ -268,6 +268,11 @@ struct Attention {
     /// Opt-in vendored flash attention for prefill, see
     /// [`Gemma4Model::enable_flash_causal`].
     flash_causal: bool,
+    /// Sliding-window size for the windowed flash kernel, set by
+    /// [`Gemma4Model::enable_flash_causal`]. `None` for full-attention
+    /// layers, `Some(window)` for sliding-window layers, where the query
+    /// sees `window` total keys including itself.
+    sliding_window: Option<usize>,
 }
 
 impl Attention {
@@ -331,6 +336,7 @@ impl Attention {
             kv_cache: None,
             cache_seq_len: 0,
             flash_causal: false,
+            sliding_window: None,
         })
     }
 
@@ -374,6 +380,7 @@ impl Attention {
             kv_cache: None,
             cache_seq_len: 0,
             flash_causal: false,
+            sliding_window: None,
         })
     }
 
@@ -437,7 +444,6 @@ impl Attention {
         cos: &Tensor,
         sin: &Tensor,
         attention_mask: Option<&Tensor>,
-        flash_mask: Option<&Tensor>,
         layer_type: LayerType,
         rotated_dim: Option<usize>,
         shared_kv: Option<&(Tensor, Tensor)>,
@@ -528,16 +534,21 @@ impl Attention {
             return self.o_proj.forward(&attn_output);
         }
 
-        // Opt-in vendored flash attention for prefill, GPU only. The mask is
-        // the layer's own: causal for full layers, causal plus the sliding
-        // window for the others. The kernel reads it, and its analytic
-        // `KV_max` only trims keys past the causal diagonal. Gemma4 scales by
+        // Opt-in vendored flash attention for prefill, GPU only. Sliding
+        // layers use the windowed kernel, which bounds both window edges
+        // itself with no host-built mask. Full layers use plain causal,
+        // whose analytic `KV_max` needs no mask either. Gemma4 scales by
         // 1.0, the QK norms handle normalization. It returns `None` for what
         // it cannot serve, such as `head_dim` 512 on AMD, and the SDPA below
         // runs.
         if self.flash_causal && seq_len > 1 {
-            let mask = flash_mask.or(attention_mask);
-            if let Some(out) = gpu_flash_attn::try_causal_prefill(&q, &k, &v, 1.0, mask)? {
+            let out = match self.sliding_window {
+                Some(window) => {
+                    gpu_flash_attn::try_windowed_prefill(&q, &k, &v, 1.0, window - 1, 0)?
+                },
+                None => gpu_flash_attn::try_causal_prefill(&q, &k, &v, 1.0, None)?,
+            };
+            if let Some(out) = out {
                 return self.o_proj.forward(&out);
             }
         }
@@ -799,7 +810,6 @@ impl DecoderLayer {
         cos: &Tensor,
         sin: &Tensor,
         attention_mask: Option<&Tensor>,
-        flash_mask: Option<&Tensor>,
         rotated_dim: Option<usize>,
         shared_kv: Option<&(Tensor, Tensor)>,
     ) -> Result<Tensor> {
@@ -811,7 +821,6 @@ impl DecoderLayer {
             cos,
             sin,
             attention_mask,
-            flash_mask,
             self.layer_type,
             rotated_dim,
             shared_kv,
@@ -849,9 +858,10 @@ impl DecoderLayer {
         self.self_attn.clear_kv_cache();
     }
 
-    fn enable_flash_causal(&mut self) {
+    fn enable_flash_causal(&mut self, sliding_window: Option<usize>) {
         gpu_flash_attn::warn_if_no_flash_backend("Gemma4", false);
         self.self_attn.flash_causal = true;
+        self.self_attn.sliding_window = sliding_window;
     }
 }
 
@@ -968,7 +978,8 @@ impl Gemma4Model {
         let ple_embed_scale = (ple_dim as f64).sqrt();
         let ple_projection_scale = (config.hidden_size as f64).powf(-0.5);
         let ple_input_scale = 2.0_f64.powf(-0.5);
-        let sliding_window = config.sliding_window.unwrap_or(512);
+        // `window - 1` elsewhere assumes at least one visible key.
+        let sliding_window = config.sliding_window.unwrap_or(512).max(1);
 
         Ok(Self {
             embed_tokens,
@@ -1057,9 +1068,11 @@ impl Gemma4Model {
         let ple_dim = md
             .opt_usize(&key("embedding_length_per_layer_input"))
             .unwrap_or(256);
+        // `window - 1` elsewhere assumes at least one visible key.
         let sliding_window = md
             .opt_usize(&key("attention.sliding_window"))
-            .unwrap_or(512);
+            .unwrap_or(512)
+            .max(1);
         let final_logit_softcapping = md.opt_f32(&key("final_logit_softcapping"));
 
         let layer_types_str: Vec<String> = if let Some(gguf_file::Value::Array(arr)) = gg
@@ -1353,11 +1366,6 @@ impl Gemma4Model {
             None
         };
 
-        // One F16 copy of each mask for every opted-in layer, instead of a
-        // cast in each of them.
-        let (flash_sliding, flash_full) =
-            self.prepare_flash_masks(sliding_mask.as_ref(), causal_mask.as_ref())?;
-
         // Forward pass through layers
         let mut hidden_states = hidden_states;
         let first_shared = self.config.first_kv_shared_layer();
@@ -1366,19 +1374,9 @@ impl Gemma4Model {
         for i in 0..self.layers.len() {
             let lt = self.layer_types[i];
 
-            let (cos, sin, mask, flash_mask) = match lt {
-                LayerType::SlidingAttention => (
-                    &cos_sliding,
-                    &sin_sliding,
-                    sliding_mask.as_ref(),
-                    flash_sliding.as_ref(),
-                ),
-                LayerType::FullAttention => (
-                    &cos_full,
-                    &sin_full,
-                    causal_mask.as_ref(),
-                    flash_full.as_ref(),
-                ),
+            let (cos, sin, mask) = match lt {
+                LayerType::SlidingAttention => (&cos_sliding, &sin_sliding, sliding_mask.as_ref()),
+                LayerType::FullAttention => (&cos_full, &sin_full, causal_mask.as_ref()),
             };
 
             let rotated_dim = match lt {
@@ -1397,7 +1395,6 @@ impl Gemma4Model {
                 cos,
                 sin,
                 mask,
-                flash_mask,
                 rotated_dim,
                 shared_kv,
             )?;
@@ -1481,35 +1478,23 @@ impl Gemma4Model {
     }
 
     /// Enable fused causal attention for prefill. The caller guarantees an
-    /// unpadded standard prefill, whose masks are the plain causal mask for
-    /// full layers and the causal sliding-window mask for the others.
+    /// unpadded standard prefill. Full layers dispatch to the analytic
+    /// causal kernel and sliding layers to the windowed kernel, both with no
+    /// host-built mask: the kernel bounds the causal diagonal and, for
+    /// sliding layers, the window's left edge, itself.
     ///
-    /// The vendored kernels compute `KV_max` analytically and skip KV tiles
-    /// past the causal diagonal, so a mask that is not causal is cut off
-    /// silently instead of honored. A mask that hides extra keys below the
-    /// diagonal, as the sliding window does, is honored. An F32 model runs
-    /// the kernel in F16, so its opted-in attention has F16 precision.
-    /// Anything the kernels cannot serve, such as the 512-wide full-attention
-    /// heads on AMD or a CPU device, keeps the default path.
+    /// An F32 model runs the kernel in F16, so its opted-in attention has
+    /// F16 precision. Anything the kernels cannot serve, such as the
+    /// 512-wide full-attention heads on AMD or a CPU device, keeps the
+    /// default path.
     pub fn enable_flash_causal(&mut self) {
         for layer in &mut self.layers {
-            layer.enable_flash_causal();
+            let window = match layer.layer_type {
+                LayerType::SlidingAttention => Some(self.sliding_window),
+                LayerType::FullAttention => None,
+            };
+            layer.enable_flash_causal(window);
         }
-    }
-
-    /// F16 copies of the sliding and full masks for the opted-in layers, see
-    /// [`gpu_flash_attn::prepare_mask`]. Both are `None` when no layer opted
-    /// in or the masks need no cast.
-    fn prepare_flash_masks(
-        &self,
-        sliding: Option<&Tensor>,
-        full: Option<&Tensor>,
-    ) -> Result<(Option<Tensor>, Option<Tensor>)> {
-        if !self.layers.iter().any(|l| l.self_attn.flash_causal) {
-            return Ok((None, None));
-        }
-        let prepare = |mask: Option<&Tensor>| mask.map_or(Ok(None), gpu_flash_attn::prepare_mask);
-        Ok((prepare(sliding)?, prepare(full)?))
     }
 
     pub fn num_layers(&self) -> usize {
