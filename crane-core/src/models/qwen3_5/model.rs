@@ -677,6 +677,14 @@ impl Qwen3_5TextModel {
             // chunked formulation's dozens (long prefill chunks keep it).
             slot.prefer_serial = serial_gdn && seq_len <= SPEC_SERIAL_MAX;
         }
+        // This loop calls each layer's `forward` directly instead of going
+        // through `run_layers`, so `flash_kv_max` would otherwise still hold
+        // whatever shape the last `run_layers` call built it for. Clear it so
+        // the flash path (if any layer opted in) falls back to its per-call
+        // rebuild, which is sized for this block's own (seq_q, seq_kv).
+        for layer in &mut self.layers {
+            layer.set_flash_kv_max(None);
+        }
         let mask = super::prefill::causal_mask(
             seq_len,
             start_pos,
@@ -759,16 +767,39 @@ impl Qwen3_5TextModel {
         if xs.dim(1)? > 1 && xs.dtype() != self.attention_dtype() {
             xs = xs.to_dtype(self.attention_dtype())?;
         }
+        let any_flash = self.layers.iter().any(DecoderLayer::flash_causal_enabled);
+        let seq_q = xs.dim(1)?;
+
         // One F16 copy of the causal mask for every opted-in layer, instead
         // of a cast in each of them.
         let flash_mask = match attention_mask {
-            Some(mask)
-                if xs.dim(1)? > 1 && self.layers.iter().any(DecoderLayer::flash_causal_enabled) =>
-            {
-                gpu_flash_attn::prepare_mask(mask)?
-            },
+            Some(mask) if seq_q > 1 && any_flash => gpu_flash_attn::prepare_mask(mask)?,
             _ => None,
         };
+        // One shared KV_max for every opted-in layer, instead of a rebuild
+        // (CPU fill + device alloc + H2D copy) in each of them. `seq_kv`
+        // comes from the mask's own KV axis rather than a `start_pos`
+        // parameter, since `run_layers` is shared by both the plain and
+        // vision-embedded forward paths and neither threads `start_pos`
+        // this far; the mask's leading batch dim may be a broadcast `1`
+        // even when the real batch is larger, but its trailing two dims are
+        // always the true `(seq_q, seq_kv)`.
+        let flash_kv_max = match attention_mask {
+            Some(mask) if seq_q > 1 && any_flash => gpu_flash_attn::prepare_causal_kv_max(
+                xs.dim(0)?,
+                seq_q,
+                mask.dim(mask.rank() - 1)?,
+                self.cfg.head_dim,
+                self.cfg.num_attention_heads,
+                self.cfg.num_key_value_heads,
+                self.attention_dtype(),
+                xs.device(),
+            )?,
+            _ => None,
+        };
+        for layer in &mut self.layers {
+            layer.set_flash_kv_max(flash_kv_max.clone());
+        }
         let debug = std::env::var_os("CRANE_QWEN35_DEBUG_LAYERS").is_some();
         #[cfg(feature = "cuda")]
         let graphs = xs.dim(1)? == 1

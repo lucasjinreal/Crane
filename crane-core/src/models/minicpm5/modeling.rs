@@ -111,6 +111,12 @@ struct Attention {
     /// Opt-in vendored flash attention for prefill, see
     /// [`MiniCpm5Model::enable_flash_causal`].
     flash_causal: bool,
+    /// `KV_max` shared across every layer in one forward pass, built once by
+    /// [`MiniCpm5Model::forward`] via `gpu_flash_attn::prepare_causal_kv_max`
+    /// instead of rebuilt per layer. `None` when flash attention is off,
+    /// there is nothing to share for this shape, or during decode
+    /// (`seq_len == 1`, which never takes the flash path).
+    flash_kv_max: Option<Tensor>,
 }
 
 impl Attention {
@@ -206,6 +212,7 @@ impl Attention {
             kv_cache: None,
             cache_seq_len: 0,
             flash_causal: false,
+            flash_kv_max: None,
         })
     }
 
@@ -239,6 +246,7 @@ impl Attention {
             kv_cache: None,
             cache_seq_len: 0,
             flash_causal: false,
+            flash_kv_max: None,
         })
     }
 
@@ -372,7 +380,8 @@ impl Attention {
         #[allow(clippy::cast_possible_truncation)]
         let scale = (1.0 / (self.head_dim as f64).sqrt()) as f32;
         let mask = flash_mask.or(attention_mask);
-        match gpu_flash_attn::try_causal_prefill(q, k, v, scale, mask)? {
+        let kv_max = self.flash_kv_max.as_ref();
+        match gpu_flash_attn::try_causal_prefill_with_kv_max(q, k, v, scale, mask, kv_max)? {
             Some(out) => self.o_proj.forward(&out).map(Some),
             None => Ok(None),
         }
@@ -816,7 +825,8 @@ impl MiniCpm5Model {
         #[cfg(feature = "cuda")]
         let _event_guard = EventTrackingGuard::disable(input_ids.device());
 
-        let (_b_sz, seq_len) = input_ids.dims2()?;
+        let (b_sz, seq_len) = input_ids.dims2()?;
+        let total_len = start_pos + seq_len;
         // Cast embedding output to the target dtype — the safetensors file may store
         // weights in BF16 which is unsupported for CPU matmul.
         let hidden_states = self.embed_tokens.forward(input_ids)?.to_dtype(self.dtype)?;
@@ -827,7 +837,6 @@ impl MiniCpm5Model {
 
         // Build causal mask
         let attention_mask = if seq_len > 1 {
-            let total_len = start_pos + seq_len;
             // Build [seq_len, total_len] mask: 1.0 where allowed, 0.0 where masked
             let mut mask_data = vec![0f32; seq_len * total_len];
             for i in 0..seq_len {
@@ -849,14 +858,34 @@ impl MiniCpm5Model {
             None
         };
 
+        let any_flash = self.layers.iter().any(|l| l.self_attn.flash_causal);
+
         // One F16 copy of the causal mask for every opted-in layer, instead
         // of a cast in each of them.
         let flash_mask = match attention_mask.as_ref() {
-            Some(mask) if self.layers.iter().any(|l| l.self_attn.flash_causal) => {
-                gpu_flash_attn::prepare_mask(mask)?
-            },
+            Some(mask) if any_flash => gpu_flash_attn::prepare_mask(mask)?,
             _ => None,
         };
+        // One shared KV_max for every opted-in layer, instead of a rebuild
+        // (CPU fill + device alloc + H2D copy) in each of them. There is no
+        // model-level `Config` field here, so the shape comes from the first
+        // layer's own cached dims, identical across layers.
+        let flash_kv_max = match self.layers.first() {
+            Some(layer) if any_flash && seq_len > 1 => gpu_flash_attn::prepare_causal_kv_max(
+                b_sz,
+                seq_len,
+                total_len,
+                layer.self_attn.head_dim,
+                layer.self_attn.num_heads,
+                layer.self_attn.num_kv_heads,
+                self.dtype,
+                input_ids.device(),
+            )?,
+            _ => None,
+        };
+        for layer in &mut self.layers {
+            layer.self_attn.flash_kv_max.clone_from(&flash_kv_max);
+        }
 
         let mut hidden_states = hidden_states;
         for layer in self.layers.iter_mut() {

@@ -30,12 +30,15 @@
 //! `causal_hd64`/`full_no_mask_hd64` tests). A `head_dim=64` call that
 //! cannot reach the MMA kernel returns `None` instead of using it.
 
-use candle_core::{Result, Tensor};
+use candle_core::{DType, Device, Result, Tensor};
 
 #[cfg(crane_fattn)]
+use crate::ops::fused_ops::fattn::{FATTN_KQ_STRIDE, build_analytic_kv_max};
+#[cfg(crane_fattn)]
 use crate::ops::fused_ops::fattn_mma::{
-    fattn_mma_bf16_causal, fattn_mma_bf16_causal_with_mask, fattn_mma_bf16_windowed,
-    fattn_mma_causal, fattn_mma_causal_with_mask, fattn_mma_windowed,
+    compute_mma_ncols1, fattn_mma_bf16_causal, fattn_mma_bf16_causal_with_mask,
+    fattn_mma_bf16_causal_with_mask_kv_max, fattn_mma_bf16_windowed, fattn_mma_causal,
+    fattn_mma_causal_with_mask, fattn_mma_causal_with_mask_kv_max, fattn_mma_windowed,
 };
 #[cfg(crane_fattn)]
 use crate::ops::fused_ops::fattn_tile::{
@@ -45,8 +48,6 @@ use crate::ops::fused_ops::fattn_tile::{
 // an inherent `is_rocm()`.
 #[cfg(all(crane_fattn, feature = "cuda", not(feature = "rocm")))]
 use crate::utils::DeviceExt;
-#[cfg(crane_fattn)]
-use candle_core::DType;
 #[cfg(crane_fattn)]
 use std::sync::Once;
 
@@ -128,6 +129,39 @@ pub(crate) fn try_causal_prefill(
         .transpose()
 }
 
+/// Same as [`try_causal_prefill`], but for a caller that also already has
+/// `KV_max` (e.g. from [`prepare_causal_kv_max`], built once per forward pass
+/// and shared across every layer). Skips the per-call `KV_max` rebuild
+/// [`try_causal_prefill`] still pays whenever `mask` is `Some`.
+///
+/// Falls back to [`try_causal_prefill`]'s own dispatch whenever `mask` or
+/// `kv_max` is `None`: a plain causal call (`mask: None`) has no host-built
+/// `KV_max` to share in the first place, since the kernel derives its bound
+/// from `kv_offset` directly.
+///
+/// # Errors
+///
+/// See [`try_causal`].
+pub(crate) fn try_causal_prefill_with_kv_max(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    mask: Option<&Tensor>,
+    kv_max: Option<&Tensor>,
+) -> Result<Option<Tensor>> {
+    let out = match (mask, kv_max) {
+        (Some(mask), Some(kv_max)) => dispatch_causal_with_kv_max(q, k, v, scale, mask, kv_max),
+        _ => dispatch_causal(q, k, v, scale, mask),
+    };
+    out.transpose()?
+        .map(|o| {
+            let (batch, heads, seq, dim) = o.dims4()?;
+            o.transpose(1, 2)?.reshape((batch, seq, heads * dim))
+        })
+        .transpose()
+}
+
 /// Tries sliding-window flash attention for prefill: key `j` is visible
 /// from query `i` when `i + kv_offset - window_left <= j <= i + kv_offset +
 /// window_right`, where `kv_offset` is `k`'s sequence length minus `q`'s.
@@ -187,6 +221,93 @@ pub(crate) fn prepare_mask(mask: &Tensor) -> Result<Option<Tensor>> {
     }
     let _ = mask;
     Ok(None)
+}
+
+/// Builds the analytic `KV_max` tensor once per forward pass for a decoder
+/// stack whose layers all share one `(batch, seq_q, seq_kv, head_dim,
+/// num_heads_q, num_heads_kv)` shape, mirroring [`prepare_mask`]. Pass the
+/// result to [`try_causal_prefill_with_kv_max`] in place of letting every
+/// layer rebuild its own via `fattn_mma_causal_with_mask`/
+/// `fattn_mma_bf16_causal_with_mask`.
+///
+/// `seq_kv` is `k`'s live sequence length (prefill length plus any KV cache
+/// offset); `dtype` is the model's compute dtype (BF16 picks the native-bf16
+/// kernel's tiling unless `CRANE_DISABLE_BF16_FLASH_ATTN` is set, same as
+/// [`try_causal`]'s own dispatch).
+///
+/// Returns `None` when there is nothing to share: no kernel backend serves
+/// `device`, `CRANE_FLASH_ATTN_INTREE=0`/`CRANE_DISABLE_MMA_FLASH_ATTN` are
+/// set, `head_dim` is unsupported, or no instantiated MMA kernel covers this
+/// shape. Callers then pass `None` through to every layer, which falls back
+/// to the existing per-call rebuild.
+///
+/// Every layer sharing the returned tensor must use the same effective
+/// attention dtype for its flash-attention dispatch: `dtype` alone decides
+/// the bf16-vs-f16 kernel tiling baked into the result. A layer whose own
+/// runtime dtype (e.g. a per-layer `attn_dtype` override) disagrees would
+/// need its own `KV_max` instead of sharing this one.
+///
+/// # Errors
+///
+/// Returns an error if `num_heads_kv` is `0`, `num_heads_q` isn't a positive
+/// multiple of it, or the device query fails.
+// Only fallible under crane_fattn (compute_mma_ncols1/build_analytic_kv_max);
+// CPU-only builds always return Ok.
+#[allow(clippy::unnecessary_wraps)]
+#[allow(clippy::too_many_arguments)] // one build_analytic_kv_max call's worth of shape inputs
+pub(crate) fn prepare_causal_kv_max(
+    batch: usize,
+    seq_q: usize,
+    seq_kv: usize,
+    head_dim: usize,
+    num_heads_q: usize,
+    num_heads_kv: usize,
+    dtype: DType,
+    device: &Device,
+) -> Result<Option<Tensor>> {
+    #[cfg(crane_fattn)]
+    {
+        if intree_env() == Some(false)
+            || mma_disabled()
+            || !on_kernel_device_dev(device)
+            || !head_dim_supported_scalar(head_dim)
+        {
+            return Ok(None);
+        }
+        let bf16 = dtype == DType::BF16 && !bf16_disabled();
+        let Some(ncols1) = compute_mma_ncols1(
+            head_dim,
+            num_heads_q,
+            num_heads_kv,
+            batch,
+            seq_q,
+            bf16,
+            device,
+        )?
+        else {
+            return Ok(None);
+        };
+        let kv_offset = seq_kv.saturating_sub(seq_q);
+        let kv_max_cap = seq_kv.next_multiple_of(FATTN_KQ_STRIDE);
+        build_analytic_kv_max(
+            batch, seq_q, ncols1, kv_offset, seq_kv, 0, kv_max_cap, device,
+        )
+        .map(Some)
+    }
+    #[cfg(not(crane_fattn))]
+    {
+        let _ = (
+            batch,
+            seq_q,
+            seq_kv,
+            head_dim,
+            num_heads_q,
+            num_heads_kv,
+            dtype,
+            device,
+        );
+        Ok(None)
+    }
 }
 
 /// Logs a warning, once per process, when `model` opts into flash attention
@@ -263,6 +384,59 @@ fn dispatch_causal(
     mask: Option<&Tensor>,
 ) -> Option<Result<Tensor>> {
     let _ = (q, k, v, scale, mask);
+    None
+}
+
+/// Shared body of [`try_causal_prefill_with_kv_max`], for the case where both
+/// `mask` and `kv_max` are already built. Otherwise identical to
+/// [`dispatch_causal`], including the tile-kernel fallback, which ignores
+/// `kv_max` (the tile kernel uses a different cap, see
+/// [`fattn_tile_causal_with_mask`]) and builds its own from `mask`/`offset`
+/// the same way it always has.
+#[cfg(crane_fattn)]
+fn dispatch_causal_with_kv_max(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    mask: &Tensor,
+    kv_max: &Tensor,
+) -> Option<Result<Tensor>> {
+    if intree_env() == Some(false) || !on_kernel_device(q) || !head_dim_supported(q) {
+        return None;
+    }
+    let offset = match kv_offset(q, k) {
+        Ok(offset) => offset,
+        Err(e) => return Some(Err(e)),
+    };
+    // The device pointer helpers need a fully contiguous mask. This is an
+    // `Arc` clone when it already is, which is the usual case.
+    let mask = match mask.contiguous() {
+        Ok(mask) => mask,
+        Err(e) => return Some(Err(e)),
+    };
+    run(
+        q,
+        k,
+        v,
+        |qf, kf, vf| fattn_mma_bf16_causal_with_mask_kv_max(qf, kf, vf, scale, &mask, kv_max),
+        |qf, kf, vf| fattn_mma_causal_with_mask_kv_max(qf, kf, vf, scale, &mask, kv_max),
+        |qf, kf, vf| fattn_tile_causal_with_mask(qf, kf, vf, scale, offset, &mask),
+    )
+    .transpose()
+}
+
+/// Builds without a GPU kernel backend never serve a call.
+#[cfg(not(crane_fattn))]
+fn dispatch_causal_with_kv_max(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    mask: &Tensor,
+    kv_max: &Tensor,
+) -> Option<Result<Tensor>> {
+    let _ = (q, k, v, scale, mask, kv_max);
     None
 }
 
@@ -483,8 +657,14 @@ fn copy_unaddressable(t: &Tensor) -> Result<Tensor> {
 /// compiled in.
 #[cfg(crane_fattn)]
 fn on_kernel_device(q: &Tensor) -> bool {
-    (cfg!(feature = "cuda") && q.device().is_cuda())
-        || (cfg!(feature = "rocm") && q.device().is_rocm())
+    on_kernel_device_dev(q.device())
+}
+
+/// [`on_kernel_device`] from a bare `Device`, for a caller that has not
+/// built its `q` tensor yet (e.g. [`prepare_causal_kv_max`]).
+#[cfg(crane_fattn)]
+fn on_kernel_device_dev(device: &Device) -> bool {
+    (cfg!(feature = "cuda") && device.is_cuda()) || (cfg!(feature = "rocm") && device.is_rocm())
 }
 
 /// `k`'s sequence length minus `q`'s. `q`/`k` are BHSD, so the sequence axis
@@ -502,12 +682,19 @@ fn kv_offset(q: &Tensor, k: &Tensor) -> Result<usize> {
 /// no such restriction.
 #[cfg(crane_fattn)]
 fn head_dim_supported(q: &Tensor) -> bool {
+    match q.dim(3) {
+        Ok(d) => head_dim_supported_scalar(d),
+        Err(_) => false,
+    }
+}
+
+/// [`head_dim_supported`] from a bare `head_dim`, for a caller that has not
+/// built its `q` tensor yet (e.g. [`prepare_causal_kv_max`]).
+#[cfg(crane_fattn)]
+fn head_dim_supported_scalar(head_dim: usize) -> bool {
     use crate::ops::fused_ops::fattn::is_amd_backend;
 
-    match q.dim(3) {
-        Ok(d @ (64 | 128 | 256 | 512)) => !(is_amd_backend() && d > 256),
-        _ => false,
-    }
+    matches!(head_dim, 64 | 128 | 256 | 512) && !(is_amd_backend() && head_dim > 256)
 }
 
 /// `CRANE_FLASH_ATTN_INTREE`: `None` when unset, `Some(false)` for empty or

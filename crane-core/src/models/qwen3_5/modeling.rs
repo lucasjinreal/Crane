@@ -477,6 +477,13 @@ pub struct FullAttention {
     /// activations' (see [`Self::set_attention_dtype`]); `None` follows them.
     attn_dtype: Option<DType>,
     flash_causal: bool,
+    /// `KV_max` shared across every full-attention layer in one forward
+    /// pass, built once by [`super::model::Qwen3_5TextModel::run_layers`]
+    /// via `gpu_flash_attn::prepare_causal_kv_max` instead of rebuilt per
+    /// layer. `None` when flash attention is off, there is nothing to share
+    /// for this shape, or during decode (`seq_len == 1`, which never takes
+    /// the flash path).
+    flash_kv_max: Option<Tensor>,
 }
 
 impl FullAttention {
@@ -486,6 +493,12 @@ impl FullAttention {
     /// half-precision cache, which is what long contexts are sized by.
     pub fn set_attention_dtype(&mut self, dtype: Option<DType>) {
         self.attn_dtype = dtype;
+    }
+
+    /// Sets the `KV_max` shared across every full-attention layer for one
+    /// forward pass, see the `flash_kv_max` field's doc comment.
+    fn set_flash_kv_max(&mut self, kv_max: Option<Tensor>) {
+        self.flash_kv_max = kv_max;
     }
 
     /// # Errors
@@ -539,6 +552,7 @@ impl FullAttention {
             has_output_gate: output_gate,
             attn_dtype: None,
             flash_causal: false,
+            flash_kv_max: None,
         })
     }
 
@@ -604,6 +618,7 @@ impl FullAttention {
             has_output_gate: dims.output_gate,
             attn_dtype: None,
             flash_causal: false,
+            flash_kv_max: None,
         })
     }
 
@@ -743,7 +758,8 @@ impl FullAttention {
             #[allow(clippy::cast_possible_truncation)]
             let scale = scale as f32;
             let mask = flash_mask.or(attention_mask);
-            gpu_flash_attn::try_causal_prefill(&q, &k, &v, scale, mask)?
+            let kv_max = self.flash_kv_max.as_ref();
+            gpu_flash_attn::try_causal_prefill_with_kv_max(&q, &k, &v, scale, mask, kv_max)?
         } else {
             flash_output
         };
@@ -1175,6 +1191,15 @@ impl DecoderLayer {
     /// layer. GDN layers never are.
     pub(super) fn flash_causal_enabled(&self) -> bool {
         matches!(&self.layer_impl, LayerImpl::FullAttention(a) if a.flash_causal)
+    }
+
+    /// Shares one forward pass's `KV_max` with this layer's full-attention
+    /// block, see [`FullAttention::set_flash_kv_max`]. A no-op on a
+    /// `LinearAttention` (GDN) layer, which never takes the flash path.
+    pub(super) fn set_flash_kv_max(&mut self, kv_max: Option<Tensor>) {
+        if let LayerImpl::FullAttention(attention) = &mut self.layer_impl {
+            attention.set_flash_kv_max(kv_max);
+        }
     }
 
     /// [`Self::forward`] with the model's causal mask already cast to the
