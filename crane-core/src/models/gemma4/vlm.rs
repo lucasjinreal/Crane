@@ -196,4 +196,10 @@ impl Gemma4VLModel {
     pub fn clear_kv_cache(&mut self) {
         self.language_model.clear_kv_cache();
     }
+
+    /// Enable fused causal attention for prefill in the language model,
+    /// see [`Gemma4Model::enable_flash_causal`].
+    pub fn enable_flash_causal(&mut self) {
+        self.language_model.enable_flash_causal();
+    }
 }

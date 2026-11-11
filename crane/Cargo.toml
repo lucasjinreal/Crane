@@ -34,6 +34,10 @@ onnx = ["crane-core/onnx"]
 metal = ["crane-core/metal"]
 accelerate = ["crane-core/accelerate"]
 cuda = ["crane-core/cuda", "dep:nvml-wrapper"]
+# The two CUDA flash-attention backends, mutually exclusive. See
+# `crane-core/Cargo.toml`.
+flash-attn = ["cuda", "crane-core/flash-attn"]
+flash-attn-intree = ["cuda", "crane-core/flash-attn-intree"]
 # ROCm does not pull `nvml-wrapper` (NVIDIA-only telemetry, cuda-gated).
 rocm = ["crane-core/rocm"]
 # Intel SYCL / oneAPI backend (proof-of-concept).
