@@ -19,7 +19,8 @@ use candle_core::op::BackpropOp;
 use candle_core::rocm_backend::{
     RocmDevice, RocmStorage, RocmStorageSlice, SendSyncDeviceMemory, rocm_rs,
 };
-use candle_core::{DType, Layout, Result, Shape, Storage, Tensor};
+use candle_core::{DType, Device, DeviceLocation, Layout, Result, Shape, Storage, Tensor};
+use ribo::utils::log;
 
 /// The `ROCm` slice behind a tensor's storage, or an error naming the operand.
 ///
@@ -51,6 +52,24 @@ pub fn device_ptr(
     slice_ptr(rocm_slice(storage, what)?, layout, dtype, what)
 }
 
+/// [`device_ptr`] for kernels that take explicit strides: any layout is
+/// accepted, not only a contiguous one. The caller must check that the
+/// kernel can address `layout` first. For the fattn kernels, that is
+/// `fattn::check_kernel_layout`, run by `fattn::validate_fattn_bshd`.
+///
+/// # Errors
+///
+/// Returns an error if `storage` is not `ROCm` storage, or if the slice's
+/// dtype is not `dtype`.
+pub(crate) fn strided_device_ptr(
+    storage: &Storage,
+    layout: &Layout,
+    dtype: DType,
+    what: &str,
+) -> Result<*mut c_void> {
+    ptr_at_start(rocm_slice(storage, what)?, layout, dtype, what)
+}
+
 /// [`device_ptr`] for a slice already unwrapped from its `Storage`/`RocmStorage`
 /// wrapper — what `CustomOp2::rocm_fwd` implementations receive directly.
 ///
@@ -67,6 +86,16 @@ pub fn slice_ptr(
     if !layout.is_contiguous() {
         candle_core::bail!("{what} must be contiguous");
     }
+    ptr_at_start(slice, layout, dtype, what)
+}
+
+/// Pointer to `layout`'s first element, after checking `slice`'s dtype.
+fn ptr_at_start(
+    slice: &RocmStorageSlice,
+    layout: &Layout,
+    dtype: DType,
+    what: &str,
+) -> Result<*mut c_void> {
     if slice.dtype() != dtype {
         candle_core::bail!("{what} must be {dtype:?}, got {:?}", slice.dtype());
     }
@@ -88,6 +117,45 @@ pub fn slice_ptr(
         }
     };
     Ok(ptr)
+}
+
+/// Compute units of the GPU behind `device`.
+///
+/// One `hipDeviceGetAttribute` driver call, no stream sync.
+///
+/// # Errors
+///
+/// Returns an error if `device` is not a `ROCm` device or the query fails.
+pub(crate) fn multiprocessor_count(device: &Device) -> Result<usize> {
+    use rocm_rs::hip::bindings;
+
+    let DeviceLocation::Rocm { gpu_id } = device.location() else {
+        candle_core::bail!("multiprocessor_count: not a rocm device");
+    };
+    let ordinal = i32::try_from(gpu_id)
+        .map_err(|_| candle_core::Error::Msg(format!("rocm gpu id {gpu_id} exceeds i32::MAX")))?;
+    let mut count: std::os::raw::c_int = 0;
+    // SAFETY: `count` is only read once the status has been checked.
+    let status = unsafe {
+        bindings::hipDeviceGetAttribute(
+            &raw mut count,
+            bindings::hipDeviceAttribute_t_hipDeviceAttributeMultiprocessorCount,
+            ordinal,
+        )
+    };
+    if status != bindings::hipError_t_hipSuccess {
+        candle_core::bail!(
+            "hipDeviceGetAttribute(MultiprocessorCount) failed for device {ordinal} \
+             with error {status}"
+        );
+    }
+    if count <= 0 {
+        log::warn!(
+            "hipDeviceGetAttribute(MultiprocessorCount) returned {count} for \
+             device {ordinal}, defaulting to 1"
+        );
+    }
+    Ok(usize::try_from(count).unwrap_or(1).max(1))
 }
 
 /// One entry of a kernel argument list.
@@ -170,6 +238,90 @@ pub unsafe fn launch_2d(
     let func = dev.get_or_load_custom_func(kernel, module, source)?;
     func.launch(grid, block, shared_mem_bytes, Some(dev.stream()), args)
         .map_err(|e| candle_core::Error::Msg(format!("{kernel} launch failed: {e}")))
+}
+
+/// [`launch_2d`], but resolves the kernel through
+/// [`RocmDevice::get_or_load_custom_module`] instead of
+/// [`RocmDevice::get_or_load_custom_func`]. `source` must be a reference
+/// Crane holds for the life of the process (every kernel source here is
+/// built once into a `'static` `String` behind a `OnceLock`): that lets
+/// candle-rocm recognise a repeat call by `source`'s address and skip the
+/// SHA-256 pass `get_or_load_custom_func` repeats on every call to form its
+/// cache key. A launcher that calls into the same module more than once per
+/// op, the fattn MMA kernel and its stream-K fixup pass, say, would
+/// otherwise pay that cost once per launch instead of once per process.
+///
+/// # Safety
+///
+/// Same contract as [`launch_2d`].
+///
+/// # Errors
+///
+/// Same as [`launch_2d`].
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn launch_2d_cached(
+    dev: &RocmDevice,
+    module: &str,
+    kernel: &str,
+    source: &'static str,
+    grid: rocm_rs::hip::Dim3,
+    block: rocm_rs::hip::Dim3,
+    shared_mem_bytes: u32,
+    args: &mut [*mut c_void],
+) -> Result<()> {
+    let func = dev
+        .get_or_load_custom_module(module, source)?
+        .function(kernel)?;
+    func.launch(grid, block, shared_mem_bytes, Some(dev.stream()), args)
+        .map_err(|e| candle_core::Error::Msg(format!("{kernel} launch failed: {e}")))
+}
+
+/// The real occupancy of `kernel` in `module`: how many blocks of `threads`
+/// threads and `shared_mem_bytes` of dynamic shared memory the driver
+/// reports can be co-resident on one CU. Resolves the kernel the same way
+/// [`launch_2d_cached`] does; see its doc comment for why `source` must be
+/// `'static`.
+///
+/// A config table only guesses this; the driver knows the kernel's actual
+/// register and LDS footprint. A stream-K grid-sizing decision should use
+/// this instead of a table value when it is available.
+///
+/// # Errors
+///
+/// Returns an error if the module fails to load, `kernel` is not in it, or
+/// the driver query itself fails.
+pub fn occupancy_max_active_blocks(
+    dev: &RocmDevice,
+    module: &str,
+    kernel: &str,
+    source: &'static str,
+    threads: u32,
+    shared_mem_bytes: u32,
+) -> Result<usize> {
+    let func = dev
+        .get_or_load_custom_module(module, source)?
+        .function(kernel)?;
+    let mut n: i32 = -1;
+    let threads = i32::try_from(threads)
+        .map_err(|_| candle_core::Error::Msg(format!("{kernel}: thread count overflows i32")))?;
+    // SAFETY: `func` is a function handle resolved from a loaded module;
+    // `n` is only read once the status below is checked.
+    let status = unsafe {
+        rocm_rs::hip::bindings::hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(
+            &raw mut n,
+            func.as_raw(),
+            threads,
+            shared_mem_bytes as usize,
+        )
+    };
+    if status != rocm_rs::hip::bindings::hipError_t_hipSuccess || n < 0 {
+        candle_core::bail!(
+            "hipModuleOccupancyMaxActiveBlocksPerMultiprocessor failed for {kernel}: status {status}"
+        );
+    }
+    // n >= 0 was just checked above.
+    #[allow(clippy::cast_sign_loss)]
+    Ok(n as usize)
 }
 
 /// A dtype whose device buffer can be wrapped straight into a

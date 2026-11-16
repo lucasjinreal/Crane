@@ -186,6 +186,8 @@ pub struct ServerInfoResponse {
     pub port: u16,
     pub max_concurrent: usize,
     pub decode_tokens_per_seq: usize,
+    /// Whether `--flash-attention` was requested.
+    pub flash_attention: bool,
     pub max_seq_len: usize,
     pub gpu_memory_limit: String,
     /// Live engine statistics snapshot.

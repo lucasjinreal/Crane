@@ -92,6 +92,12 @@ jobs:
           # No GPU on this runner, so candle-kernels' build script can't
           # call nvidia-smi to auto-detect the compute capability.
           CUDA_COMPUTE_CAP: "80"
+      # The in-tree flash-attention kernels only compile under this
+      # feature, so no other job builds their CUDA code.
+      - name: Build (CUDA, in-tree flash attention)
+        run: cargo build --release -p crane-serve --features "cuda,onnx,flash-attn-intree"
+        env:
+          CUDA_COMPUTE_CAP: "80"
 
   build-sycl:
     # Intel's oneAPI apt repo (same one docker/sycl/Dockerfile.dev's base

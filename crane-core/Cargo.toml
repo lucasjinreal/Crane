@@ -31,6 +31,11 @@ ahash = "0.8"
 anyhow = "1.0.97"
 
 candle-flash-attn = { version = "=0.11.1", optional = true }
+# ROCm counterpart to `candle-flash-attn` above, for parity/speed testing
+# against this crate's own vendored fattn_mma/fattn_tile kernels: same
+# forward-pass causal/windowed API shape, backed by AMD Composable Kernel
+# instead of CUTLASS.
+candle-flash-attn-rocm = { git = "https://github.com/cryptomilk/candle-flash-attn-rocm", optional = true }
 # Candle backend variants — see `src/candle_backend.rs`. Every variant,
 # including the plain/stock one, is a *renamed* dependency on the underlying
 # `candle-core`/`candle-nn`/`candle-transformers` package (`candle-core-default`,
@@ -152,6 +157,14 @@ flash-attn = ["cuda", "dep:candle-flash-attn", "dep:cudaforge"]
 # Inference adapters reuse this dependency's headers. It must be enabled so
 # Cargo fetches its sources on fresh machines, not just developer caches.
 flash-inference = ["cuda", "dep:candle-flash-attn", "dep:cudaforge"]
+# The in-tree flash-attention kernels (`kernels/cuda/fattn/`) as the CUDA
+# backend behind `enable_flash_causal()`. Mutually exclusive with
+# `flash-attn`/`flash-inference`. `rocm` always has these kernels, so it
+# needs no feature.
+flash-attn-intree = ["cuda"]
+# Builds both CUDA flash-attention backends, for A/B testing and the FA2
+# parity tests only. Not for production builds.
+flash-attn-ab = ["flash-attn", "flash-attn-intree"]
 # AMD ROCm/HIP backend (experimental fork). Also enables the fork's own
 # `rocm` feature — it's off by default there too. Build with
 # `--no-default-features`: this crate's `default` feature pulls in the
@@ -164,6 +177,10 @@ rocm = [
     "candle-nn-rocm/rocm",
     "candle-transformers-rocm/rocm",
 ]
+# Pulls in candle-flash-attn-rocm (CK-backed) purely for the parity tests in
+# `ops::fused_ops::fattn_mma`'s `gpu_tests` that compare it against this
+# crate's own vendored kernels. Requires `rocm`.
+flash-attn-rocm = ["rocm", "dep:candle-flash-attn-rocm"]
 # Intel oneAPI/SYCL backend (experimental fork). Same deal as `rocm` above,
 # including the `--no-default-features` requirement.
 sycl = [

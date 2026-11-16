@@ -87,6 +87,17 @@ pub trait ModelBackend: Send + 'static {
     /// Warm up the model with a small forward pass.
     fn warmup(&mut self);
 
+    /// Opt into fused flash attention for causal prefill. The caller
+    /// guarantees an unpadded standard causal mask, which single-sequence
+    /// prefill builds. Returns whether this backend type is wired to
+    /// request flash attention; whether the current build and sequence
+    /// shape actually dispatch a kernel is decided per-call and falls back
+    /// to SDPA otherwise. The default is `false`, and the model then keeps
+    /// its normal attention.
+    fn enable_flash_attention(&mut self) -> bool {
+        false
+    }
+
     // ── KV cache swap (for concurrent sequence serving) ───────
 
     /// Whether this backend supports extracting and restoring KV caches.
@@ -232,6 +243,11 @@ impl Gemma4Backend {
 }
 
 impl ModelBackend for Gemma4Backend {
+    fn enable_flash_attention(&mut self) -> bool {
+        self.model.enable_flash_causal();
+        true
+    }
+
     fn forward_step(&mut self, input_ids: &[u32], start_pos: usize) -> Result<Tensor> {
         self.model
             .forward_step(input_ids, start_pos)
@@ -313,6 +329,11 @@ impl HunyuanBackend {
 }
 
 impl ModelBackend for HunyuanBackend {
+    fn enable_flash_attention(&mut self) -> bool {
+        self.model.enable_flash_causal();
+        true
+    }
+
     fn forward_step(&mut self, input_ids: &[u32], start_pos: usize) -> Result<Tensor> {
         self.model
             .forward_step(input_ids, start_pos)
@@ -527,6 +548,11 @@ impl Minicpm5Backend {
 }
 
 impl ModelBackend for Minicpm5Backend {
+    fn enable_flash_attention(&mut self) -> bool {
+        self.model.enable_flash_causal();
+        true
+    }
+
     fn forward_step(&mut self, input_ids: &[u32], start_pos: usize) -> Result<Tensor> {
         self.model
             .forward_step(input_ids, start_pos)
@@ -636,6 +662,11 @@ impl Qwen3_5Backend {
 }
 
 impl ModelBackend for Qwen3_5Backend {
+    fn enable_flash_attention(&mut self) -> bool {
+        self.model.enable_flash_causal();
+        true
+    }
+
     fn forward_step(&mut self, input_ids: &[u32], start_pos: usize) -> Result<Tensor> {
         // The underlying model already returns anyhow::Result — no conversion needed.
         self.model.forward_step(input_ids, start_pos)
@@ -830,6 +861,11 @@ impl Qwen3Backend {
 }
 
 impl ModelBackend for Qwen3Backend {
+    fn enable_flash_attention(&mut self) -> bool {
+        self.model.enable_flash_causal();
+        true
+    }
+
     fn forward_step(&mut self, input_ids: &[u32], start_pos: usize) -> Result<Tensor> {
         self.model
             .forward_step(input_ids, start_pos)

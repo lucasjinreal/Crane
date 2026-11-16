@@ -1,4 +1,5 @@
 use crate::models::modules::embedding::EmbeddingLayer;
+use crate::models::modules::gpu_flash_attn;
 use crate::models::modules::rotary::RotaryEmbedding;
 use crate::quantized::gguf_metadata::GgufMetadata;
 use crate::utils::DeviceExt;
@@ -122,6 +123,15 @@ struct Attention {
     kv_cache: Option<(Tensor, Tensor)>,
     /// Number of valid (filled) positions in the KV cache buffer.
     cache_seq_len: usize,
+    /// Opt-in vendored flash attention for prefill, see
+    /// [`HunYuanDenseV1::enable_flash_causal`].
+    flash_causal: bool,
+    /// `KV_max` shared across every layer in one forward pass, built once by
+    /// [`HunYuanDenseV1::forward`] via `gpu_flash_attn::prepare_causal_kv_max`
+    /// instead of rebuilt per layer. `None` when flash attention is off,
+    /// there is nothing to share for this shape, or during decode
+    /// (`seq_len == 1`, which never takes the flash path).
+    flash_kv_max: Option<Tensor>,
 }
 
 impl Attention {
@@ -240,6 +250,8 @@ impl Attention {
             kv_dim,
             kv_cache: None,
             cache_seq_len: 0,
+            flash_causal: false,
+            flash_kv_max: None,
         })
     }
 
@@ -283,6 +295,8 @@ impl Attention {
             kv_dim: num_kv_heads * head_dim,
             kv_cache: None,
             cache_seq_len: 0,
+            flash_causal: false,
+            flash_kv_max: None,
         })
     }
 
@@ -355,6 +369,7 @@ impl Attention {
         cos: &Tensor,
         sin: &Tensor,
         attention_mask: Option<&Tensor>,
+        flash_mask: Option<&Tensor>,
         shared_kv: Option<(Tensor, Tensor)>,
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _) = hidden_states.dims3()?;
@@ -371,6 +386,9 @@ impl Attention {
             } else {
                 q
             };
+            if let Some(out) = self.try_flash_prefill(&q, &k, &v, attention_mask, flash_mask)? {
+                return Ok(out);
+            }
             return self.compute_attention(&q, k, v, attention_mask, b_sz, seq_len);
         }
 
@@ -417,7 +435,38 @@ impl Attention {
 
         let (k, v) = self.update_kv_cache(&k, &v)?;
 
+        if let Some(out) = self.try_flash_prefill(&q, &k, &v, attention_mask, flash_mask)? {
+            return Ok(out);
+        }
         self.compute_attention(&q, k, v, attention_mask, b_sz, seq_len)
+    }
+
+    /// Opt-in prefill through the vendored flash-attention kernels, GPU only,
+    /// returning the projected output. `None` leaves the call to
+    /// [`Self::compute_attention`]. The kernel never sees padding, so this is
+    /// only valid for the unpadded standard causal mask that
+    /// `enable_flash_causal` requires. Shared CLA layers qualify too, since
+    /// the anchor's cache already holds this chunk.
+    fn try_flash_prefill(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        attention_mask: Option<&Tensor>,
+        flash_mask: Option<&Tensor>,
+    ) -> Result<Option<Tensor>> {
+        if !self.flash_causal || q.dim(2)? == 1 {
+            return Ok(None);
+        }
+        // 1/sqrt(head_dim) is always small and positive, far inside f32.
+        #[allow(clippy::cast_possible_truncation)]
+        let scale = (1.0 / (self.head_dim as f64).sqrt()) as f32;
+        let mask = flash_mask.or(attention_mask);
+        let kv_max = self.flash_kv_max.as_ref();
+        match gpu_flash_attn::try_causal_prefill_with_kv_max(q, k, v, scale, mask, kv_max)? {
+            Some(out) => self.o_proj.forward(&out).map(Some),
+            None => Ok(None),
+        }
     }
 
     /// Shared attention computation used by both normal and CLA paths.
@@ -668,13 +717,19 @@ impl DecoderLayer {
         cos: &Tensor,
         sin: &Tensor,
         attention_mask: Option<&Tensor>,
+        flash_mask: Option<&Tensor>,
         shared_kv: Option<(Tensor, Tensor)>,
     ) -> Result<Tensor> {
         let residual = hidden_states;
         let hidden_states = self.input_layernorm.forward(hidden_states)?;
-        let hidden_states =
-            self.self_attn
-                .forward(&hidden_states, cos, sin, attention_mask, shared_kv)?;
+        let hidden_states = self.self_attn.forward(
+            &hidden_states,
+            cos,
+            sin,
+            attention_mask,
+            flash_mask,
+            shared_kv,
+        )?;
         let hidden_states = (residual + hidden_states)?;
 
         let residual = &hidden_states;
@@ -685,6 +740,11 @@ impl DecoderLayer {
 
     fn clear_kv_cache(&mut self) {
         self.self_attn.clear_kv_cache();
+    }
+
+    fn enable_flash_causal(&mut self) {
+        gpu_flash_attn::warn_if_no_flash_backend("HunyuanDense", false);
+        self.self_attn.flash_causal = true;
     }
 }
 
@@ -886,7 +946,8 @@ impl HunYuanDenseV1 {
         #[cfg(feature = "cuda")]
         let _event_guard = EventTrackingGuard::disable(input_ids.device());
 
-        let (_b_sz, seq_len) = input_ids.dims2()?;
+        let (b_sz, seq_len) = input_ids.dims2()?;
+        let total_len = start_pos + seq_len;
         // Cast embedding output to the target dtype — the safetensors file may store
         // weights in BF16 which is unsupported for CPU matmul.
         let hidden_states = self.embed_tokens.forward(input_ids)?.to_dtype(self.dtype)?;
@@ -897,7 +958,6 @@ impl HunYuanDenseV1 {
 
         // Build causal mask
         let attention_mask = if seq_len > 1 {
-            let total_len = start_pos + seq_len;
             // Build [seq_len, total_len] mask: 1.0 where allowed, 0.0 where masked
             let mut mask_data = vec![0f32; seq_len * total_len];
             for i in 0..seq_len {
@@ -924,6 +984,34 @@ impl HunYuanDenseV1 {
         let use_cla = self.config.use_cla.unwrap_or(false);
         let cla_factor = self.config.cla_share_factor.unwrap_or(1);
 
+        let any_flash = self.layers.iter().any(|l| l.self_attn.flash_causal);
+
+        // One F16 copy of the causal mask for every opted-in layer, instead
+        // of a cast in each of them.
+        let flash_mask = match attention_mask.as_ref() {
+            Some(mask) if any_flash => gpu_flash_attn::prepare_mask(mask)?,
+            _ => None,
+        };
+        // One shared KV_max for every opted-in layer, instead of a rebuild
+        // (CPU fill + device alloc + H2D copy) in each of them.
+        let flash_kv_max = if any_flash && seq_len > 1 {
+            gpu_flash_attn::prepare_causal_kv_max(
+                b_sz,
+                seq_len,
+                total_len,
+                self.config.head_dim(),
+                self.config.num_attention_heads,
+                self.config.num_key_value_heads,
+                self.dtype,
+                input_ids.device(),
+            )?
+        } else {
+            None
+        };
+        for layer in &mut self.layers {
+            layer.self_attn.flash_kv_max.clone_from(&flash_kv_max);
+        }
+
         let mut hidden_states = hidden_states;
         let mut anchor_kv: Option<(Tensor, Tensor)> = None;
 
@@ -938,6 +1026,7 @@ impl HunYuanDenseV1 {
                 &cos,
                 &sin,
                 attention_mask.as_ref(),
+                flash_mask.as_ref(),
                 shared_kv,
             )?;
 
@@ -962,6 +1051,23 @@ impl HunYuanDenseV1 {
             layer.clear_kv_cache();
         }
         // rotary_emb tables are static and reusable — do not clear.
+    }
+
+    /// Enable fused causal attention for prefill. The caller guarantees an
+    /// unpadded standard causal mask, which is what prefill builds. Batched
+    /// decode with padding never reaches the fused path, because it is
+    /// single-token.
+    ///
+    /// The vendored kernels compute `KV_max` analytically and skip KV tiles
+    /// past the causal diagonal, so a non-causal mask is cut off silently
+    /// instead of honored. An F32 model runs the kernel in F16, so its
+    /// opted-in attention has F16 precision. Anything the kernels cannot
+    /// serve, such as an unsupported `head_dim` or a CPU device, keeps the
+    /// default path.
+    pub fn enable_flash_causal(&mut self) {
+        for layer in &mut self.layers {
+            layer.enable_flash_causal();
+        }
     }
 
     /// Compute the total bytes held by the model's KV caches without any
@@ -1149,7 +1255,8 @@ impl HunYuanDenseV1 {
 
         let mut hidden_states = hidden_states;
         for layer in &mut self.layers {
-            hidden_states = layer.forward(&hidden_states, &cos, &sin, attention_mask, None)?;
+            hidden_states =
+                layer.forward(&hidden_states, &cos, &sin, attention_mask, None, None)?;
         }
 
         let hidden_states = self.norm.forward(&hidden_states)?;
@@ -1325,4 +1432,39 @@ fn pad_and_stack_kv_caches(
     let stacked_k = Tensor::cat(&padded_ks, 0)?.contiguous()?;
     let stacked_v = Tensor::cat(&padded_vs, 0)?.contiguous()?;
     Ok(Some((stacked_k, stacked_v)))
+}
+
+#[cfg(all(test, crane_fattn))]
+mod flash_causal_tests {
+    use super::*;
+    use crate::models::flash_test_support::{assert_flash_tracks_default, hash_weights};
+
+    /// `head_dim` 128 so the vendored kernels have an instantiation. Four
+    /// layers with `cla_share_factor` 2 make every second layer reuse the
+    /// anchor's K/V.
+    fn tiny_config() -> Config {
+        serde_json::from_str(
+            r#"{"vocab_size":64,"hidden_size":256,"intermediate_size":128,
+            "num_hidden_layers":4,"num_attention_heads":4,"num_key_value_heads":2,
+            "head_dim":128,"hidden_act":"silu","max_position_embeddings":256,
+            "rms_norm_eps":1e-6,"rope_theta":10000.0,"use_qk_norm":true,
+            "tie_word_embeddings":true,"use_cla":true,"cla_share_factor":2}"#,
+        )
+        .unwrap()
+    }
+
+    // Prefill and continuation prefill through the vendored kernel, then a
+    // decode step through the default path, must track an unflagged model.
+    // This includes the CLA layers that reuse an anchor's K/V.
+    #[test]
+    fn flash_causal_tracks_default_attention() {
+        assert_flash_tracks_default(
+            "hunyuan",
+            64,
+            [(DType::BF16, 0.06), (DType::F16, 0.008)],
+            |dev, dtype| HunYuanDenseV1::new(&tiny_config(), &hash_weights(dev, dtype)).unwrap(),
+            |m, ids, start| m.forward(ids, start).unwrap(),
+            HunYuanDenseV1::enable_flash_causal,
+        );
+    }
 }
