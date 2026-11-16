@@ -16,7 +16,10 @@ pub struct SchedulerOutput {
 ///     maximizes GPU utilization since larger batch decodes are more efficient.
 ///   - Once `running` reaches `max_running` (or `effective_max_running`),
 ///     no more prefills are admitted — the scheduler only decodes.
-///   - A prefill step processes exactly ONE new sequence (its full prompt).
+///   - A prefill step processes exactly ONE sequence (one chunk of its prompt
+///     on backends that swap KV; the whole prompt otherwise). After a
+///     non-final chunk the engine sets `decode_next`, so a decode round runs
+///     before the next chunk.
 ///   - A decode step processes ALL running sequences (one token each).
 ///   - `max_running` limits how many sequences can be in decode phase
 ///     simultaneously (controls peak KV-cache memory).
@@ -34,6 +37,9 @@ pub struct Scheduler {
     /// exceed the KV budget again. Reset to `None` when a sequence finishes
     /// naturally, allowing the system to try admitting more.
     pub effective_max_running: Option<usize>,
+    /// Skip the next prefill pick when sequences are running, so decode gets
+    /// a turn between the chunks of a long prompt. Cleared by `schedule`.
+    pub decode_next: bool,
 }
 
 impl Scheduler {
@@ -44,6 +50,7 @@ impl Scheduler {
             running: VecDeque::new(),
             max_running,
             effective_max_running: None,
+            decode_next: false,
         }
     }
 
@@ -67,7 +74,9 @@ impl Scheduler {
     pub fn schedule(&mut self) -> Option<SchedulerOutput> {
         // Priority 1: Prefill a waiting sequence if there's capacity.
         let max = self.effective_max_running.unwrap_or(self.max_running);
-        if self.running.len() < max
+        let prefill_turn = !std::mem::take(&mut self.decode_next) || self.running.is_empty();
+        if prefill_turn
+            && self.running.len() < max
             && let Some(seq_id) = self.waiting.pop_front()
         {
             return Some(SchedulerOutput {

@@ -51,6 +51,10 @@ pub struct Sequence {
     /// at the position it actually reached — unlike an attention KV cache,
     /// there is no truncating it to an arbitrary shorter prefix.
     pub cached_prefix_len: usize,
+    /// Tokens after `cached_prefix_len` already fed by earlier prefill chunks.
+    /// Non-zero only while a long prompt is paused between chunks; the
+    /// engine resets it when it evicts the sequence.
+    pub prefill_pos: usize,
 
     // ── KV cache (one entry per transformer layer) ──
     /// Saved KV caches when this sequence is not the one loaded in the model.
@@ -101,6 +105,8 @@ pub struct Sequence {
     /// Set once, the first time a generated-text chunk is sent to the
     /// client via `EngineResponse::Token`. `None` until then.
     pub first_token_at: Option<Instant>,
+    /// Microseconds spent in this prefill's chunks so far.
+    pub prefill_us: u64,
 
     // ── response channel ──
     /// Sends `EngineResponse` chunks back to the API handler.
@@ -221,7 +227,7 @@ impl Sequence {
         // During decode each step adds one token, so the cache covers
         // tokens.len() - 1 positions (the new token hasn't been cached yet).
         if self.status == SequenceStatus::Waiting {
-            self.cached_prefix_len
+            self.cached_prefix_len + self.prefill_pos
         } else {
             self.tokens.len().saturating_sub(1)
         }
@@ -233,7 +239,7 @@ impl Sequence {
         if self.status == SequenceStatus::Waiting {
             // Prefill: feed every token the model does not hold yet (the prompt,
             // plus any output kept across an eviction).
-            &self.tokens[self.cached_prefix_len..]
+            &self.tokens[self.cached_prefix_len + self.prefill_pos..]
         } else {
             // Decode: feed only the last generated token.
             &self.tokens[self.tokens.len() - 1..]
@@ -335,6 +341,8 @@ mod tests {
         tokens.extend_from_slice(generated);
         Sequence {
             cached_prefix_len: 0,
+            prefill_pos: 0,
+            prefill_us: 0,
             id: "test-seq".into(),
             status,
             tokens,
