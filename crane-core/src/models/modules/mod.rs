@@ -8,5 +8,6 @@ pub mod mel;
 pub mod moe;
 pub mod rotary;
 pub mod siglip2;
+pub mod tiled_sdpa;
 pub mod transformer;
 pub mod voice_embedding;
