@@ -74,6 +74,16 @@ MODELS = {
         "kind": "asr",
         "description": "Qwen3-ASR 1.7B, speech-to-text (Apache-2.0)",
     },
+    "oruk-fourier-2b": {
+        "repo_id": "oruk/oruk-fourier-2b",
+        # Pin to the native HF Transformers BF16 checkpoint revision so
+        # snapshot_download skips the multi-format GGUF/ONNX/MLX folders on
+        # main (~4.1 GB instead of ~13+ GB).
+        "revision": "8c2a8871f1304aa2f634da4fb95e24438c4945b9",
+        "dirname": "oruk-fourier-2b",
+        "kind": "asr",
+        "description": "Oruk Fourier 2B, English-only Qwen3-ASR fine-tune (CC-BY-NC-4.0)",
+    },
     "silero-vad": {
         "repo_id": "onnx-community/silero-vad",
         "dirname": "silero-vad",
@@ -447,8 +457,11 @@ def list_quants(model_key, token):
 
     prefix, _, suffix = quant_template.partition("{quant}")
     repo_type = info.get("repo_type", "model")
+    revision = info.get("revision")
     try:
-        files = HfApi(token=token).list_repo_files(info["repo_id"], repo_type=repo_type)
+        files = HfApi(token=token).list_repo_files(
+            info["repo_id"], revision=revision, repo_type=repo_type
+        )
     except HfHubHTTPError as e:
         status = e.response.status_code if e.response is not None else None
         print(f"error: could not list files for {info['repo_id']}: {e}", file=sys.stderr)
@@ -545,6 +558,7 @@ def download_model(model_key, path, token, quant):
 
     quant_template = info.get("quant_template")
     repo_type = info.get("repo_type", "model")
+    revision = info.get("revision")
 
     if quant_template:
         filename = quant_template.format(quant=quant)
@@ -552,13 +566,17 @@ def download_model(model_key, path, token, quant):
         print(f"Downloading {info['repo_id']}:{filename} to {target} ...")
     else:
         target = local_dir
-        print(f"Downloading {info['repo_id']} to {local_dir} ...")
+        rev_suffix = f"@{revision[:8]}" if revision else ""
+        print(f"Downloading {info['repo_id']}{rev_suffix} to {local_dir} ...")
 
     try:
         if quant_template:
             os.makedirs(local_dir, exist_ok=True)
             cached = hf_hub_download(
-                repo_id=info["repo_id"], filename=filename, token=token
+                repo_id=info["repo_id"],
+                filename=filename,
+                revision=revision,
+                token=token,
             )
             shutil.copy2(cached, target)
         else:
@@ -569,6 +587,7 @@ def download_model(model_key, path, token, quant):
                     cached = hf_hub_download(
                         repo_id=info["repo_id"],
                         filename=repo_path,
+                        revision=revision,
                         repo_type=repo_type,
                         token=token,
                     )
@@ -578,6 +597,7 @@ def download_model(model_key, path, token, quant):
             else:
                 snapshot_download(
                     repo_id=info["repo_id"],
+                    revision=revision,
                     local_dir=local_dir,
                     repo_type=repo_type,
                     token=token,

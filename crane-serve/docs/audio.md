@@ -381,12 +381,34 @@ On CPU with F32 weights, generation is slow. Use CUDA or Metal.
 
 ## Speech recognition (ASR)
 
-Crane supports Qwen3-ASR via `--model-type qwen3_asr` (auto-detected from
-`config.json`). Start the server the same way as any other model:
+Crane supports native Hugging Face `Qwen3ASRForConditionalGeneration` checkpoints
+via `--model-type qwen3_asr` (auto-detected from `config.json`), including the
+multilingual `Qwen/Qwen3-ASR-0.6B-hf` / `Qwen/Qwen3-ASR-1.7B-hf` (Apache-2.0)
+models and the opt-in English-only
+[Oruk Fourier 2B](https://huggingface.co/oruk/oruk-fourier-2b) fine-tune
+(noncommercial **CC BY-NC 4.0** license).
+
+Download a checkpoint with `data/crane-model-download` (or `hf download`):
+
+```bash
+# Multilingual Qwen3-ASR (Apache-2.0)
+python3 data/crane-model-download --model qwen3-asr-0.6b --path checkpoints
+python3 data/crane-model-download --model qwen3-asr-1.7b --path checkpoints
+
+# Opt-in English-only Oruk Fourier 2B (CC BY-NC 4.0, pinned BF16 revision)
+python3 data/crane-model-download --model oruk-fourier-2b --path checkpoints
+```
+
+Start the server the same way as any other model:
 
 ```bash
 ./target/release/crane-serve \
-    --model-path checkpoints/Qwen3-ASR \
+    --model-path checkpoints/asr/Qwen3-ASR-0.6B-hf \
+    --port 8080
+
+# Or with Oruk Fourier 2B (English-only, CC BY-NC 4.0; auto-detected as qwen3_asr)
+./target/release/crane-serve \
+    --model-path checkpoints/asr/oruk-fourier-2b \
     --port 8080
 ```
 

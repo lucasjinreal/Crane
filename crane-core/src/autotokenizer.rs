@@ -943,4 +943,71 @@ mod tests {
         let output = rewrite_python_str_methods(input);
         assert_eq!(output, input);
     }
+
+    #[test]
+    fn deserialize_oruk_fourier_2b_tokenizer_config() {
+        // Exact tokenizer_config.json from oruk/oruk-fourier-2b@8c2a8871f1304aa2f634da4fb95e24438c4945b9.
+        const TOKENIZER_CONFIG: &str = r#"{
+          "add_prefix_space": false,
+          "audio_bos_token": "<|audio_start|>",
+          "audio_eos_token": "<|audio_end|>",
+          "audio_token": "<|audio_pad|>",
+          "backend": "tokenizers",
+          "bos_token": null,
+          "clean_up_tokenization_spaces": false,
+          "eos_token": "<|im_end|>",
+          "errors": "replace",
+          "extra_special_tokens": [
+            "<|im_start|>",
+            "<|im_end|>",
+            "<|object_ref_start|>",
+            "<|object_ref_end|>",
+            "<|box_start|>",
+            "<|box_end|>",
+            "<|quad_start|>",
+            "<|quad_end|>",
+            "<|vision_start|>",
+            "<|vision_end|>",
+            "<|vision_pad|>",
+            "<|image_pad|>",
+            "<|video_pad|>",
+            "<|audio_start|>",
+            "<|audio_end|>",
+            "<tts_pad>",
+            "<tts_text_bos>",
+            "<tts_text_bos_single>",
+            "<|audio_pad|>"
+          ],
+          "image_token": "<|image_pad|>",
+          "is_local": true,
+          "local_files_only": true,
+          "model_max_length": 131072,
+          "model_specific_special_tokens": {
+            "audio_bos_token": "<|audio_start|>",
+            "audio_eos_token": "<|audio_end|>",
+            "audio_token": "<|audio_pad|>",
+            "image_token": "<|image_pad|>",
+            "video_token": "<|video_pad|>",
+            "vision_bos_token": "<|vision_start|>",
+            "vision_eos_token": "<|vision_end|>"
+          },
+          "pad_token": "<|endoftext|>",
+          "processor_class": "Qwen3ASRProcessor",
+          "split_special_tokens": false,
+          "tokenizer_class": "Qwen2Tokenizer",
+          "unk_token": null,
+          "video_token": "<|video_pad|>",
+          "vision_bos_token": "<|vision_start|>",
+          "vision_eos_token": "<|vision_end|>"
+        }"#;
+
+        let cfg: AutoTokenizerConfig = serde_json::from_str(TOKENIZER_CONFIG).unwrap();
+        assert_eq!(cfg.tokenizer_class, "Qwen2Tokenizer");
+        assert_eq!(cfg.model_max_length, 131_072);
+        assert!(!cfg.clean_up_tokenization_spaces);
+        assert!(cfg.bos_token.is_none());
+        assert!(cfg.eos_token.is_some());
+        assert!(cfg.pad_token.is_some());
+        assert!(cfg.chat_template.is_none());
+    }
 }

@@ -511,4 +511,134 @@ mod tests {
         assert!(!qwen3_config.use_sliding_window);
         assert_eq!(qwen3_config.eos_token_id, None);
     }
+
+    #[test]
+    fn deserialize_oruk_fourier_2b_config() {
+        // Exact config.json from oruk/oruk-fourier-2b@8c2a8871f1304aa2f634da4fb95e24438c4945b9
+        // (native HF Transformers Qwen3ASRForConditionalGeneration layout).
+        const CONFIG_FOURIER_2B: &str = r#"{
+          "architectures": [
+            "Qwen3ASRForConditionalGeneration"
+          ],
+          "audio_config": {
+            "activation_dropout": 0,
+            "activation_function": "gelu",
+            "attention_dropout": 0,
+            "conv_chunksize": 500,
+            "d_model": 1024,
+            "downsample_hidden_size": 480,
+            "dropout": 0,
+            "encoder_attention_heads": 16,
+            "encoder_ffn_dim": 4096,
+            "encoder_layers": 24,
+            "initializer_range": 0.02,
+            "max_position_embeddings": 13,
+            "model_type": "qwen3_asr_encoder",
+            "n_window": 50,
+            "n_window_infer": 800,
+            "num_key_value_heads": 16,
+            "num_mel_bins": 128,
+            "output_dim": 2048,
+            "scale_embedding": false
+          },
+          "audio_token_id": 151676,
+          "auto_map": {
+            "AutoConfig": "configuration_qwen3_asr.Qwen3ASRConfig"
+          },
+          "dtype": "bfloat16",
+          "eos_token_id": [
+            151643,
+            151645
+          ],
+          "initializer_range": 0.02,
+          "model_type": "qwen3_asr",
+          "pad_token_id": 151645,
+          "text_config": {
+            "attention_bias": false,
+            "attention_dropout": 0.0,
+            "bos_token_id": null,
+            "eos_token_id": null,
+            "head_dim": 128,
+            "hidden_act": "silu",
+            "hidden_size": 2048,
+            "initializer_range": 0.02,
+            "intermediate_size": 6144,
+            "layer_types": [
+              "full_attention",
+              "full_attention",
+              "full_attention",
+              "full_attention",
+              "full_attention",
+              "full_attention",
+              "full_attention",
+              "full_attention",
+              "full_attention",
+              "full_attention",
+              "full_attention",
+              "full_attention",
+              "full_attention",
+              "full_attention",
+              "full_attention",
+              "full_attention",
+              "full_attention",
+              "full_attention",
+              "full_attention",
+              "full_attention",
+              "full_attention",
+              "full_attention",
+              "full_attention",
+              "full_attention",
+              "full_attention",
+              "full_attention",
+              "full_attention",
+              "full_attention"
+            ],
+            "max_position_embeddings": 65536,
+            "max_window_layers": 28,
+            "model_type": "qwen3",
+            "num_attention_heads": 16,
+            "num_hidden_layers": 28,
+            "num_key_value_heads": 8,
+            "pad_token_id": null,
+            "rms_norm_eps": 1e-06,
+            "rope_parameters": {
+              "rope_theta": 1000000,
+              "rope_type": "default"
+            },
+            "sliding_window": null,
+            "tie_word_embeddings": true,
+            "use_cache": true,
+            "use_sliding_window": false,
+            "vocab_size": 151936
+          },
+          "tie_word_embeddings": true,
+          "timestamp_token_id": 151705,
+          "token_classification_bias": false,
+          "transformers_version": "5.21.0.dev0"
+        }"#;
+
+        let (config, defaults) = Config::from_json_slice(CONFIG_FOURIER_2B.as_bytes()).unwrap();
+        assert!(defaults.is_none());
+        assert_eq!(config.audio_token_id, 151_676);
+        assert_eq!(config.timestamp_token_id, 151_705);
+        assert_eq!(config.pad_token_id, 151_645);
+        assert_eq!(config.eos_token_id, vec![151_643, 151_645]);
+        assert!(config.tie_word_embeddings);
+
+        assert_eq!(config.audio_config.d_model, 1024);
+        assert_eq!(config.audio_config.encoder_layers, 24);
+        assert_eq!(config.audio_config.output_dim, 2048);
+        assert_eq!(config.audio_config.max_position_embeddings, 13);
+
+        let qwen3 = config.text_config.to_qwen3_config();
+        assert_eq!(qwen3.vocab_size, 151_936);
+        assert_eq!(qwen3.hidden_size, 2048);
+        assert_eq!(qwen3.intermediate_size, 6144);
+        assert_eq!(qwen3.num_hidden_layers, 28);
+        assert_eq!(qwen3.num_attention_heads, 16);
+        assert_eq!(qwen3.num_key_value_heads, 8);
+        assert_eq!(qwen3.head_dim, Some(128));
+        assert!(qwen3.tie_word_embeddings);
+        assert!((qwen3.rope_theta - 1_000_000.0).abs() < f64::EPSILON);
+    }
 }
