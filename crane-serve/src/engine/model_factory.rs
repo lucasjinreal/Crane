@@ -395,6 +395,7 @@ pub fn detect_model_type(model_path: &str) -> ModelType {
     } else if path_lower.contains("qwen3-asr")
         || path_lower.contains("qwen3_asr")
         || path_lower.contains("qwen3asr")
+        || path_lower.contains("oruk-fourier")
     {
         ModelType::Qwen3ASR
     } else if QWEN3_5_FAMILY_VL_MARKERS
@@ -1449,6 +1450,29 @@ mod tests {
     #[test]
     fn detect_path_heuristic_qwen3_asr() {
         let result = detect_model_type("/models/Qwen3-ASR-0.6B-hf");
+        assert_eq!(result, ModelType::Qwen3ASR);
+    }
+
+    #[test]
+    fn detect_from_config_json_oruk_fourier_2b() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.json");
+        std::fs::write(
+            &config,
+            r#"{
+                "architectures": ["Qwen3ASRForConditionalGeneration"],
+                "auto_map": {"AutoConfig": "configuration_qwen3_asr.Qwen3ASRConfig"},
+                "model_type": "qwen3_asr"
+            }"#,
+        )
+        .unwrap();
+        let result = detect_model_type(dir.path().to_str().unwrap());
+        assert_eq!(result, ModelType::Qwen3ASR);
+    }
+
+    #[test]
+    fn detect_path_heuristic_oruk_fourier_2b() {
+        let result = detect_model_type("/models/asr/oruk-fourier-2b");
         assert_eq!(result, ModelType::Qwen3ASR);
     }
 
